@@ -10,6 +10,7 @@ import { HOUR, validWildCell } from './seaweed.js';
 import { fishOrigin, validBreedingRecord, inheritedGlyph } from './breeding.js';
 import { defaultFishName, displayFishName, fishCatalog } from './fish-profile.js';
 import { drawPedigree } from './pedigree.js';
+import { normalizeInvite } from './invite.js';
 const $ = id => document.getElementById(id);
 const renderer = new Renderer($('sea'));
 let world = new World(), identity, network, meta, creator, mode = null, selected = null, dragging, histories = {}, known = [], members = new Map(), pending = new Map(), inbox = new Map(), lastPicture = null, priorCheckpoint = null;
@@ -43,7 +44,7 @@ function update() {
   if ($('myFishDialog').open) renderMyFishes();
   if (selected) inspect(selected, false);
 }
-function remember(url) { if (!url || url === meta?.url) return; if (!known.includes(url)) { known.push(url); set('known', known).catch(() => {}); } }
+async function remember(url) { try { if (!url) return; url = await normalizeInvite(url); if (url === meta?.url) return; if (!known.includes(url)) { known.push(url); set('known', known).catch(() => {}); } } catch { } }
 function syncIncomeSerial() { for (const op of Object.values(world.data.ops)) if (op.kind === 'earn' && op.actor === identity.actor) identity.serial = Math.max(identity.serial || 0, op.serial); }
 async function requestHistory(peer) { const ids = (historyQueues.get(peer.id) || []).filter(id => !histories[id]); historyQueues.set(peer.id, ids); if (ids.length) await network.direct(peer, 'historyRequest', { ids: ids.slice(0, 32) }); else historyQueues.delete(peer.id); }
 async function verifyChats(messages = {}) {
@@ -142,7 +143,7 @@ async function onMessage(message, peer) {
     const missing = (body.historyIndex || []).filter(id => !histories[id]); if (missing.length) { historyQueues.set(peer.id, missing); await requestHistory(peer); }
     status = ''; toast('已接入伙伴，两个世界正在合流'); update();
   } else if (message.kind === 'beat') {
-    if (body.member?.id === message.from && body.member.actor === message.actor) { const direct = network.live().find(p => p.node === message.from); members.set(message.from, { ...body.member, direct: !!direct, url: direct?.url || body.member.url, at: Date.now() }); remember(body.member.url); if (Date.now() - lastRepair > 5000 && (body.rootCount > world.roots.length || body.opCount > Object.keys(world.data.ops).length || body.chatCount > Object.keys(world.data.chats).length || body.chatSourceCount > Object.keys(world.data.chatSources).length)) { lastRepair = Date.now(); network.broadcast('replicaRequest', { to: message.from }).catch(() => {}); } }
+    if (body.member?.id === message.from && body.member.actor === message.actor) { const direct = network.live().find(p => p.node === message.from); members.set(message.from, { ...body.member, direct: !!direct, url: await normalizeInvite(direct?.url || body.member.url), at: Date.now() }); remember(body.member.url); if (Date.now() - lastRepair > 5000 && (body.rootCount > world.roots.length || body.opCount > Object.keys(world.data.ops).length || body.chatCount > Object.keys(world.data.chats).length || body.chatSourceCount > Object.keys(world.data.chatSources).length)) { lastRepair = Date.now(); network.broadcast('replicaRequest', { to: message.from }).catch(() => {}); } }
   } else if (message.kind === 'merge') {
     await mergeReplica(body.world); geometryRepair = true; reconcileHistory(); syncIncomeSerial(); update();
   } else if (message.kind === 'replicaRequest') {
@@ -173,7 +174,7 @@ async function networkChange(error) {
   const ids = new Set(live.map(p => p.node)); for (const m of active()) if (m.id !== network.node && m.direct && !ids.has(m.id)) { m.direct = false; probeGone(m.id, m.url); } for (const id of ids) if (members.has(id)) members.get(id).direct = true;
   network.presence(active().filter(m => m.id !== network.node).map(m => ({ id: m.id, url: m.url }))).catch(() => {}); update();
 }
-async function probeGone(id, url) { if (!id || id === network.node || !members.has(id)) return; try { const s = await network.local('probe', { url }); if (!(s.clients || []).some(c => c.id === id)) { members.delete(id); await network.broadcast('lost', { id, url }); update(); } } catch { /* Membership lease expires if the publishing computer is unreachable. */ } }
+async function probeGone(id, url) { if (!id || id === network.node || !members.has(id)) return; try { url = await normalizeInvite(url); const s = await network.local('probe', { url }); if (!(s.clients || []).some(c => c.id === id)) { members.delete(id); await network.broadcast('lost', { id, url }); update(); } } catch { /* Membership lease expires if the publishing computer is unreachable. */ } }
 async function broadcastWorld() {
   if (snapshotBusy || !amLeader()) return; snapshotBusy = true;
   try {
@@ -339,11 +340,13 @@ function endedCard(checkpoint, endedAt) { const roots = Object.keys(checkpoint.w
 function currentCheckpoint() { return { world: world.serialize(), picture: lastPicture || localPicture(), at: Date.now(), lastOnlineAt }; }
 async function save() { if (!identity) return; if (!lastPicture || JSON.stringify(lastPicture.counts) !== JSON.stringify(world.counts()) || lastPicture.roots.length !== world.roots.length || !world.roots.every(root => lastPicture.roots.includes(root)) || lastPicture.participants !== (Object.keys(world.data.participants).length || 1)) lastPicture = localPicture(); await putMany([['identity', identity], ['histories', histories], ['known', known], ['checkpoint', currentCheckpoint()]]); }
 async function takePicture() { if (!amLeader()) return; lastPicture = localPicture(); await network.broadcast('picture', lastPicture); }
-async function reconnect() { const input = new URLSearchParams(location.search).get('join') || meta.joinUrl; const urls = [...new Set([input, ...known].filter(Boolean))]; for (const url of urls.slice(0, 12)) { if (network.live().length) break; try { await network.connect(url); remember(url); } catch { } } }
+async function reconnect() { const params = new URLSearchParams(location.search), input = params.get('join') || meta.joinUrl; if (params.has('join')) { params.delete('join'); history.replaceState(null, '', location.pathname + (params.size ? '?' + params.toString() : '') + location.hash); } const urls = [...new Set([input, ...known].filter(Boolean))]; for (const url of urls.slice(0, 12)) { if (network.live().length) break; try { await network.connect(url); remember(url); } catch { } } }
 async function start() {
   meta = await (await fetch('/local/meta')).json(); if (!meta.token) throw new Error('请运行自己的启动器，从固定本地地址进入');
+  meta.url = await normalizeInvite(meta.url);
   identity = await get('identity'); if (!identity) { $('welcomeDialog').showModal(); await new Promise(resolve => $('welcomeForm').onsubmit = async e => { e.preventDefault(); const nick = $('nickInput').value.trim(); if (!nick) return; identity = await newIdentity(nick); $('welcomeDialog').close(); resolve(); }); }
   histories = await get('histories') || {}; known = await get('known') || []; const previous = await get('checkpoint'), now = Date.now();
+  const migrated = await Promise.allSettled((Array.isArray(known) ? known : []).map(normalizeInvite)); known = [...new Set(migrated.filter(result => result.status === 'fulfilled').map(result => result.value))]; await set('known', known);
   await verifyChats(previous?.world?.chats);
   const restored = restoreCheckpoint(previous, now);
   if (previous?.world && !restored.expired) await verifyReplica(previous.world);
@@ -394,8 +397,8 @@ $('foodForm').onsubmit = e => {
 $('surface').onclick = () => { trackedFish = null; surfaceCamera(); update(); }; $('seabed').onclick = () => { trackedFish = null; renderer.camera = { x: MONUMENT.x + 4, y: CONFIG.depth - 15 }; update(); };
 $('zoomIn').onclick = () => { renderer.zoom(renderer.scale + .15); update(); }; $('zoomOut').onclick = () => { renderer.zoom(renderer.scale - .15); update(); };
 $('connect').onclick = () => $('connectionDialog').showModal(); $('closeConnection').onclick = () => $('connectionDialog').close();
-$('connectionForm').onsubmit = async e => { e.preventDefault(); const url = $('peerUrl').value.trim(); status = '正在自动配对…'; update(); try { await network.connect(url); remember(url); $('connectionDialog').close(); } catch (e) { status = e.message; toast(e.message); } update(); };
-$('copyUrl').onclick = async () => { await navigator.clipboard.writeText(meta.url); toast('发布地址已复制'); };
+$('connectionForm').onsubmit = async e => { e.preventDefault(); status = '正在自动配对…'; update(); try { const code = await normalizeInvite($('peerUrl').value); $('peerUrl').value = code; await network.connect(code); await remember(code); $('connectionDialog').close(); } catch (e) { status = e.message; toast(e.message); } update(); };
+$('copyUrl').onclick = async () => { await navigator.clipboard.writeText(meta.url); toast('邀请码已复制'); };
 $('backup').onclick = () => download('鱼来-身份与记忆备份.json', { format: 'tide-backup-1', identity, histories, known, checkpoint: currentCheckpoint() });
 $('importBackup').onchange = async e => { try { const data = JSON.parse(await e.target.files[0].text()); if (data.format !== 'tide-backup-1' || !data.identity?.secret || await actorId(data.identity.pub) !== data.identity.actor) throw new Error('备份无效'); const entries = [['identity', data.identity], ['histories', data.histories || {}], ['known', data.known || []]]; if (data.checkpoint) { await verifyReplica(data.checkpoint.world); entries.push(['checkpoint', data.checkpoint]); } await putMany(entries); await network.stop(); location.reload(); } catch (e) { toast(e.message); } };
 $('help').onclick = () => $('helpDialog').showModal(); $('closeHelp').onclick = () => $('helpDialog').close(); $('closeHistory').onclick = () => $('historyDialog').close();

@@ -1,4 +1,5 @@
 import { signer, verifyEnvelope } from './storage.js';
+import { normalizeInvite } from './invite.js';
 const CHUNK = 16000, MAX_PEERS = 8, MAX_RAW = 32 * 1024 * 1024, encoder = new TextEncoder(), decoder = new TextDecoder();
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 async function inflateBounded(bytes) { const reader = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip')).getReader(), chunks = []; let size = 0; while (true) { const { done, value } = await reader.read(); if (done) break; size += value.length; if (size > MAX_RAW) { await reader.cancel(); throw new Error('解压数据过大'); } chunks.push(value); } const result = new Uint8Array(size); let offset = 0; for (const chunk of chunks) { result.set(chunk, offset); offset += chunk.length; } return result; }
@@ -9,6 +10,7 @@ export class Network {
   live() { return [...this.connections.values()].filter(p => p.dc?.readyState === 'open'); }
   has(node) { return [...this.connections.values()].some(p => p.node === node && !['closed', 'failed'].includes(p.pc.connectionState)); }
   async connect(url, requestedNode = '', visited = new Set()) {
+    url = await normalizeInvite(url);
     if (this.connections.size >= MAX_PEERS) return;
     if (visited.has(url + requestedNode)) return; visited.add(url + requestedNode);
     const status = await this.local('probe', { url });
@@ -27,6 +29,7 @@ export class Network {
   async ice(pc) { if (pc.iceGatheringState === 'complete') return; await new Promise(resolve => { const done = () => { if (pc.iceGatheringState === 'complete') { pc.removeEventListener('icegatheringstatechange', done); resolve(); } }; pc.addEventListener('icegatheringstatechange', done); setTimeout(() => { pc.removeEventListener('icegatheringstatechange', done); resolve(); }, 5000); }); }
   async signal(s) {
     if (s.from === this.node) return;
+    s.fromUrl = await normalizeInvite(s.fromUrl);
     if (s.type === 'offer') {
       if (this.connections.size >= MAX_PEERS || this.has(s.from)) { await this.local('relay', { url: s.fromUrl, signal: { type: 'reject', from: this.node, to: s.from, connection: s.connection } }); return; }
       const p = this.make(s.connection, s.fromUrl, s.from); try { await p.pc.setRemoteDescription(s.sdp); await p.pc.setLocalDescription(await p.pc.createAnswer()); await this.ice(p.pc); await this.local('relay', { url: p.url, signal: { type: 'answer', from: this.node, to: s.from, connection: s.connection, sdp: p.pc.localDescription.toJSON() } }); } catch (e) { this.close(p); throw e; }

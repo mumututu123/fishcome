@@ -12,7 +12,7 @@ async function open(context, port, nick) {
   await page.waitForFunction(() => window.tide); return page;
 }
 async function main() {
-  for (const port of ports) { const child = spawn(path.join(project, 'dist', '鱼来', '鱼来.exe'), ['--headless', '--loopback', '--port', String(port)], { windowsHide: true, stdio: 'ignore' }); children.push(child); await until(async () => { try { return (await fetch(`http://127.0.0.1:${port}/health`)).ok; } catch { return false; } }, '启动器未就绪'); }
+  for (const port of ports) { const child = spawn(process.env.TIDE_TEST_LAUNCHER || path.join(project, 'dist', '鱼来', '鱼来.exe'), ['--headless', '--loopback', '--port', String(port)], { windowsHide: true, stdio: 'ignore' }); children.push(child); await until(async () => { try { return (await fetch(`http://127.0.0.1:${port}/health`)).ok; } catch { return false; } }, '启动器未就绪'); }
   browser = await chromium.launch({ executablePath: 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe', headless: true });
   const first = await browser.newContext({ viewport: { width: 1440, height: 900 } }), second = await browser.newContext({ viewport: { width: 1440, height: 900 } });
   let a = await open(first, ports[0], '父鱼作者'), b = await open(second, ports[1], '母鱼作者'); await a.close(); await b.close();
