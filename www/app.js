@@ -180,7 +180,7 @@ async function submit(payload) {
 function cancelMode() { mode = null; renderer.preview = null; $('modeBanner').hidden = true; $('sea').style.cursor = 'grab'; }
 function stopObserving() { selected = null; trackedFish = null; renderer.selected = null; renderer.observedFish = null; $('inspector').hidden = true; }
 function surfaceCamera() { const size = renderer.cell * renderer.scale; renderer.camera.y = (renderer.height / 2 - renderer.height * .27 + size / 2) / size; }
-function placement(kind, cells) { trackedFish = null; mode = { kind, cells }; $('modeBanner').textContent = `在空水域点击投放${kind === 'fish' ? '鱼' : '造景'} · 消耗 ${cells.length} 字符 · Esc 取消`; $('modeBanner').hidden = false; $('sea').style.cursor = 'crosshair'; }
+function placement(kind, cells, gender) { trackedFish = null; mode = { kind, cells, ...(kind === 'fish' ? { gender } : {}) }; $('modeBanner').textContent = `在空水域点击投放${kind === 'fish' ? '鱼' : '造景'} · 消耗 ${cells.length} 字符 · Esc 取消`; $('modeBanner').hidden = false; $('sea').style.cursor = 'crosshair'; }
 function updateFoodBrush() {
   const ch = $('foodGlyphInput').value, valid = validGlyph(ch);
   $('foodGlyphInput').setCustomValidity(valid ? '' : '请输入一个中文、中文标点或 ASCII 字符，不能是空格');
@@ -214,6 +214,11 @@ function drawFishThumbnail(canvas, fish, cells) {
   ctx.clearRect(0, 0, 88, 64); ctx.font = `${size * .85}px 'Microsoft YaHei',Consolas,monospace`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
   for (const cell of cells) { const x = fish.facing === 1 ? cell.x - body.minX : body.maxX - cell.x; ctx.fillStyle = cell.color; ctx.fillText(cell.ch, (88 - body.width * size) / 2 + (x + .5) * size, (64 - body.height * size) / 2 + (cell.y - body.minY + .5) * size, size); }
 }
+function renderFishGender(element, fish) {
+  const gender = world.data.ops[fish.id]?.gender;
+  element.className = `fishGender${gender ? ' ' + gender : ''}`;
+  element.textContent = gender === 'male' ? '♂ 公' : gender === 'female' ? '♀ 母' : '性别未记录';
+}
 function renderMyFishes() {
   if (!identity) return; const fishes = world.myFishes(identity.actor), groups = world.fishGroups(), now = Date.now(), ids = fishes.map(fish => fish.id), key = ids.join(',');
   const total = Object.values(world.data.ops).filter(op => op.kind === 'fish' && op.actor === identity.actor).length;
@@ -221,13 +226,13 @@ function renderMyFishes() {
   for (const id of myFishCards.keys()) if (!ids.includes(id)) myFishCards.delete(id);
   for (const fish of fishes) {
     if (!myFishCards.has(fish.id)) {
-      const card = document.createElement('button'), canvas = document.createElement('canvas'), body = document.createElement('span'), title = document.createElement('strong'), health = document.createElement('span'), info = document.createElement('span'), metrics = document.createElement('span');
+      const card = document.createElement('button'), canvas = document.createElement('canvas'), body = document.createElement('span'), title = document.createElement('strong'), gender = document.createElement('span'), health = document.createElement('span'), info = document.createElement('span'), metrics = document.createElement('span');
       card.type = 'button'; card.className = 'fishCard'; card.dataset.fish = fish.id; canvas.width = 88; canvas.height = 64; canvas.setAttribute('aria-hidden', 'true'); body.className = 'fishCardText'; health.className = 'fishHealth'; info.className = 'fishCardInfo'; metrics.className = 'fishCardMetrics';
-      body.append(title, health, info, metrics); card.append(canvas, body); card.onclick = () => { $('myFishDialog').close(); focusFish(fish.id); }; myFishCards.set(fish.id, { card, canvas, title, health, info, metrics });
+      body.append(title, gender, health, info, metrics); card.append(canvas, body); card.onclick = () => { $('myFishDialog').close(); focusFish(fish.id); }; myFishCards.set(fish.id, { card, canvas, title, gender, health, info, metrics });
     }
     const entry = myFishCards.get(fish.id), cells = groups.get(fish.id) || [], status = world.fishStatus(fish.id, now);
-    entry.title.textContent = `鱼 ${fish.id.slice(0, 6)}`; entry.health.textContent = status.hungry ? '饥饿' : '未饥饿'; entry.health.classList.toggle('hungry', status.hungry);
-    entry.info.textContent = `${cells.length} 字符 · 创建于 ${fishDate.format(fish.created)}`;
+    entry.title.textContent = `${identity.nick} 的鱼`; renderFishGender(entry.gender, fish); entry.health.textContent = status.hungry ? '饥饿' : '未饥饿'; entry.health.classList.toggle('hungry', status.hungry);
+    entry.info.textContent = `${fish.id.slice(0, 6)} · ${cells.length} 字符 · 创建于 ${fishDate.format(fish.created)}`;
     entry.metrics.textContent = `今日运动 ${status.trackedSince === undefined ? '待同步' : status.movement.toFixed(1) + ' 格'} · 近24小时进食 ${status.meals24} 颗`;
     drawFishThumbnail(entry.canvas, fish, cells);
   }
@@ -237,9 +242,10 @@ function inspect(hit, show = true) {
   if (trackedFish && (hit.kind !== 'fish' || hit.id !== trackedFish)) trackedFish = null;
   selected = hit; if (hit.kind === 'monument') { renderer.observedFish = null; renderer.selected = null; $('inspector').hidden = true; historyDialog(); selected = null; return; }
   const object = hit.kind === 'fish' ? world.data.fishes[hit.id] : world.data.scenes[hit.id]; if (!object) { $('inspector').hidden = true; selected = null; renderer.observedFish = null; return; }
-  const cells = hit.kind === 'fish' ? world.fishCells(hit.id) : world.sceneCells(hit.id); $('objectTitle').textContent = `${object.nick || '自然沉积'} 的${hit.kind === 'fish' ? '鱼' : '造景'}`;
+  const cells = hit.kind === 'fish' ? world.fishCells(hit.id) : world.sceneCells(hit.id), ownFish = hit.kind === 'fish' && world.data.ops[hit.id]?.actor === identity.actor; $('objectTitle').textContent = `${ownFish ? identity.nick : object.nick || '自然沉积'} 的${hit.kind === 'fish' ? '鱼' : '造景'}`;
   $('fishDetails').hidden = hit.kind !== 'fish'; renderer.observedFish = hit.kind === 'fish' ? hit.id : null;
   if (hit.kind === 'fish') {
+    renderFishGender($('fishGender'), object);
     const v = velocities(cells), eyes = cells.filter(c => EYES.has(c.ch)).length, now = Date.now(), status = world.fishStatus(hit.id, now), travel = world.data.travel[hit.id];
     $('objectInfo').textContent = `${cells.length} 字符 · ${eyes ? eyes + ' 个眼睛' : '盲鱼'} · 水平 ${v.x.toFixed(2)} 格/秒 · 垂直 ${v.y.toFixed(2)} 格/秒`;
     $('fishMovement').textContent = status.trackedSince === undefined ? '待同步' : `${status.movement.toFixed(1)} 格`; $('fishMeals24').textContent = `${status.meals24} 颗`; $('fishHunger').textContent = status.hungry ? '饥饿' : '未饥饿'; $('fishHunger').classList.toggle('hungry', status.hungry);
@@ -362,7 +368,7 @@ $('scaleScene').onclick = () => selected && submit({ kind: 'sceneScale', scene: 
 $('shrinkScene').onclick = () => selected && submit({ kind: 'sceneScale', scene: selected.id, factor: .5, cost: 0 });
 $('deleteScene').onclick = () => { if (!selected) return; submit({ kind: 'sceneDelete', scene: selected.id, cost: 0 }); selected = null; renderer.selected = null; $('inspector').hidden = true; };
 $('sea').oncontextmenu = e => { e.preventDefault(); cancelMode(); };
-$('sea').addEventListener('pointerdown', e => { if (e.button !== 0) return; if (mode) { const p = renderer.point(e.clientX, e.clientY); if (mode.kind === 'food') { if (p.y !== 0) { toast('请在亮蓝色水面行点击投食'); return; } submit({ kind: 'food', ch: mode.ch, color: mode.color, x: p.x, y: 0, cost: 1 }); } else { const b = bounds(mode.cells), x = p.x - b.minX, y = p.y - b.minY; submit({ kind: mode.kind, cells: mode.cells, scene: mode.scene, x, y, cost: mode.kind === 'sceneMove' ? 0 : mode.cells.length }); cancelMode(); } return; } dragging = { startX: e.clientX, startY: e.clientY, x: renderer.camera.x, y: renderer.camera.y, moved: false }; $('sea').setPointerCapture(e.pointerId); });
+$('sea').addEventListener('pointerdown', e => { if (e.button !== 0) return; if (mode) { const p = renderer.point(e.clientX, e.clientY); if (mode.kind === 'food') { if (p.y !== 0) { toast('请在亮蓝色水面行点击投食'); return; } submit({ kind: 'food', ch: mode.ch, color: mode.color, x: p.x, y: 0, cost: 1 }); } else { const b = bounds(mode.cells), x = p.x - b.minX, y = p.y - b.minY; submit({ kind: mode.kind, cells: mode.cells, ...(mode.kind === 'fish' ? { gender: mode.gender } : {}), scene: mode.scene, x, y, cost: mode.kind === 'sceneMove' ? 0 : mode.cells.length }); cancelMode(); } return; } dragging = { startX: e.clientX, startY: e.clientY, x: renderer.camera.x, y: renderer.camera.y, moved: false }; $('sea').setPointerCapture(e.pointerId); });
 $('sea').addEventListener('pointermove', e => { if (mode) { const p = renderer.point(e.clientX, e.clientY), b = bounds(mode.cells || []); renderer.preview = { ...mode, x: mode.kind === 'food' ? p.x : p.x - b.minX, y: mode.kind === 'food' ? 0 : p.y - b.minY }; } else if (dragging) { const s = renderer.cell * renderer.scale; renderer.camera.x = Math.min(CONFIG.width, Math.max(0, dragging.x - (e.clientX - dragging.startX) / s)); renderer.camera.y = Math.min(CONFIG.depth, Math.max(0, dragging.y - (e.clientY - dragging.startY) / s)); dragging.moved ||= Math.hypot(e.clientX - dragging.startX, e.clientY - dragging.startY) > 4; if (dragging.moved) trackedFish = null; update(); } });
 $('sea').addEventListener('pointerup', e => { if (dragging && !dragging.moved) { const hit = renderer.hit(e.clientX, e.clientY); if (hit) inspect(hit); else { selected = null; renderer.selected = null; $('inspector').hidden = true; } } dragging = null; });
 $('sea').addEventListener('wheel', e => { e.preventDefault(); renderer.zoom(renderer.scale * (e.deltaY < 0 ? 1.1 : .9)); update(); }, { passive: false });
