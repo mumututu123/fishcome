@@ -17,6 +17,9 @@ async function main() {
   const plants = await fetch(base + '/seaweed.js', { cache: 'no-store', signal: AbortSignal.timeout(5000) });
   assert(plants.ok && (await plants.text()).includes('updateSeaweed'), '实际入口缺少海草生态模块');
   assert(html.includes('海底会长海草'), '实际入口缺少海草玩法说明');
-  console.log('实际启动器入口：我的鱼、完整昵称、公母性别与海草生态均已发布');
+  const reproduction = await fetch(base + '/breeding.js', { cache: 'no-store', signal: AbortSignal.timeout(5000) });
+  assert(reproduction.ok && (await reproduction.text()).includes('finishBreeding'), '实际入口缺少繁殖模块');
+  assert(html.includes('id="fishBreeding"') && html.includes('结伴繁殖'), '实际入口缺少繁殖状态和玩法说明');
+  console.log('实际启动器入口：我的鱼、性别、海草与繁殖系统均已发布');
 }
 main().catch(error => { console.error(error.message); process.exitCode = 1; });

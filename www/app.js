@@ -1,4 +1,4 @@
-import { World, CONFIG, clone, EYES, bounds, velocities, validGlyph, maskNick, hash } from './engine.js';
+import { World, CONFIG, clone, EYES, bounds, validGlyph, maskNick, hash } from './engine.js';
 import { get, set, putMany, newIdentity, verifyEnvelope, actorId, download } from './storage.js';
 import { Network } from './network.js';
 import { Renderer, MONUMENT } from './renderer.js';
@@ -7,6 +7,7 @@ import { restoreCheckpoint } from './lifecycle.js';
 import { CHAT_FLOOR, validChatMessage, orderedChats, chatGlyphs, chatColor, chatCellId, mergeChatRecords } from './chat.js';
 import { DAY, shanghaiDay, validTravel } from './fish-status.js';
 import { HOUR, validWildCell } from './seaweed.js';
+import { fishOrigin, validBreedingRecord, inheritedGlyph } from './breeding.js';
 const $ = id => document.getElementById(id);
 const renderer = new Renderer($('sea'));
 let world = new World(), identity, network, meta, creator, mode = null, selected = null, dragging, histories = {}, known = [], members = new Map(), pending = new Map(), inbox = new Map(), lastPicture = null, priorCheckpoint = null;
@@ -55,9 +56,14 @@ async function verifyReplica(data) {
   for (const [root, at] of Object.entries(data.roots)) if (!/^[0-9a-f-]{36}$/i.test(root) || !Number.isFinite(at)) throw new Error('世界起源无效');
   if (data.seaweedHour !== undefined && (!Number.isInteger(data.seaweedHour) || data.seaweedHour < 0 || data.seaweedHour > Math.floor((Date.now() + 60000) / HOUR))) throw new Error('海草生长时钟无效');
   await verifyChats(data.chats); await verifyChats(data.chatSources);
-  for (const [id, fish] of Object.entries(data.fishes)) { const source = data.ops[id] || world.data.ops[id]; if (fish.id !== id || source?.kind !== 'fish' || fish.actor !== source.actor || fish.created !== source.t) throw new Error('鱼的创建者记录无效'); }
+  const sources = { ops: { ...world.data.ops, ...data.ops }, breeding: { ...world.data.breeding, ...data.breeding } };
+  if (data.breeding !== undefined && (!data.breeding || typeof data.breeding !== 'object' || Array.isArray(data.breeding) || Object.keys(data.breeding).length > 500000)) throw new Error('繁殖记录无效');
+  for (const [id, record] of Object.entries(data.breeding || {})) if (record.id !== id || !validBreedingRecord(record, sources) || record.at > Date.now() + 60000) throw new Error('繁殖记录缺少合法来源');
+  if (data.contacts !== undefined && (!data.contacts || typeof data.contacts !== 'object' || Array.isArray(data.contacts) || Object.keys(data.contacts).length > 500000 || !Number.isFinite(data.contactAt) || data.contactAt > Date.now() + 60000)) throw new Error('接触计时无效');
+  for (const [id, contact] of Object.entries(data.contacts || {})) if (id !== `${contact.male}|${contact.female}` || fishOrigin(sources, contact.male)?.gender !== 'male' || fishOrigin(sources, contact.female)?.gender !== 'female' || !Number.isFinite(contact.since) || !Number.isFinite(contact.lastAt) || contact.since < 0 || contact.since > contact.lastAt || contact.lastAt > data.contactAt) throw new Error('接触计时缺少合法来源');
+  for (const [id, fish] of Object.entries(data.fishes)) { const source = fishOrigin(sources, id); if (fish.id !== id || !source || fish.actor !== source.actor || fish.created !== source.created || (fish.birth && sources.breeding[fish.birth]?.baby?.id !== id)) throw new Error('鱼的创建者记录无效'); }
   if (data.travel !== undefined && (!data.travel || typeof data.travel !== 'object' || Array.isArray(data.travel))) throw new Error('鱼运动记录无效');
-  for (const [id, record] of Object.entries(data.travel || {})) { const source = data.ops[id] || world.data.ops[id]; if (!validTravel(record) || source?.kind !== 'fish' || record.since < source.t || record.since > Date.now() + 60000) throw new Error('鱼运动记录缺少合法来源'); }
+  for (const [id, record] of Object.entries(data.travel || {})) { const source = fishOrigin(sources, id); if (!validTravel(record) || !source || record.since < source.created || record.since > Date.now() + 60000) throw new Error('鱼运动记录缺少合法来源'); }
   const sourceGlyphs = new Map();
   for (const [id, c] of Object.entries(data.chars)) {
     if (id !== c.id) throw new Error('字符身份重复或被篡改');
@@ -69,13 +75,13 @@ async function verifyReplica(data) {
       continue;
     }
     if (c.wild || c.kind === 'seaweed') {
-      if (!validWildCell(c, CONFIG, hash) || c.created > Date.now() + 60000 || (c.kind === 'fish' && (!c.path.some(event => event.reason === 'eat' && event.target === c.entity) || !(data.fishes[c.entity] || world.data.fishes[c.entity])))) throw new Error('海草缺少合法生态来源');
+      if (!validWildCell(c, CONFIG, hash) || (!['scene', 'burn'].includes(c.kind) && inheritedGlyph(c, '草', sources) !== c.ch) || c.created > Date.now() + 60000 || (c.kind === 'fish' && (!c.path.some(event => ['eat', 'birth'].includes(event.reason) && event.target === c.entity) || !(data.fishes[c.entity] || world.data.fishes[c.entity])))) throw new Error('海草缺少合法生态来源');
       continue;
     }
     const source = data.ops[c.id.slice(0, 36)] || world.data.ops[c.id.slice(0, 36)], index = +c.id.slice(37);
     const initial = source?.kind === 'food' && c.id === source.id ? source : ['fish', 'scene'].includes(source?.kind) ? source.cells[index] : source?.kind === 'sceneScale' && source.factor === 2 && Number.isInteger(index) && index >= 0 && index < source.cost * 4 / 3 && index % 4 !== 0 ? c : null;
     if (!initial || source.actor !== c.payer) throw new Error('字符缺少合法消费凭据');
-    if (c.kind === 'fish' || c.kind === 'food') { if (!['food', 'fish'].includes(source.kind) || initial.ch !== c.ch || initial.color !== c.color) throw new Error('鱼字符只能由合法创建与生态流转生成'); if (c.kind === 'fish' && !c.path.length && (c.entity !== source.id || c.x !== initial.x || c.y !== initial.y)) throw new Error('禁止人工重排已投放的鱼'); }
+    if (c.kind === 'fish' || c.kind === 'food') { if (!['food', 'fish'].includes(source.kind) || inheritedGlyph(c, initial.ch, sources) !== c.ch || initial.color !== c.color) throw new Error('鱼字符只能由合法创建与生态流转生成'); if (c.kind === 'fish' && !c.path.length && (c.entity !== source.id || c.x !== initial.x || c.y !== initial.y)) throw new Error('禁止人工重排已投放的鱼'); }
   }
 }
 async function mergeReplica(data) {
@@ -173,7 +179,7 @@ async function broadcastWorld() {
     for (const [id, message] of Object.entries(data.chats)) if (full || !sentChats.has(id)) chats[id] = message;
     for (const [id, message] of Object.entries(data.chatSources)) if (full || !sentChatSources.has(id)) chatSources[id] = message;
     for (const [id, record] of Object.entries(data.travel)) { const mark = JSON.stringify(record); travelMarks.set(id, mark); if (full || sentTravel.get(id) !== mark) travel[id] = record; }
-    await network.broadcast('world', { delta: !full, world: { protocol: 1, roots: data.roots, tick: data.tick, seaweedHour: data.seaweedHour, chars, fishes: data.fishes, scenes: data.scenes, participants: data.participants, ops, notices: [], chats, chatSources, travel } });
+    await network.broadcast('world', { delta: !full, world: { protocol: 1, roots: data.roots, tick: data.tick, seaweedHour: data.seaweedHour, chars, fishes: data.fishes, breeding: data.breeding, contacts: data.contacts, contactAt: data.contactAt, scenes: data.scenes, participants: data.participants, ops, notices: [], chats, chatSources, travel } });
     sentChars = nextMarks; sentOps = new Set(Object.keys(data.ops)); sentChats = new Set(Object.keys(data.chats)); sentChatSources = new Set(Object.keys(data.chatSources)); sentTravel = travelMarks; if (full) lastFull = Date.now();
   } catch (e) { status = e.message; } finally { snapshotBusy = false; }
 }
@@ -221,24 +227,30 @@ function drawFishThumbnail(canvas, fish, cells) {
   for (const cell of cells) { const x = fish.facing === 1 ? cell.x - body.minX : body.maxX - cell.x; ctx.fillStyle = cell.color; ctx.fillText(cell.ch, (88 - body.width * size) / 2 + (x + .5) * size, (64 - body.height * size) / 2 + (cell.y - body.minY + .5) * size, size); }
 }
 function renderFishGender(element, fish) {
-  const gender = world.data.ops[fish.id]?.gender;
+  const gender = world.fishOrigin(fish.id)?.gender;
   element.className = `fishGender${gender ? ' ' + gender : ''}`;
   element.textContent = gender === 'male' ? '♂ 公' : gender === 'female' ? '♀ 母' : '性别未记录';
 }
+function shortFishId(id) { return id.startsWith('born:') ? id.slice(-6) : id.slice(0, 6); }
+function renderBreeding(element, fish, now = Date.now()) {
+  const record = world.breedingState(fish.id); element.hidden = !record;
+  if (record) { const seconds = Math.max(0, Math.ceil((record.ends - now) / 1000)); element.textContent = `繁殖中 · ${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`; }
+}
 function renderMyFishes() {
   if (!identity) return; const fishes = world.myFishes(identity.actor), groups = world.fishGroups(), now = Date.now(), ids = fishes.map(fish => fish.id), key = ids.join(',');
-  const total = Object.values(world.data.ops).filter(op => op.kind === 'fish' && op.actor === identity.actor).length;
+  const total = Object.values(world.data.ops).filter(op => op.kind === 'fish' && op.actor === identity.actor).length + Object.values(world.data.breeding || {}).filter(record => record.status === 'born' && record.baby.actor === identity.actor).length;
   $('myFishCount').textContent = `${fishes.length} 条存活 · ${total - fishes.length} 条已消失`; $('myFishEmpty').hidden = !!fishes.length;
   for (const id of myFishCards.keys()) if (!ids.includes(id)) myFishCards.delete(id);
   for (const fish of fishes) {
     if (!myFishCards.has(fish.id)) {
-      const card = document.createElement('button'), canvas = document.createElement('canvas'), body = document.createElement('span'), title = document.createElement('strong'), gender = document.createElement('span'), health = document.createElement('span'), info = document.createElement('span'), metrics = document.createElement('span');
+      const card = document.createElement('button'), canvas = document.createElement('canvas'), body = document.createElement('span'), title = document.createElement('strong'), gender = document.createElement('span'), health = document.createElement('span'), breeding = document.createElement('span'), info = document.createElement('span'), metrics = document.createElement('span');
       card.type = 'button'; card.className = 'fishCard'; card.dataset.fish = fish.id; canvas.width = 88; canvas.height = 64; canvas.setAttribute('aria-hidden', 'true'); body.className = 'fishCardText'; health.className = 'fishHealth'; info.className = 'fishCardInfo'; metrics.className = 'fishCardMetrics';
-      body.append(title, gender, health, info, metrics); card.append(canvas, body); card.onclick = () => { $('myFishDialog').close(); focusFish(fish.id); }; myFishCards.set(fish.id, { card, canvas, title, gender, health, info, metrics });
+      breeding.className = 'fishBreeding'; body.append(title, gender, health, breeding, info, metrics); card.append(canvas, body); card.onclick = () => { $('myFishDialog').close(); focusFish(fish.id); }; myFishCards.set(fish.id, { card, canvas, title, gender, health, breeding, info, metrics });
     }
     const entry = myFishCards.get(fish.id), cells = groups.get(fish.id) || [], status = world.fishStatus(fish.id, now);
     entry.title.textContent = `${identity.nick} 的鱼`; renderFishGender(entry.gender, fish); entry.health.textContent = status.hungry ? '饥饿' : '未饥饿'; entry.health.classList.toggle('hungry', status.hungry);
-    entry.info.textContent = `${fish.id.slice(0, 6)} · ${cells.length} 字符 · 创建于 ${fishDate.format(fish.created)}`;
+    renderBreeding(entry.breeding, fish, now);
+    entry.info.textContent = `${shortFishId(fish.id)} · ${cells.length} 字符 · ${fish.birth ? '自然出生于' : '创建于'} ${fishDate.format(fish.created)}`;
     entry.metrics.textContent = `今日运动 ${status.trackedSince === undefined ? '待同步' : status.movement.toFixed(1) + ' 格'} · 近24小时进食 ${status.meals24} 颗`;
     drawFishThumbnail(entry.canvas, fish, cells);
   }
@@ -248,12 +260,14 @@ function inspect(hit, show = true) {
   if (trackedFish && (hit.kind !== 'fish' || hit.id !== trackedFish)) trackedFish = null;
   selected = hit; if (hit.kind === 'monument') { renderer.observedFish = null; renderer.selected = null; $('inspector').hidden = true; historyDialog(); selected = null; return; }
   const object = hit.kind === 'fish' ? world.data.fishes[hit.id] : world.data.scenes[hit.id]; if (!object) { $('inspector').hidden = true; selected = null; renderer.observedFish = null; return; }
-  const cells = hit.kind === 'fish' ? world.fishCells(hit.id) : world.sceneCells(hit.id), ownFish = hit.kind === 'fish' && world.data.ops[hit.id]?.actor === identity.actor; $('objectTitle').textContent = `${ownFish ? identity.nick : object.nick || '自然沉积'} 的${hit.kind === 'fish' ? '鱼' : '造景'}`;
+  const cells = hit.kind === 'fish' ? world.fishCells(hit.id) : world.sceneCells(hit.id), ownFish = hit.kind === 'fish' && world.fishOrigin(hit.id)?.actor === identity.actor; $('objectTitle').textContent = `${ownFish ? identity.nick : object.nick || '自然沉积'} 的${hit.kind === 'fish' ? '鱼' : '造景'}`;
   $('fishDetails').hidden = hit.kind !== 'fish'; renderer.observedFish = hit.kind === 'fish' ? hit.id : null;
   if (hit.kind === 'fish') {
     renderFishGender($('fishGender'), object);
-    const v = velocities(cells), eyes = cells.filter(c => EYES.has(c.ch)).length, now = Date.now(), status = world.fishStatus(hit.id, now), travel = world.data.travel[hit.id];
-    $('objectInfo').textContent = `${cells.length} 字符 · ${eyes ? eyes + ' 个眼睛' : '盲鱼'} · 水平 ${v.x.toFixed(2)} 格/秒 · 垂直 ${v.y.toFixed(2)} 格/秒`;
+    renderBreeding($('fishBreeding'), object);
+    $('fishParentage').hidden = !object.birth; $('fishParentage').textContent = object.birth ? `自然出生 · 父鱼 ${shortFishId(object.parents[0])} · 母鱼 ${shortFishId(object.parents[1])}` : '';
+    const v = world.swimVelocities(hit.id), eyes = cells.filter(c => EYES.has(c.ch)).length, now = Date.now(), status = world.fishStatus(hit.id, now), travel = world.data.travel[hit.id];
+    $('objectInfo').textContent = `${cells.length} 字符 · ${eyes ? eyes + ' 个眼睛' : '盲鱼'} · ${world.breedingState(hit.id) ? '合体游速 · ' : ''}水平 ${v.x.toFixed(2)} 格/秒 · 垂直 ${v.y.toFixed(2)} 格/秒`;
     $('fishMovement').textContent = status.trackedSince === undefined ? '待同步' : `${status.movement.toFixed(1)} 格`; $('fishMeals24').textContent = `${status.meals24} 颗`; $('fishHunger').textContent = status.hungry ? '饥饿' : '未饥饿'; $('fishHunger').classList.toggle('hungry', status.hungry);
     const minutes = Math.floor(status.hoursSinceFed * 60);
     $('fishLastMeal').textContent = `${status.neverFed ? '尚未进食 · 投放已' : '距上次进食'} ${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分钟`;

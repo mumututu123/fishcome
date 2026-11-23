@@ -1,6 +1,7 @@
 import { CHAT_FLOOR, validChatMessage, buildChatFloor, chatGlyphs } from './chat.js';
 import { shanghaiDay, mealIndex, fishStatus, mergeTravel } from './fish-status.js';
 import { HOUR, updateSeaweed } from './seaweed.js';
+import { fishOrigin, activeBreeding, finishBreeding, updateContacts, motionUnits, commitUnit, mergeBreeding, normalizeBreeding, normalizeBirthCells } from './breeding.js';
 export const CONFIG = Object.freeze({ width: 800, depth: 120, shallow: 60, step: 500, speed: 2, foodLife: 300000, hunger: 86400000, initial: 20, offlineLife: 240 * 60 * 60 * 1000 });
 export const MONUMENT = { x: 610, y: CONFIG.depth - 5, rows: ['  ____  ', ' /记忆\\ ', ' | 口 | ', ' |____| ', '________'] };
 export const EYES = new Set(['0', 'O', 'o', '。', '.', '口']);
@@ -63,7 +64,7 @@ function transition(c, next, record) { Object.assign(c, next); c.path.push({ ...
 
 export class World {
   constructor(now = Date.now(), id = crypto.randomUUID()) {
-    this.data = { protocol: 1, roots: { [id]: now }, tick: now, seaweedHour: Math.floor(now / HOUR), chars: {}, fishes: {}, scenes: {}, ops: {}, participants: {}, notices: [], chats: {}, chatSources: {}, pendingChatGlyphs: 0, travel: {} };
+    this.data = { protocol: 1, roots: { [id]: now }, tick: now, seaweedHour: Math.floor(now / HOUR), chars: {}, fishes: {}, breeding: {}, contacts: {}, contactAt: now, scenes: {}, ops: {}, participants: {}, notices: [], chats: {}, chatSources: {}, pendingChatGlyphs: 0, travel: {} };
     this.dirty = true; this.foodRevision = 0;
   }
   get id() { return Object.keys(this.data.roots).sort()[0]; }
@@ -83,7 +84,10 @@ export class World {
     if (!this.mealCache || this.mealCache.revision !== this.foodRevision || now < this.mealCache.at) this.mealCache = { revision: this.foodRevision, at: now, fish: mealIndex(this.data.chars, now) };
     return fishStatus(fish, this.data.travel[id], this.mealCache.fish.get(id), now);
   }
-  myFishes(actor) { return Object.values(this.data.fishes).filter(fish => this.data.ops[fish.id]?.kind === 'fish' && this.data.ops[fish.id].actor === actor).sort((a, b) => a.created - b.created || a.id.localeCompare(b.id)); }
+  fishOrigin(id) { return fishOrigin(this.data, id); }
+  breedingState(id) { return activeBreeding(this.data, id); }
+  swimVelocities(id) { const record = this.breedingState(id); if (!record) return velocities(this.fishCells(id)); const cells = [record.male, record.female].flatMap(parent => this.fishCells(parent).map(cell => ({ ...cell, ...cellPosition(this.data.fishes[parent], cell) }))); return velocities(cells); }
+  myFishes(actor) { return Object.values(this.data.fishes).filter(fish => this.fishOrigin(fish.id)?.actor === actor).sort((a, b) => a.created - b.created || a.id.localeCompare(b.id)); }
   addChat(message) {
     if (!validChatMessage(message) || !message.body.roots.some(root => this.data.roots[root] !== undefined)) return { ok: false, error: '聊天不属于当前世界' };
     const existing = this.data.chats[message.id];
@@ -195,6 +199,7 @@ export class World {
   }
   step(now) {
     this.initializeTracking(now);
+    finishBreeding(this, now, transition);
     updateSeaweed(this, now, CONFIG, MONUMENT, hash, transition);
     const dt = Math.min(1, Math.max(0, (now - this.data.tick) / 1000)); this.data.tick = now;
     let scenery = this.sceneryMap(), groups = this.fishGroups(); const fishOccupancy = this.fishMap();
@@ -230,9 +235,9 @@ export class World {
     const waitingToEat = new Set(); for (const food of edible) for (const id of contact(food)) waitingToEat.add(id);
     const bins = new Map(), atFood = new Map();
     for (const food of edible) { const bin = key(Math.floor(food.x / 10), Math.floor(food.y / 10)); if (!bins.has(bin)) bins.set(bin, []); bins.get(bin).push(food); const p = key(food.x, food.y); if (!atFood.has(p)) atFood.set(p, []); atFood.get(p).push(food); }
-    for (const [id, cells] of groups) {
-      const f = this.data.fishes[id]; if (!f || !cells.length) continue;
-      if (waitingToEat.has(id)) { f.posAt = now; continue; }
+    for (const unit of motionUnits(this, groups)) {
+      const { id, cells, fish: f } = unit; if (!cells.length) continue;
+      if (unit.members.some(member => waitingToEat.has(member.id))) { commitUnit(unit, now); continue; }
       const found = new Map(); for (const eye of cells) if (EYES.has(eye.ch)) { const p = cellPosition(f, eye), r = p.y < CONFIG.shallow ? 10 : 5, bx = Math.floor(p.x / 10), by = Math.floor(p.y / 10); for (const [dx, dy] of [[0, 0], ...NEIGHBORS]) for (const food of bins.get(key(bx + dx, by + dy)) || []) if (Math.max(Math.abs(food.x - p.x), Math.abs(food.y - p.y)) <= r) found.set(food.id, food); } const visible = [...found.values()];
       const center = bounds(cells), midX = f.x + f.facing * (center.minX + center.maxX) / 2, midY = f.y + (center.minY + center.maxY) / 2;
       visible.sort((a, b) => (Math.abs(a.x - midX) + Math.abs(a.y - midY)) - (Math.abs(b.x - midX) + Math.abs(b.y - midY)) || a.id.localeCompare(b.id));
@@ -243,8 +248,8 @@ export class World {
       const v = velocities(cells); f.cx = dx ? Math.min(2, (f.cx || 0) + v.x * dt) : 0; f.cy = dy ? Math.min(2, (f.cy || 0) + v.y * dt) : 0;
       if (f.cx >= 1 && dx) { const next = { ...f, x: f.x + dx }; if (this.canOccupy(next, cells, scenery) && cells.every(c => { const p = cellPosition(next, c); return !foodPositions.has(key(p.x, p.y)); })) { f.x += dx; movedX = dx; } f.cx--; }
       if (f.cy >= 1 && dy) { const next = { ...f, y: f.y + dy }; if (this.canOccupy(next, cells, scenery) && cells.every(c => { const p = cellPosition(next, c); return !foodPositions.has(key(p.x, p.y)); })) { f.y += dy; movedY = dy; } f.cy--; }
-      this.recordMovement(id, Math.hypot(movedX, movedY), now);
-      f.posAt = now;
+      commitUnit(unit, now);
+      for (const member of unit.members) this.recordMovement(member.id, Math.hypot(movedX, movedY), now);
     }
     // Rank uses this step's pre-consumption size for every simultaneous contest.
     const sizes = new Map([...groups].map(([id, cs]) => [id, cs.length]));
@@ -259,6 +264,7 @@ export class World {
       }
     }
     for (const [id, cells] of groups) { const f = this.data.fishes[id]; if (f && now >= f.hungerAt) this.starve(id, f.hungerAt); }
+    normalizeBreeding(this, now); updateContacts(this, now, this.fishGroups(), scenery);
   }
   turn(f, cells, scenery = this.sceneryMap()) {
     const b = bounds(cells), next = { ...f, x: f.x + f.facing * (b.minX + b.maxX), facing: -f.facing };
@@ -280,6 +286,7 @@ export class World {
     if (!other || other.protocol !== 1 || !other.chars || !other.fishes || !other.scenes || !other.ops) throw new Error('世界协议不兼容');
     Object.assign(this.data.roots, other.roots); for (const [id, op] of Object.entries(other.ops)) if (!this.data.ops[id]) this.data.ops[id] = clone(op); Object.assign(this.data.participants, other.participants);
     this.data.seaweedHour = Math.max(this.data.seaweedHour ?? Math.floor(this.data.tick / HOUR), other.seaweedHour ?? Math.floor(other.tick / HOUR));
+    mergeBreeding(this, other);
     for (const [id, record] of Object.entries(other.travel || {})) this.data.travel[id] = mergeTravel(this.data.travel[id], record);
     for (const message of Object.values(other.chats || {})) { const result = this.addChat(message); if (!result.ok) throw new Error(result.error); }
     for (const [id, message] of Object.entries(other.chatSources || {})) {
@@ -289,7 +296,7 @@ export class World {
     }
     for (const [id, c] of Object.entries(other.chars)) this.data.chars[id] = clone(this.data.chars[id] ? chooseClaim(this.data.chars[id], c) : c);
     for (const type of ['fishes', 'scenes']) for (const [id, obj] of Object.entries(other[type])) { const old = this.data[type][id]; if (!old || (obj.posAt || 0) > (old.posAt || 0) || ((obj.posAt || 0) === (old.posAt || 0) && JSON.stringify(obj).localeCompare(JSON.stringify(old)) > 0)) this.data[type][id] = clone(obj); }
-    const groups = this.fishGroups();
+    normalizeBirthCells(this); const groups = this.fishGroups();
     const latestFeed = new Map(); for (const c of Object.values(this.data.chars)) for (const r of c.path) if (r.reason === 'eat') latestFeed.set(r.target, Math.max(latestFeed.get(r.target) || 0, r.t));
     for (const id of Object.keys(this.data.fishes)) {
       const f = this.data.fishes[id], cs = groups.get(id) || []; if (!cs.length) { delete this.data.fishes[id]; continue; }
@@ -303,7 +310,7 @@ export class World {
     }
     if (!this.sceneCells(CHAT_FLOOR).length) delete this.data.scenes[CHAT_FLOOR];
     this.data.pendingChatGlyphs = Math.max(0, Object.values(this.data.chatSources).reduce((sum, message) => sum + chatGlyphs(message.body.text).length, 0) - Object.values(this.data.chars).filter(c => c.chat).length);
-    this.data.tick = Math.max(this.data.tick, other.tick); this.foodRevision++; this.dirty = true;
+    this.data.tick = Math.max(this.data.tick, other.tick); normalizeBreeding(this, this.data.tick); this.foodRevision++; this.dirty = true;
   }
   counts() { const chars = Object.values(this.data.chars); return { fish: Object.keys(this.data.fishes).length, scene: Object.keys(this.data.scenes).length, food: chars.filter(c => c.kind === 'food' && this.data.tick - c.born < CONFIG.foodLife).length, characters: chars.filter(c => c.kind !== 'burn').length }; }
 }
