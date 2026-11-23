@@ -39,14 +39,14 @@ async function main() {
   await page.locator('#myFish').click();
   for (const fish of fishes) {
     const card = page.locator(`[data-fish="${fish.id}"]`);
-    assert.equal(await card.locator('strong').textContent(), '完整昵称测试 的鱼');
+    assert((await card.locator('.fishCardInfo').textContent()).includes('完整昵称测试'));
     assert.equal(await card.locator('.fishGender').textContent(), fish.gender === 'male' ? '♂ 公' : '♀ 母');
     assert.equal(await card.locator('.fishGender').evaluate(node => getComputedStyle(node).color), fish.gender === 'male' ? 'rgb(121, 184, 255)' : 'rgb(255, 159, 200)');
   }
   fs.mkdirSync(path.join(project, 'test-output'), { recursive: true });
   await page.screenshot({ path: path.join(project, 'test-output', 'my-fish-gender.png') });
   await page.locator(`[data-fish="${fishes[1].id}"]`).click();
-  assert.equal(await page.locator('#objectTitle').textContent(), '完整昵称测试 的鱼');
+  assert((await page.locator('#objectInfo').textContent()).includes('完整昵称测试'));
   assert.equal(await page.locator('#fishGender').textContent(), '♀ 母');
   await page.reload(); await page.waitForFunction(() => window.tide); await page.locator('#myFish').click();
   assert.equal(await page.locator('#myFishList .fishGender.male').count(), 1); assert.equal(await page.locator('#myFishList .fishGender.female').count(), 1);
