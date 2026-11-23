@@ -1,4 +1,6 @@
+import { CHAT_FLOOR, validChatMessage, buildChatFloor, chatGlyphs } from './chat.js';
 export const CONFIG = Object.freeze({ width: 800, depth: 120, shallow: 60, step: 500, speed: 2, foodLife: 300000, hunger: 86400000, initial: 20, offlineLife: 240 * 60 * 60 * 1000 });
+export const MONUMENT = { x: 610, y: CONFIG.depth - 5, rows: ['  ____  ', ' /记忆\\ ', ' | 口 | ', ' |____| ', '________'] };
 export const EYES = new Set(['0', 'O', 'o', '。', '.', '口']);
 export const NEIGHBORS = [-1, 0, 1].flatMap(x => [-1, 0, 1].map(y => [x, y])).filter(([x, y]) => x || y);
 export const clone = value => structuredClone(value);
@@ -59,12 +61,35 @@ function transition(c, next, record) { Object.assign(c, next); c.path.push({ ...
 
 export class World {
   constructor(now = Date.now(), id = crypto.randomUUID()) {
-    this.data = { protocol: 1, roots: { [id]: now }, tick: now, chars: {}, fishes: {}, scenes: {}, ops: {}, participants: {}, notices: [] };
+    this.data = { protocol: 1, roots: { [id]: now }, tick: now, chars: {}, fishes: {}, scenes: {}, ops: {}, participants: {}, notices: [], chats: {}, chatSources: {}, pendingChatGlyphs: 0 };
     this.dirty = true;
   }
   get id() { return Object.keys(this.data.roots).sort()[0]; }
   get roots() { return Object.keys(this.data.roots); }
   serialize() { return clone(this.data); }
+  addChat(message) {
+    if (!validChatMessage(message) || !message.body.roots.some(root => this.data.roots[root] !== undefined)) return { ok: false, error: '聊天不属于当前世界' };
+    const existing = this.data.chats[message.id];
+    if (existing) return JSON.stringify(existing) === JSON.stringify(message) ? { ok: true, duplicate: true } : { ok: false, error: '已有聊天记录不可覆盖' };
+    this.data.chats[message.id] = clone(message); this.data.participants[message.actor] ||= maskNick(message.body.nick); this.dirty = true; return { ok: true };
+  }
+  reconcileChatFloor(now = this.data.tick) {
+    const occupied = new Set(this.fishMap().keys());
+    const monumentWidth = Math.max(...MONUMENT.rows.map(row => Array.from(row).length));
+    for (let y = MONUMENT.y; y < MONUMENT.y + MONUMENT.rows.length; y++) for (let x = MONUMENT.x; x < MONUMENT.x + monumentWidth; x++) occupied.add(key(x, y));
+    for (const c of Object.values(this.data.chars)) {
+      if (c.kind === 'food') occupied.add(key(c.x, c.y));
+      else if (c.kind === 'scene' && !c.chat) { const s = this.data.scenes[c.entity]; if (s) occupied.add(key(s.x + c.x, s.y + c.y)); }
+    }
+    const result = buildChatFloor(this.data.chatSources, CONFIG, occupied, hash);
+    for (const [id, c] of Object.entries(this.data.chars)) if (c.chat && !result.chars[id]) delete this.data.chars[id];
+    for (const [id, c] of Object.entries(result.chars)) {
+      const old = this.data.chars[id]; this.data.chars[id] = { ...c, moveAt: old && old.x === c.x && old.y === c.y ? old.moveAt : now };
+    }
+    if (this.sceneCells(CHAT_FLOOR).length) this.data.scenes[CHAT_FLOOR] = { id: CHAT_FLOOR, actor: '', nick: '旧海的聊天', x: 0, y: 0, posAt: 0, poseId: CHAT_FLOOR, fixed: true };
+    else delete this.data.scenes[CHAT_FLOOR];
+    this.data.pendingChatGlyphs = result.waiting; this.dirty = true; return result;
+  }
   fishCells(id) { return Object.values(this.data.chars).filter(c => c.kind === 'fish' && c.entity === id); }
   sceneCells(id) { return Object.values(this.data.chars).filter(c => c.kind === 'scene' && c.entity === id); }
   fishGroups() { const map = new Map(); for (const c of Object.values(this.data.chars)) if (c.kind === 'fish') { if (!map.has(c.entity)) map.set(c.entity, []); map.get(c.entity).push(c); } return map; }
@@ -76,12 +101,14 @@ export class World {
   canOccupy(f, cells, scenery = this.sceneryMap()) { return cells.every(c => { const p = cellPosition(f, c); return p.x >= 0 && p.x < CONFIG.width && p.y >= 0 && p.y < CONFIG.depth && !scenery.has(key(p.x, p.y)); }); }
   reconcileGeometry(now = this.data.tick) {
     // Only the elected browser calls this after a merge. Keep every fish and move conflicting scenery as a whole.
+    this.reconcileChatFloor(now);
     const occupied = new Set(this.fishMap().keys());
     for (const c of Object.values(this.data.chars)) if (c.kind === 'food') occupied.add(key(c.x, c.y));
     const scenes = new Map(); for (const c of Object.values(this.data.chars)) if (c.kind === 'scene') { if (!scenes.has(c.entity)) scenes.set(c.entity, []); scenes.get(c.entity).push(c); }
     let waiting = 0;
     for (const s of Object.values(this.data.scenes).sort((a, b) => a.id.localeCompare(b.id))) {
       const cells = scenes.get(s.id) || [], b = bounds(cells);
+      if (s.id === CHAT_FLOOR) { for (const c of cells) occupied.add(key(s.x + c.x, s.y + c.y)); continue; }
       const fits = (x, y) => x + b.minX >= 0 && x + b.maxX < CONFIG.width && y + b.minY >= 0 && y + b.maxY < CONFIG.depth && cells.every(c => !occupied.has(key(x + c.x, y + c.y)));
       if (!fits(s.x, s.y)) {
         let target;
@@ -124,6 +151,7 @@ export class World {
       this.data.chars[op.id] = { id: op.id, payer: op.actor, ch: op.ch, color: op.color, kind: 'food', entity: '', x: op.x, y: 0, born: op.t, fall: 0, path: [], created: op.t };
     } else if (op.kind.startsWith('scene')) {
       const s = this.data.scenes[op.scene]; if (!s) return { ok: false, error: '造景已不存在' };
+      if (s.id === CHAT_FLOOR) return { ok: false, error: '海底聊天记忆已固化，不能编辑、搬动或删除' };
       const cells = this.sceneCells(s.id);
       if (op.kind === 'sceneDelete') { for (const c of cells) transition(c, { kind: 'burn', entity: '' }, { id: op.id, t: op.t, reason: 'delete' }); delete this.data.scenes[s.id]; }
       else if (op.kind === 'sceneMove') {
@@ -227,6 +255,12 @@ export class World {
   merge(other) {
     if (!other || other.protocol !== 1 || !other.chars || !other.fishes || !other.scenes || !other.ops) throw new Error('世界协议不兼容');
     Object.assign(this.data.roots, other.roots); for (const [id, op] of Object.entries(other.ops)) if (!this.data.ops[id]) this.data.ops[id] = clone(op); Object.assign(this.data.participants, other.participants);
+    for (const message of Object.values(other.chats || {})) { const result = this.addChat(message); if (!result.ok) throw new Error(result.error); }
+    for (const [id, message] of Object.entries(other.chatSources || {})) {
+      if (id !== message.id || !validChatMessage(message)) throw new Error('聊天沉积来源无效');
+      if (this.data.chatSources[id] && JSON.stringify(this.data.chatSources[id]) !== JSON.stringify(message)) throw new Error('已有聊天沉积来源不可覆盖');
+      this.data.chatSources[id] = clone(message);
+    }
     for (const [id, c] of Object.entries(other.chars)) this.data.chars[id] = clone(this.data.chars[id] ? chooseClaim(this.data.chars[id], c) : c);
     for (const type of ['fishes', 'scenes']) for (const [id, obj] of Object.entries(other[type])) { const old = this.data[type][id]; if (!old || (obj.posAt || 0) > (old.posAt || 0) || ((obj.posAt || 0) === (old.posAt || 0) && JSON.stringify(obj).localeCompare(JSON.stringify(old)) > 0)) this.data[type][id] = clone(obj); }
     const groups = this.fishGroups();
@@ -238,6 +272,11 @@ export class World {
       if (cs.length === 1) { const c = cs[0], p = cellPosition(f, c); transition(c, { kind: 'food', entity: '', x: p.x, y: p.y, born: Math.max(this.data.tick, other.tick), fall: 0 }, { id: `normalize:${id}`, t: Math.max(this.data.tick, other.tick), reason: 'shed' }); delete this.data.fishes[id]; }
     }
     for (const id of Object.keys(this.data.scenes)) if (!this.sceneCells(id).length) delete this.data.scenes[id];
+    for (const [id, message] of Object.entries(this.data.chatSources)) if (message.body.roots.some(root => this.data.roots[root] !== undefined)) {
+      delete this.data.chatSources[id]; for (const [cellId, c] of Object.entries(this.data.chars)) if (c.chat === id) delete this.data.chars[cellId];
+    }
+    if (!this.sceneCells(CHAT_FLOOR).length) delete this.data.scenes[CHAT_FLOOR];
+    this.data.pendingChatGlyphs = Math.max(0, Object.values(this.data.chatSources).reduce((sum, message) => sum + chatGlyphs(message.body.text).length, 0) - Object.values(this.data.chars).filter(c => c.chat).length);
     this.data.tick = Math.max(this.data.tick, other.tick); this.dirty = true;
   }
   counts() { const chars = Object.values(this.data.chars); return { fish: Object.keys(this.data.fishes).length, scene: Object.keys(this.data.scenes).length, food: chars.filter(c => c.kind === 'food' && this.data.tick - c.born < CONFIG.foodLife).length, characters: chars.filter(c => c.kind !== 'burn').length }; }

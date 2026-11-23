@@ -15,7 +15,7 @@ async function page(b, port, nick) { const ctx = await b.newContext({ viewport: 
 async function createFish(p, glyphs, x, y) { await p.locator('#makeFish').click(); const rect = await p.locator('#gridCanvas').boundingBox(); for (let i = 0; i < glyphs.length; i++) { await p.locator('#glyphInput').fill(glyphs[i]); await p.mouse.click(rect.x + (7 + i + .5) * rect.width / 15, rect.y + 7.5 * rect.height / 15); } await p.locator('#placeDrawing').click(); await p.mouse.click(x, y); await until(async () => (await p.evaluate(() => window.tide.world.counts.fish)) >= 1, '鱼没有投放'); }
 async function connect(p, port) { await p.locator('#connect').click(); await p.locator('#peerUrl').fill(`http://127.0.0.1:${port}`); await p.locator('#connectionForm .primary').click(); }
 async function createScene(p) { await p.locator('#makeScene').click(); const g = await p.locator('#gridCanvas').boundingBox(); await p.locator('#glyphInput').fill('木'); for (const x of [10.5, 11.5]) await p.mouse.click(g.x + x * g.width / 20, g.y + 10.5 * g.height / 20); await p.locator('#placeDrawing').click(); await p.mouse.click(950, 580); await until(async () => (await p.evaluate(() => tide.world.counts.scene)) >= 1, '造景未投放'); }
-async function feed(p, x) { await p.locator('#feed').click(); await p.mouse.click(x, 243); await p.keyboard.press('Escape'); }
+async function feed(p, x) { await p.locator('#feed').click(); await p.locator('#placeFood').click(); await p.mouse.click(x, 243); await p.keyboard.press('Escape'); }
 async function reopen(ctx, port) { const p = await ctx.newPage(); p.on('pageerror', e => errors.push(e.message)); await p.goto(`http://127.0.0.1:${port}`); await p.waitForFunction(() => window.tide); return p; }
 async function ageCheckpoint(ctx, port, hours, legacy = false) {
   // This page edits an isolated test profile without registering an online game node.
@@ -44,8 +44,9 @@ async function main() {
   await until(async () => (await a.locator('#chatMessages').textContent()).includes('你好，中文字符世界'), '聊天未同步');
   assert.equal((await a.locator('#chatMessages').textContent()).includes('浏览器乙'), false, '未打码昵称暴露');
   await until(async () => (await b.evaluate(() => { const d = tide.world.data, cs = Object.values(d.chars).filter(c => c.kind === 'scene'); return cs.length === 4 && new Set(cs.map(c => `${d.scenes[c.entity].x + c.x},${d.scenes[c.entity].y + c.y}`)).size === 4; })), '合流造景重叠');
-  const before = await a.evaluate(() => tide.balance()); await a.locator('#feed').click(); await a.mouse.click(710, 370); await pause(700); assert.equal(await a.evaluate(() => tide.balance()), before, '水下点击消耗了配额'); await a.mouse.click(710, 243); await a.keyboard.press('Escape');
+  const before = await a.evaluate(() => tide.balance()); await a.locator('#feed').click(); await a.locator('#foodGlyphInput').fill('粮'); await a.locator('#foodColorInput').fill('#ff9933'); await a.locator('#placeFood').click(); await a.mouse.click(710, 370); await pause(700); assert.equal(await a.evaluate(() => tide.balance()), before, '水下点击消耗了配额'); await a.mouse.click(710, 243); await a.keyboard.press('Escape');
   await until(async () => (await b.evaluate(() => Object.values(tide.world.data.chars).some(c => c.kind === 'food'))), '水面食物未同步');
+  assert.equal(await b.evaluate(() => Object.values(tide.world.data.chars).some(c => c.kind === 'food' && c.ch === '粮' && c.color === '#ff9933')), true, '自定义鱼食字符或颜色未同步');
   const foodY = await b.evaluate(() => Object.values(tide.world.data.chars).find(c => c.kind === 'food').y); assert(foodY <= 2, '食物未从水面开始');
   const c = await page(chrome, 39083, '第三个同事'); await createFish(c, ['水', '。'], 1000, 400);
   await until(async () => (await a.evaluate(() => tide.network.leader)) === (await b.evaluate(() => tide.network.leader)), '协调者未统一');

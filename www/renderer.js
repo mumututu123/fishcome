@@ -1,6 +1,6 @@
-import { CONFIG, cellPosition, EYES } from './engine.js';
+import { CONFIG, cellPosition, EYES, MONUMENT } from './engine.js';
 const FONT = "'Microsoft YaHei',Consolas,monospace";
-export const MONUMENT = { x: 610, y: CONFIG.depth - 5, rows: ['  ____  ', ' /记忆\\ ', ' | 口 | ', ' |____| ', '________'] };
+export { MONUMENT } from './engine.js';
 export class Renderer {
   constructor(canvas) { this.canvas = canvas; this.ctx = canvas.getContext('2d'); this.camera = { x: 380, y: 23 }; this.scale = 1; this.cell = 18; this.pointer = { x: 0, y: 0 }; this.preview = null; this.selected = null; this.world = null; this.resize(); window.addEventListener('resize', () => this.resize()); }
   resize() { this.width = innerWidth; this.height = innerHeight; this.dpr = Math.min(2, devicePixelRatio || 1); this.canvas.width = this.width * this.dpr; this.canvas.height = this.height * this.dpr; this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0); }

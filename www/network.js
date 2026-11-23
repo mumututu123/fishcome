@@ -41,7 +41,8 @@ export class Network {
   close(p) { if (!this.connections.has(p.id)) return; this.connections.delete(p.id); p.pc.onconnectionstatechange = null; if (p.dc) p.dc.onclose = null; p.pc.close(); this.onChange(); }
   async makeEnvelope(kind, body) { const message = { id: crypto.randomUUID(), kind, from: this.node, actor: this.identity.actor, key: this.identity.pub, body }; return { ...message, signature: await this.sign(message) }; }
   async encode(message) { const raw = encoder.encode(JSON.stringify(message)); if (raw.byteLength > 32 * 1024 * 1024) throw new Error('世界快照过大'); if (raw.byteLength > 2048 && typeof CompressionStream !== 'undefined') { const bytes = new Uint8Array(await new Response(new Blob([raw]).stream().pipeThrough(new CompressionStream('gzip'))).arrayBuffer()); const result = new Uint8Array(bytes.length + 1); result[0] = 1; result.set(bytes, 1); return result; } const result = new Uint8Array(raw.length + 1); result.set(raw, 1); return result; }
-  async broadcast(kind, body) { const message = await this.makeEnvelope(kind, body); this.seen.set(message.id, Date.now()); const bytes = await this.encode(message); await Promise.allSettled(this.live().map(p => this.send(p, message.id, bytes))); return message; }
+  async broadcastEnvelope(message) { this.seen.set(message.id, Date.now()); const bytes = await this.encode(message); await Promise.allSettled(this.live().map(p => this.send(p, message.id, bytes))); return message; }
+  async broadcast(kind, body) { return this.broadcastEnvelope(await this.makeEnvelope(kind, body)); }
   async direct(p, kind, body) { const message = await this.makeEnvelope(kind, body); this.seen.set(message.id, Date.now()); await this.send(p, message.id, await this.encode(message)); return message; }
   send(p, id, bytes) {
     if (!p.dc || p.dc.readyState !== 'open' || p.queued > 8) return Promise.resolve(); p.queued++;

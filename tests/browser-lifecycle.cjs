@@ -55,8 +55,32 @@ async function main() {
   const shortSleep = await state(page); assert.deepEqual(shortSleep.roots, beforeSleep.roots); assert.equal(shortSleep.counts.fish, 1); assert.equal(shortSleep.balance, 18);
   await page.evaluate(() => { const realNow = Date.now; Date.now = () => realNow() + 240 * 3600000; }); await pause(1200);
   const longSleep = await state(page); assert.equal(longSleep.counts.fish, 0); assert.equal(longSleep.balance, 20); assert(longSleep.cards.some(card => beforeSleep.roots.every(root => card.roots.includes(root))));
+  const foodContext = await browser.newContext({ viewport: { width: 1440, height: 900 } }), foodPage = await open(foodContext);
+  await foodPage.locator('#nickInput').fill('鱼食测试'); await foodPage.locator('#welcomeForm .primary').click(); await ready(foodPage);
+  await foodPage.evaluate(() => { document.getElementById('glyphInput').value = '木'; document.getElementById('colorInput').value = '#112233'; });
+  await foodPage.keyboard.press('e'); assert.equal(await foodPage.locator('#foodDialog').isVisible(), true);
+  for (const invalid of ['', ' ', '你好', '🐟']) { await foodPage.locator('#foodGlyphInput').fill(invalid); assert.equal(await foodPage.locator('#placeFood').isDisabled(), true); assert.equal(await foodPage.evaluate(() => tide.balance()), 20); }
+  await foodPage.locator('#foodGlyphInput').fill('粮'); await foodPage.locator('#foodColorInput').fill('#ff3366');
+  assert.equal(await foodPage.locator('#foodPreview').textContent(), '粮'); assert.equal(await foodPage.locator('#foodPreview').evaluate(element => getComputedStyle(element).color), 'rgb(255, 51, 102)');
+  await foodPage.screenshot({ path: path.join(project, 'test-output', 'food-settings.png') });
+  await foodPage.setViewportSize({ width: 390, height: 844 });
+  assert.equal(await foodPage.locator('#foodDialog').evaluate(element => element.scrollWidth <= element.clientWidth), true, '小屏鱼食设置横向溢出');
+  await foodPage.screenshot({ path: path.join(project, 'test-output', 'food-settings-mobile.png') });
+  await foodPage.setViewportSize({ width: 1440, height: 900 });
+  await foodPage.locator('#closeFood').click(); assert.equal(await foodPage.evaluate(() => tide.balance()), 20, '关闭设置扣费');
+  await foodPage.locator('#feed').click(); assert.equal(await foodPage.locator('#foodGlyphInput').inputValue(), '粮'); assert.equal(await foodPage.locator('#foodColorInput').inputValue(), '#ff3366');
+  await foodPage.locator('#placeFood').click(); await foodPage.mouse.click(600, 370); await pause(600);
+  assert.equal(await foodPage.evaluate(() => tide.balance()), 20, '水下投食扣费'); await foodPage.keyboard.press('Escape');
+  assert.equal(await foodPage.evaluate(() => tide.balance()), 20, '取消水面投放扣费');
+  for (const [index, [ch, color]] of [['粮', '#ff3366'], ['𠮷', '#12ab34'], ['+', '#abcdef']].entries()) {
+    await foodPage.locator('#feed').click(); await foodPage.locator('#foodGlyphInput').fill(ch); await foodPage.locator('#foodColorInput').fill(color); await foodPage.locator('#placeFood').click(); await foodPage.mouse.click(600 + index * 80, 243);
+    await foodPage.waitForFunction(({ ch, color }) => Object.values(tide.world.data.chars).some(cell => cell.kind === 'food' && cell.ch === ch && cell.color === color), { ch, color });
+    assert.equal(await foodPage.evaluate(() => tide.balance()), 19 - index); await foodPage.keyboard.press('Escape');
+  }
+  assert.equal(await foodPage.locator('#glyphInput').inputValue(), '木'); assert.equal(await foodPage.locator('#colorInput').inputValue(), '#112233');
+  await foodContext.close();
   assert.deepEqual(errors, []);
-  const result = { edge: 'passed', version: browser.version(), fixture: 'Node static/pairing service, no launcher execution', checks: ['short offline preserves fish, scenery, wallet and roots', 'no 15-second premature archive', '239-hour legacy checkpoint restoration', '240-hour expiry creates empty world with 20 characters and archive', 'short sleep preserves world and wallet', '240-hour sleep expires world and keeps archive'], errors };
+  const result = { edge: 'passed', version: browser.version(), fixture: 'Node static/pairing service, no launcher execution', checks: ['short offline preserves fish, scenery, wallet and roots', 'no 15-second premature archive', '239-hour legacy checkpoint restoration', '240-hour expiry creates empty world with 20 characters and archive', 'short sleep preserves world and wallet', '240-hour sleep expires world and keeps archive', 'independent food glyph and color settings with preview', 'invalid glyphs and canceled feeding do not spend characters', 'Chinese, supplementary Han and ASCII food retain chosen colors', 'surface-only custom food costs one character per drop', 'food dialog fits desktop and narrow viewport'], errors };
   fs.mkdirSync(path.join(project, 'test-output'), { recursive: true }); fs.writeFileSync(path.join(project, 'test-output', 'browser-lifecycle-results.json'), JSON.stringify(result, null, 2)); console.log(JSON.stringify(result, null, 2));
 }
 main().catch(error => { console.error(error.stack); process.exitCode = 1; }).finally(async () => { if (browser) await browser.close(); server.closeAllConnections(); server.close(); });
