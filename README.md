@@ -69,6 +69,8 @@
 
 在 Windows PowerShell 运行 `./build.ps1` 构建 `dist/鱼来/鱼来.exe` 和干净发行 ZIP。编译器为 Windows 自带的 .NET Framework C# 编译器。
 
+如果已有 `dist/潮生` 兼容目录，构建会同时更新其中的 `www`、使用说明与验证记录，保留原启动器。已打开的旧页面需要刷新才能载入更新；固定本地地址和 IndexedDB 数据库保持不变。`node tests/served-ui.cjs` 可检查当前 `http://127.0.0.1:39241` 实际发布的“我的鱼”入口、快捷键绑定及鱼况模块，其他测试地址可通过 `TIDE_UI_URL` 指定。
+
 安装 Node.js 后，`npm test` 运行规则测试，`node tests/benchmark.mjs` 检查模拟负载。浏览器测试需 Playwright：`node tests/browser-smoke.cjs`，也可用 `TIDE_TEST_MODULES` 指向已有 Playwright 包。测试启动器只监听本机 39081–39084，浏览器使用临时配置。缺少 Chrome 时联机测试使用另一独立 Edge 实例；`TIDE_SKIP_FIREFOX=1` 可跳过 Firefox。`node tests/browser-lifecycle.cjs` 使用本机随机端口的 Node 测试服务和 Edge 临时配置，专项验证离线期限，不运行 Windows 启动器。
 
 完整产品规格见「鱼来世界开发规格.md」。暂定水深、浅深分界、速度系数与结算步长集中于 `www/engine.js` 的 `CONFIG`，可根据真实试玩调整。
