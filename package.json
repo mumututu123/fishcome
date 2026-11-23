@@ -1,0 +1,8 @@
+{
+  "name": "tide-character-world",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node --test tests/*.test.mjs" },
+  "description": "鱼来：中文与 ASCII 字符组成的浏览器 P2P 鱼来世界"
+}

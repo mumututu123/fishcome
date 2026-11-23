@@ -1,0 +1,5 @@
+dist/
+test-output/
+.browsers/
+node_modules/
+*.log
