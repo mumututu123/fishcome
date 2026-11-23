@@ -5,12 +5,16 @@ import { Renderer, MONUMENT } from './renderer.js';
 import { Creator } from './creator.js';
 import { restoreCheckpoint } from './lifecycle.js';
 import { CHAT_FLOOR, validChatMessage, orderedChats, chatGlyphs, chatColor, chatCellId, mergeChatRecords } from './chat.js';
+import { DAY, shanghaiDay, validTravel } from './fish-status.js';
 const $ = id => document.getElementById(id);
 const renderer = new Renderer($('sea'));
 let world = new World(), identity, network, meta, creator, mode = null, selected = null, dragging, histories = {}, known = [], members = new Map(), pending = new Map(), inbox = new Map(), lastPicture = null, priorCheckpoint = null;
 let chatLimit = 80, renderedChatWorld, renderedChatCount = -1, renderedChatLimit = -1;
+let trackedFish = null, followBounds = null, myFishListKey = '';
+const myFishCards = new Map();
+const fishDate = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
 let lastSnapshot = 0, snapshotBusy = false, lastHello = new Set(), lastMeter = Date.now(), lastSave = 0, lastPictureTime = 0, lastChat = 0, selfBeat = 0, lastLeader = '', status = '', started = false, lastRepair = 0;
-let lastFull = 0, sentOps = new Set(), sentChars = new Map(), sentChats = new Set(), sentChatSources = new Set();
+let lastFull = 0, sentOps = new Set(), sentChars = new Map(), sentChats = new Set(), sentChatSources = new Set(), sentTravel = new Map();
 let geometryRepair = false;
 let lastOnlineAt = Date.now();
 const historyQueues = new Map();
@@ -30,6 +34,7 @@ function update() {
   $('depthLabel').textContent = `水深 ${Math.max(0, Math.round(renderer.camera.y))} 格 · ${renderer.camera.y < CONFIG.shallow ? '浅水区' : '深水区'}`; $('zoomLabel').textContent = Math.round(renderer.scale * 100) + '%';
   $('networkDetails').textContent = `直连邻居 ${network.live().length}/8 · 已收 ${(network.stats.received / 1024).toFixed(0)} KB · 已发 ${(network.stats.sent / 1024).toFixed(0)} KB`;
   if ($('foodDialog').open) updateFoodBrush();
+  if ($('myFishDialog').open) renderMyFishes();
   if (selected) inspect(selected, false);
 }
 function remember(url) { if (!url || url === meta?.url) return; if (!known.includes(url)) { known.push(url); set('known', known).catch(() => {}); } }
@@ -48,6 +53,9 @@ async function verifyReplica(data) {
   for (const [id, op] of Object.entries(data.ops)) { if (world.data.ops[id]) { if (JSON.stringify(opBody(world.data.ops[id])) !== JSON.stringify(opBody(op))) throw new Error('已有消费记录不可覆盖'); } else { const { proof, ...clean } = op; if (id !== op.id || !proof || proof.kind !== 'op' || JSON.stringify(clean) !== JSON.stringify(proof.body) || proof.actor !== op.actor || !await verifyEnvelope(proof) || world.validOp(op)) throw new Error('世界包含无效操作凭据'); } }
   for (const [root, at] of Object.entries(data.roots)) if (!/^[0-9a-f-]{36}$/i.test(root) || !Number.isFinite(at)) throw new Error('世界起源无效');
   await verifyChats(data.chats); await verifyChats(data.chatSources);
+  for (const [id, fish] of Object.entries(data.fishes)) { const source = data.ops[id] || world.data.ops[id]; if (fish.id !== id || source?.kind !== 'fish' || fish.actor !== source.actor || fish.created !== source.t) throw new Error('鱼的创建者记录无效'); }
+  if (data.travel !== undefined && (!data.travel || typeof data.travel !== 'object' || Array.isArray(data.travel))) throw new Error('鱼运动记录无效');
+  for (const [id, record] of Object.entries(data.travel || {})) { const source = data.ops[id] || world.data.ops[id]; if (!validTravel(record) || source?.kind !== 'fish' || record.since < source.t || record.since > Date.now() + 60000) throw new Error('鱼运动记录缺少合法来源'); }
   const sourceGlyphs = new Map();
   for (const [id, c] of Object.entries(data.chars)) {
     if (id !== c.id) throw new Error('字符身份重复或被篡改');
@@ -84,9 +92,9 @@ function resumeAfterInactivity(now = Date.now()) {
       priorCheckpoint = checkpoint; world = restored.world;
       acceptHistory(endedCard(checkpoint, restored.expiresAt));
       chatLimit = 80; renderChat();
-      lastPicture = null; pending.clear(); inbox.clear(); selected = null; renderer.selected = null; $('inspector').hidden = true; cancelMode();
+      lastPicture = null; pending.clear(); inbox.clear(); selected = null; trackedFish = null; renderer.selected = null; renderer.observedFish = null; $('inspector').hidden = true; cancelMode();
     } else world.data.tick = now;
-    members.clear(); members.set(network.node, member()); lastHello.clear(); lastLeader = ''; lastFull = 0; sentChars.clear(); sentOps.clear(); sentChats.clear(); sentChatSources.clear(); lastPictureTime = 0;
+    members.clear(); members.set(network.node, member()); lastHello.clear(); lastLeader = ''; lastFull = 0; sentChars.clear(); sentOps.clear(); sentChats.clear(); sentChatSources.clear(); sentTravel.clear(); lastPictureTime = 0;
   }
   lastOnlineAt = Math.max(lastOnlineAt, now);
   if (elapsed > 120000) { networkChange().catch(() => {}); reconnect().catch(() => {}); }
@@ -118,7 +126,7 @@ async function onMessage(message, peer) {
     const missing = (body.historyIndex || []).filter(id => !histories[id]); if (missing.length) { historyQueues.set(peer.id, missing); await requestHistory(peer); }
     status = ''; toast('已接入伙伴，两个世界正在合流'); update();
   } else if (message.kind === 'beat') {
-    if (body.member?.id === message.from && body.member.actor === message.actor) { const direct = network.live().find(p => p.node === message.from); members.set(message.from, { ...body.member, url: direct?.url || body.member.url, at: Date.now() }); remember(body.member.url); if (Date.now() - lastRepair > 5000 && (body.rootCount > world.roots.length || body.opCount > Object.keys(world.data.ops).length || body.chatCount > Object.keys(world.data.chats).length || body.chatSourceCount > Object.keys(world.data.chatSources).length)) { lastRepair = Date.now(); network.broadcast('replicaRequest', { to: message.from }).catch(() => {}); } }
+    if (body.member?.id === message.from && body.member.actor === message.actor) { const direct = network.live().find(p => p.node === message.from); members.set(message.from, { ...body.member, direct: !!direct, url: direct?.url || body.member.url, at: Date.now() }); remember(body.member.url); if (Date.now() - lastRepair > 5000 && (body.rootCount > world.roots.length || body.opCount > Object.keys(world.data.ops).length || body.chatCount > Object.keys(world.data.chats).length || body.chatSourceCount > Object.keys(world.data.chatSources).length)) { lastRepair = Date.now(); network.broadcast('replicaRequest', { to: message.from }).catch(() => {}); } }
   } else if (message.kind === 'merge') {
     await mergeReplica(body.world); geometryRepair = true; reconcileHistory(); syncIncomeSerial(); update();
   } else if (message.kind === 'replicaRequest') {
@@ -153,13 +161,14 @@ async function probeGone(id, url) { if (!id || id === network.node || !members.h
 async function broadcastWorld() {
   if (snapshotBusy || !amLeader()) return; snapshotBusy = true;
   try {
-    const full = Date.now() - lastFull > 30000, data = world.data, chars = {}, ops = {}, chats = {}, chatSources = {}, nextMarks = new Map();
+    const full = Date.now() - lastFull > 30000, data = world.data, chars = {}, ops = {}, chats = {}, chatSources = {}, travel = {}, nextMarks = new Map(), travelMarks = new Map();
     for (const [id, c] of Object.entries(data.chars)) { const mark = `${c.kind}:${c.entity}:${c.x}:${c.y}:${c.ch}:${c.color}:${c.editAt || 0}:${c.moveAt || 0}:${JSON.stringify(c.path)}`; nextMarks.set(id, mark); if (full || sentChars.get(id) !== mark) chars[id] = c; }
     for (const [id, op] of Object.entries(data.ops)) if (full || !sentOps.has(id)) ops[id] = op;
     for (const [id, message] of Object.entries(data.chats)) if (full || !sentChats.has(id)) chats[id] = message;
     for (const [id, message] of Object.entries(data.chatSources)) if (full || !sentChatSources.has(id)) chatSources[id] = message;
-    await network.broadcast('world', { delta: !full, world: { protocol: 1, roots: data.roots, tick: data.tick, chars, fishes: data.fishes, scenes: data.scenes, participants: data.participants, ops, notices: [], chats, chatSources } });
-    sentChars = nextMarks; sentOps = new Set(Object.keys(data.ops)); sentChats = new Set(Object.keys(data.chats)); sentChatSources = new Set(Object.keys(data.chatSources)); if (full) lastFull = Date.now();
+    for (const [id, record] of Object.entries(data.travel)) { const mark = JSON.stringify(record); travelMarks.set(id, mark); if (full || sentTravel.get(id) !== mark) travel[id] = record; }
+    await network.broadcast('world', { delta: !full, world: { protocol: 1, roots: data.roots, tick: data.tick, chars, fishes: data.fishes, scenes: data.scenes, participants: data.participants, ops, notices: [], chats, chatSources, travel } });
+    sentChars = nextMarks; sentOps = new Set(Object.keys(data.ops)); sentChats = new Set(Object.keys(data.chats)); sentChatSources = new Set(Object.keys(data.chatSources)); sentTravel = travelMarks; if (full) lastFull = Date.now();
   } catch (e) { status = e.message; } finally { snapshotBusy = false; }
 }
 async function submit(payload) {
@@ -169,7 +178,9 @@ async function submit(payload) {
   try { const message = await network.broadcast('op', op); inbox.set(op.id, clone(message)); if (amLeader()) { const result = world.apply({ ...clone(op), proof: message }); pending.delete(op.id); if (!result.ok) toast(result.error); else await save(); await broadcastWorld(); } else { setTimeout(() => { if (pending.has(op.id)) toast('这次投放仍在等待确认，连接恢复后同步'); }, 12000); } } catch (e) { pending.delete(op.id); toast(e.message); } update();
 }
 function cancelMode() { mode = null; renderer.preview = null; $('modeBanner').hidden = true; $('sea').style.cursor = 'grab'; }
-function placement(kind, cells) { mode = { kind, cells }; $('modeBanner').textContent = `在空水域点击投放${kind === 'fish' ? '鱼' : '造景'} · 消耗 ${cells.length} 字符 · Esc 取消`; $('modeBanner').hidden = false; $('sea').style.cursor = 'crosshair'; }
+function stopObserving() { selected = null; trackedFish = null; renderer.selected = null; renderer.observedFish = null; $('inspector').hidden = true; }
+function surfaceCamera() { const size = renderer.cell * renderer.scale; renderer.camera.y = (renderer.height / 2 - renderer.height * .27 + size / 2) / size; }
+function placement(kind, cells) { trackedFish = null; mode = { kind, cells }; $('modeBanner').textContent = `在空水域点击投放${kind === 'fish' ? '鱼' : '造景'} · 消耗 ${cells.length} 字符 · Esc 取消`; $('modeBanner').hidden = false; $('sea').style.cursor = 'crosshair'; }
 function updateFoodBrush() {
   const ch = $('foodGlyphInput').value, valid = validGlyph(ch);
   $('foodGlyphInput').setCustomValidity(valid ? '' : '请输入一个中文、中文标点或 ASCII 字符，不能是空格');
@@ -180,12 +191,65 @@ function updateFoodBrush() {
   $('foodCost').textContent = `每颗 1 字符 · 当前余额 ${balance()}`;
   $('placeFood').disabled = !valid || balance() < 1;
 }
-function feedMode() { if (!identity) return; resumeAfterInactivity(); if (balance() < 1) { toast('投食需要 1 字符余额'); return; } cancelMode(); updateFoodBrush(); $('foodDialog').showModal(); }
+function feedMode() { if (!identity) return; resumeAfterInactivity(); if (balance() < 1) { toast('投食需要 1 字符余额'); return; } stopObserving(); cancelMode(); updateFoodBrush(); $('foodDialog').showModal(); }
+function observationRect() {
+  const tools = document.querySelector('.tools').getBoundingClientRect(), inspector = $('inspector').getBoundingClientRect();
+  if (innerWidth <= 700) return { left: tools.right + 12, right: innerWidth - 16, top: Math.max(120, inspector.bottom + 16), bottom: innerHeight - 100 };
+  return { left: tools.right + 20, right: Math.max(tools.right + 160, inspector.left - 20), top: 128, bottom: innerHeight - 52 };
+}
+function moveCameraToFish(fish, body) {
+  const rect = observationRect(), size = renderer.cell * renderer.scale, x = (rect.left + rect.right) / 2, y = (rect.top + rect.bottom) / 2;
+  renderer.camera = { x: fish.x + fish.facing * (body.minX + body.maxX) / 2 + (renderer.width / 2 - x) / size, y: fish.y + (body.minY + body.maxY) / 2 + (renderer.height / 2 - y) / size };
+}
+function focusFish(id) {
+  const fish = world.data.fishes[id]; if (!fish) { toast('这条鱼已不再存活'); renderMyFishes(); return; }
+  cancelMode(); trackedFish = id; inspect({ kind: 'fish', id });
+  if (innerWidth <= 700) { document.querySelector('.chat').classList.add('collapsed'); $('collapseChat').textContent = '+'; }
+  const rect = observationRect(), body = followBounds = bounds(world.fishCells(id));
+  renderer.zoom(Math.min(1.25, Math.max(1, renderer.scale), Math.max(80, rect.right - rect.left) / (renderer.cell * (body.width + 4)), Math.max(80, rect.bottom - rect.top) / (renderer.cell * (body.height + 4))));
+  moveCameraToFish(fish, body); update();
+}
+function drawFishThumbnail(canvas, fish, cells) {
+  const ctx = canvas.getContext('2d'), body = bounds(cells), size = Math.min(12, 76 / Math.max(1, body.width), 52 / Math.max(1, body.height));
+  ctx.clearRect(0, 0, 88, 64); ctx.font = `${size * .85}px 'Microsoft YaHei',Consolas,monospace`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  for (const cell of cells) { const x = fish.facing === 1 ? cell.x - body.minX : body.maxX - cell.x; ctx.fillStyle = cell.color; ctx.fillText(cell.ch, (88 - body.width * size) / 2 + (x + .5) * size, (64 - body.height * size) / 2 + (cell.y - body.minY + .5) * size, size); }
+}
+function renderMyFishes() {
+  if (!identity) return; const fishes = world.myFishes(identity.actor), groups = world.fishGroups(), now = Date.now(), ids = fishes.map(fish => fish.id), key = ids.join(',');
+  const total = Object.values(world.data.ops).filter(op => op.kind === 'fish' && op.actor === identity.actor).length;
+  $('myFishCount').textContent = `${fishes.length} 条存活 · ${total - fishes.length} 条已消失`; $('myFishEmpty').hidden = !!fishes.length;
+  for (const id of myFishCards.keys()) if (!ids.includes(id)) myFishCards.delete(id);
+  for (const fish of fishes) {
+    if (!myFishCards.has(fish.id)) {
+      const card = document.createElement('button'), canvas = document.createElement('canvas'), body = document.createElement('span'), title = document.createElement('strong'), health = document.createElement('span'), info = document.createElement('span'), metrics = document.createElement('span');
+      card.type = 'button'; card.className = 'fishCard'; card.dataset.fish = fish.id; canvas.width = 88; canvas.height = 64; canvas.setAttribute('aria-hidden', 'true'); body.className = 'fishCardText'; health.className = 'fishHealth'; info.className = 'fishCardInfo'; metrics.className = 'fishCardMetrics';
+      body.append(title, health, info, metrics); card.append(canvas, body); card.onclick = () => { $('myFishDialog').close(); focusFish(fish.id); }; myFishCards.set(fish.id, { card, canvas, title, health, info, metrics });
+    }
+    const entry = myFishCards.get(fish.id), cells = groups.get(fish.id) || [], status = world.fishStatus(fish.id, now);
+    entry.title.textContent = `鱼 ${fish.id.slice(0, 6)}`; entry.health.textContent = status.hungry ? '饥饿' : '未饥饿'; entry.health.classList.toggle('hungry', status.hungry);
+    entry.info.textContent = `${cells.length} 字符 · 创建于 ${fishDate.format(fish.created)}`;
+    entry.metrics.textContent = `今日运动 ${status.trackedSince === undefined ? '待同步' : status.movement.toFixed(1) + ' 格'} · 近24小时进食 ${status.meals24} 颗`;
+    drawFishThumbnail(entry.canvas, fish, cells);
+  }
+  if (myFishListKey !== key) { $('myFishList').replaceChildren(...fishes.map(fish => myFishCards.get(fish.id).card)); myFishListKey = key; }
+}
 function inspect(hit, show = true) {
-  selected = hit; if (hit.kind === 'monument') { historyDialog(); selected = null; return; }
-  const object = hit.kind === 'fish' ? world.data.fishes[hit.id] : world.data.scenes[hit.id]; if (!object) { $('inspector').hidden = true; selected = null; return; }
+  if (trackedFish && (hit.kind !== 'fish' || hit.id !== trackedFish)) trackedFish = null;
+  selected = hit; if (hit.kind === 'monument') { renderer.observedFish = null; renderer.selected = null; $('inspector').hidden = true; historyDialog(); selected = null; return; }
+  const object = hit.kind === 'fish' ? world.data.fishes[hit.id] : world.data.scenes[hit.id]; if (!object) { $('inspector').hidden = true; selected = null; renderer.observedFish = null; return; }
   const cells = hit.kind === 'fish' ? world.fishCells(hit.id) : world.sceneCells(hit.id); $('objectTitle').textContent = `${object.nick || '自然沉积'} 的${hit.kind === 'fish' ? '鱼' : '造景'}`;
-  if (hit.kind === 'fish') { const v = velocities(cells), eyes = cells.filter(c => EYES.has(c.ch)).length; $('objectInfo').textContent = `${cells.length} 字符 · ${eyes ? eyes + ' 个眼睛' : '盲鱼'} · 水平 ${v.x.toFixed(2)} 格/秒 · 垂直 ${v.y.toFixed(2)} 格/秒`; $('objectFootnote').textContent = `投放后不可人工修改或删除。距下次饥饿约 ${Math.max(0, (object.hungerAt - Date.now()) / 3600000).toFixed(1)} 小时。`; $('sceneActions').hidden = true; renderer.selected = null; }
+  $('fishDetails').hidden = hit.kind !== 'fish'; renderer.observedFish = hit.kind === 'fish' ? hit.id : null;
+  if (hit.kind === 'fish') {
+    const v = velocities(cells), eyes = cells.filter(c => EYES.has(c.ch)).length, now = Date.now(), status = world.fishStatus(hit.id, now), travel = world.data.travel[hit.id];
+    $('objectInfo').textContent = `${cells.length} 字符 · ${eyes ? eyes + ' 个眼睛' : '盲鱼'} · 水平 ${v.x.toFixed(2)} 格/秒 · 垂直 ${v.y.toFixed(2)} 格/秒`;
+    $('fishMovement').textContent = status.trackedSince === undefined ? '待同步' : `${status.movement.toFixed(1)} 格`; $('fishMeals24').textContent = `${status.meals24} 颗`; $('fishHunger').textContent = status.hungry ? '饥饿' : '未饥饿'; $('fishHunger').classList.toggle('hungry', status.hungry);
+    const minutes = Math.floor(status.hoursSinceFed * 60);
+    $('fishLastMeal').textContent = `${status.neverFed ? '尚未进食 · 投放已' : '距上次进食'} ${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分钟`;
+    $('followFish').textContent = trackedFish === hit.id ? '停止跟随' : '跟随观察'; if (trackedFish === hit.id) followBounds = bounds(cells);
+    $('fishTrackingNote').textContent = !travel ? '运动记录尚未同步。' : status.partialMovement ? `旧版运动量未记录，从 ${fishDate.format(status.trackedSince)} 起累计。` : '运动量按北京时间自然日统计，原地转头和碰壁不计。';
+    const rows = []; for (let index = 0; index < 7; index++) { const day = shanghaiDay(now - index * DAY), row = document.createElement('p'); row.textContent = `${day} · ${travel && day >= shanghaiDay(travel.since) ? (travel.days[day] || 0).toFixed(1) + ' 格' : '未记录'}`; rows.push(row); } $('fishDailyRows').replaceChildren(...rows);
+    $('objectFootnote').textContent = `连续 24 小时未进食即饥饿。距下一次饥饿退化约 ${Math.max(0, (object.hungerAt - now) / 3600000).toFixed(1)} 小时。`; $('sceneActions').hidden = true; renderer.selected = null;
+  }
   else { const fixed = hit.id === CHAT_FLOOR; $('objectInfo').textContent = `${cells.length} 字符 · 八方向地形 · ${fixed ? '海底聊天记忆' : '共享摆放'}`; $('objectFootnote').textContent = fixed ? '旧世界聊天已固化在海底，不能编辑、搬动或删除。' : '移除、缩小不返字符；放大产生的新字符需要支付配额。'; $('sceneActions').hidden = fixed; renderer.selected = hit.id; }
   if (show) $('inspector').hidden = false;
 }
@@ -244,7 +308,7 @@ async function start() {
   document.addEventListener('visibilitychange', () => { resumeAfterInactivity(); network.broadcast('beat', { member: member() }).catch(() => {}); save().catch(() => {}); });
   window.addEventListener('pagehide', () => { const blob = new Blob([JSON.stringify({ node: network.node, token: meta.token })], { type: 'application/json' }); navigator.sendBeacon('/local/unregister', blob); lastPicture = localPicture(); save().catch(() => {}); });
   // Exposes read-only diagnostics for the project's automated browser checks.
-  window.tide = { get world() { return { data: world.serialize(), counts: world.counts() }; }, get network() { return { node: network.node, leader: leader(), peers: network.live().map(p => ({ node: p.node, url: p.url })), stats: clone(network.stats) }; }, get identity() { return { actor: identity.actor, nick: maskNick(identity.nick) }; }, get histories() { return clone(histories); }, balance };
+  window.tide = { get world() { return { data: world.serialize(), counts: world.counts() }; }, get network() { return { node: network.node, leader: leader(), peers: network.live().map(p => ({ node: p.node, url: p.url })), stats: clone(network.stats) }; }, get identity() { return { actor: identity.actor, nick: maskNick(identity.nick) }; }, get histories() { return clone(histories); }, get view() { return { camera: clone(renderer.camera), scale: renderer.scale, followingFish: trackedFish, selected: clone(selected) }; }, balance };
 }
 async function tick() {
   const now = Date.now(), elapsed = now - lastMeter; lastMeter = now;
@@ -253,7 +317,7 @@ async function tick() {
   if (identity.remainder >= 3600) { identity.remainder -= 3600; identity.serial = (identity.serial || 0) + 1; await submit({ kind: 'earn', cost: 0, serial: identity.serial }); }
   members.set(network.node, member());
   if (now - selfBeat >= 3000) { selfBeat = now; network.broadcast('beat', { member: member(), rootCount: world.roots.length, opCount: Object.keys(world.data.ops).length, chatCount: Object.keys(world.data.chats).length, chatSourceCount: Object.keys(world.data.chatSources).length }).catch(() => {}); }
-  const currentLeader = leader(); if (currentLeader !== lastLeader) { lastLeader = currentLeader; lastFull = 0; sentChars.clear(); sentOps.clear(); sentChats.clear(); sentChatSources.clear(); if (amLeader()) { geometryRepair = true; world.data.tick = Math.max(world.data.tick, now - 2000); for (const envelope of [...inbox.values()].sort((a, b) => a.body.t - b.body.t || a.body.id.localeCompare(b.body.id))) { if (!world.data.ops[envelope.body.id]) { const result = world.apply({ ...clone(envelope.body), proof: clone(envelope) }); network.broadcast('ack', { id: envelope.body.id, result }).catch(() => {}); } } for (const id of pending.keys()) if (world.data.ops[id]) pending.delete(id); } }
+  const currentLeader = leader(); if (currentLeader !== lastLeader) { lastLeader = currentLeader; lastFull = 0; sentChars.clear(); sentOps.clear(); sentChats.clear(); sentChatSources.clear(); sentTravel.clear(); if (amLeader()) { geometryRepair = true; world.data.tick = Math.max(world.data.tick, now - 2000); for (const envelope of [...inbox.values()].sort((a, b) => a.body.t - b.body.t || a.body.id.localeCompare(b.body.id))) { if (!world.data.ops[envelope.body.id]) { const result = world.apply({ ...clone(envelope.body), proof: clone(envelope) }); network.broadcast('ack', { id: envelope.body.id, result }).catch(() => {}); } } for (const id of pending.keys()) if (world.data.ops[id]) pending.delete(id); } }
   if (amLeader() && geometryRepair) { const result = world.reconcileGeometry(now); geometryRepair = false; if (result.waiting) toast('世界空间不足，部分合流造景仍待安置'); }
   if (amLeader() && world.data.pendingChatGlyphs && now - lastSave > 5000) world.reconcileChatFloor(now);
   if (amLeader()) { let loops = 0; while (world.data.tick + CONFIG.step <= now && loops++ < 20) world.step(world.data.tick + CONFIG.step); if (now - lastSnapshot >= 1000) { lastSnapshot = now; broadcastWorld(); } }
@@ -262,17 +326,20 @@ async function tick() {
   update();
 }
 
-$('makeFish').onclick = () => { cancelMode(); creator?.open('fish'); }; $('makeScene').onclick = () => { cancelMode(); creator?.open('scene'); }; $('feed').onclick = () => feedMode();
+$('makeFish').onclick = () => { stopObserving(); cancelMode(); creator?.open('fish'); }; $('makeScene').onclick = () => { stopObserving(); cancelMode(); creator?.open('scene'); }; $('feed').onclick = () => feedMode();
+$('myFish').onclick = () => { if (!identity) return; renderMyFishes(); $('myFishDialog').showModal(); };
+$('closeMyFish').onclick = () => $('myFishDialog').close(); $('createFromMyFish').onclick = () => { $('myFishDialog').close(); $('makeFish').click(); };
+$('followFish').onclick = () => { if (selected?.kind !== 'fish') return; if (trackedFish === selected.id) { trackedFish = null; update(); } else focusFish(selected.id); };
 $('closeFood').onclick = () => $('foodDialog').close();
 $('foodGlyphInput').oninput = updateFoodBrush; $('foodColorInput').oninput = updateFoodBrush;
 $('foodForm').onsubmit = e => {
   e.preventDefault(); updateFoodBrush(); if ($('placeFood').disabled) return;
   mode = { kind: 'food', ch: $('foodGlyphInput').value, color: $('foodColorInput').value };
-  $('foodDialog').close(); renderer.camera.y = 12;
+  $('foodDialog').close(); surfaceCamera();
   $('modeBanner').textContent = `选择水面上的位置投食「${mode.ch}」 · 每颗 1 字符 · Esc 取消`;
   $('modeBanner').hidden = false; $('sea').style.cursor = 'crosshair'; update();
 };
-$('surface').onclick = () => { renderer.camera.y = 12; update(); }; $('seabed').onclick = () => { renderer.camera = { x: MONUMENT.x + 4, y: CONFIG.depth - 15 }; update(); };
+$('surface').onclick = () => { trackedFish = null; surfaceCamera(); update(); }; $('seabed').onclick = () => { trackedFish = null; renderer.camera = { x: MONUMENT.x + 4, y: CONFIG.depth - 15 }; update(); };
 $('zoomIn').onclick = () => { renderer.zoom(renderer.scale + .15); update(); }; $('zoomOut').onclick = () => { renderer.zoom(renderer.scale - .15); update(); };
 $('connect').onclick = () => $('connectionDialog').showModal(); $('closeConnection').onclick = () => $('connectionDialog').close();
 $('connectionForm').onsubmit = async e => { e.preventDefault(); const url = $('peerUrl').value.trim(); status = '正在自动配对…'; update(); try { await network.connect(url); remember(url); $('connectionDialog').close(); } catch (e) { status = e.message; toast(e.message); } update(); };
@@ -288,7 +355,7 @@ $('chatForm').onsubmit = async e => {
   try { const message = await network.makeEnvelope('chat', { nick: maskNick(identity.nick), text, t: Date.now(), roots: [world.id] }); const result = world.addChat(message); if (!result.ok) throw new Error(result.error); renderChat(); $('chatInput').value = ''; await save(); await network.broadcastEnvelope(message); }
   catch (error) { toast('聊天保存或发送失败：' + error.message); }
 };
-$('closeInspector').onclick = () => { selected = null; renderer.selected = null; $('inspector').hidden = true; };
+$('closeInspector').onclick = stopObserving;
 $('moveScene').onclick = () => { if (!selected) return; mode = { kind: 'sceneMove', scene: selected.id, cells: world.sceneCells(selected.id) }; $('modeBanner').textContent = '选择造景的新位置 · 不返还或消耗现有字符 · Esc 取消'; $('modeBanner').hidden = false; };
 $('rotateScene').onclick = () => selected && submit({ kind: 'sceneRotate', scene: selected.id, cost: 0 });
 $('scaleScene').onclick = () => selected && submit({ kind: 'sceneScale', scene: selected.id, factor: 2, cost: world.sceneCells(selected.id).length * 3 });
@@ -296,8 +363,8 @@ $('shrinkScene').onclick = () => selected && submit({ kind: 'sceneScale', scene:
 $('deleteScene').onclick = () => { if (!selected) return; submit({ kind: 'sceneDelete', scene: selected.id, cost: 0 }); selected = null; renderer.selected = null; $('inspector').hidden = true; };
 $('sea').oncontextmenu = e => { e.preventDefault(); cancelMode(); };
 $('sea').addEventListener('pointerdown', e => { if (e.button !== 0) return; if (mode) { const p = renderer.point(e.clientX, e.clientY); if (mode.kind === 'food') { if (p.y !== 0) { toast('请在亮蓝色水面行点击投食'); return; } submit({ kind: 'food', ch: mode.ch, color: mode.color, x: p.x, y: 0, cost: 1 }); } else { const b = bounds(mode.cells), x = p.x - b.minX, y = p.y - b.minY; submit({ kind: mode.kind, cells: mode.cells, scene: mode.scene, x, y, cost: mode.kind === 'sceneMove' ? 0 : mode.cells.length }); cancelMode(); } return; } dragging = { startX: e.clientX, startY: e.clientY, x: renderer.camera.x, y: renderer.camera.y, moved: false }; $('sea').setPointerCapture(e.pointerId); });
-$('sea').addEventListener('pointermove', e => { if (mode) { const p = renderer.point(e.clientX, e.clientY), b = bounds(mode.cells || []); renderer.preview = { ...mode, x: mode.kind === 'food' ? p.x : p.x - b.minX, y: mode.kind === 'food' ? 0 : p.y - b.minY }; } else if (dragging) { const s = renderer.cell * renderer.scale; renderer.camera.x = Math.min(CONFIG.width, Math.max(0, dragging.x - (e.clientX - dragging.startX) / s)); renderer.camera.y = Math.min(CONFIG.depth, Math.max(0, dragging.y - (e.clientY - dragging.startY) / s)); dragging.moved ||= Math.hypot(e.clientX - dragging.startX, e.clientY - dragging.startY) > 4; update(); } });
+$('sea').addEventListener('pointermove', e => { if (mode) { const p = renderer.point(e.clientX, e.clientY), b = bounds(mode.cells || []); renderer.preview = { ...mode, x: mode.kind === 'food' ? p.x : p.x - b.minX, y: mode.kind === 'food' ? 0 : p.y - b.minY }; } else if (dragging) { const s = renderer.cell * renderer.scale; renderer.camera.x = Math.min(CONFIG.width, Math.max(0, dragging.x - (e.clientX - dragging.startX) / s)); renderer.camera.y = Math.min(CONFIG.depth, Math.max(0, dragging.y - (e.clientY - dragging.startY) / s)); dragging.moved ||= Math.hypot(e.clientX - dragging.startX, e.clientY - dragging.startY) > 4; if (dragging.moved) trackedFish = null; update(); } });
 $('sea').addEventListener('pointerup', e => { if (dragging && !dragging.moved) { const hit = renderer.hit(e.clientX, e.clientY); if (hit) inspect(hit); else { selected = null; renderer.selected = null; $('inspector').hidden = true; } } dragging = null; });
 $('sea').addEventListener('wheel', e => { e.preventDefault(); renderer.zoom(renderer.scale * (e.deltaY < 0 ? 1.1 : .9)); update(); }, { passive: false });
-document.addEventListener('keydown', e => { if (e.key === 'Escape') { cancelMode(); return; } if (e.target.matches('input,textarea') || document.querySelector('dialog[open]')) return; if (e.key.toLowerCase() === 'f') $('makeFish').click(); else if (e.key.toLowerCase() === 's') $('makeScene').click(); else if (e.key.toLowerCase() === 'e') feedMode(); else if (e.key.toLowerCase() === 'm') $('seabed').click(); });
-function render() { renderer.draw(world); requestAnimationFrame(render); } render(); start().catch(e => { toast(e.message); status = e.message; $('networkStatus').textContent = e.message; });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') { cancelMode(); return; } if (e.target.matches('input,textarea') || document.querySelector('dialog[open]')) return; if (e.key.toLowerCase() === 'f') $('makeFish').click(); else if (e.key.toLowerCase() === 's') $('makeScene').click(); else if (e.key.toLowerCase() === 'e') feedMode(); else if (e.key.toLowerCase() === 'm') $('seabed').click(); else if (e.key.toLowerCase() === 'p') $('myFish').click(); });
+function render() { if (trackedFish) { const fish = world.data.fishes[trackedFish]; if (fish && followBounds) moveCameraToFish(fish, followBounds); else { trackedFish = null; toast('这条鱼已不再存活'); } } renderer.draw(world); requestAnimationFrame(render); } render(); start().catch(e => { toast(e.message); status = e.message; $('networkStatus').textContent = e.message; });

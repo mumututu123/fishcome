@@ -79,8 +79,43 @@ async function main() {
   }
   assert.equal(await foodPage.locator('#glyphInput').inputValue(), '木'); assert.equal(await foodPage.locator('#colorInput').inputValue(), '#112233');
   await foodContext.close();
+  const fishContext = await browser.newContext({ viewport: { width: 1440, height: 900 } }); let fishPage = await open(fishContext);
+  await fishPage.locator('#nickInput').fill('鱼况测试'); await fishPage.locator('#welcomeForm .primary').click(); await ready(fishPage); await fishPage.close(); await pause(400);
+  const setup = await fishContext.newPage(); await setup.goto(origin + '/welcome.html');
+  const ownId = await setup.evaluate(async () => {
+    const { World } = await import('./engine.js'), { get, set, signer, actorId } = await import('./storage.js'), { Network } = await import('./network.js');
+    const identity = await get('identity'), checkpoint = await get('checkpoint'), now = Date.now(), world = new World(now - 48 * 3600000, Object.keys(checkpoint.world.roots)[0]);
+    const network = new Network(identity, {}, () => {}, () => {}); network.sign = await signer(identity);
+    async function apply(body, sender = network) { const message = await sender.makeEnvelope('op', body); if (!world.apply({ ...body, proof: message }).ok) throw new Error('fixture operation failed'); }
+    const id = crypto.randomUUID(); await apply({ id, actor: identity.actor, nick: '鱼＊试', t: now - 48 * 3600000, roots: [world.id], kind: 'fish', x: 390, y: 15, cells: Array.from({ length: 6 }, (_, x) => ({ x, y: 0, ch: 'o', color: '#8be7df' })), cost: 6 });
+    for (const [index, hours] of [25, 23].entries()) { const food = crypto.randomUUID(), at = now - hours * 3600000; await apply({ id: food, actor: identity.actor, nick: '鱼＊试', t: at, roots: [world.id], kind: 'food', x: 389, y: 0, ch: index ? '口' : '食', color: '#ff9933', cost: 1 }); world.data.chars[food].y = 14 - index; world.step(at); }
+    const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']), pub = await crypto.subtle.exportKey('jwk', pair.publicKey), secret = await crypto.subtle.exportKey('jwk', pair.privateKey), other = { actor: await actorId(pub), pub, secret };
+    const otherNetwork = new Network(other, {}, () => {}, () => {}); otherNetwork.sign = await signer(other);
+    await apply({ id: crypto.randomUUID(), actor: other.actor, nick: '其＊人', t: now - 3600000, roots: [world.id], kind: 'fish', x: 500, y: 15, cells: [0, 1].map(x => ({ x, y: 0, ch: '口', color: '#aabbcc' })), cost: 2 }, otherNetwork);
+    world.recordMovement(id, 12.5, now); world.data.tick = now; checkpoint.world = world.serialize(); checkpoint.lastOnlineAt = now; await set('checkpoint', checkpoint); return id;
+  }); await setup.close();
+  fishPage = await open(fishContext); await ready(fishPage); await fishPage.keyboard.press('p');
+  assert.equal(await fishPage.locator('#myFishList [data-fish]').count(), 1, '我的鱼混入其他作者'); assert.equal(await fishPage.locator('#myFishList [data-fish]').getAttribute('data-fish'), ownId);
+  await fishPage.screenshot({ path: path.join(project, 'test-output', 'my-fish-list.png') });
+  await fishPage.locator('#myFishList [data-fish]').click(); await fishPage.waitForFunction(id => tide.view.followingFish === id, ownId);
+  assert.equal(await fishPage.locator('#fishMeals24').textContent(), '1 颗'); assert.equal(await fishPage.locator('#fishHunger').textContent(), '未饥饿'); assert(parseFloat(await fishPage.locator('#fishMovement').textContent()) >= 12.5);
+  await fishPage.screenshot({ path: path.join(project, 'test-output', 'fish-observation.png') });
+  await fishPage.setViewportSize({ width: 390, height: 844 }); await fishPage.locator('#myFish').click(); assert.equal(await fishPage.locator('#myFishDialog').evaluate(element => element.scrollWidth <= element.clientWidth), true);
+  await fishPage.locator('#myFishList [data-fish]').click(); await pause(200);
+  assert.equal(await fishPage.evaluate(id => { const data = tide.world.data, fish = data.fishes[id], cells = Object.values(data.chars).filter(c => c.kind === 'fish' && c.entity === id), xs = cells.map(c => c.x), ys = cells.map(c => c.y), centerY = fish.y + (Math.min(...ys) + Math.max(...ys)) / 2, centerX = fish.x + fish.facing * (Math.min(...xs) + Math.max(...xs)) / 2, view = tide.view, size = 18 * view.scale, px = innerWidth / 2 + (centerX - view.camera.x) * size, py = innerHeight / 2 + (centerY - view.camera.y) * size; return px > document.querySelector('.tools').getBoundingClientRect().right && py > document.getElementById('inspector').getBoundingClientRect().bottom && py < innerHeight - 100; }, ownId), true, '小屏定位后鱼被面板遮住');
+  await fishPage.screenshot({ path: path.join(project, 'test-output', 'fish-observation-mobile.png') });
+  const beforeFeeding = await fishPage.evaluate(() => tide.balance()); await fishPage.locator('#feed').click(); assert.equal(await fishPage.locator('#inspector').isVisible(), false); await fishPage.locator('#placeFood').click();
+  await fishPage.mouse.click(220, 844 * .27); await fishPage.waitForFunction(balance => tide.balance() === balance - 1, beforeFeeding); await fishPage.keyboard.press('Escape');
+  await fishPage.locator('#myFish').click(); await fishPage.locator('#myFishList [data-fish]').click();
+  const operationCount = await fishPage.evaluate(() => Object.keys(tide.world.data.ops).length);
+  await fishPage.evaluate(() => { const original = Date.now; Date.now = () => original() + 2 * 3600000; });
+  await fishPage.waitForFunction(() => document.getElementById('fishHunger').textContent === '饥饿'); assert.equal(await fishPage.locator('#fishMeals24').textContent(), '0 颗');
+  await fishPage.locator('#followFish').click(); assert.equal(await fishPage.evaluate(() => tide.view.followingFish), null);
+  await fishPage.locator('#followFish').click(); await fishPage.mouse.move(210, 610); await fishPage.mouse.down(); await fishPage.mouse.move(250, 640, { steps: 4 }); await fishPage.mouse.up(); assert.equal(await fishPage.evaluate(() => tide.view.followingFish), null, '拖动水域没有停止跟随');
+  assert.equal(await fishPage.evaluate(() => Object.keys(tide.world.data.ops).length), operationCount, '观察行为产生鱼控制操作');
+  await fishPage.close(); await pause(400); fishPage = await open(fishContext); await ready(fishPage); assert.equal(await fishPage.evaluate(id => Object.values(tide.world.data.travel[id].days).reduce((a, b) => a + b, 0) >= 12.5, ownId), true, '重开丢失运动量'); await fishContext.close();
   assert.deepEqual(errors, []);
-  const result = { edge: 'passed', version: browser.version(), fixture: 'Node static/pairing service, no launcher execution', checks: ['short offline preserves fish, scenery, wallet and roots', 'no 15-second premature archive', '239-hour legacy checkpoint restoration', '240-hour expiry creates empty world with 20 characters and archive', 'short sleep preserves world and wallet', '240-hour sleep expires world and keeps archive', 'independent food glyph and color settings with preview', 'invalid glyphs and canceled feeding do not spend characters', 'Chinese, supplementary Han and ASCII food retain chosen colors', 'surface-only custom food costs one character per drop', 'food dialog fits desktop and narrow viewport'], errors };
+  const result = { edge: 'passed', version: browser.version(), fixture: 'Node static/pairing service, no launcher execution', checks: ['short offline preserves fish, scenery, wallet and roots', 'no 15-second premature archive', '239-hour legacy checkpoint restoration', '240-hour expiry creates empty world with 20 characters and archive', 'short sleep preserves world', '240-hour sleep expires world', 'independent custom food with preview and glyph validation', 'surface-only food costs one character, cancellation is free', 'my fish filters by signed creator', 'fish status shows movement and rolling meal count', '24-hour hunger updates while observing', 'one-click focus and follow without fish control operations', 'manual pan stops follow', 'fish remains visible beside mobile inspector', 'movement survives reopen'], errors };
   fs.mkdirSync(path.join(project, 'test-output'), { recursive: true }); fs.writeFileSync(path.join(project, 'test-output', 'browser-lifecycle-results.json'), JSON.stringify(result, null, 2)); console.log(JSON.stringify(result, null, 2));
 }
 main().catch(error => { console.error(error.stack); process.exitCode = 1; }).finally(async () => { if (browser) await browser.close(); server.closeAllConnections(); server.close(); });
