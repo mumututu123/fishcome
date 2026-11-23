@@ -6,6 +6,7 @@ import { Creator } from './creator.js';
 import { restoreCheckpoint } from './lifecycle.js';
 import { CHAT_FLOOR, validChatMessage, orderedChats, chatGlyphs, chatColor, chatCellId, mergeChatRecords } from './chat.js';
 import { DAY, shanghaiDay, validTravel } from './fish-status.js';
+import { HOUR, validWildCell } from './seaweed.js';
 const $ = id => document.getElementById(id);
 const renderer = new Renderer($('sea'));
 let world = new World(), identity, network, meta, creator, mode = null, selected = null, dragging, histories = {}, known = [], members = new Map(), pending = new Map(), inbox = new Map(), lastPicture = null, priorCheckpoint = null;
@@ -52,6 +53,7 @@ async function verifyReplica(data) {
   if (!data || data.protocol !== 1 || !data.roots || !data.chars || !data.fishes || !data.scenes || !data.ops || Object.keys(data.chars).length > 100000 || Object.keys(data.ops).length > 500000) throw new Error('世界快照不兼容或超出首版规模');
   for (const [id, op] of Object.entries(data.ops)) { if (world.data.ops[id]) { if (JSON.stringify(opBody(world.data.ops[id])) !== JSON.stringify(opBody(op))) throw new Error('已有消费记录不可覆盖'); } else { const { proof, ...clean } = op; if (id !== op.id || !proof || proof.kind !== 'op' || JSON.stringify(clean) !== JSON.stringify(proof.body) || proof.actor !== op.actor || !await verifyEnvelope(proof) || world.validOp(op)) throw new Error('世界包含无效操作凭据'); } }
   for (const [root, at] of Object.entries(data.roots)) if (!/^[0-9a-f-]{36}$/i.test(root) || !Number.isFinite(at)) throw new Error('世界起源无效');
+  if (data.seaweedHour !== undefined && (!Number.isInteger(data.seaweedHour) || data.seaweedHour < 0 || data.seaweedHour > Math.floor((Date.now() + 60000) / HOUR))) throw new Error('海草生长时钟无效');
   await verifyChats(data.chats); await verifyChats(data.chatSources);
   for (const [id, fish] of Object.entries(data.fishes)) { const source = data.ops[id] || world.data.ops[id]; if (fish.id !== id || source?.kind !== 'fish' || fish.actor !== source.actor || fish.created !== source.t) throw new Error('鱼的创建者记录无效'); }
   if (data.travel !== undefined && (!data.travel || typeof data.travel !== 'object' || Array.isArray(data.travel))) throw new Error('鱼运动记录无效');
@@ -59,11 +61,15 @@ async function verifyReplica(data) {
   const sourceGlyphs = new Map();
   for (const [id, c] of Object.entries(data.chars)) {
     if (id !== c.id) throw new Error('字符身份重复或被篡改');
-    if ((!c.chat && !validGlyph(c.ch)) || !/^#[0-9a-f]{6}$/i.test(c.color) || !Number.isInteger(c.x) || !Number.isInteger(c.y) || !Array.isArray(c.path) || c.path.length > 1024 || !['fish', 'scene', 'food', 'burn'].includes(c.kind)) throw new Error('世界字符无效');
+    if ((!c.chat && !validGlyph(c.ch)) || !/^#[0-9a-f]{6}$/i.test(c.color) || !Number.isInteger(c.x) || !Number.isInteger(c.y) || !Array.isArray(c.path) || c.path.length > 1024 || !['fish', 'scene', 'food', 'burn', 'seaweed'].includes(c.kind)) throw new Error('世界字符无效');
     if (c.chat) {
       const message = data.chatSources?.[c.chat] || world.data.chatSources[c.chat], floor = data.scenes[CHAT_FLOOR] || world.data.scenes[CHAT_FLOOR];
       if (message && !sourceGlyphs.has(c.chat)) sourceGlyphs.set(c.chat, new Map(chatGlyphs(message.body.text).map(glyph => [glyph.index, glyph.ch])));
       if (!message || id !== chatCellId(message, c.chatIndex) || sourceGlyphs.get(c.chat).get(c.chatIndex) !== c.ch || c.color !== chatColor(hash(message.actor)) || c.payer !== '' || c.kind !== 'scene' || c.entity !== CHAT_FLOOR || c.path.length || c.x < 0 || c.x >= CONFIG.width || c.y < 0 || c.y >= CONFIG.depth || floor?.x !== 0 || floor?.y !== 0 || !floor.fixed) throw new Error('聊天沉积缺少合法来源或被修改');
+      continue;
+    }
+    if (c.wild || c.kind === 'seaweed') {
+      if (!validWildCell(c, CONFIG, hash) || c.created > Date.now() + 60000 || (c.kind === 'fish' && (!c.path.some(event => event.reason === 'eat' && event.target === c.entity) || !(data.fishes[c.entity] || world.data.fishes[c.entity])))) throw new Error('海草缺少合法生态来源');
       continue;
     }
     const source = data.ops[c.id.slice(0, 36)] || world.data.ops[c.id.slice(0, 36)], index = +c.id.slice(37);
@@ -167,7 +173,7 @@ async function broadcastWorld() {
     for (const [id, message] of Object.entries(data.chats)) if (full || !sentChats.has(id)) chats[id] = message;
     for (const [id, message] of Object.entries(data.chatSources)) if (full || !sentChatSources.has(id)) chatSources[id] = message;
     for (const [id, record] of Object.entries(data.travel)) { const mark = JSON.stringify(record); travelMarks.set(id, mark); if (full || sentTravel.get(id) !== mark) travel[id] = record; }
-    await network.broadcast('world', { delta: !full, world: { protocol: 1, roots: data.roots, tick: data.tick, chars, fishes: data.fishes, scenes: data.scenes, participants: data.participants, ops, notices: [], chats, chatSources, travel } });
+    await network.broadcast('world', { delta: !full, world: { protocol: 1, roots: data.roots, tick: data.tick, seaweedHour: data.seaweedHour, chars, fishes: data.fishes, scenes: data.scenes, participants: data.participants, ops, notices: [], chats, chatSources, travel } });
     sentChars = nextMarks; sentOps = new Set(Object.keys(data.ops)); sentChats = new Set(Object.keys(data.chats)); sentChatSources = new Set(Object.keys(data.chatSources)); sentTravel = travelMarks; if (full) lastFull = Date.now();
   } catch (e) { status = e.message; } finally { snapshotBusy = false; }
 }

@@ -14,6 +14,9 @@ async function main() {
   assert(app.includes('`${identity.nick} 的鱼`') && app.includes('renderFishGender(entry.gender, fish)'), '实际入口缺少完整昵称或性别展示');
   const stats = await fetch(base + '/fish-status.js', { cache: 'no-store', signal: AbortSignal.timeout(5000) });
   assert(stats.ok, '实际入口缺少鱼况统计模块');
-  console.log('实际启动器入口：我的鱼、完整昵称、公母性别选择与展示均已发布');
+  const plants = await fetch(base + '/seaweed.js', { cache: 'no-store', signal: AbortSignal.timeout(5000) });
+  assert(plants.ok && (await plants.text()).includes('updateSeaweed'), '实际入口缺少海草生态模块');
+  assert(html.includes('海底会长海草'), '实际入口缺少海草玩法说明');
+  console.log('实际启动器入口：我的鱼、完整昵称、公母性别与海草生态均已发布');
 }
 main().catch(error => { console.error(error.message); process.exitCode = 1; });
