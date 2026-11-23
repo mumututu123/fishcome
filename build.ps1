@@ -8,9 +8,15 @@ if ($LASTEXITCODE -ne 0) { throw '启动器编译失败' }
 Copy-Item -LiteralPath (Join-Path $projectRoot 'www') -Destination $outputRoot -Recurse -Force
 Copy-Item -LiteralPath (Join-Path $projectRoot 'README.md') -Destination (Join-Path $outputRoot '使用说明.md') -Force
 Copy-Item -LiteralPath (Join-Path $projectRoot '验证记录.md') -Destination (Join-Path $outputRoot '验证记录.md') -Force
-# Older installations run from dist/潮生. Keep their web assets current while retaining the existing launcher.
+# Older installations run from dist/潮生. Invitation routing needs matching web assets and launcher.
 $legacyOutputRoot = Join-Path $projectRoot 'dist\潮生'
 if (Test-Path -LiteralPath $legacyOutputRoot -PathType Container) {
+    foreach ($legacyName in @('潮生.exe', '鱼来.exe')) {
+        $legacyLauncher = Join-Path $legacyOutputRoot $legacyName
+        if (Test-Path -LiteralPath $legacyLauncher -PathType Leaf) {
+            Copy-Item -LiteralPath (Join-Path $outputRoot '鱼来.exe') -Destination $legacyLauncher -Force
+        }
+    }
     Copy-Item -LiteralPath (Join-Path $projectRoot 'www') -Destination $legacyOutputRoot -Recurse -Force
     Copy-Item -LiteralPath (Join-Path $projectRoot 'README.md') -Destination (Join-Path $legacyOutputRoot '使用说明.md') -Force
     Copy-Item -LiteralPath (Join-Path $projectRoot '验证记录.md') -Destination (Join-Path $legacyOutputRoot '验证记录.md') -Force

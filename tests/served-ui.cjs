@@ -22,6 +22,8 @@ async function main() {
   assert(html.includes('id="fishBreeding"') && html.includes('结伴繁殖'), '实际入口缺少繁殖状态和玩法说明');
   assert(html.includes('id="fishNameInput"') && html.includes('id="pedigreeTab"'), '实际入口缺少鱼名输入或鱼谱页签');
   const pedigree = await fetch(base + '/pedigree.js', { cache: 'no-store', signal: AbortSignal.timeout(5000) }); assert(pedigree.ok, '实际入口缺少鱼谱渲染模块');
-  console.log('实际启动器入口：鱼名、鱼谱及原有生态系统均已发布');
+  const invitation = await fetch(base + '/invite', { cache: 'no-store', signal: AbortSignal.timeout(5000) }); assert(invitation.ok && (await invitation.json()).invite.startsWith('YL1.'), '实际启动器缺少非明文邀请码接口');
+  assert(html.includes('同事的邀请码') && !html.includes('http://192.168.'), '连接界面仍展示明文地址');
+  console.log('实际启动器入口：非明文邀请码与已有游戏功能均已发布');
 }
 main().catch(error => { console.error(error.message); process.exitCode = 1; });

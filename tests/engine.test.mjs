@@ -44,7 +44,7 @@ test('合流景物避开鱼及其他景物，完整保留作品且重复安置�
 });
 test('同位置多颗鱼食到期逐字堆积，不能重叠丢字', () => {
   const w = new World(t); for (let i = 0; i < 3; i++) { const f = op('food', { x: 30, y: 0, ch: '口', color: '#ffeeaa', cost: 1 }); w.apply(f); w.data.chars[f.id].y = CONFIG.depth - 1; }
-  w.step(t + CONFIG.foodLife); assert.equal(w.sceneryMap().size, 3); assert.equal(w.counts().characters, 3); assert.equal(w.wallet('alice'), 17);
+  w.step(t + CONFIG.foodLife); assert.equal(w.sceneryMap().size, 3); assert.equal(Object.values(w.data.chars).filter(c => c.payer === 'alice').length, 3); assert.equal(w.wallet('alice'), 17);
 });
 test('饥饿只选外部轮廓，密闭内部孔洞不构成外轮廓', () => {
   const cells = []; for (let x = 0; x < 7; x++) for (let y = 0; y < 7; y++) if (x !== 3 || y !== 3) cells.push(cell(x, y));
