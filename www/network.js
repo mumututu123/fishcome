@@ -1,8 +1,15 @@
 import { signer, verifyEnvelope } from './storage.js';
-import { normalizeInvite } from './invite.js';
+import { normalizeInvite, decodeInvite } from './invite.js';
 const CHUNK = 16000, MAX_PEERS = 8, MAX_RAW = 32 * 1024 * 1024, encoder = new TextEncoder(), decoder = new TextDecoder();
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const DIRECT_ERROR = '入口可访问，但浏览器直连未建立，请检查双方网络及防火墙后重试';
+export async function lanDescription(description, fromUrl) {
+  const ip = new URL(await decodeInvite(fromUrl)).hostname;
+  if (!/^(?:\d{1,3}\.){3}\d{1,3}$/.test(ip) || typeof description?.sdp !== 'string') return description;
+  // The launcher supplies its IPv4 route to this peer; ICE supplies the UDP port.
+  const sdp = description.sdp.replace(/^(a=candidate:\S+[ \t]+\d+[ \t]+udp[ \t]+\d+[ \t]+)\S+\.local([ \t]+\d+[ \t]+typ[ \t]+host(?=[ \t\r\n]|$)[^\r\n]*)/gim, (_, prefix, suffix) => prefix + ip + suffix);
+  return sdp === description.sdp ? description : { ...description, sdp };
+}
 async function inflateBounded(bytes) { const reader = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip')).getReader(), chunks = []; let size = 0; while (true) { const { done, value } = await reader.read(); if (done) break; size += value.length; if (size > MAX_RAW) { await reader.cancel(); throw new Error('解压数据过大'); } chunks.push(value); } const result = new Uint8Array(size); let offset = 0; for (const chunk of chunks) { result.set(chunk, offset); offset += chunk.length; } return result; }
 export class Network {
   constructor(identity, meta, onMessage, onChange) { this.identity = identity; this.meta = meta; this.node = identity.actor.slice(0, 16) + '-' + crypto.randomUUID().replace(/-/g, '').slice(0, 19); this.onMessage = onMessage; this.onChange = onChange; this.connections = new Map(); this.seen = new Map(); this.pending = new Map(); this.stats = { sent: 0, received: 0, rejected: 0 }; }
@@ -37,8 +44,8 @@ export class Network {
     s.fromUrl = await normalizeInvite(s.fromUrl);
     if (s.type === 'offer') {
       if (this.connections.size >= MAX_PEERS || this.has(s.from)) { await this.local('relay', { url: s.fromUrl, signal: { type: 'reject', from: this.node, to: s.from, connection: s.connection } }); return; }
-      const p = this.make(s.connection, s.fromUrl, s.from); try { await p.pc.setRemoteDescription(s.sdp); await p.pc.setLocalDescription(await p.pc.createAnswer()); await this.ice(p.pc); await this.local('relay', { url: p.url, signal: { type: 'answer', from: this.node, to: s.from, connection: s.connection, sdp: p.pc.localDescription.toJSON() } }); } catch (e) { this.close(p); throw e; }
-    } else { const p = this.connections.get(s.connection); if (!p) return; if (s.type === 'reject') { this.close(p, new Error('对方暂时无法接受连接，请稍后重试')); return; } p.node = s.from; p.url = s.fromUrl; await p.pc.setRemoteDescription(s.sdp); }
+      const p = this.make(s.connection, s.fromUrl, s.from); try { await p.pc.setRemoteDescription(await lanDescription(s.sdp, s.fromUrl)); await p.pc.setLocalDescription(await p.pc.createAnswer()); await this.ice(p.pc); await this.local('relay', { url: p.url, signal: { type: 'answer', from: this.node, to: s.from, connection: s.connection, sdp: p.pc.localDescription.toJSON() } }); } catch (e) { this.close(p); throw e; }
+    } else { const p = this.connections.get(s.connection); if (!p) return; if (s.type === 'reject') { this.close(p, new Error('对方暂时无法接受连接，请稍后重试')); return; } p.node = s.from; p.url = s.fromUrl; await p.pc.setRemoteDescription(await lanDescription(s.sdp, s.fromUrl)); }
   }
   attach(p, dc) {
     p.dc = dc; dc.binaryType = 'arraybuffer'; dc.bufferedAmountLowThreshold = 65536;
