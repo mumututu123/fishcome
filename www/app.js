@@ -644,6 +644,28 @@ $('foodForm').onsubmit = e => {
 };
 $('surface').onclick = () => { trackedFish = null; surfaceCamera(); update(); }; $('seabed').onclick = () => { trackedFish = null; renderer.camera = { x: world.monument.x + 4, y: world.floorAt(world.monument.x + 4) - 15 }; update(); };
 $('zoomIn').onclick = () => { renderer.zoom(renderer.scale + .15); update(); }; $('zoomOut').onclick = () => { renderer.zoom(renderer.scale - .15); update(); };
+const scene3dToggle = $('scene3dToggle'), scene3dPreference = 'tide.scene3d';
+function applyScene3d(scene) {
+  renderer.scene3d = scene;
+  scene3dToggle.setAttribute('aria-pressed', String(Boolean(scene)));
+  try { if (scene) localStorage.setItem(scene3dPreference, '1'); else localStorage.removeItem(scene3dPreference); } catch {}
+}
+async function setScene3d(enabled) {
+  if (scene3dToggle.getAttribute('aria-busy') === 'true') return;
+  if (!enabled) { applyScene3d(null); return; }
+  scene3dToggle.setAttribute('aria-busy', 'true');
+  try {
+    const { Scene3D } = await import('./scene-3d.js');
+    applyScene3d(new Scene3D());
+  } catch {
+    applyScene3d(null);
+    toast('立体海景加载失败，当前使用平面海景');
+  } finally {
+    scene3dToggle.removeAttribute('aria-busy');
+  }
+}
+scene3dToggle.onclick = () => setScene3d(!renderer.scene3d);
+try { if (localStorage.getItem(scene3dPreference) === '1') setScene3d(true); } catch {}
 $('connect').onclick = () => $('connectionDialog').showModal(); $('closeConnection').onclick = () => $('connectionDialog').close();
 $('connectionForm').onsubmit = async e => { e.preventDefault(); status = '正在自动配对…'; update(); try { const code = await normalizeInvite($('peerUrl').value); $('peerUrl').value = code; await network.connectInvite(code); await remember(code); $('connectionDialog').close(); } catch (e) { status = e.message; toast(e.message); } update(); };
 $('copyUrl').onclick = async () => { await navigator.clipboard.writeText(meta.url); toast('邀请码已复制'); };
@@ -683,4 +705,20 @@ document.addEventListener('keydown', e => {
 });
 document.addEventListener('keyup', e => heldShortcuts.delete(e.code || e.key.toLowerCase()));
 window.addEventListener('blur', () => heldShortcuts.clear());
-function render() { if (trackedFish) { const fish = world.data.fishes[trackedFish]; if (fish && followBounds) moveCameraToFish(fish, followBounds); else { trackedFish = null; toast('这条鱼已不再存活'); } } renderer.draw(world); requestAnimationFrame(render); } render(); start().catch(e => { toast(e.message); status = e.message; const label = $('networkStatus'); if (label) label.textContent = e.message; });
+function render(now) {
+  if (trackedFish) {
+    const fish = world.data.fishes[trackedFish];
+    if (fish && followBounds) moveCameraToFish(fish, followBounds);
+    else { trackedFish = null; toast('这条鱼已不再存活'); }
+  }
+  try { renderer.draw(world, now); }
+  catch (error) {
+    if (!renderer.scene3d) throw error;
+    applyScene3d(null);
+    renderer.resize();
+    toast('立体海景绘制失败，当前使用平面海景');
+    renderer.draw(world, now);
+  }
+  requestAnimationFrame(render);
+}
+render(); start().catch(e => { toast(e.message); status = e.message; const label = $('networkStatus'); if (label) label.textContent = e.message; });
