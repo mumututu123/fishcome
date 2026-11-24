@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { World, CONFIG } from '../www/engine.js';
+import { World, CONFIG } from './empty-world.mjs';
 import { restoreCheckpoint } from '../www/lifecycle.js';
 
 const at = Date.now() - 10000;
@@ -29,7 +29,8 @@ test('达到240小时及超过期限均湮灭，新世界余额20且不复活旧
     assert.equal(restored.expired, true);
     assert.equal(restored.expiresAt, at + CONFIG.offlineLife);
     assert.notEqual(restored.world.id, Object.keys(checkpoint.world.roots)[0]);
-    assert.equal(restored.world.counts().fish, 0);
+    assert(restored.world.counts().fish >= 2 && restored.world.counts().fish <= 10);
+    assert(!Object.keys(checkpoint.world.fishes).some(id => restored.world.data.fishes[id]));
     assert.equal(restored.world.wallet('alice'), 20);
   }
 });

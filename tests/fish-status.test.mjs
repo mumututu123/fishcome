@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { World } from '../www/engine.js';
+import { World } from './empty-world.mjs';
 import { DAY, shanghaiDay, mealIndex, fishStatus, mergeTravel, validTravel } from '../www/fish-status.js';
 import { restoreCheckpoint } from '../www/lifecycle.js';
 const t = Date.now() - 10000;

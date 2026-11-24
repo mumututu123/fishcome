@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { World } from '../www/engine.js';
+import { World } from './empty-world.mjs';
 import { restoreCheckpoint } from '../www/lifecycle.js';
 
 test('公母性别随创建、恢复及合流保存，旧鱼仍可恢复', () => {

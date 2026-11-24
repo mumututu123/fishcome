@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { World } from '../www/engine.js';
+import { World } from './empty-world.mjs';
 import { defaultFishName, fishNameError, fishCatalog, displayFishName, familyTree } from '../www/fish-profile.js';
 import { restoreCheckpoint } from '../www/lifecycle.js';
 const now = Date.now() - 1000;

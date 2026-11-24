@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { World, CONFIG, hash, cellPosition, canSee } from '../www/engine.js';
+import { World, CONFIG, hash, cellPosition, canSee } from './empty-world.mjs';
 import { HOUR, GREENS, growthRoll, weedId, validWildCell, updateSeaweed } from '../www/seaweed.js';
 import { restoreCheckpoint } from '../www/lifecycle.js';
 const now = Math.floor((Date.now() - HOUR) / HOUR) * HOUR + HOUR / 2;

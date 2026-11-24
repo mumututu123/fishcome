@@ -2,6 +2,7 @@ import { CHAT_FLOOR, validChatMessage, buildChatFloor, chatGlyphs } from './chat
 import { shanghaiDay, mealIndex, fishStatus, mergeTravel } from './fish-status.js';
 import { HOUR, updateSeaweed } from './seaweed.js';
 import { MINUTE, updateBubbles, mergeBubbles } from './bubbles.js';
+import { initialLife, initialSources, validInitialOp } from './genesis.js';
 import { fishNameError } from './fish-profile.js';
 import { REFERRAL_REWARD, referralError, chooseReferral } from './referral.js';
 import { WORLD_WIDTH, MAX_FLOOR, wrapX, worldKey, deltaX, nearX, makeTerrain, terrainOf, validTerrain, chooseTerrain, floorAt, waterAt } from './geography.js';
@@ -69,9 +70,13 @@ export function chooseClaim(a, b) {
 function transition(c, next, record) { Object.assign(c, next); c.path.push({ ...record, target: next.entity || '', x: next.x, y: next.y }); }
 
 export class World {
-  constructor(now = Date.now(), id = crypto.randomUUID()) {
+  constructor(now = Date.now(), id = crypto.randomUUID(), { populate = true } = {}) {
     this.data = { protocol: 1, roots: { [id]: now }, terrain: makeTerrain(id, now), tick: now, seaweedHour: Math.floor(now / HOUR), bubbleMinute: Math.floor(now / MINUTE), bubbles: {}, chars: {}, fishes: {}, breeding: {}, contacts: {}, contactAt: now, scenes: {}, ops: {}, participants: {}, notices: [], chats: {}, chatSources: {}, pendingChatGlyphs: 0, travel: {} };
     this.dirty = true; this.foodRevision = 0;
+    if (populate) {
+      const life = initialLife(id, now); Object.assign(this.data.chars, life.chars);
+      for (const op of Object.values(life.ops)) { const result = this.apply(op); if (!result.ok) throw new Error(result.error); }
+    }
   }
   get id() { return Object.keys(this.data.roots).sort()[0]; }
   get roots() { return Object.keys(this.data.roots); }
@@ -176,8 +181,9 @@ export class World {
     return { waiting, fishWaiting: fishRepair.waiting, fishMoved: fishRepair.moved };
   }
   validOp(op) {
+    if (op?.genesis !== undefined && !validInitialOp(op, initialSources(this.data.roots))) return '初始鱼记录被修改或无效';
     if (!op || typeof op.id !== 'string' || typeof op.actor !== 'string' || !Number.isFinite(op.t) || !['fish', 'scene', 'food', 'sceneMove', 'sceneDelete', 'sceneRotate', 'sceneScale', 'sceneEdit', 'earn', 'referral'].includes(op.kind)) return '不支持的操作';
-    if (op.t > Date.now() + 60000) return '操作时间无效';
+    if (op.genesis === undefined && op.t > Date.now() + 60000) return '操作时间无效';
     if (!['earn', 'referral'].includes(op.kind) && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(op.id)) return '操作标识无效';
     if (!Number.isInteger(op.cost) || op.cost < 0 || (!['fish', 'scene', 'food', 'sceneScale'].includes(op.kind) && op.cost !== 0)) return '鱼元费用无效';
     if (['fish', 'scene'].includes(op.kind)) { const e = validateDrawing(op.cells, op.kind); if (e) return e; if (op.cost !== op.cells.length) return '鱼元费用不一致'; }
@@ -326,6 +332,9 @@ export class World {
   merge(other) {
     if (!other || other.protocol !== 1 || !other.chars || !other.fishes || !other.scenes || !other.ops) throw new Error('世界协议不兼容');
     if (other.terrain && !validTerrain(other.terrain, other.roots)) throw new Error('固定海底地形被修改或无效');
+    for (const [root, at] of Object.entries(other.roots || {})) if (this.data.roots[root] !== undefined && this.data.roots[root] !== at) throw new Error('世界起源时间不能修改');
+    const initial = initialSources({ ...this.data.roots, ...other.roots });
+    for (const op of Object.values(other.ops)) if (op.genesis !== undefined && !validInitialOp(op, initial)) throw new Error('初始鱼记录被修改或无效');
     this.data.terrain = clone(chooseTerrain(terrainOf(this.data), terrainOf(other)));
     Object.assign(this.data.roots, other.roots); for (const [id, op] of Object.entries(other.ops)) { if (op.kind === 'referral' && (id !== op.id || this.validOp(op))) throw new Error('推广奖励记录无效'); if (!this.data.ops[id]) this.data.ops[id] = clone(op); else if (op.kind === 'referral' && this.data.ops[id].kind === 'referral') this.data.ops[id] = clone(chooseReferral(this.data.ops[id], op)); } Object.assign(this.data.participants, other.participants);
     this.data.seaweedHour = Math.max(this.data.seaweedHour ?? Math.floor(this.data.tick / HOUR), other.seaweedHour ?? Math.floor(other.tick / HOUR));

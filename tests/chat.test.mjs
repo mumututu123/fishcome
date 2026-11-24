@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { World, CONFIG, hash, MONUMENT } from '../www/engine.js';
+import { World, CONFIG, hash, MONUMENT } from './empty-world.mjs';
 import { CHAT_FLOOR, chatGlyphs, orderedChats, buildChatFloor, mergeChatRecords } from '../www/chat.js';
 import { restoreCheckpoint } from '../www/lifecycle.js';
 const at = Date.now() - 10000;
@@ -48,9 +48,9 @@ test('240小时到期后聊天形成海底地形，下一轮聊天室清空且�
 test('同一轮的多个浏览器分别重开，沉积随机位置一致且合流不复制鱼元', () => {
   const { checkpoint, world } = ended('一句话，留在下一片海里');
   const other = restoreCheckpoint(checkpoint, at + CONFIG.offlineLife).world;
-  assert.deepEqual(Object.keys(world.data.chars), Object.keys(other.data.chars));
-  const count = world.counts().characters, before = world.serialize(); world.merge(other.serialize()); other.merge(before); world.reconcileGeometry(); other.reconcileGeometry(); assert.deepEqual(world.data.chars, other.data.chars);
-  assert.equal(world.counts().characters, count);
+  assert.deepEqual(world.sceneCells(CHAT_FLOOR).map(cell => cell.id), other.sceneCells(CHAT_FLOOR).map(cell => cell.id));
+  const count = world.sceneCells(CHAT_FLOOR).length, before = world.serialize(); world.merge(other.serialize()); other.merge(before); world.reconcileGeometry(); other.reconcileGeometry(); assert.deepEqual(world.data.chars, other.data.chars);
+  assert.equal(world.sceneCells(CHAT_FLOOR).length, count);
 });
 test('聊天沉积协议拒绝编辑、移动、旋转、缩放和删除', () => {
   const { world } = ended('记忆'), before = world.serialize();
@@ -92,5 +92,5 @@ test('密集海底聊天填满底层时，仍不遮盖纪念碑入口', () => {
   const world = restoreCheckpoint({ world: previous.serialize(), lastOnlineAt: at }, at + CONFIG.offlineLife).world;
   const width = Math.max(...MONUMENT.rows.map(row => Array.from(row).length));
   assert.equal(world.sceneCells(CHAT_FLOOR).length, 9600);
-  assert.equal(world.sceneCells(CHAT_FLOOR).some(cell => cell.x >= MONUMENT.x && cell.x < MONUMENT.x + width && cell.y >= MONUMENT.y), false);
+  assert.equal(world.sceneCells(CHAT_FLOOR).some(cell => cell.x >= MONUMENT.x && cell.x < MONUMENT.x + width && cell.y >= world.monument.y && cell.y < world.monument.y + MONUMENT.rows.length), false);
 });

@@ -1,12 +1,14 @@
 import { WORLD_WIDTH, worldKey, wrapX, deltaX, nearX } from './geography.js';
+import { validInitialWeed } from './genesis.js';
 export const HOUR = 3600000;
 export const GREENS = ['#3d9854', '#48aa5d', '#55bc68', '#66cb74', '#79da84', '#92e59a'];
 const neighbors = [-1, 0, 1].flatMap(x => [-1, 0, 1].map(y => [x, y])).filter(([x, y]) => x || y);
 const key = worldKey;
 export function growthRoll(source, hour, hash) { return hash(`seaweed-roll:${source}:${hour}`) % 10000 < 100; }
 export function weedId(source, hour, hash) { return `seaweed:${hour}:${hash(source).toString(16)}-${hash('id:' + source).toString(16)}`; }
-export function validWildCell(cell, config, hash) {
+export function validWildCell(cell, config, hash, initial) {
   const wild = cell.wild; let glyph = '草'; for (const event of cell.path || []) if (event.reason === 'birth') { if (event.before !== glyph) return false; glyph = event.after; }
+  if (wild?.origin !== undefined) return validInitialWeed(cell, initial) && Array.isArray(cell.path) && ['seaweed', 'fish', 'food', 'scene', 'burn'].includes(cell.kind) && (['scene', 'burn'].includes(cell.kind) || cell.ch === glyph);
   return wild && Array.isArray(cell.path) && typeof wild.source === 'string' && /^(floor:|cell:|tip:)/.test(wild.source) && Number.isInteger(wild.hour) && wild.hour >= 0 && cell.id === weedId(wild.source, wild.hour, hash) && growthRoll(wild.source, wild.hour, hash) && typeof wild.plant === 'string' && wild.plant.startsWith('seaweed:') && Number.isInteger(wild.index) && wild.index >= 0 && wild.index < Math.max(config.depth, 120) && Number.isInteger(wild.x) && wild.x >= 0 && wild.x < config.width && Number.isInteger(wild.y) && wild.y >= 0 && wild.y < Math.max(config.depth, 120) && (['scene', 'burn'].includes(cell.kind) || (cell.ch === glyph && cell.color === GREENS[hash(cell.id) % GREENS.length])) && cell.payer === '' && cell.created === wild.hour * HOUR && ['seaweed', 'fish', 'food', 'scene', 'burn'].includes(cell.kind) && (cell.kind !== 'seaweed' || (cell.entity === wild.plant && cell.path.length === 0)) && (wild.index !== 0 || wild.plant === cell.id);
 }
 function plants(chars) {

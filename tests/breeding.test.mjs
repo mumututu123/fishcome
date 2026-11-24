@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { World, CONFIG, EYES, cellPosition, components, velocities, clone, hash } from '../www/engine.js';
+import { World, CONFIG, EYES, cellPosition, components, velocities, clone, hash } from './empty-world.mjs';
 import { CONTACT_TIME, BREEDING_TIME, updateContacts, finishBreeding, chooseOwner, motionUnits, commitUnit, validBreedingRecord, inheritedGlyph } from '../www/breeding.js';
 import { restoreCheckpoint } from '../www/lifecycle.js';
 import { HOUR, GREENS, growthRoll, weedId, validWildCell } from '../www/seaweed.js';

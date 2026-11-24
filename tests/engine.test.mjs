@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { World, EYES, CONFIG, components, validateDrawing, velocities, canSee, touching, cellPosition, validGlyph, chooseClaim, exteriorContour } from '../www/engine.js';
+import { World, EYES, CONFIG, components, validateDrawing, velocities, canSee, touching, cellPosition, validGlyph, chooseClaim, exteriorContour } from './empty-world.mjs';
 const t = Date.now() - 10000;
 const cell = (x, y, ch = 'o') => ({ x, y, ch, color: '#8be7df' });
 const op = (kind, values = {}, actor = 'alice') => ({ id: crypto.randomUUID(), actor, nick: 'a＊＊e', t, kind, cost: 0, ...values });
