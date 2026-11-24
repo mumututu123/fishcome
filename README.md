@@ -102,6 +102,19 @@
 
 在 Windows PowerShell 运行 `./build.ps1` 构建 `dist/鱼来/鱼来.exe` 和干净发行 ZIP。编译器为 Windows 自带的 .NET Framework C# 编译器。
 
+GitHub Release 工作流位于 `.github/workflows/release.yml`。将工作流和构建脚本提交、推送到 master 后，在要发布的提交上创建并推送版本标签，例如：
+
+```powershell
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+工作流在 Windows runner 上运行规则测试、编译启动器，再解压 ZIP 实际启动程序并校验所有网页资源，全部通过才创建 Release。用户下载 Release 附件「鱼来-0.1.0.zip」，完整解压后双击根目录「鱼来.exe」即可；包内只包含程序和必需的 `www`，不含源码、测试或验证文档。用户手册可在 Release 说明中打开。
+
+已存在的版本标签也可在 GitHub 的 Actions → Release → Run workflow 中填写标签手动重发；工作流构建该标签对应的代码，重复执行更新同名 ZIP 附件。带后缀的版本（如 `v0.2.0-beta.1`）会发布为预发行版。发布使用 GitHub 自动提供的令牌，无需另配个人令牌。日常推送 master 不自动发布。
+
+本地可用 `./build.ps1 -Version 0.1.0 -OutputDirectory ./dist/release` 构建，再用 `./scripts/test-release.ps1 -ArchivePath ./dist/鱼来-0.1.0.zip` 检查解压后的发行包。每次打包从独立的新目录收集文件，已有输出目录中的旧文件不会混进 ZIP。
+
 如果已有 `dist/潮生` 兼容目录，构建会同时更新其中的 `www`、使用说明与验证记录，同步更新对应启动器以支持邀请码。已打开的旧页面需要刷新才能载入更新；固定本地地址和 IndexedDB 数据库保持不变。`node tests/served-ui.cjs` 可检查当前 `http://127.0.0.1:39241` 实际发布的“我的鱼”入口、快捷键绑定及鱼况模块，其他测试地址可通过 `TIDE_UI_URL` 指定。
 
 安装 Node.js 后，`npm test` 运行规则测试，`node tests/benchmark.mjs` 检查模拟负载。浏览器测试需 Playwright：`node tests/browser-smoke.cjs`，也可用 `TIDE_TEST_MODULES` 指向已有 Playwright 包。测试启动器只监听本机 39081–39084，浏览器使用临时配置。缺少 Chrome 时联机测试使用另一独立 Edge 实例；`TIDE_SKIP_FIREFOX=1` 可跳过 Firefox。`node tests/browser-lifecycle.cjs` 使用本机随机端口的 Node 测试服务和 Edge 临时配置，专项验证离线期限，不运行 Windows 启动器。
