@@ -7,23 +7,34 @@ export function ensureEcology(world, now, legacy = false) { return world.data.ec
 export function validEcology(state, now = Date.now() + 60000) { return state === undefined || !!state && state.version === 1 && typeof state.legacy === 'boolean' && Number.isFinite(state.activated) && state.activated >= 0 && state.activated <= now && Number.isInteger(state.hour) && state.hour >= 0 && state.hour <= Math.floor(now / 3600000); }
 export function mergeEcology(a, b) { if (!a) return b; if (!b) return a; return { version: 1, activated: Math.min(a.activated, b.activated), legacy: a.legacy || b.legacy, hour: Math.max(a.hour, b.hour) }; }
 export function densityField(world, scenery = world.sceneryMap()) {
-  const occupied = new Set(scenery.keys());
-  for (const key of world.fishMap().keys()) occupied.add(key);
-  for (const cell of Object.values(world.data.chars)) if (['food', 'seaweed'].includes(cell.kind)) occupied.add(worldKey(cell.x, cell.y));
-  const monument = world.monument; for (const [dy, row] of monument.rows.entries()) for (const [dx, ch] of Array.from(row).entries()) if (ch !== ' ') occupied.add(worldKey(monument.x + dx, monument.y + dy));
+  const width = 1000, floors = Array.from({ length: width }, (_, x) => world.floorAt(x)), height = Math.max(...floors), stride = width + 1;
+  const occupied = new Uint8Array(width * height), used = new Uint32Array(stride * (height + 1)), wet = new Uint32Array(used.length);
+  const mark = (x, y) => { if (Number.isInteger(y) && y >= 0 && y < height) occupied[y * width + wrapX(x)] = 1; };
+  for (const { scene, cell } of scenery.values()) mark(scene.x + cell.x, scene.y + cell.y);
+  for (const c of Object.values(world.data.chars)) {
+    if (['food', 'seaweed'].includes(c.kind)) mark(c.x, c.y);
+    if (c.kind === 'fish') { const f = world.data.fishes[c.entity]; if (f) mark(f.x + f.facing * c.x, f.y + c.y); }
+  }
+  const monument = world.monument; for (const [dy, row] of monument.rows.entries()) for (const [dx, ch] of Array.from(row).entries()) if (ch !== ' ') mark(monument.x + dx, monument.y + dy);
+  // Summed-area tables make every local density query constant-time, even on hourly turnover.
+  for (let y = 0; y < height; y++) { let rowWet = 0, rowUsed = 0; for (let x = 0; x < width; x++) { const water = y < floors[x]; rowWet += +water; rowUsed += water ? occupied[y * width + x] : 0; const index = (y + 1) * stride + x + 1; wet[index] = wet[index - stride] + rowWet; used[index] = used[index - stride] + rowUsed; } }
+  const rectangle = (table, left, right, top, bottom) => table[(bottom + 1) * stride + right + 1] - table[top * stride + right + 1] - table[(bottom + 1) * stride + left] + table[top * stride + left];
   const cache = new Map();
   return (cx, cy) => {
     const x = wrapX(Math.round(cx)), y = Math.round(cy), key = worldKey(x, y); if (cache.has(key)) return cache.get(key);
-    let wet = 0, used = 0;
-    for (let dx = -ECOLOGY.radius; dx <= ECOLOGY.radius; dx++) { const column = wrapX(x + dx), floor = world.floorAt(column); for (let dy = -ECOLOGY.radius; dy <= ECOLOGY.radius; dy++) { const row = y + dy; if (row < 0 || row >= floor) continue; wet++; if (occupied.has(worldKey(column, row))) used++; } }
-    const result = wet ? used / wet : 1; cache.set(key, result); return result;
+    const left = x - ECOLOGY.radius, right = x + ECOLOGY.radius, top = Math.max(0, y - ECOLOGY.radius), bottom = Math.min(height - 1, y + ECOLOGY.radius);
+    if (top > bottom) return 1;
+    const ranges = left < 0 ? [[0, right], [width + left, width - 1]] : right >= width ? [[left, width - 1], [0, right - width]] : [[left, right]];
+    let totalWet = 0, totalUsed = 0; for (const [a, b] of ranges) { totalWet += rectangle(wet, a, b, top, bottom); totalUsed += rectangle(used, a, b, top, bottom); }
+    const result = totalWet ? totalUsed / totalWet : 1; cache.set(key, result); return result;
   };
 }
 export const contactTime = density => density >= .4 ? Infinity : density >= .2 ? 20000 : 5000;
 export const growthChance = density => density >= .4 ? 0 : density >= .2 ? .005 : .01;
 export function weedExpires(cell, state) {
   const ordinary = cell.created + ECOLOGY.weedMinLife + hash(`weed-life:${cell.id}`) % (ECOLOGY.weedLifeRange + 1);
-  const grace = state?.legacy && cell.created < state.activated ? state.activated + 24 * 3600000 + hash(`weed-grace:${cell.id}`) % (24 * 3600000 + 1) : 0;
+  const activated = cell.ecoGraceAt ?? (state?.legacy && cell.created < state.activated ? state.activated : undefined);
+  const grace = Number.isFinite(activated) ? activated + 24 * 3600000 + hash(`weed-grace:${cell.id}`) % (24 * 3600000 + 1) : 0;
   return Math.max(ordinary, grace);
 }
 export function weedAlpha(cell, state, now) { const remaining = weedExpires(cell, state) - now; return Math.max(.25, Math.min(1, .25 + remaining / (12 * 3600000) * .75)); }
@@ -36,10 +47,15 @@ export function settleAt(cell) { return Math.max(...cell.path.filter(event => ev
 export function updateEcology(world, now, transition) {
   const state = ensureEcology(world, now), deadPlants = new Map();
   for (const c of Object.values(world.data.chars)) {
-    if (c.kind === 'seaweed' && now >= weedExpires(c, state)) { deadPlants.set(c.entity, Math.min(deadPlants.get(c.entity) ?? Infinity, c.wild.index)); transition(c, { kind: 'burn', entity: '' }, { id: `wither:${c.id}`, t: weedExpires(c, state), reason: 'wither' }); world.foodRevision++; world.dirty = true; }
+    if (c.kind === 'seaweed' && now >= weedExpires(c, state)) { if (!deadPlants.has(c.entity)) deadPlants.set(c.entity, []); deadPlants.get(c.entity).push({ index: c.wild.index, at: weedExpires(c, state) }); transition(c, { kind: 'burn', entity: '' }, { id: `wither:${c.id}`, t: weedExpires(c, state), reason: 'wither' }); world.foodRevision++; world.dirty = true; }
     else if (c.kind === 'food' && looseWither(c) && now >= c.born + ECOLOGY.looseLife) { transition(c, { kind: 'burn', entity: '' }, { id: `wither-dissolve:${c.id}:${c.born}`, t: c.born + ECOLOGY.looseLife, reason: 'wither-dissolve' }); world.dirty = true; }
   }
-  for (const c of Object.values(world.data.chars)) if (c.kind === 'seaweed' && c.wild.index > (deadPlants.get(c.entity) ?? Infinity)) { transition(c, { kind: 'food', entity: '', born: now, fall: 0 }, { id: `wither-loose:${c.id}:${now}`, t: now, reason: 'wither-loose' }); world.foodRevision++; world.dirty = true; }
+  for (const c of Object.values(world.data.chars)) if (c.kind === 'seaweed') {
+    const cuts = (deadPlants.get(c.entity) || []).filter(cut => cut.index < c.wild.index); if (!cuts.length) continue;
+    const at = Math.min(...cuts.map(cut => cut.at)); transition(c, { kind: 'food', entity: '', born: at, fall: 0 }, { id: `wither-loose:${c.id}:${at}`, t: at, reason: 'wither-loose' });
+    if (now >= at + ECOLOGY.looseLife) transition(c, { kind: 'burn', entity: '' }, { id: `wither-dissolve:${c.id}:${at}`, t: at + ECOLOGY.looseLife, reason: 'wither-dissolve' });
+    world.foodRevision++; world.dirty = true;
+  }
   const hour = Math.floor(now / 3600000); if (hour <= state.hour) return;
   const density = densityField(world), edited = new Set(Object.values(world.data.ops).filter(op => op.kind === 'sceneEdit').map(op => op.cell));
   for (const c of Object.values(world.data.chars)) {

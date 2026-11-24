@@ -10,7 +10,7 @@ export function restoreCheckpoint(checkpoint, now = Date.now()) {
   const expiresAt = Number.isFinite(lastOnlineAt) ? lastOnlineAt + CONFIG.offlineLife : undefined;
   const expired = !Number.isFinite(expiresAt) || now >= expiresAt;
   const world = new World(now, undefined, { populate: expired });
-  if (!expired) { world.data = { ...world.data, ...clone(checkpoint.world), ecology: checkpoint.world.ecology || newEcology(now, true), terrain: clone(terrainOf(checkpoint.world)) }; world.data.bubbles = mergeBubbles({}, checkpoint.world.bubbles, now, world.data.chars); world.data.bubbleMinute = checkpoint.world.bubbleMinute ?? Math.floor(now / MINUTE); world.data.tick = now; world.initializeTracking(now); }
+  if (!expired) { world.data = { ...world.data, ...clone(checkpoint.world), ecology: checkpoint.world.ecology || newEcology(now, true), terrain: clone(terrainOf(checkpoint.world)) }; if (!checkpoint.world.ecology) for (const c of Object.values(world.data.chars)) if (c.kind === 'seaweed' && c.created < now && c.ecoGraceAt === undefined) c.ecoGraceAt = now; world.data.bubbles = mergeBubbles({}, checkpoint.world.bubbles, now, world.data.chars); world.data.bubbleMinute = checkpoint.world.bubbleMinute ?? Math.floor(now / MINUTE); world.data.tick = now; world.initializeTracking(now); }
   else { world.data.chatSources = clone(checkpoint.world.chats || {}); world.reconcileChatFloor(now); }
   return { world, expired, expiresAt };
 }

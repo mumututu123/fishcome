@@ -17,7 +17,7 @@ import { wrapX, nearX, validTerrain } from './geography.js';
 import { initialSources, validInitialOp } from './genesis.js';
 import { validateLife, validPlankton, weatherAt, fishLifeText, storiesFor, storyText, returnStory } from './life.js';
 import { validEcology } from './ecology.js';
-import { ARCHIVE, ARCHIVE_FIELDS, ArchiveStore, archivePlan, archiveChunks, decodeArchive, validArchiveState, emptyArchiveState, mergeArchiveState, compactKnown } from './archive.js';
+import { ARCHIVE, ARCHIVE_FIELDS, ArchiveStore, archivePlan, archiveChunks, decodeArchive, assembleFragments, validArchiveState, emptyArchiveState, mergeArchiveState, compactKnown } from './archive.js';
 const $ = id => document.getElementById(id);
 const renderer = new Renderer($('sea'));
 let world = new World(undefined, undefined, { populate: false }), identity, network, meta, creator, mode = null, selected = null, dragging, histories = {}, known = [], members = new Map(), pending = new Map(), inbox = new Map(), lastPicture = null, priorCheckpoint = null;
@@ -35,6 +35,7 @@ function newArchiveStore() { return new ArchiveStore({ load: id => get('archive:
 let archiveStore = newArchiveStore(), archiveBusy = false, archiveCheckAt = 0, olderChats = {};
 const archiveWaiters = new Map(), archiveRequests = new Map(), historyArchiveStores = new Map();
 let resumeTask;
+let archiveView;
 const rejectedOps = new Set();
 function rejectOperation(id) { rejectedOps.add(id); inbox.delete(id); }
 let lastOnlineAt = Date.now();
@@ -73,9 +74,10 @@ async function requestArchive(id, peer) {
     throw new Error('缺少历史归档，等待持有记忆的伙伴重新接入');
   })(); archiveRequests.set(id, task); try { return await task; } finally { archiveRequests.delete(id); }
 }
-async function verifyArchivedOps(ops, roots) {
+async function verifyArchivedOps(ops, roots, scope = roots) {
   const initial = initialSources(roots);
   for (const [id, op] of Object.entries(ops)) {
+    if (op.roots !== undefined && (!Array.isArray(op.roots) || !op.roots.some(root => scope[root] !== undefined))) throw new Error('归档操作不属于这个世界');
     if (op.genesis !== undefined) { if (id !== op.id || !validInitialOp(op, initial)) throw new Error('归档初始鱼凭据无效'); continue; }
     const { proof, ...clean } = op;
     if (id !== op.id || !proof || proof.kind !== 'op' || JSON.stringify(clean) !== JSON.stringify(proof.body) || proof.actor !== op.actor || !await verifyEnvelope(proof) || world.validOp(op) || op.kind === 'referral' && !await verifyReferral(op)) throw new Error('归档操作签名或凭据无效');
@@ -90,25 +92,27 @@ async function ensureArchives(data, peer, bundle, target = archiveStore) {
     const raw = await decodeArchive(encoded, manifest); for (const [root, at] of Object.entries(raw.roots)) if (data.roots[root] !== at) throw new Error('归档不属于这个世界'); chunks.push({ encoded, manifest, raw });
   }
   if (!chunks.length) return;
-  const pool = Object.fromEntries(ARCHIVE_FIELDS.map(f => [f, {}])); for (const chunk of chunks) for (const field of ARCHIVE_FIELDS) Object.assign(pool[field], chunk.raw.records[field]);
+  await assembleFragments(chunks, data.archives, async id => ({ manifest: target.manifests[id], raw: await target.raw(id) }));
+  const pool = Object.fromEntries(ARCHIVE_FIELDS.map(f => [f, {}])); for (const chunk of chunks) for (const field of ARCHIVE_FIELDS) Object.assign(pool[field], (chunk.logical || chunk.raw.records)[field]);
   const prior = await target.dependencies({ ...data, ...Object.fromEntries(ARCHIVE_FIELDS.map(f => [f, { ...data[f], ...pool[f] }])) }, world.data);
   const sources = Object.fromEntries(ARCHIVE_FIELDS.map(f => [f, { ...prior[f], ...world.data[f], ...pool[f], ...data[f] }]));
-  await verifyArchivedOps({ ...pool.ops, ...data.ops }, { ...world.data.roots, ...data.roots });
+  await verifyArchivedOps({ ...pool.ops, ...data.ops }, { ...world.data.roots, ...data.roots }, data.roots);
   for (const record of Object.values(sources.breeding)) if (!validBreedingRecord(record, sources)) throw new Error('归档繁殖凭据无效');
-  for (const chunk of chunks) await verifyReplica({ protocol: 1, roots: data.roots, ...chunk.raw.records }, sources, target);
+  for (const chunk of chunks) await verifyReplica({ protocol: 1, roots: data.roots, ...(chunk.logical || chunk.raw.records) }, sources, target);
   await putMany(chunks.map(chunk => ['archive:' + chunk.manifest.id, chunk.encoded]));
   for (const chunk of chunks) await target.ingest(chunk, chooseClaim);
 }
 async function archiveWorld(now = Date.now()) {
   if (archiveBusy || !amLeader() || now - archiveCheckAt < 60000) return; archiveCheckAt = now;
-  if (now - (world.data.archives?.at || 0) < ARCHIVE.period && new TextEncoder().encode(JSON.stringify(world.data)).length < ARCHIVE.threshold) return;
-  archiveBusy = true; const target = world;
+  const pressure = new TextEncoder().encode(JSON.stringify(world.data)).length >= ARCHIVE.threshold;
+  if (now - (world.data.archives?.at || 0) < ARCHIVE.period && !pressure) return;
+  archiveBusy = true; const target = world, store = archiveStore;
   try {
-    const plan = archivePlan(target.data, now), chunks = await archiveChunks(plan, target.data.roots);
+    const plan = archivePlan(target.data, now, { pressure }), chunks = await archiveChunks(plan, target.data.roots);
     await putMany(chunks.map(chunk => ['archive:' + chunk.manifest.id, chunk.encoded])); if (world !== target) return;
-    for (const chunk of chunks) { await archiveStore.ingest(chunk, chooseClaim); target.data.archives ||= emptyArchiveState(); target.data.archives.chunks[chunk.manifest.id] = chunk.manifest; }
-    for (const field of ARCHIVE_FIELDS) for (const [id, record] of Object.entries(plan[field])) if (archiveStore.ids[field].has(id) && JSON.stringify(target.data[field][id]) === JSON.stringify(record)) delete target.data[field][id];
-    target.data.archives.at = now; target.dirty = true; target.foodRevision++; target.attachArchives(archiveStore); lastFull = 0;
+    for (const chunk of chunks) { await store.ingest(chunk, chooseClaim); target.data.archives ||= emptyArchiveState(); target.data.archives.chunks[chunk.manifest.id] = chunk.manifest; }
+    await compactKnown(target, store); if (world !== target || archiveStore !== store) return;
+    target.data.archives.at = now; target.dirty = true; target.foodRevision++; target.attachArchives(store); lastFull = 0;
     await save(); await broadcastWorld(); renderChat();
   } catch (error) { status = '记忆整理稍后重试：' + error.message; } finally { archiveBusy = false; }
 }
@@ -128,7 +132,14 @@ async function verifyReplica(data, extra = {}, store = archiveStore) {
   for (const [root, at] of Object.entries(data.roots)) if (!/^[0-9a-f-]{36}$/i.test(root) || !Number.isFinite(at) || at < 0 || at > Date.now() + 60000) throw new Error('世界起源无效');
   for (const [root, at] of Object.entries(data.roots)) if (world.data.roots[root] !== undefined && world.data.roots[root] !== at) throw new Error('世界起源时间不能修改');
   const genesisSources = initialSources({ ...world.data.roots, ...data.roots });
-  for (const [id, op] of Object.entries(data.ops)) { if (op.genesis !== undefined) { if (id !== op.id || !validInitialOp(op, genesisSources)) throw new Error('初始鱼记录被修改或无效'); continue; } if (world.data.ops[id] && JSON.stringify(opBody(world.data.ops[id])) === JSON.stringify(opBody(op))) continue; if (world.data.ops[id] && !(op.kind === 'referral' && world.data.ops[id].kind === 'referral')) throw new Error('已有消费记录不可覆盖'); const { proof, ...clean } = op; if (id !== op.id || !proof || proof.kind !== 'op' || JSON.stringify(clean) !== JSON.stringify(proof.body) || proof.actor !== op.actor || !await verifyEnvelope(proof) || world.validOp(op) || (op.kind === 'referral' && !await verifyReferral(op))) throw new Error('世界包含无效操作凭据'); }
+  for (const [id, op] of Object.entries(data.ops)) {
+    if (op.genesis !== undefined) { if (id !== op.id || !validInitialOp(op, genesisSources)) throw new Error('初始鱼记录被修改或无效'); continue; }
+    const known = world.data.ops[id] || await store.get('ops', id);
+    if (known && JSON.stringify(opBody(known)) === JSON.stringify(opBody(op))) continue;
+    if (known && !(op.kind === 'referral' && known.kind === 'referral')) throw new Error('已有消费记录不可覆盖');
+    const { proof, ...clean } = op;
+    if (id !== op.id || !proof || proof.kind !== 'op' || JSON.stringify(clean) !== JSON.stringify(proof.body) || proof.actor !== op.actor || !await verifyEnvelope(proof) || world.validOp(op) || (op.kind === 'referral' && !await verifyReferral(op))) throw new Error('世界包含无效操作凭据');
+  }
   if (data.seaweedHour !== undefined && (!Number.isInteger(data.seaweedHour) || data.seaweedHour < 0 || data.seaweedHour > Math.floor((Date.now() + 60000) / HOUR))) throw new Error('海草生长时钟无效');
   if (data.bubbleMinute !== undefined && (!Number.isInteger(data.bubbleMinute) || data.bubbleMinute < 0 || data.bubbleMinute > Math.floor((Date.now() + 60000) / MINUTE))) throw new Error('气泡生成时钟无效');
   if (data.bubbles !== undefined && (!data.bubbles || typeof data.bubbles !== 'object' || Array.isArray(data.bubbles) || Object.keys(data.bubbles).length > 200000)) throw new Error('气泡记录无效');
@@ -148,6 +159,7 @@ async function verifyReplica(data, extra = {}, store = archiveStore) {
   const sourceGlyphs = new Map();
   for (const [id, c] of Object.entries(data.chars)) {
     if (id !== c.id) throw new Error('鱼元身份重复或被篡改');
+    if (c.ecoGraceAt !== undefined && (!Number.isFinite(c.ecoGraceAt) || c.ecoGraceAt < c.created || c.ecoGraceAt > Date.now() + 60000)) throw new Error('海草更替过渡时间无效');
     if ((!c.chat && !validGlyph(c.ch)) || !/^#[0-9a-f]{6}$/i.test(c.color) || !Number.isInteger(c.x) || !Number.isInteger(c.y) || !Array.isArray(c.path) || c.path.length > 1024 || !['fish', 'scene', 'food', 'burn', 'seaweed'].includes(c.kind)) throw new Error('世界鱼元无效');
     if (c.chat) {
       const message = data.chatSources?.[c.chat] || world.data.chatSources[c.chat] || extra.chatSources?.[c.chat] || extra.chats?.[c.chat], floor = data.scenes[CHAT_FLOOR] || world.data.scenes[CHAT_FLOOR] || extra.scenes?.[CHAT_FLOOR];
@@ -460,6 +472,7 @@ function historyDialog() {
     const div = document.createElement('div'), title = document.createElement('h3'), info = document.createElement('p'); title.textContent = `海 ${card.id.slice(0, 6)} · ${new Date(card.at).toLocaleString('zh-CN')}`;
     info.textContent = `${card.counts?.fish || 0} 条鱼 · ${card.counts?.scene || 0} 处造景 · ${card.participants || 1} 位参与者${card.status === 'pending' ? ' · 暂定湮灭，重逢后校正' : ''}`;
     div.append(title, info); article.append(img, div);
+    if (card.archives && Object.keys(card.archives.chunks).length) { const past = document.createElement('button'); past.type = 'button'; past.textContent = '过去的作品与收支'; past.className = 'archiveOpen'; past.onclick = () => { $('historyDialog').close(); archiveViewer(card); }; div.append(past); }
     const messages = orderedChats(card.chats || {});
     if (messages.length || card.chatCount) {
       const details = document.createElement('details'), summary = document.createElement('summary'), log = document.createElement('div'); summary.textContent = `查看当时的聊天 · ${Math.max(messages.length, card.chatCount || 0)} 条`; log.className = 'archivedChat';
@@ -470,6 +483,38 @@ function historyDialog() {
   }
   $('historyDialog').showModal();
 }
+async function archiveViewer(card) {
+  $('archiveDialog').showModal(); $('archiveWorks').textContent = '正在翻开记忆…'; $('archiveLedger').replaceChildren(); $('archiveMore').hidden = true;
+  try {
+    const store = card ? await historyArchiveStore(card) : archiveStore, hot = card ? null : world.data;
+    const ops = { ...store.summary.ops, ...hot?.ops }, catalog = card ? new Map(Object.entries(store.summary.catalog)) : fishCatalog(world.data);
+    const works = [...catalog.values()].map(entry => ({ id: entry.id, t: entry.created, type: entry.parents?.length ? 'born' : 'fish', entry }));
+    for (const op of Object.values(ops)) if (op.kind === 'scene') works.push({ id: op.id, t: op.t, type: 'scene' });
+    const ledger = Object.values(ops).filter(op => op.actor === identity.actor || op.kind === 'referral' && op.inviter === identity.actor);
+    archiveView = { store, hot, works: works.sort((a, b) => b.t - a.t || a.id.localeCompare(b.id)), ledger: ledger.sort((a, b) => b.t - a.t || a.id.localeCompare(b.id)), catalog, limit: 40 };
+    $('archiveTitle').textContent = card ? '旧海的作品与收支' : '这片海的作品与收支'; await renderArchives();
+  } catch (error) { $('archiveWorks').textContent = '这份记忆暂时没有读到，请稍后再看。'; toast(error.message); }
+}
+async function renderArchives() {
+  const view = archiveView; if (!view) return; const works = $('archiveWorks'), ledger = $('archiveLedger'); works.replaceChildren(); ledger.replaceChildren();
+  const record = (field, id) => view.hot?.[field]?.[id] || view.store.get(field, id);
+  for (const entry of view.works.slice(0, view.limit)) {
+    const birth = entry.type === 'born' ? await record('breeding', entry.id.slice(5)) : null, op = birth ? null : await record('ops', entry.id); if (!birth && !op) continue;
+    const body = birth?.baby || op, cells = birth ? body.cells.map(c => ({ x: c.x, y: c.y, ch: c.after, color: c.color })) : body.cells;
+    const row = document.createElement('article'), canvas = document.createElement('canvas'), title = document.createElement('strong'), info = document.createElement('p'); canvas.width = 88; canvas.height = 64; row.className = 'archiveWork'; drawFishThumbnail(canvas, { facing: 1 }, cells);
+    title.textContent = entry.type === 'scene' ? '一处造景' : displayFishName(view.catalog.get(entry.id), identity);
+    info.textContent = `${authorNick(body.actor, body.nick)} · ${fishDate.format(entry.t)} · ${entry.type === 'born' ? '出生时' : '投放时'}的模样`;
+    row.append(canvas, title, info); works.append(row);
+  }
+  const names = { fish: '造鱼', scene: '造景', food: '投食', sceneMove: '搬动造景', sceneDelete: '移除造景', sceneRotate: '旋转造景', sceneScale: '缩放造景', sceneEdit: '改字', earn: '在线奖励', referral: '邀请推广' };
+  for (const item of view.ledger.slice(0, view.limit)) {
+    const op = await record('ops', item.id); if (!op) continue; const row = document.createElement('p');
+    const amount = op.kind === 'earn' ? '+1 鱼元' : op.kind === 'referral' && op.inviter === identity.actor ? '+10 鱼元' : op.cost ? `花费 ${op.cost} 鱼元` : '无花费';
+    row.textContent = `${fishDate.format(op.t)} · ${names[op.kind] || '作品变化'} · ${amount}`; ledger.append(row);
+  }
+  if (!works.childElementCount) works.textContent = '这片海还没有留下这一类作品。'; if (!ledger.childElementCount) ledger.textContent = '你在这片海还没有消费或奖励记录。';
+  $('archiveMore').hidden = view.limit >= Math.max(view.works.length, view.ledger.length);
+}
 function localPicture() { return { id: world.id, roots: world.roots, image: renderer.snapshot(world), at: Date.now(), counts: world.counts(), participants: Object.keys(world.data.participants).length || 1 }; }
 async function endedCard(checkpoint, endedAt) {
   const roots = Object.keys(checkpoint.world.roots).sort(), chunks = await archiveChunks(Object.fromEntries(ARCHIVE_FIELDS.map(f => [f, checkpoint.world[f] || {}])), checkpoint.world.roots);
@@ -479,8 +524,8 @@ async function endedCard(checkpoint, endedAt) {
   return { ...checkpoint.picture, counts: { ...checkpoint.picture?.counts, scene: sceneryCount(checkpoint.world) }, id: roots[0], roots, chats: remainingChats, chatCount: Object.keys(checkpoint.world.chats || {}).length, archives, archiveRoots: checkpoint.world.roots, status: 'ended', endedAt };
 }
 async function historyArchiveStore(card, peer, bundle) {
-  const key = JSON.stringify(card.archives?.chunks || {}); if (historyArchiveStores.has(key)) return historyArchiveStores.get(key);
-  const store = newArchiveStore(); await ensureArchives({ protocol: 1, roots: card.archiveRoots || {}, archives: card.archives, ...Object.fromEntries(ARCHIVE_FIELDS.map(f => [f, {}])) }, peer, bundle, store); historyArchiveStores.set(key, store); return store;
+  const key = Object.keys(card.archives?.chunks || {}).sort().join(',') + JSON.stringify(Object.entries(card.archiveRoots || {}).sort(([a], [b]) => a.localeCompare(b))); if (historyArchiveStores.has(key)) { const store = historyArchiveStores.get(key); historyArchiveStores.delete(key); historyArchiveStores.set(key, store); return store; }
+  const store = newArchiveStore(); await ensureArchives({ protocol: 1, roots: card.archiveRoots || {}, archives: card.archives, ...Object.fromEntries(ARCHIVE_FIELDS.map(f => [f, {}])) }, peer, bundle, store); historyArchiveStores.set(key, store); while (historyArchiveStores.size > 2) historyArchiveStores.delete(historyArchiveStores.keys().next().value); return store;
 }
 async function receiveHistory(card, peer, bundle) {
   const store = await historyArchiveStore(card, peer, bundle); await verifyChats(card.chats, store); acceptHistory(card);
@@ -539,6 +584,9 @@ async function tick() {
 }
 $('lifePeek').onclick = lifeDialog;
 $('closeLife').onclick = () => $('lifeDialog').close();
+$('closeArchive').onclick = () => { $('archiveDialog').close(); archiveView = null; };
+$('openArchives').onclick = () => { $('myFishDialog').close(); archiveViewer(); };
+$('archiveMore').onclick = async () => { if (archiveView) { archiveView.limit += 40; await renderArchives(); } };
 $('myFishStories').onclick = () => { $('myFishDialog').close(); lifeDialog(); };
 
 $('makeFish').onclick = () => { stopObserving(); cancelMode(); creator?.open('fish'); }; $('makeScene').onclick = () => { stopObserving(); cancelMode(); creator?.open('scene'); }; $('feed').onclick = () => feedMode();

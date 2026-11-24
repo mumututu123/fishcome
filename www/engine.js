@@ -394,12 +394,12 @@ export class World {
       if (this.data.chatSources[id] && JSON.stringify(this.data.chatSources[id]) !== JSON.stringify(message)) throw new Error('已有聊天沉积来源不可覆盖');
       this.data.chatSources[id] = clone(message);
     }
-    for (const [id, c] of Object.entries(other.chars)) { const cold = archived.chars?.[id], old = this.data.chars[id] || cold, chosen = old ? chooseClaim(old, c) : c; if (!this.data.chars[id] && cold && JSON.stringify(chosen) === JSON.stringify(cold)) continue; this.data.chars[id] = clone(chosen); }
+    for (const [id, c] of Object.entries(other.chars)) { const cold = archived.chars?.[id], old = this.data.chars[id] || cold, chosen = old ? chooseClaim(old, c) : c; if (!this.data.chars[id] && cold && JSON.stringify(chosen) === JSON.stringify(cold)) continue; this.data.chars[id] = clone(chosen); const grace = [old?.ecoGraceAt, c.ecoGraceAt].filter(Number.isFinite); if (grace.length) this.data.chars[id].ecoGraceAt = Math.min(...grace); }
     for (const type of ['fishes', 'scenes']) for (const [id, obj] of Object.entries(other[type])) { const old = this.data[type][id]; if (!old || (obj.posAt || 0) > (old.posAt || 0) || ((obj.posAt || 0) === (old.posAt || 0) && JSON.stringify(obj).localeCompare(JSON.stringify(old)) > 0)) this.data[type][id] = clone(obj); }
     const dependencies = archiveDependencies({ ...this.data, ops: { ...archived.ops, ...this.data.ops }, breeding: { ...archived.breeding, ...this.data.breeding } });
     for (const field of ['ops', 'breeding']) for (const [id, record] of Object.entries(archived[field] || {})) { if (!this.data[field][id] && dependencies[field].has(id)) this.data[field][id] = clone(record); else if (!dependencies[field].has(id) && JSON.stringify(this.data[field][id]) === JSON.stringify(record)) delete this.data[field][id]; }
     normalizeBirthCells(this); const groups = this.fishGroups();
-    const latestFeed = new Map(); for (const c of Object.values(this.data.chars)) for (const r of c.path) if (r.reason === 'eat') latestFeed.set(r.target, Math.max(latestFeed.get(r.target) || 0, r.t));
+    const latestFeed = new Map(this.archives?.summary.lastMeals || []); for (const c of Object.values(this.data.chars)) for (const r of c.path) if (r.reason === 'eat') latestFeed.set(r.target, Math.max(latestFeed.get(r.target) || 0, r.t));
     for (const id of Object.keys(this.data.fishes)) {
       const f = this.data.fishes[id], cs = groups.get(id) || []; if (!cs.length) { delete this.data.fishes[id]; continue; }
       let fed = Math.max(f.created, latestFeed.get(id) || 0);

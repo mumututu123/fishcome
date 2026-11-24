@@ -1,6 +1,6 @@
 import { WORLD_WIDTH, worldKey, wrapX, deltaX, nearX } from './geography.js';
 import { validInitialWeed } from './genesis.js';
-import { densityField, growthChance } from './ecology.js';
+import { densityField, growthChance, weedExpires } from './ecology.js';
 export const HOUR = 3600000;
 export const GREENS = ['#3d9854', '#48aa5d', '#55bc68', '#66cb74', '#79da84', '#92e59a'];
 const neighbors = [-1, 0, 1].flatMap(x => [-1, 0, 1].map(y => [x, y])).filter(([x, y]) => x || y);
@@ -56,6 +56,7 @@ export function updateSeaweed(world, now, config, monument, hash, transition) {
       if (source.created > at - HOUR || !growthRoll(source.id, hour, hash)) continue;
       if (density && hash(`seaweed-roll:${source.id}:${hour}`) % 10000 >= growthChance(density(source.x, source.y)) * 10000) continue;
       const id = weedId(source.id, hour, hash); if (world.data.chars[id]) continue;
+      if (world.ambient && weedExpires({ id, created: at }, world.data.ecology) <= now) continue;
       const choices = (source.plant ? [[-1, -1], [0, -1], [1, -1]] : neighbors).map(([dx, dy]) => ({ x: canonical(source.x + dx), y: source.y + dy })).filter(p => fits(p.x, p.y));
       if (!choices.length) continue;
       const p = choices[hash(`seaweed-place:${id}`) % choices.length], plant = source.plant || id;

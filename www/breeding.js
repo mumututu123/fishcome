@@ -1,4 +1,4 @@
-import { CONFIG, EYES, NEIGHBORS, bounds, cellPosition, components, hash, clone, key } from './engine.js';
+import { CONFIG, EYES, NEIGHBORS, bounds, cellPosition, components, hash, clone, key, touching } from './engine.js';
 import { defaultFishName, fishNameError } from './fish-profile.js';
 import { wrapX, nearX, deltaX } from './geography.js';
 import { recordStory } from './life.js';
@@ -96,10 +96,12 @@ export function updateContacts(world, now, groups, scenery) {
       }
     }
   }
-  const contacts = {}, density = world.ambient ? densityField(world, scenery) : null;
+  const contacts = {}, density = world.ambient && pairs.size ? densityField(world, scenery) : null;
   for (const [key, pair] of [...pairs].sort(([a], [b]) => a.localeCompare(b))) {
     if (taken.has(pair.male) || taken.has(pair.female)) continue;
-    const f = world.data.fishes[pair.male], m = world.data.fishes[pair.female], wait = density ? contactTime(density((f.x + nearX(m.x, f.x)) / 2, (f.y + m.y) / 2)) : CONTACT_TIME;
+    const f = world.data.fishes[pair.male], m = world.data.fishes[pair.female], contact = contactCells(f, groups.get(pair.male), m, groups.get(pair.female), scenery);
+    const maleCell = groups.get(pair.male).find(c => c.id === contact.male[0]), p = maleCell && cellPosition(f, maleCell), femaleCell = [...groups.get(pair.female)].sort((a, b) => a.id.localeCompare(b.id)).find(c => maleCell && touching(f, [maleCell], cellPosition(m, c), scenery)), q = femaleCell && cellPosition(m, femaleCell);
+    const wait = density && p && q ? contactTime(density((p.x + nearX(q.x, p.x)) / 2, (p.y + q.y) / 2)) : CONTACT_TIME;
     if (!Number.isFinite(wait)) continue;
     const prior = world.data.contacts[key], since = prior && now >= prior.lastAt && now - prior.lastAt <= CONFIG.step * 2 ? prior.since : now;
     contacts[key] = { ...pair, since, lastAt: now };

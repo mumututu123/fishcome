@@ -17,7 +17,7 @@ const server = http.createServer((request, response) => {
 });
 async function open(context) { const page = await context.newPage(); page.on('pageerror', error => errors.push(error.message)); await page.goto(origin); return page; }
 async function ready(page) { await page.waitForFunction(() => window.tide); }
-async function state(page) { return page.evaluate(() => ({ roots: Object.keys(tide.world.data.roots), counts: tide.world.counts, balance: tide.balance(), cards: Object.values(tide.histories).filter(c => c.status !== 'corrected') })); }
+async function state(page) { return page.evaluate(() => ({ roots: Object.keys(tide.world.data.roots), counts: tide.world.counts, ownFish: Object.values(tide.world.data.fishes).filter(f => f.actor === tide.identity.actor).map(f => f.id).sort(), scenes: Object.keys(tide.world.data.scenes).sort(), balance: tide.balance(), cards: Object.values(tide.histories).filter(c => c.status !== 'corrected') })); }
 async function age(context, hours, legacy = false) {
   const page = await context.newPage(); await page.goto(origin + '/welcome.html');
   await page.evaluate(async ({ hours, legacy }) => {
@@ -43,18 +43,18 @@ async function main() {
   await create(page, 'fish', 600, 370); await create(page, 'scene', 950, 580);
   const original = await state(page); assert.equal(original.balance, 16); await page.close(); await pause(500);
   page = await open(context); await ready(page); await pause(17000);
-  const short = await state(page); assert.deepEqual(short.roots, original.roots); assert.equal(short.balance, 16); assert.equal(short.counts.fish, 1); assert.equal(short.counts.scene, 1); assert.equal(short.cards.length, 0);
+  const short = await state(page); assert.deepEqual(short.roots, original.roots); assert.equal(short.balance, 16); assert.deepEqual(short.ownFish, original.ownFish); assert.deepEqual(short.scenes, original.scenes); assert.equal(short.counts.fish, original.counts.fish); assert.equal(short.cards.length, 0);
   await page.close(); await pause(500); await age(context, 239, true);
   page = await open(context); await ready(page);
   const legacy = await state(page); assert.deepEqual(legacy.roots, original.roots); assert.equal(legacy.balance, 16); assert.equal(legacy.cards.length, 0);
   await page.close(); await pause(500); await age(context, 240);
   page = await open(context); await ready(page);
-  const expired = await state(page); assert.equal(expired.counts.fish, 0); assert.equal(expired.counts.scene, 0); assert.equal(expired.balance, 20); assert(!expired.roots.some(root => original.roots.includes(root))); assert(expired.cards.some(card => original.roots.every(root => card.roots.includes(root)) && Number.isFinite(card.endedAt)));
+  const expired = await state(page); assert.equal(expired.ownFish.length, 0); assert(!expired.scenes.some(id => original.scenes.includes(id))); assert.equal(expired.balance, 20); assert(!expired.roots.some(root => original.roots.includes(root))); assert(expired.cards.some(card => original.roots.every(root => card.roots.includes(root)) && Number.isFinite(card.endedAt)));
   await create(page, 'fish', 600, 370); const beforeSleep = await state(page);
   await page.evaluate(() => { const realNow = Date.now; Date.now = () => realNow() + 180000; }); await pause(1200);
-  const shortSleep = await state(page); assert.deepEqual(shortSleep.roots, beforeSleep.roots); assert.equal(shortSleep.counts.fish, 1); assert.equal(shortSleep.balance, 18);
+  const shortSleep = await state(page); assert.deepEqual(shortSleep.roots, beforeSleep.roots); assert.deepEqual(shortSleep.ownFish, beforeSleep.ownFish); assert.equal(shortSleep.balance, 18);
   await page.evaluate(() => { const realNow = Date.now; Date.now = () => realNow() + 240 * 3600000; }); await pause(1200);
-  const longSleep = await state(page); assert.equal(longSleep.counts.fish, 0); assert.equal(longSleep.balance, 20); assert(longSleep.cards.some(card => beforeSleep.roots.every(root => card.roots.includes(root))));
+  const longSleep = await state(page); assert.equal(longSleep.ownFish.length, 0); assert(!longSleep.roots.some(root => beforeSleep.roots.includes(root))); assert.equal(longSleep.balance, 20); assert(longSleep.cards.some(card => beforeSleep.roots.every(root => card.roots.includes(root))));
   const foodContext = await browser.newContext({ viewport: { width: 1440, height: 900 } }), foodPage = await open(foodContext);
   await foodPage.locator('#nickInput').fill('鱼食测试'); await foodPage.locator('#welcomeForm .primary').click(); await ready(foodPage);
   await foodPage.evaluate(() => { document.getElementById('glyphInput').value = '木'; document.getElementById('colorInput').value = '#112233'; });
@@ -116,7 +116,7 @@ async function main() {
   assert.equal(await fishPage.evaluate(() => Object.keys(tide.world.data.ops).length), operationCount, '观察行为产生鱼控制操作');
   await fishPage.close(); await pause(400); await fishContext.addInitScript(() => { const original = Date.now; Date.now = () => original() + 2 * 3600000; }); fishPage = await open(fishContext); await ready(fishPage); assert.equal(await fishPage.evaluate(id => Object.values(tide.world.data.travel[id].days).reduce((a, b) => a + b, 0) >= 12.5, ownId), true, '重开丢失运动量'); await fishContext.close();
   assert.deepEqual(errors, []);
-  const result = { edge: 'passed', version: browser.version(), fixture: 'Node static/pairing service, no launcher execution', checks: ['short offline preserves fish, scenery, wallet and roots', 'no 15-second premature archive', '239-hour legacy checkpoint restoration', '240-hour expiry creates empty world with 20 characters and archive', 'short sleep preserves world', '240-hour sleep expires world', 'independent custom food with preview and glyph validation', 'surface-only food costs one character, cancellation is free', 'my fish filters by signed creator', 'fish status shows movement and rolling meal count', '24-hour hunger updates while observing', 'one-click focus and follow without fish control operations', 'manual pan stops follow', 'fish remains visible beside mobile inspector', 'movement survives reopen'], errors };
+  const result = { edge: 'passed', version: browser.version(), fixture: 'Node static/pairing service, no launcher execution', checks: ['short offline preserves fish, scenery, wallet and roots', 'no 15-second premature archive', '239-hour legacy checkpoint restoration', '240-hour expiry creates new genesis world with 20 characters and archive', 'short sleep preserves world', '240-hour sleep expires world', 'independent custom food with preview and glyph validation', 'surface-only food costs one character, cancellation is free', 'my fish filters by signed creator', 'fish status shows movement and rolling meal count', '24-hour hunger updates while observing', 'one-click focus and follow without fish control operations', 'manual pan stops follow', 'fish remains visible beside mobile inspector', 'movement survives reopen'], errors };
   fs.mkdirSync(path.join(project, 'test-output'), { recursive: true }); fs.writeFileSync(path.join(project, 'test-output', 'browser-lifecycle-results.json'), JSON.stringify(result, null, 2)); console.log(JSON.stringify(result, null, 2));
 }
 main().catch(error => { console.error(error.stack); process.exitCode = 1; }).finally(async () => { if (browser) await browser.close(); server.closeAllConnections(); server.close(); });
