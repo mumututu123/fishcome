@@ -104,6 +104,8 @@
 
 GitHub Release 工作流位于 `.github/workflows/release.yml`。将工作流和构建脚本提交、推送到 master 后，在要发布的提交上创建并推送版本标签，例如：
 
+提交时也要包含新增的 `package-lock.json`、`tests/browser-release.cjs` 和 `tests/ui-contract.test.mjs`；只用 `git commit -am` 不会自动加入尚未追踪的新文件。工作流会在安装依赖前检查必需文件是否齐全。
+
 ```powershell
 git tag v0.1.1
 git push origin v0.1.1

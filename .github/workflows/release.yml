@@ -40,6 +40,12 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Check required release files
+        run: |
+          $required = @('package-lock.json', 'tests/browser-release.cjs', 'tests/ui-contract.test.mjs', 'build.ps1', 'scripts/test-release.ps1', 'scripts/resolve-release.ps1', 'tests/release-workflow.ps1')
+          $missing = @($required | Where-Object { -not (Test-Path -LiteralPath $_ -PathType Leaf) })
+          if ($missing.Count) { throw "Required release files were not committed: $($missing -join ', '). Add and commit all new files before publishing." }
+
       - name: Test release selection
         run: ./tests/release-workflow.ps1
 
