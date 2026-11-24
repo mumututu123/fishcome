@@ -48,7 +48,8 @@ export function finishBreeding(world, now, transition) {
     const selectedFather = fatherCells.filter(cell => record.contact.male.includes(cell.id)), selectedMother = motherCells.filter(cell => record.contact.female.includes(cell.id));
     const selected = [...selectedFather, ...selectedMother], removed = new Set(selected.map(cell => cell.id)), remainingFather = fatherCells.filter(cell => !removed.has(cell.id)), remainingMother = motherCells.filter(cell => !removed.has(cell.id));
     const placed = selected.map(cell => ({ ...cell, ...cellPosition(cell.entity === father.id ? father : mother, cell) }));
-    const viable = remainingFather.length >= 2 && remainingMother.length >= 2 && components(remainingFather).length === 1 && components(remainingMother).length === 1 && selectedFather.length > 0 && selectedMother.length > 0 && selected.length >= 2 && new Set(placed.map(cell => key(cell.x, cell.y))).size === placed.length && components(placed).length === 1;
+    const occupants = world.fishOccupants(), parents = new Set([father.id, mother.id]);
+    const viable = remainingFather.length >= 2 && remainingMother.length >= 2 && components(remainingFather).length === 1 && components(remainingMother).length === 1 && selectedFather.length > 0 && selectedMother.length > 0 && selected.length >= 2 && new Set(placed.map(cell => key(cell.x, cell.y))).size === placed.length && components(placed).length === 1 && placed.every(cell => [...(occupants.get(key(cell.x, cell.y)) || [])].every(id => parents.has(id)));
     if (!viable) { cancel(record, now, 'incomplete-bodies'); father.cx = father.cy = mother.cx = mother.cy = 0; world.dirty = true; continue; }
     const id = `born:${record.id}`, owner = chooseOwner(record, selectedFather.length, selectedMother.length, remainingFather.length, remainingMother.length), parent = owner === father.id ? father : mother;
     const body = bounds(placed), gender = hash(`gender:${id}`) % 2 ? 'male' : 'female';

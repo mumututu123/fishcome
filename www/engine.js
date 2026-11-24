@@ -121,9 +121,31 @@ export class World {
     const map = new Map(); for (const c of Object.values(this.data.chars)) if (c.kind === 'scene') { const s = this.data.scenes[c.entity]; if (s) map.set(key(s.x + c.x, s.y + c.y), { scene: s, cell: c }); } return map;
   }
   fishMap() { const map = new Map(); for (const [id, cells] of this.fishGroups()) { const f = this.data.fishes[id]; if (f) for (const c of cells) { const p = cellPosition(f, c); map.set(key(p.x, p.y), id); } } return map; }
-  canOccupy(f, cells, scenery = this.sceneryMap()) { return cells.every(c => { const p = cellPosition(f, c); return p.x >= 0 && p.x < CONFIG.width && p.y >= 0 && p.y < CONFIG.depth && !scenery.has(key(p.x, p.y)); }); }
+  fishOccupants(groups = this.fishGroups()) { const map = new Map(); for (const [id, cells] of groups) { const fish = this.data.fishes[id]; if (!fish) continue; for (const cell of cells) { const p = cellPosition(fish, cell), k = key(p.x, p.y); if (!map.has(k)) map.set(k, new Set()); map.get(k).add(id); } } return map; }
+  collisionIds(f) { const pair = this.data.breeding[f.id]; return new Set(pair?.status === 'active' ? [pair.male, pair.female] : [f.id]); }
+  canOccupy(f, cells, scenery = this.sceneryMap(), occupants = this.fishOccupants()) { const ignored = this.collisionIds(f); return cells.every(c => { const p = cellPosition(f, c), k = key(p.x, p.y); return p.x >= 0 && p.x < CONFIG.width && p.y >= 0 && p.y < CONFIG.depth && !scenery.has(k) && ![...(occupants.get(k) || [])].some(id => !ignored.has(id)); }); }
+  updateFishOccupants(occupants, members, groups, remove = false) { for (const fish of members) for (const cell of groups.get(fish.id) || []) { const p = cellPosition(fish, cell), k = key(p.x, p.y); if (remove) { occupants.get(k)?.delete(fish.id); if (!occupants.get(k)?.size) occupants.delete(k); } else { if (!occupants.has(k)) occupants.set(k, new Set()); occupants.get(k).add(fish.id); } } }
+  separateFish(now = this.data.tick) {
+    normalizeBreeding(this, now);
+    const groups = this.fishGroups(), occupants = this.fishOccupants(groups), scenery = this.sceneryMap(), resources = new Set(Object.values(this.data.chars).filter(c => ['food', 'seaweed'].includes(c.kind)).map(c => key(c.x, c.y))), processed = new Set();
+    let moved = 0, waiting = 0;
+    for (const unit of motionUnits(this, groups).sort((a, b) => a.id.localeCompare(b.id))) {
+      const { fish, cells, members } = unit;
+      const overlaps = cells.some(cell => { const p = cellPosition(fish, cell); return [...(occupants.get(key(p.x, p.y)) || [])].some(id => processed.has(id)); });
+      if (overlaps) {
+        const fits = (x, y) => { const next = { ...fish, x, y }; return this.canOccupy(next, cells, scenery, occupants) && cells.every(cell => { const p = cellPosition(next, cell); return !resources.has(key(p.x, p.y)); }); };
+        let target;
+        for (let radius = 1; radius <= CONFIG.width + CONFIG.depth && !target; radius++) for (let dx = -radius; dx <= radius && !target; dx++) { const dy = radius - Math.abs(dx); for (const offset of dy ? [-dy, dy] : [0]) if (fits(fish.x + dx, fish.y + offset)) { target = [fish.x + dx, fish.y + offset]; break; } }
+        if (target) { this.updateFishOccupants(occupants, members, groups, true); [fish.x, fish.y] = target; fish.cx = fish.cy = 0; commitUnit(unit, Math.max(now, ...members.map(member => member.posAt + 1))); this.updateFishOccupants(occupants, members, groups); moved++; this.dirty = true; }
+        else waiting++;
+      }
+      for (const member of members) processed.add(member.id);
+    }
+    return { moved, waiting };
+  }
   reconcileGeometry(now = this.data.tick) {
-    // Only the elected browser calls this after a merge. Keep every fish and move conflicting scenery as a whole.
+    // The elected browser separates overlapping fish and places conflicting scenery as a whole.
+    const fishRepair = this.separateFish(now);
     this.reconcileChatFloor(now);
     const occupied = new Set(this.fishMap().keys());
     for (const c of Object.values(this.data.chars)) if (c.kind === 'food') occupied.add(key(c.x, c.y));
@@ -142,7 +164,7 @@ export class World {
       }
       for (const c of cells) occupied.add(key(s.x + c.x, s.y + c.y));
     }
-    return { waiting };
+    return { waiting, fishWaiting: fishRepair.waiting, fishMoved: fishRepair.moved };
   }
   validOp(op) {
     if (!op || typeof op.id !== 'string' || typeof op.actor !== 'string' || !Number.isFinite(op.t) || !['fish', 'scene', 'food', 'sceneMove', 'sceneDelete', 'sceneRotate', 'sceneScale', 'sceneEdit', 'earn', 'referral'].includes(op.kind)) return '不支持的操作';
@@ -165,7 +187,7 @@ export class World {
     if (['fish', 'scene', 'food'].includes(op.kind) && (!Number.isInteger(op.x) || op.x < 0 || op.x >= CONFIG.width || !Number.isInteger(op.y))) return { ok: false, error: '投放位置无效' };
     if (op.kind === 'fish') {
       const f = { id: op.id, actor: op.actor, nick: op.nick, ...(op.name === undefined ? {} : { name: op.name }), ...(op.gender === undefined ? {} : { gender: op.gender }), x: op.x, y: op.y, facing: 1, created: op.t, lastFed: op.t, hungerAt: op.t + CONFIG.hunger, cx: 0, cy: 0, posAt: op.t };
-      if (!this.canOccupy(f, op.cells, scenery) || op.cells.some(c => Object.values(this.data.chars).some(existing => ['food', 'seaweed'].includes(existing.kind) && existing.x === f.x + c.x && existing.y === f.y + c.y))) return { ok: false, error: '鱼体碰到造景、食物或世界边界，换个空位置投放' };
+      if (!this.canOccupy(f, op.cells, scenery) || op.cells.some(c => Object.values(this.data.chars).some(existing => ['food', 'seaweed'].includes(existing.kind) && existing.x === f.x + c.x && existing.y === f.y + c.y))) return { ok: false, error: '鱼体碰到其他鱼、造景、食物或世界边界，换个空位置投放' };
       this.data.fishes[f.id] = f;
       this.data.travel[f.id] = { since: op.t, days: {} };
       op.cells.forEach((c, i) => this.data.chars[`${op.id}:${i}`] = { ...c, id: `${op.id}:${i}`, payer: op.actor, kind: 'fish', entity: f.id, path: [], created: op.t });
@@ -239,7 +261,8 @@ export class World {
     const waitingToEat = new Set(); for (const food of edible) for (const id of contact(food)) waitingToEat.add(id);
     const bins = new Map(), atFood = new Map();
     for (const food of edible) { const bin = key(Math.floor(food.x / 10), Math.floor(food.y / 10)); if (!bins.has(bin)) bins.set(bin, []); bins.get(bin).push(food); const p = key(food.x, food.y); if (!atFood.has(p)) atFood.set(p, []); atFood.get(p).push(food); }
-    for (const unit of motionUnits(this, groups)) {
+    const movingOccupants = this.fishOccupants(groups);
+    for (const unit of motionUnits(this, groups).sort((a, b) => a.id.localeCompare(b.id))) {
       const { id, cells, fish: f } = unit; if (!cells.length) continue;
       if (unit.members.some(member => waitingToEat.has(member.id))) { commitUnit(unit, now); continue; }
       const found = new Map(); for (const eye of cells) if (EYES.has(eye.ch)) { const p = cellPosition(f, eye), r = p.y < CONFIG.shallow ? 10 : 5, bx = Math.floor(p.x / 10), by = Math.floor(p.y / 10); for (const [dx, dy] of [[0, 0], ...NEIGHBORS]) for (const food of bins.get(key(bx + dx, by + dy)) || []) if (Math.max(Math.abs(food.x - p.x), Math.abs(food.y - p.y)) <= r) found.set(food.id, food); } const visible = [...found.values()];
@@ -247,12 +270,14 @@ export class World {
       visible.sort((a, b) => (Math.abs(a.x - midX) + Math.abs(a.y - midY)) - (Math.abs(b.x - midX) + Math.abs(b.y - midY)) || a.id.localeCompare(b.id));
       let dx, dy; if (visible.length) { dx = Math.sign(visible[0].x - midX); dy = Math.sign(visible[0].y - midY); }
       else { const phase = Math.floor((now - f.created) / 12000), r = hash(`${id}:${phase}`); dx = [-1, 0, 1][r % 3]; dy = [-1, 0, 1][Math.floor(r / 3) % 3]; }
-      if (dx && dx !== f.facing) this.turn(f, cells, turningObstacles);
+      this.updateFishOccupants(movingOccupants, unit.members, groups, true);
+      if (dx && dx !== f.facing) this.turn(f, cells, turningObstacles, movingOccupants);
       let movedX = 0, movedY = 0;
       const v = velocities(cells); f.cx = dx ? Math.min(2, (f.cx || 0) + v.x * dt) : 0; f.cy = dy ? Math.min(2, (f.cy || 0) + v.y * dt) : 0;
-      if (f.cx >= 1 && dx) { const next = { ...f, x: f.x + dx }; if (this.canOccupy(next, cells, scenery) && cells.every(c => { const p = cellPosition(next, c); return !foodPositions.has(key(p.x, p.y)); })) { f.x += dx; movedX = dx; } f.cx--; }
-      if (f.cy >= 1 && dy) { const next = { ...f, y: f.y + dy }; if (this.canOccupy(next, cells, scenery) && cells.every(c => { const p = cellPosition(next, c); return !foodPositions.has(key(p.x, p.y)); })) { f.y += dy; movedY = dy; } f.cy--; }
+      if (f.cx >= 1 && dx) { const next = { ...f, x: f.x + dx }; if (this.canOccupy(next, cells, scenery, movingOccupants) && cells.every(c => { const p = cellPosition(next, c); return !foodPositions.has(key(p.x, p.y)); })) { f.x += dx; movedX = dx; } f.cx--; }
+      if (f.cy >= 1 && dy) { const next = { ...f, y: f.y + dy }; if (this.canOccupy(next, cells, scenery, movingOccupants) && cells.every(c => { const p = cellPosition(next, c); return !foodPositions.has(key(p.x, p.y)); })) { f.y += dy; movedY = dy; } f.cy--; }
       commitUnit(unit, now);
+      this.updateFishOccupants(movingOccupants, unit.members, groups);
       for (const member of unit.members) this.recordMovement(member.id, Math.hypot(movedX, movedY), now);
     }
     // Rank uses this step's pre-consumption size for every simultaneous contest.
@@ -260,20 +285,21 @@ export class World {
     const bids = new Map(), bodyOccupancy = new Map();
     for (const [id, cs] of groups) { const f = this.data.fishes[id]; if (!f) continue; const occupied = new Set(cs.map(c => { const p = cellPosition(f, c); return key(p.x, p.y); })); bodyOccupancy.set(id, occupied); for (const c of cs) { const p = cellPosition(f, c); for (const [dx, dy] of NEIGHBORS) for (const food of atFood.get(key(p.x + dx, p.y + dy)) || []) if (!occupied.has(key(food.x, food.y))) { if (!bids.has(food.id)) bids.set(food.id, new Set()); bids.get(food.id).add(id); } } }
     for (const food of edible) {
-      if (!['food', 'seaweed'].includes(food.kind) || scenery.has(key(food.x, food.y))) continue;
+      if (!['food', 'seaweed'].includes(food.kind) || scenery.has(key(food.x, food.y)) || movingOccupants.has(key(food.x, food.y))) continue;
       const candidates = [...(bids.get(food.id) || [])].filter(id => !bodyOccupancy.get(id).has(key(food.x, food.y)) && touching(this.data.fishes[id], groups.get(id), food, scenery)).map(id => [id, groups.get(id)]);
       candidates.sort(([a], [b]) => sizes.get(b) - sizes.get(a) || hash(`${food.id}:${b}`) - hash(`${food.id}:${a}`) || a.localeCompare(b));
       if (candidates.length) {
-        const [id, cs] = candidates[0], f = this.data.fishes[id]; bodyOccupancy.get(id).add(key(food.x, food.y)); transition(food, { kind: 'fish', entity: id, x: (food.x - f.x) * f.facing, y: food.y - f.y }, { id: `eat:${food.id}:${food.path.length}`, t: now, reason: 'eat', rank: sizes.get(id) }); cs.push(food); f.lastFed = now; f.hungerAt = now + CONFIG.hunger; this.foodRevision++; this.dirty = true;
+        const [id, cs] = candidates[0], f = this.data.fishes[id]; bodyOccupancy.get(id).add(key(food.x, food.y)); movingOccupants.set(key(food.x, food.y), new Set([id])); transition(food, { kind: 'fish', entity: id, x: (food.x - f.x) * f.facing, y: food.y - f.y }, { id: `eat:${food.id}:${food.path.length}`, t: now, reason: 'eat', rank: sizes.get(id) }); cs.push(food); f.lastFed = now; f.hungerAt = now + CONFIG.hunger; this.foodRevision++; this.dirty = true;
       }
     }
     for (const [id, cells] of groups) { const f = this.data.fishes[id]; if (f && now >= f.hungerAt) this.starve(id, f.hungerAt); }
     normalizeBreeding(this, now); updateContacts(this, now, this.fishGroups(), scenery);
   }
-  turn(f, cells, scenery = this.sceneryMap()) {
+  turn(f, cells, scenery = this.sceneryMap(), occupants = this.fishOccupants()) {
     const b = bounds(cells), next = { ...f, x: f.x + f.facing * (b.minX + b.maxX), facing: -f.facing };
-    for (const c of cells) { const a = cellPosition(f, c), z = cellPosition(next, c); for (let x = Math.min(a.x, z.x); x <= Math.max(a.x, z.x); x++) if (scenery.has(key(x, a.y))) return false; }
-    if (!this.canOccupy(next, cells, scenery)) return false; f.x = next.x; f.facing = next.facing; return true;
+    const ignored = this.collisionIds(f);
+    for (const c of cells) { const a = cellPosition(f, c), z = cellPosition(next, c); for (let x = Math.min(a.x, z.x); x <= Math.max(a.x, z.x); x++) if (scenery.has(key(x, a.y)) || [...(occupants.get(key(x, a.y)) || [])].some(id => !ignored.has(id))) return false; }
+    if (!this.canOccupy(next, cells, scenery, occupants)) return false; f.x = next.x; f.facing = next.facing; return true;
   }
   starve(id, at, selectedId = null) {
     const f = this.data.fishes[id], cells = this.fishCells(id); if (!f || cells.length < 2) return;

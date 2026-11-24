@@ -6,7 +6,7 @@ import { restoreCheckpoint } from '../www/lifecycle.js';
 const t = Date.now() - 10000;
 const cell = (x, y, ch = 'o') => ({ x, y, ch, color: '#8be7df' });
 function fish(world, cells = [cell(0, 0), cell(1, 0)], actor = 'alice') {
-  const id = crypto.randomUUID(); assert(world.apply({ id, actor, t, kind: 'fish', x: 20, y: 20, cells, cost: cells.length }).ok); return id;
+  const id = crypto.randomUUID(); assert(world.apply({ id, actor, t, kind: 'fish', x: 20 + Object.keys(world.data.fishes).length * 16, y: 20, cells, cost: cells.length }).ok); return id;
 }
 function food(world, x, y) {
   const id = crypto.randomUUID(); assert(world.apply({ id, actor: 'giver', t, kind: 'food', x, y: 0, ch: '口', color: '#ff9933', cost: 1 }).ok); world.data.chars[id].y = y; return id;
