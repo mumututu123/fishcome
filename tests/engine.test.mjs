@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { World, EYES, CONFIG, components, validateDrawing, velocities, canSee, touching, cellPosition, validGlyph, chooseClaim, exteriorContour } from './empty-world.mjs';
+import { World, EYES, CONFIG, components, validateDrawing, velocities, canSee, touching, cellPosition, validGlyph, chooseClaim, exteriorContour, hash } from './empty-world.mjs';
 const t = Date.now() - 10000;
 const cell = (x, y, ch = 'o') => ({ x, y, ch, color: '#8be7df' });
 const op = (kind, values = {}, actor = 'alice') => ({ id: crypto.randomUUID(), actor, nick: 'a＊＊e', t, kind, cost: 0, ...values });
@@ -8,7 +8,35 @@ const fish = (w, cells, x = 30, y = 20, actor = 'alice') => { const p = op('fish
 test('中文、扩展汉字与 ASCII 每格一个鱼元；眼睛只有六种', () => { for (const ch of ['鱼', '口', '。', '𠮷', '/', 'Q', '.']) assert.equal(validGlyph(ch), true, ch); for (const ch of ['你好', '', ' ', '🐟']) assert.equal(validGlyph(ch), false); assert.deepEqual([...EYES], ['0', 'O', 'o', '。', '.', '口']); assert.equal(EYES.has('8'), false); assert.equal(EYES.has('Q'), false); });
 test('创建需八方向整体连通，鱼最多十五字，中文按格计费', () => { assert.equal(components([cell(0, 0), cell(1, 1)]).length, 1); assert.equal(validateDrawing([cell(0, 0), cell(1, 1)], 'fish', 2), ''); assert.match(validateDrawing([cell(0, 0), cell(1, 0), cell(5, 0), cell(6, 0)], 'fish'), /整体/); assert.match(validateDrawing(Array.from({ length: 16 }, (_, i) => cell(i % 8, Math.floor(i / 8))), 'fish'), /15/); assert.match(validateDrawing([cell(0, 0)], 'scene'), /两个/); const w = new World(t); fish(w, [cell(0, 0, '鱼'), cell(1, 0, '口')]); assert.equal(w.wallet('alice'), 18); });
 test('鱼的外接宽高除以总鱼元数，斜线有双向优势', () => { assert.deepEqual(velocities([cell(0, 0), cell(1, 1)]), { x: 2, y: 2 }); assert.deepEqual(velocities([cell(0, 0), cell(1, 0)]), { x: 2, y: 1 }); });
-test('每个眼睛独立视野，浅水十格、深水五格，盲鱼不能追', () => { const f = { x: 0, y: 0, facing: 1 }; assert.equal(canSee(f, [cell(0, 0, 'Q')], { x: 1, y: 1 }), false); assert.equal(canSee(f, [cell(0, 0)], { x: 10, y: 10 }), true); assert.equal(canSee(f, [cell(0, 0)], { x: 11, y: 0 }), false); const deep = { ...f, y: 80 }; assert.equal(canSee(deep, [cell(0, 0)], { x: 5, y: 85 }), true); assert.equal(canSee(deep, [cell(0, 0)], { x: 6, y: 80 }), false); assert.equal(canSee(f, [cell(0, 0), cell(10, 0)], { x: 20, y: 0 }), true); });
+test('每只眼睛浅水二十格、深水十格，包含边界和斜角，按眼睛所在深度划分且盲鱼不能追', () => {
+  const f = { x: 40, y: 20, facing: 1 };
+  assert.equal(canSee(f, [cell(0, 0, 'Q')], { x: 41, y: 21 }), false);
+  for (const [y, radius] of [[20, 20], [59, 20], [60, 10], [80, 10]]) {
+    const fish = { ...f, y };
+    assert(canSee(fish, [cell(0, 0)], { x: 40 + radius, y: y - radius }));
+    assert.equal(canSee(fish, [cell(0, 0)], { x: 41 + radius, y }), false);
+    assert.equal(canSee(fish, [cell(0, 0)], { x: 40, y: y - radius - 1 }), false);
+  }
+  assert(canSee(f, [cell(0, 0), cell(10, 0)], { x: 70, y: 20 }));
+  assert.equal(canSee({ ...f, y: 59 }, [cell(0, 1)], { x: 55, y: 60 }), false);
+  assert(canSee({ x: 995, y: 20, facing: 1 }, [cell(0, 0)], { x: 15, y: 20 }));
+});
+
+test('实际觅食覆盖扩大的分桶范围，浅水20格、深水10格及左右接缝不会漏食', () => {
+  for (const [x, y, dx, dy] of [[49, 20, 20, 0], [49, 40, -20, 0], [49, 25, 0, 20], [49, 45, 0, -20], [49, 25, 20, 20], [49, 65, 10, 0], [995, 20, 20, 0], [5, 20, -20, 0]]) {
+    const world = new World(t), targetX = (x + dx + 1000) % 1000;
+    let id, random;
+    do { id = crypto.randomUUID(); const r = hash(`${id}:0`); random = { x: [-1, 0, 1][r % 3], y: [-1, 0, 1][Math.floor(r / 3) % 3] }; } while (random.x === (dx > 0 ? 1 : -1) && random.y === Math.sign(dy));
+    assert(world.apply({ ...op('fish', { cells: [cell(0, 0), cell(1, 0, '鱼')], x, y, cost: 2 }), id }).ok);
+    const food = op('food', { x: targetX, y: 0, ch: '食', color: '#ffffff', cost: 1 }, 'feeder'); assert(world.apply(food).ok); world.data.chars[food.id].y = y + dy;
+    world.data.fishes[id].cx = world.data.fishes[id].cy = 1;
+    world.step(t + 500);
+    // A left turn moves the two-cell body's anchor one cell right before swimming left.
+    assert.equal(world.data.fishes[id].x, (x + (dx > 0 ? 1 : 0)) % 1000, `${x},${y}朝${dx},${dy}`);
+    assert.equal(world.data.fishes[id].facing, dx > 0 ? 1 : -1);
+    assert.equal(world.data.fishes[id].y, y + Math.sign(dy), `${x},${y}朝${dx},${dy}`);
+  }
+});
 test('接触包含对角，盲鱼可被动吃食，原色原字成为原位新部分', () => { const w = new World(t), id = fish(w, [cell(0, 0, 'Q'), cell(1, 0, '8')], 20, 2); const food = op('food', { ch: '口', color: '#ff9933', x: 19, y: 0, cost: 1 }, 'bob'); assert.equal(w.apply(food).ok, true); w.data.chars[food.id].y = 1; w.step(t + 500); const c = w.data.chars[food.id]; assert.equal(c.kind, 'fish'); assert.equal(c.entity, id); assert.equal(c.ch, '口'); assert.equal(c.color, '#ff9933'); assert.equal(w.fishCells(id).length, 3); assert.equal(w.wallet('alice'), 18); assert.equal(w.wallet('bob'), 19); });
 test('同时接触同一颗鱼食，大鱼唯一胜出', () => { const w = new World(t); const small = fish(w, [cell(0, 0, 'x'), cell(1, 0, 'x')], 20, 2, 's'); const big = fish(w, [cell(0, 0, 'x'), cell(1, 0, 'x'), cell(2, 0, 'x')], 17, 2, 'b'); const food = op('food', { ch: '.', color: '#ffeeaa', x: 20, y: 0, cost: 1 }, 'giver'); w.apply(food); w.data.chars[food.id].y = 1; for (const f of Object.values(w.data.fishes)) { f.cx = -10; f.cy = -10; } w.step(t + 500); assert.equal(w.data.chars[food.id].entity, big); assert.equal(w.fishCells(small).length, 2); assert.equal(w.fishCells(big).length, 4); });
 test('24小时丢掉桥接字，只留最大块，其余逐字为鱼食且无退款', () => { const w = new World(t), id = fish(w, [cell(0, 0), cell(1, 0), cell(2, 0, '-'), cell(3, 0), cell(4, 0), cell(5, 0)], 20, 20); const middle = w.fishCells(id).find(c => c.x === 2); w.starve(id, t + CONFIG.hunger, middle.id); assert.equal(w.fishCells(id).length, 3); assert.equal(w.data.chars[middle.id].kind, 'burn'); assert.equal(Object.values(w.data.chars).filter(c => c.kind === 'food').length, 2); assert.equal(w.wallet('alice'), 14); });

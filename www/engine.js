@@ -7,7 +7,7 @@ import { fishNameError } from './fish-profile.js';
 import { REFERRAL_REWARD, referralError, chooseReferral } from './referral.js';
 import { WORLD_WIDTH, MAX_FLOOR, wrapX, worldKey, deltaX, nearX, makeTerrain, terrainOf, validTerrain, chooseTerrain, floorAt, waterAt } from './geography.js';
 import { fishOrigin, activeBreeding, finishBreeding, updateContacts, motionUnits, commitUnit, mergeBreeding, normalizeBreeding, normalizeBirthCells } from './breeding.js';
-export const CONFIG = Object.freeze({ width: WORLD_WIDTH, depth: MAX_FLOOR + 1, shallow: 60, step: 500, speed: 2, foodLife: 300000, hunger: 86400000, initial: 20, offlineLife: 240 * 60 * 60 * 1000 });
+export const CONFIG = Object.freeze({ width: WORLD_WIDTH, depth: MAX_FLOOR + 1, shallow: 60, sightShallow: 20, sightDeep: 10, step: 500, speed: 2, foodLife: 300000, hunger: 86400000, initial: 20, offlineLife: 240 * 60 * 60 * 1000 });
 export const MONUMENT = { x: 610, y: CONFIG.depth - 5, rows: ['  ____  ', ' /记忆\\ ', ' | 口 | ', ' |____| ', '________'] };
 export const EYES = new Set(['0', 'O', 'o', '。', '.', '口']);
 export const NEIGHBORS = [-1, 0, 1].flatMap(x => [-1, 0, 1].map(y => [x, y])).filter(([x, y]) => x || y);
@@ -46,7 +46,8 @@ export function validateDrawing(cells, kind, balance = Infinity) {
 }
 export function cellPosition(fish, cell) { return { x: fish.x + fish.facing * cell.x, y: fish.y + cell.y }; }
 export function velocities(cells) { const b = bounds(cells); return { x: CONFIG.speed * b.width / Math.max(1, cells.length), y: CONFIG.speed * b.height / Math.max(1, cells.length) }; }
-export function canSee(fish, cells, food) { return cells.some(c => { if (!EYES.has(c.ch)) return false; const p = cellPosition(fish, c), r = p.y < CONFIG.shallow ? 10 : 5; return Math.max(Math.abs(deltaX(food.x, p.x)), Math.abs(p.y - food.y)) <= r; }); }
+export const sightRadius = depth => depth < CONFIG.shallow ? CONFIG.sightShallow : CONFIG.sightDeep;
+export function canSee(fish, cells, food) { return cells.some(c => { if (!EYES.has(c.ch)) return false; const p = cellPosition(fish, c); return Math.max(Math.abs(deltaX(food.x, p.x)), Math.abs(p.y - food.y)) <= sightRadius(p.y); }); }
 export function touching(fish, cells, food, scenery = new Map()) { return cells.some(c => { const p = cellPosition(fish, c), dx = Math.abs(deltaX(food.x, p.x)), dy = Math.abs(p.y - food.y); return dx <= 1 && dy <= 1 && (dx || dy) && !(dx && dy && (scenery.has(key(p.x, food.y)) || scenery.has(key(food.x, p.y)))); }); }
 export function displayNick(value) { return typeof value === 'string' ? value.trim() : ''; }
 export const maskNick = displayNick; // Old test fixtures and saved tools can keep importing this alias.
@@ -282,7 +283,14 @@ export class World {
     for (const unit of motionUnits(this, groups).sort((a, b) => a.id.localeCompare(b.id))) {
       const { id, cells, fish: f } = unit; if (!cells.length) continue;
       if (unit.members.some(member => waitingToEat.has(member.id))) { commitUnit(unit, now); continue; }
-      const found = new Map(); for (const eye of cells) if (EYES.has(eye.ch)) { const p = cellPosition(f, eye), r = p.y < CONFIG.shallow ? 10 : 5, bx = Math.floor(wrapX(p.x) / 10), by = Math.floor(p.y / 10); for (const [dx, dy] of [[0, 0], ...NEIGHBORS]) for (const food of bins.get(key((bx + dx + CONFIG.width / 10) % (CONFIG.width / 10), by + dy)) || []) if (Math.max(Math.abs(deltaX(food.x, p.x)), Math.abs(food.y - p.y)) <= r) found.set(food.id, food); } const visible = [...found.values()];
+      const found = new Map();
+      for (const eye of cells) if (EYES.has(eye.ch)) {
+        const p = cellPosition(f, eye), r = sightRadius(p.y), binWidth = CONFIG.width / 10;
+        for (let bx = Math.floor((p.x - r) / 10); bx <= Math.floor((p.x + r) / 10); bx++) for (let by = Math.floor((p.y - r) / 10); by <= Math.floor((p.y + r) / 10); by++) {
+          for (const food of bins.get(key((bx % binWidth + binWidth) % binWidth, by)) || []) if (Math.max(Math.abs(deltaX(food.x, p.x)), Math.abs(food.y - p.y)) <= r) found.set(food.id, food);
+        }
+      }
+      const visible = [...found.values()];
       const center = bounds(cells), midX = f.x + f.facing * (center.minX + center.maxX) / 2, midY = f.y + (center.minY + center.maxY) / 2;
       visible.sort((a, b) => (Math.abs(deltaX(a.x, midX)) + Math.abs(a.y - midY)) - (Math.abs(deltaX(b.x, midX)) + Math.abs(b.y - midY)) || a.id.localeCompare(b.id));
       let dx, dy; if (visible.length) { dx = Math.sign(deltaX(visible[0].x, midX)); dy = Math.sign(visible[0].y - midY); }

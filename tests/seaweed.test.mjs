@@ -72,9 +72,9 @@ test('顶端长出连续草茎，短海草不摆动，三字以上根部固定�
   const tip = Object.values(growth.data.chars).find(c => c.wild?.source === `tip:${existing[0].id}`);
   assert(tip); assert.equal(tip.entity, existing[0].entity); assert.equal(tip.wild.index, 1); assert.equal(tip.y, existing[0].y - 1);
 });
-test('鱼眼海草视距与食物一致，浅水10格、深水5格，盲鱼只能碰到后吃', () => {
+test('鱼眼海草视距与食物一致，浅水20格、深水10格，盲鱼只能碰到后吃', () => {
   for (const y of [20, 80]) {
-    const fish = { x: 20, y, facing: 1 }, radius = y < CONFIG.shallow ? 10 : 5;
+    const fish = { x: 20, y, facing: 1 }, radius = y < CONFIG.shallow ? 20 : 10;
     for (const distance of [radius, radius + 1]) assert.equal(canSee(fish, [glyph(0, 0)], { x: 20 + distance, y, kind: 'seaweed' }), distance === radius);
     assert.equal(canSee(fish, [glyph(0, 0, 'Q')], { x: 21, y, kind: 'seaweed' }), false);
   }
