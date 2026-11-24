@@ -19,7 +19,7 @@ async function main() {
   const page = await browser.newPage({ viewport: { width: 1440, height: 900 } }); page.on('pageerror', e => errors.push(e.message));
   await page.goto(origin); await page.locator('#nickInput').fill('键盘测试'); await page.locator('#welcomeForm .primary').click(); await page.waitForFunction(() => window.tide);
   const input = page.locator('#gridCellInput'), count = page.locator('#drawingCount');
-  async function cell(x, y) { assert.equal(await input.getAttribute('aria-label'), `字符画板第 ${y + 1} 行，第 ${x + 1} 列`); }
+  async function cell(x, y) { assert.equal(await input.getAttribute('aria-label'), `鱼元画板第 ${y + 1} 行，第 ${x + 1} 列`); }
   async function glyph(x, y, ch, color) {
     assert(await page.locator('#gridCanvas').evaluate((canvas, { x, y, ch, color }) => {
       const ctx = canvas.getContext('2d'), size = document.querySelector('#creatorTitle').textContent.includes('鱼') ? 15 : 20, s = 400 / size;

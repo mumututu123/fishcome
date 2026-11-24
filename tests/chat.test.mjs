@@ -45,7 +45,7 @@ test('240小时到期后聊天形成海底地形，下一轮聊天室清空且�
   assert.equal(new Set(cells.map(cell => `${cell.x},${cell.y}`)).size, 6);
   assert.equal(world.wallet('alice'), 20); assert.equal(world.data.scenes[CHAT_FLOOR].fixed, true);
 });
-test('同一轮的多个浏览器分别重开，沉积随机位置一致且合流不复制字符', () => {
+test('同一轮的多个浏览器分别重开，沉积随机位置一致且合流不复制鱼元', () => {
   const { checkpoint, world } = ended('一句话，留在下一片海里');
   const other = restoreCheckpoint(checkpoint, at + CONFIG.offlineLife).world;
   assert.deepEqual(world.data.chars, other.data.chars);

@@ -105,7 +105,7 @@ test('生长时钟、海草、随机绿色与进食来源跨存档、合流和�
   assert.deepEqual(restored.data.chars, saved.chars);
   for (const bad of [{ ...cells[0], ch: '鱼' }, { ...cells[0], payer: 'alice' }, { ...cells[0], color: '#ff0000' }, { ...cells[0], id: 'fake' }]) assert(!validWildCell(bad, CONFIG, hash));
 });
-test('不能通过投放、搬动或缩放造景覆盖海草，也不扣字符', () => {
+test('不能通过投放、搬动或缩放造景覆盖海草，也不扣鱼元', () => {
   const world = new World(now), weed = stem(world, 30)[0];
   const sceneId = crypto.randomUUID(); assert(world.apply({ id: sceneId, actor: 'builder', t: now, kind: 'scene', x: 32, y: 118, cells: [glyph(0, 0, '#'), glyph(0, 1, '#')], cost: 2 }).ok);
   const move = world.apply({ id: crypto.randomUUID(), actor: 'builder', t: now, kind: 'sceneMove', scene: sceneId, x: 30, y: 118, cost: 0 }); assert.equal(move.ok, false);

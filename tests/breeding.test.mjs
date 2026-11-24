@@ -43,7 +43,7 @@ test('合体游速按外接宽高和两鱼总字数计算，移动与水平翻�
   const reflected = world.fishCells(male).map(c => cellPosition(world.data.fishes[male], c));
   assert.deepEqual(reflected, initial.map(p => ({ x: 45 - p.x - 1, y: p.y + 1 })));
 });
-test('合体移动、转头检查两条鱼全部字符与扫过路径，碰墙不移动', () => {
+test('合体移动、转头检查两条鱼全部鱼元与扫过路径，碰墙不移动', () => {
   const { world } = pair(); bind(world); const unit = motionUnits(world, world.fishGroups())[0];
   assert(world.apply({ id: crypto.randomUUID(), actor: 'wall', t, kind: 'scene', x: 26, y: 20, cells: [cell(0, 0, '#'), cell(0, 1, '#')], cost: 2 }).ok);
   assert.equal(world.canOccupy({ ...unit.fish, x: unit.fish.x + 1 }, unit.cells), false);
@@ -62,7 +62,7 @@ test('繁殖期间两鱼正常进食，字色长在吃到的鱼上，合体仍�
   assert.equal(world.data.fishes[male].lastFed, t + 5500); assert.equal(world.data.fishes[female].lastFed, t + 5500);
   assert.equal(world.data.fishes[male].x - world.data.fishes[female].x, -3); assert.equal(world.fishStatus(male, t + 5500).meals24, 1);
 });
-test('1小时后只转移进入繁殖时的接触字符，父母各保留至少两个连通字符，小鱼补眼且不复制字符', () => {
+test('1小时后只转移进入繁殖时的接触鱼元，父母各保留至少两个连通鱼元，小鱼补眼且不复制鱼元', () => {
   const { world, male, female } = pair(), record = bind(world), ids = Object.keys(world.data.chars), positions = new Map(Object.values(world.data.chars).map(c => [c.id, cellPosition(world.data.fishes[c.entity], c)]));
   finishBreeding(world, record.ends - 1, transition); assert.equal(world.counts().fish, 2);
   finishBreeding(world, record.ends, transition); assert.equal(record.status, 'born'); assert.equal(world.counts().fish, 3); assert.deepEqual(Object.keys(world.data.chars), ids);
@@ -74,29 +74,29 @@ test('1小时后只转移进入繁殖时的接触字符，父母各保留至少�
   assert.equal(world.myFishes(baby.actor).some(f => f.id === baby.id), true); assert.equal(world.fishStatus(baby.id, record.ends).meals24, 0);
   finishBreeding(world, record.ends + 500, transition); assert.equal(world.counts().fish, 3);
 });
-test('归属优先继承字符数量，再比较分裂后的父母字数，最后稳定随机', () => {
+test('归属优先继承鱼元数量，再比较分裂后的父母字数，最后稳定随机', () => {
   const { world, female } = pair(undefined, [0, 1, 2, 3, 4].map(y => cell(0, y)), 23, 19), record = bind(world);
   finishBreeding(world, record.ends, transition); assert.equal(record.baby.fatherCount, 1); assert.equal(record.baby.motherCount, 3); assert.equal(record.baby.owner, female); assert.equal(record.baby.actor, 'female'); assert(validBreedingRecord(record, world.data));
   const largeFather = pair([0, 1, 2, 3, 4].map(x => cell(x, 0)), undefined, 25, 20), second = bind(largeFather.world); finishBreeding(largeFather.world, second.ends, transition); assert.equal(second.baby.owner, largeFather.male);
   assert.equal(chooseOwner(record, 1, 2, 10, 2), record.female);
   const chosen = chooseOwner(record, 2, 2, 4, 4); assert([record.male, record.female].includes(chosen)); assert.equal(chooseOwner(clone(record), 2, 2, 4, 4), chosen);
 });
-test('出生后父母过小、父母断裂或小鱼不连通时取消出生，字符不减少', () => {
+test('出生后父母过小、父母断裂或小鱼不连通时取消出生，鱼元不减少', () => {
   const cases = [pair([cell(0, 0), cell(1, 0)], [cell(0, 0), cell(1, 0)], 22, 20), pair([0, 1, 2, 3, 4].map(x => cell(x, 0)), [0, 1, 2].map(y => cell(0, y)), 22, 17), pair([0, 1, 2, 3, 4, 5, 6].map(x => cell(x, 0)), [cell(0, 0), cell(6, 0), ...[0, 1, 2, 3, 4, 5, 6].map(x => cell(x, 1))], 20, 21)];
   for (const { world } of cases) { const record = bind(world); assert(record); const before = clone(world.data.chars); finishBreeding(world, record.ends, transition); assert.equal(record.status, 'cancelled'); assert.equal(world.counts().fish, 2); assert.deepEqual(world.data.chars, before); }
 });
-test('繁殖期间亲鱼消失取消绑定，饥饿丢失接触字符时不转移其他字符替代', () => {
+test('繁殖期间亲鱼消失取消绑定，饥饿丢失接触鱼元时不转移其他鱼元替代', () => {
   const { world, male } = pair(), record = bind(world); delete world.data.fishes[male]; finishBreeding(world, t + 6000, transition); assert.equal(record.reason, 'parent-gone');
   const second = pair(), attempt = bind(second.world), removed = attempt.contact.male[0]; second.world.starve(second.male, t + 6000, removed); finishBreeding(second.world, attempt.ends, transition); assert.equal(attempt.status, 'cancelled'); assert.equal(second.world.data.chars[removed].kind, 'burn');
 });
-test('繁殖状态、出生归属、字符和运动记录跨存档与合流保存，旧快照不复活孕期或重复出生', () => {
+test('繁殖状态、出生归属、鱼元和运动记录跨存档与合流保存，旧快照不复活孕期或重复出生', () => {
   const { world } = pair(), record = bind(world), active = world.serialize();
   const restored = restoreCheckpoint({ world: active, at: t + 5000, lastOnlineAt: t + 5000 }, t + 6000).world; assert(restored.breedingState(record.male));
   finishBreeding(restored, record.ends, transition); const born = restored.serialize(), peer = new World(t); peer.merge(born); peer.merge(active); peer.merge(born);
   assert.equal(peer.counts().fish, 3); assert.equal(peer.data.breeding[record.id].status, 'born'); assert.equal(peer.breedingState(record.male), undefined); assert.equal(peer.fishCells(born.breeding[record.id].baby.id).length, 2);
   assert.equal(peer.data.travel[born.breeding[record.id].baby.id].since, record.ends);
 });
-test('出生记录与眼睛转换必须可追溯，伪造归属、性别或字符转换被拒绝', () => {
+test('出生记录与眼睛转换必须可追溯，伪造归属、性别或鱼元转换被拒绝', () => {
   const { world } = pair(), record = bind(world); finishBreeding(world, record.ends, transition);
   for (const mutate of [r => r.baby.actor = 'intruder', r => r.baby.gender = r.baby.gender === 'male' ? 'female' : 'male', r => r.baby.cells[0].after = '#', r => r.ends--, r => r.pose.male.x++]) { const bad = clone(record); mutate(bad); assert.equal(validBreedingRecord(bad, { ...world.data, breeding: { [bad.id]: bad } }), false); }
   const born = world.fishCells(record.baby.id)[0], bad = clone(born); bad.path.at(-1).before = '#'; assert.equal(inheritedGlyph(bad, 'Q', world.data), null);

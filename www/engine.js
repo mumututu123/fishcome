@@ -32,12 +32,12 @@ export function exteriorContour(cells) {
 }
 export function validateDrawing(cells, kind, balance = Infinity) {
   const size = kind === 'fish' ? 15 : 20;
-  if (!Array.isArray(cells) || cells.length < 2) return '至少需要两个相连的字符';
-  if (kind === 'fish' && cells.length > 15) return '创建鱼最多使用 15 个字符';
-  if (cells.length > balance) return '字符余额不足';
-  if (cells.some(c => !Number.isInteger(c.x) || !Number.isInteger(c.y) || c.x < 0 || c.y < 0 || c.x >= size || c.y >= size || !validGlyph(c.ch) || !/^#[0-9a-f]{6}$/i.test(c.color))) return '每格只能有一个中文或 ASCII 字符及有效颜色';
-  if (new Set(cells.map(c => key(c.x, c.y))).size !== cells.length) return '字符位置不能重复';
-  if (components(cells).length !== 1) return '所有字符必须八方向连成一个整体';
+  if (!Array.isArray(cells) || cells.length < 2) return '至少需要两个相连的鱼元';
+  if (kind === 'fish' && cells.length > 15) return '创建鱼最多使用 15 个鱼元';
+  if (cells.length > balance) return '鱼元余额不足';
+  if (cells.some(c => !Number.isInteger(c.x) || !Number.isInteger(c.y) || c.x < 0 || c.y < 0 || c.x >= size || c.y >= size || !validGlyph(c.ch) || !/^#[0-9a-f]{6}$/i.test(c.color))) return '每格只能有一个中文或 ASCII 鱼元及有效颜色';
+  if (new Set(cells.map(c => key(c.x, c.y))).size !== cells.length) return '鱼元位置不能重复';
+  if (components(cells).length !== 1) return '所有鱼元必须八方向连成一个整体';
   return '';
 }
 export function cellPosition(fish, cell) { return { x: fish.x + fish.facing * cell.x, y: fish.y + cell.y }; }
@@ -170,8 +170,8 @@ export class World {
     if (!op || typeof op.id !== 'string' || typeof op.actor !== 'string' || !Number.isFinite(op.t) || !['fish', 'scene', 'food', 'sceneMove', 'sceneDelete', 'sceneRotate', 'sceneScale', 'sceneEdit', 'earn', 'referral'].includes(op.kind)) return '不支持的操作';
     if (op.t > Date.now() + 60000) return '操作时间无效';
     if (!['earn', 'referral'].includes(op.kind) && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(op.id)) return '操作标识无效';
-    if (!Number.isInteger(op.cost) || op.cost < 0 || (!['fish', 'scene', 'food', 'sceneScale'].includes(op.kind) && op.cost !== 0)) return '字符费用无效';
-    if (['fish', 'scene'].includes(op.kind)) { const e = validateDrawing(op.cells, op.kind); if (e) return e; if (op.cost !== op.cells.length) return '字符费用不一致'; }
+    if (!Number.isInteger(op.cost) || op.cost < 0 || (!['fish', 'scene', 'food', 'sceneScale'].includes(op.kind) && op.cost !== 0)) return '鱼元费用无效';
+    if (['fish', 'scene'].includes(op.kind)) { const e = validateDrawing(op.cells, op.kind); if (e) return e; if (op.cost !== op.cells.length) return '鱼元费用不一致'; }
     if (op.kind === 'fish' && op.gender !== undefined && !['male', 'female'].includes(op.gender)) return '鱼的性别无效';
     if (op.kind === 'fish' && fishNameError(op.name, op.cells.length)) return fishNameError(op.name, op.cells.length);
     if (op.kind === 'food' && (!validGlyph(op.ch) || !/^#[0-9a-f]{6}$/i.test(op.color) || op.cost !== 1 || op.y !== 0)) return '鱼食只能从水面投放';
@@ -182,7 +182,7 @@ export class World {
   apply(op) {
     if (this.data.ops[op.id]) { if (op.kind === 'referral' && this.data.ops[op.id].kind === 'referral') { const invalid = this.validOp(op); if (invalid) return { ok: false, error: invalid }; this.data.ops[op.id] = clone(chooseReferral(this.data.ops[op.id], op)); } return { ok: true, duplicate: true }; }
     const invalid = this.validOp(op); if (invalid) return { ok: false, error: invalid };
-    if (op.cost > 0 && op.cost > this.wallet(op.actor)) return { ok: false, error: '字符余额不足，合并超支需由在线奖励抵扣' };
+    if (op.cost > 0 && op.cost > this.wallet(op.actor)) return { ok: false, error: '鱼元余额不足，合并超支需由在线奖励抵扣' };
     const scenery = this.sceneryMap(), fishMap = this.fishMap(), seaweedMap = new Set(Object.values(this.data.chars).filter(c => c.kind === 'seaweed').map(c => key(c.x, c.y)));
     if (['fish', 'scene', 'food'].includes(op.kind) && (!Number.isInteger(op.x) || op.x < 0 || op.x >= CONFIG.width || !Number.isInteger(op.y))) return { ok: false, error: '投放位置无效' };
     if (op.kind === 'fish') {
@@ -208,7 +208,7 @@ export class World {
         if (cells.some(c => op.x + c.x < 0 || op.x + c.x >= CONFIG.width || op.y + c.y < 0 || op.y + c.y >= CONFIG.depth || fishMap.has(key(op.x + c.x, op.y + c.y)) || seaweedMap.has(key(op.x + c.x, op.y + c.y)) || (scenery.has(key(op.x + c.x, op.y + c.y)) && scenery.get(key(op.x + c.x, op.y + c.y)).scene.id !== s.id))) return { ok: false, error: '这里会覆盖鱼、海草或其他造景' };
         Object.assign(s, { x: op.x, y: op.y, posAt: op.t, poseId: op.id });
       } else if (op.kind === 'sceneEdit') {
-        const c = this.data.chars[op.cell]; if (!c || c.entity !== s.id || c.kind !== 'scene' || !validGlyph(op.ch) || !/^#[0-9a-f]{6}$/i.test(op.color)) return { ok: false, error: '字符无效' }; Object.assign(c, { ch: op.ch, color: op.color, editAt: op.t });
+        const c = this.data.chars[op.cell]; if (!c || c.entity !== s.id || c.kind !== 'scene' || !validGlyph(op.ch) || !/^#[0-9a-f]{6}$/i.test(op.color)) return { ok: false, error: '鱼元无效' }; Object.assign(c, { ch: op.ch, color: op.color, editAt: op.t });
       } else {
         const b = bounds(cells), next = [];
         if (op.kind === 'sceneRotate') for (const c of cells) next.push({ c, x: b.minX + b.maxY - c.y, y: b.minY + c.x - b.minX });

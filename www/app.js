@@ -38,9 +38,9 @@ function pendingCost() { return [...pending.values()].reduce((n, p) => n + (p.co
 function balance() { return identity ? world.wallet(identity.actor) - pendingCost() : 20; }
 function update() {
   if (!identity) return; const count = world.counts(); $('online').textContent = new Set(active().map(m => m.actor)).size || 1; $('fishCount').textContent = count.fish; $('sceneCount').textContent = count.scene; $('balance').textContent = balance();
-  const remain = Math.max(0, 3600 - Math.floor(identity.remainder || 0)); $('hourProgress').textContent = `下一字符 ${String(Math.floor(remain / 60)).padStart(2, '0')}:${String(remain % 60).padStart(2, '0')}`;
+  const remain = Math.max(0, 3600 - Math.floor(identity.remainder || 0)); $('hourProgress').textContent = `下一鱼元 ${String(Math.floor(remain / 60)).padStart(2, '0')}:${String(remain % 60).padStart(2, '0')}`;
   $('worldLabel').textContent = world.roots.length > 1 ? `合流之海 · ${world.roots.length} 个起源` : '新生的海'; $('networkStatus').textContent = status || (network.live().length ? `伙伴已接入 · 世界由浏览器共同维持` : '独自在线，也可以开始创作');
-  if (world.data.pendingChatGlyphs) $('networkStatus').textContent += ` · ${world.data.pendingChatGlyphs} 个聊天字符等待海底空位`;
+  if (world.data.pendingChatGlyphs) $('networkStatus').textContent += ` · ${world.data.pendingChatGlyphs} 个聊天鱼元等待海底空位`;
   $('depthLabel').textContent = `水深 ${Math.max(0, Math.round(renderer.camera.y))} 格 · ${renderer.camera.y < CONFIG.shallow ? '浅水区' : '深水区'}`; $('zoomLabel').textContent = Math.round(renderer.scale * 100) + '%';
   $('networkDetails').textContent = `直连邻居 ${network.live().length}/8 · 已收 ${(network.stats.received / 1024).toFixed(0)} KB · 已发 ${(network.stats.sent / 1024).toFixed(0)} KB`;
   if ($('foodDialog').open) updateFoodBrush();
@@ -75,8 +75,8 @@ async function verifyReplica(data) {
   for (const [id, record] of Object.entries(data.travel || {})) { const source = fishOrigin(sources, id); if (!validTravel(record) || !source || record.since < source.created || record.since > Date.now() + 60000) throw new Error('鱼运动记录缺少合法来源'); }
   const sourceGlyphs = new Map();
   for (const [id, c] of Object.entries(data.chars)) {
-    if (id !== c.id) throw new Error('字符身份重复或被篡改');
-    if ((!c.chat && !validGlyph(c.ch)) || !/^#[0-9a-f]{6}$/i.test(c.color) || !Number.isInteger(c.x) || !Number.isInteger(c.y) || !Array.isArray(c.path) || c.path.length > 1024 || !['fish', 'scene', 'food', 'burn', 'seaweed'].includes(c.kind)) throw new Error('世界字符无效');
+    if (id !== c.id) throw new Error('鱼元身份重复或被篡改');
+    if ((!c.chat && !validGlyph(c.ch)) || !/^#[0-9a-f]{6}$/i.test(c.color) || !Number.isInteger(c.x) || !Number.isInteger(c.y) || !Array.isArray(c.path) || c.path.length > 1024 || !['fish', 'scene', 'food', 'burn', 'seaweed'].includes(c.kind)) throw new Error('世界鱼元无效');
     if (c.chat) {
       const message = data.chatSources?.[c.chat] || world.data.chatSources[c.chat], floor = data.scenes[CHAT_FLOOR] || world.data.scenes[CHAT_FLOOR];
       if (message && !sourceGlyphs.has(c.chat)) sourceGlyphs.set(c.chat, new Map(chatGlyphs(message.body.text).map(glyph => [glyph.index, glyph.ch])));
@@ -89,8 +89,8 @@ async function verifyReplica(data) {
     }
     const source = data.ops[c.id.slice(0, 36)] || world.data.ops[c.id.slice(0, 36)], index = +c.id.slice(37);
     const initial = source?.kind === 'food' && c.id === source.id ? source : ['fish', 'scene'].includes(source?.kind) ? source.cells[index] : source?.kind === 'sceneScale' && source.factor === 2 && Number.isInteger(index) && index >= 0 && index < source.cost * 4 / 3 && index % 4 !== 0 ? c : null;
-    if (!initial || source.actor !== c.payer) throw new Error('字符缺少合法消费凭据');
-    if (c.kind === 'fish' || c.kind === 'food') { if (!['food', 'fish'].includes(source.kind) || inheritedGlyph(c, initial.ch, sources) !== c.ch || initial.color !== c.color) throw new Error('鱼字符只能由合法创建与生态流转生成'); if (c.kind === 'fish' && !c.path.length && (c.entity !== source.id || c.x !== initial.x || c.y !== initial.y)) throw new Error('禁止人工重排已投放的鱼'); }
+    if (!initial || source.actor !== c.payer) throw new Error('鱼元缺少合法消费凭据');
+    if (c.kind === 'fish' || c.kind === 'food') { if (!['food', 'fish'].includes(source.kind) || inheritedGlyph(c, initial.ch, sources) !== c.ch || initial.color !== c.color) throw new Error('鱼鱼元只能由合法创建与生态流转生成'); if (c.kind === 'fish' && !c.path.length && (c.entity !== source.id || c.x !== initial.x || c.y !== initial.y)) throw new Error('禁止人工重排已投放的鱼'); }
   }
 }
 async function mergeReplica(data) {
@@ -213,24 +213,24 @@ async function broadcastWorld() {
 async function submit(payload) {
   if (started) resumeAfterInactivity();
   if (!identity) return; const op = { id: payload.kind === 'earn' ? `${identity.actor}:hour:${payload.serial}` : crypto.randomUUID(), actor: identity.actor, nick: maskNick(identity.nick), t: Date.now(), roots: [world.id], cost: 0, ...payload };
-  if (op.cost > 0 && op.cost > balance()) { toast('字符余额不足'); return; } pending.set(op.id, op); update();
+  if (op.cost > 0 && op.cost > balance()) { toast('鱼元余额不足'); return; } pending.set(op.id, op); update();
   try { const message = await network.broadcast('op', op); if (rejectedOps.has(op.id)) { pending.delete(op.id); update(); return; } inbox.set(op.id, clone(message)); if (amLeader()) { const result = world.apply({ ...clone(op), proof: message }); pending.delete(op.id); if (!result.ok) { rejectOperation(op.id); toast(result.error); } else await save(); await broadcastWorld(); } else { setTimeout(() => { if (pending.has(op.id)) toast('这次投放仍在等待确认，连接恢复后同步'); }, 12000); } } catch (e) { pending.delete(op.id); toast(e.message); } update();
 }
 function cancelMode() { mode = null; renderer.preview = null; $('modeBanner').hidden = true; $('sea').style.cursor = 'grab'; }
 function stopObserving() { selected = null; trackedFish = null; renderer.selected = null; renderer.observedFish = null; $('inspector').hidden = true; }
 function surfaceCamera() { const size = renderer.cell * renderer.scale; renderer.camera.y = (renderer.height / 2 - renderer.height * .27 + size / 2) / size; }
-function placement(kind, cells, gender, name) { trackedFish = null; mode = { kind, cells, ...(kind === 'fish' ? { gender, name } : {}) }; $('modeBanner').textContent = `在空水域点击投放${kind === 'fish' ? '「' + name + '」' : '造景'} · 消耗 ${cells.length} 字符 · Esc 取消`; $('modeBanner').hidden = false; $('sea').style.cursor = 'crosshair'; }
+function placement(kind, cells, gender, name) { trackedFish = null; mode = { kind, cells, ...(kind === 'fish' ? { gender, name } : {}) }; $('modeBanner').textContent = `在空水域点击投放${kind === 'fish' ? '「' + name + '」' : '造景'} · 消耗 ${cells.length} 鱼元 · Esc 取消`; $('modeBanner').hidden = false; $('sea').style.cursor = 'crosshair'; }
 function updateFoodBrush() {
   const ch = $('foodGlyphInput').value, valid = validGlyph(ch);
-  $('foodGlyphInput').setCustomValidity(valid ? '' : '请输入一个中文、中文标点或 ASCII 字符，不能是空格');
+  $('foodGlyphInput').setCustomValidity(valid ? '' : '请输入一个中文、中文标点或 ASCII 鱼元，不能是空格');
   $('foodPreview').textContent = valid ? ch : '';
   $('foodPreview').style.color = $('foodColorInput').value;
-  $('foodValidation').textContent = valid ? '从水面投放，吃到的鱼会保留这个字和颜色。' : '请输入一个中文、中文标点或 ASCII 字符，不能是空格。';
+  $('foodValidation').textContent = valid ? '从水面投放，吃到的鱼会保留这个字和颜色。' : '请输入一个中文、中文标点或 ASCII 鱼元，不能是空格。';
   $('foodValidation').style.color = valid ? '' : '#e9ac9e';
-  $('foodCost').textContent = `每颗 1 字符 · 当前余额 ${balance()}`;
+  $('foodCost').textContent = `每颗 1 鱼元 · 当前余额 ${balance()}`;
   $('placeFood').disabled = !valid || balance() < 1;
 }
-function feedMode() { if (!identity) return; resumeAfterInactivity(); if (balance() < 1) { toast('投食需要 1 字符余额'); return; } stopObserving(); cancelMode(); updateFoodBrush(); $('foodDialog').showModal(); }
+function feedMode() { if (!identity) return; resumeAfterInactivity(); if (balance() < 1) { toast('投食需要 1 鱼元余额'); return; } stopObserving(); cancelMode(); updateFoodBrush(); $('foodDialog').showModal(); }
 function observationRect() {
   const tools = document.querySelector('.tools').getBoundingClientRect(), inspector = $('inspector').getBoundingClientRect();
   if (innerWidth <= 700) return { left: tools.right + 12, right: innerWidth - 16, top: Math.max(120, inspector.bottom + 16), bottom: innerHeight - 100 };
@@ -277,7 +277,7 @@ function renderMyFishes() {
     const entry = myFishCards.get(fish.id), cells = groups.get(fish.id) || [], status = world.fishStatus(fish.id, now);
     entry.title.textContent = displayFishName(catalog.get(fish.id), identity); renderFishGender(entry.gender, fish); entry.health.textContent = status.hungry ? '饥饿' : '未饥饿'; entry.health.classList.toggle('hungry', status.hungry);
     renderBreeding(entry.breeding, fish, now);
-    entry.info.textContent = `${identity.nick} · ${shortFishId(fish.id)} · ${cells.length} 字符 · ${fish.birth ? '自然出生于' : '创建于'} ${fishDate.format(fish.created)}`;
+    entry.info.textContent = `${identity.nick} · ${shortFishId(fish.id)} · ${cells.length} 鱼元 · ${fish.birth ? '自然出生于' : '创建于'} ${fishDate.format(fish.created)}`;
     entry.metrics.textContent = `今日运动 ${status.trackedSince === undefined ? '待同步' : status.movement.toFixed(1) + ' 格'} · 近24小时进食 ${status.meals24} 颗`;
     drawFishThumbnail(entry.canvas, fish, cells);
   }
@@ -314,7 +314,7 @@ function inspect(hit, show = true) {
     renderBreeding($('fishBreeding'), object);
     $('fishParentage').hidden = !object.birth; $('fishParentage').textContent = object.birth ? `自然出生 · 父鱼 ${displayFishName(catalog.get(object.parents[0]), identity)}（${shortFishId(object.parents[0])}） · 母鱼 ${displayFishName(catalog.get(object.parents[1]), identity)}（${shortFishId(object.parents[1])}）` : '';
     const v = world.swimVelocities(hit.id), eyes = cells.filter(c => EYES.has(c.ch)).length, now = Date.now(), status = world.fishStatus(hit.id, now), travel = world.data.travel[hit.id];
-    $('objectInfo').textContent = `${ownFish ? identity.nick : object.nick} · ${cells.length} 字符 · ${eyes ? eyes + ' 个眼睛' : '盲鱼'} · ${world.breedingState(hit.id) ? '合体游速 · ' : ''}水平 ${v.x.toFixed(2)} 格/秒 · 垂直 ${v.y.toFixed(2)} 格/秒`;
+    $('objectInfo').textContent = `${ownFish ? identity.nick : object.nick} · ${cells.length} 鱼元 · ${eyes ? eyes + ' 个眼睛' : '盲鱼'} · ${world.breedingState(hit.id) ? '合体游速 · ' : ''}水平 ${v.x.toFixed(2)} 格/秒 · 垂直 ${v.y.toFixed(2)} 格/秒`;
     $('fishMovement').textContent = status.trackedSince === undefined ? '待同步' : `${status.movement.toFixed(1)} 格`; $('fishMeals24').textContent = `${status.meals24} 颗`; $('fishHunger').textContent = status.hungry ? '饥饿' : '未饥饿'; $('fishHunger').classList.toggle('hungry', status.hungry);
     const minutes = Math.floor(status.hoursSinceFed * 60);
     $('fishLastMeal').textContent = `${status.neverFed ? '尚未进食 · 投放已' : '距上次进食'} ${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分钟`;
@@ -323,7 +323,7 @@ function inspect(hit, show = true) {
     const rows = []; for (let index = 0; index < 7; index++) { const day = shanghaiDay(now - index * DAY), row = document.createElement('p'); row.textContent = `${day} · ${travel && day >= shanghaiDay(travel.since) ? (travel.days[day] || 0).toFixed(1) + ' 格' : '未记录'}`; rows.push(row); } $('fishDailyRows').replaceChildren(...rows);
     $('objectFootnote').textContent = `连续 24 小时未进食即饥饿。距下一次饥饿退化约 ${Math.max(0, (object.hungerAt - now) / 3600000).toFixed(1)} 小时。`; $('sceneActions').hidden = true; renderer.selected = null;
   }
-  else { const fixed = hit.id === CHAT_FLOOR; $('objectInfo').textContent = `${cells.length} 字符 · 八方向地形 · ${fixed ? '海底聊天记忆' : '共享摆放'}`; $('objectFootnote').textContent = fixed ? '旧世界聊天已固化在海底，不能编辑、搬动或删除。' : '移除、缩小不返字符；放大产生的新字符需要支付配额。'; $('sceneActions').hidden = fixed; renderer.selected = hit.id; }
+  else { const fixed = hit.id === CHAT_FLOOR; $('objectInfo').textContent = `${cells.length} 鱼元 · 八方向地形 · ${fixed ? '海底聊天记忆' : '共享摆放'}`; $('objectFootnote').textContent = fixed ? '旧世界聊天已固化在海底，不能编辑、搬动或删除。' : '移除、缩小不返鱼元；放大产生的新鱼元需要支付配额。'; $('sceneActions').hidden = fixed; renderer.selected = hit.id; }
   if (show) $('inspector').hidden = false;
 }
 function chatLine(message) {
@@ -416,7 +416,7 @@ $('foodForm').onsubmit = e => {
   e.preventDefault(); updateFoodBrush(); if ($('placeFood').disabled) return;
   mode = { kind: 'food', ch: $('foodGlyphInput').value, color: $('foodColorInput').value };
   $('foodDialog').close(); surfaceCamera();
-  $('modeBanner').textContent = `选择水面上的位置投食「${mode.ch}」 · 每颗 1 字符 · Esc 取消`;
+  $('modeBanner').textContent = `选择水面上的位置投食「${mode.ch}」 · 每颗 1 鱼元 · Esc 取消`;
   $('modeBanner').hidden = false; $('sea').style.cursor = 'crosshair'; update();
 };
 $('surface').onclick = () => { trackedFish = null; surfaceCamera(); update(); }; $('seabed').onclick = () => { trackedFish = null; renderer.camera = { x: MONUMENT.x + 4, y: CONFIG.depth - 15 }; update(); };
@@ -436,7 +436,7 @@ $('chatForm').onsubmit = async e => {
   catch (error) { toast('聊天保存或发送失败：' + error.message); }
 };
 $('closeInspector').onclick = stopObserving;
-$('moveScene').onclick = () => { if (!selected) return; mode = { kind: 'sceneMove', scene: selected.id, cells: world.sceneCells(selected.id) }; $('modeBanner').textContent = '选择造景的新位置 · 不返还或消耗现有字符 · Esc 取消'; $('modeBanner').hidden = false; };
+$('moveScene').onclick = () => { if (!selected) return; mode = { kind: 'sceneMove', scene: selected.id, cells: world.sceneCells(selected.id) }; $('modeBanner').textContent = '选择造景的新位置 · 不返还或消耗现有鱼元 · Esc 取消'; $('modeBanner').hidden = false; };
 $('rotateScene').onclick = () => selected && submit({ kind: 'sceneRotate', scene: selected.id, cost: 0 });
 $('scaleScene').onclick = () => selected && submit({ kind: 'sceneScale', scene: selected.id, factor: 2, cost: world.sceneCells(selected.id).length * 3 });
 $('shrinkScene').onclick = () => selected && submit({ kind: 'sceneScale', scene: selected.id, factor: .5, cost: 0 });

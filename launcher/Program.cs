@@ -55,7 +55,7 @@ namespace Tide {
       Application.EnableVisualStyles();
       using (var bitmap = new Bitmap(32, 32)) using (var graphics = Graphics.FromImage(bitmap)) {
         graphics.Clear(Color.FromArgb(11, 51, 86)); using (var font = new Font("Consolas", 16, FontStyle.Bold)) graphics.DrawString("o>", font, Brushes.Aquamarine, -1, 2);
-        using (var tray = new NotifyIcon { Icon = Icon.FromHandle(bitmap.GetHicon()), Text = "鱼来 · 字符水世界", Visible = true }) {
+        using (var tray = new NotifyIcon { Icon = Icon.FromHandle(bitmap.GetHicon()), Text = "鱼来 · 鱼元水世界", Visible = true }) {
           var menu = new ContextMenuStrip(); menu.Items.Add("打开鱼来", null, delegate { Open(); });
           menu.Items.Add("复制我的邀请码", null, delegate { Clipboard.SetText(PublishedInvite()); });
           menu.Items.Add("退出启动器", null, delegate { Running = false; Listener.Stop(); Application.Exit(); });

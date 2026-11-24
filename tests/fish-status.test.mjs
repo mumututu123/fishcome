@@ -30,7 +30,7 @@ test('北京时间午夜分开记账，跨日后今日运动从0开始', () => {
   world.recordMovement(id, 3, before); assert.equal(world.fishStatus(id, after).movement, 0);
   world.recordMovement(id, 2, after); assert.equal(world.data.travel[id].days['2026-11-23'], 3); assert.equal(world.fishStatus(id, after).movement, 2);
 });
-test('24小时进食窗口严格过滤边界、未来记录，并去重脱落或烧毁字符的历史', () => {
+test('24小时进食窗口严格过滤边界、未来记录，并去重脱落或烧毁鱼元的历史', () => {
   const events = [{ id: 'old', reason: 'eat', target: 'fish', t: t - DAY - 1 }, { id: 'boundary', reason: 'eat', target: 'fish', t: t - DAY }, { id: 'recent', reason: 'eat', target: 'fish', t: t - DAY + 1 }, { id: 'latest', reason: 'eat', target: 'fish', t }, { id: 'future', reason: 'eat', target: 'fish', t: t + 1000 }];
   const index = mealIndex({ a: { id: 'a', kind: 'burn', path: events }, b: { id: 'b', kind: 'food', path: [events[2]] } }, t);
   const f = { created: t - 2 * DAY, lastFed: t }; assert.equal(fishStatus(f, undefined, index.get('fish'), t).meals24, 2); assert.equal(fishStatus(f, undefined, index.get('fish'), t + 1000).meals24, 2);

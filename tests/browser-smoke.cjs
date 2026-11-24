@@ -40,13 +40,13 @@ async function main() {
   await connect(b, 39081);
   await until(async () => (await a.evaluate(() => tide.world.counts.fish)) === 2 && (await b.evaluate(() => tide.world.counts.fish)) === 2, '两个世界没有合并', 30000);
   assert.equal(await a.evaluate(() => tide.network.peers.length) >= 1, true);
-  await b.locator('#chatInput').fill('你好，中文字符世界 <script>不会执行</script>'); await b.locator('#chatForm button').click();
-  await until(async () => (await a.locator('#chatMessages').textContent()).includes('你好，中文字符世界'), '聊天未同步');
+  await b.locator('#chatInput').fill('你好，中文鱼元世界 <script>不会执行</script>'); await b.locator('#chatForm button').click();
+  await until(async () => (await a.locator('#chatMessages').textContent()).includes('你好，中文鱼元世界'), '聊天未同步');
   assert.equal((await a.locator('#chatMessages').textContent()).includes('浏览器乙'), false, '未打码昵称暴露');
   await until(async () => (await b.evaluate(() => { const d = tide.world.data, cs = Object.values(d.chars).filter(c => c.kind === 'scene'); return cs.length === 4 && new Set(cs.map(c => `${d.scenes[c.entity].x + c.x},${d.scenes[c.entity].y + c.y}`)).size === 4; })), '合流造景重叠');
   const before = await a.evaluate(() => tide.balance()); await a.locator('#feed').click(); await a.locator('#foodGlyphInput').fill('粮'); await a.locator('#foodColorInput').fill('#ff9933'); await a.locator('#placeFood').click(); await a.mouse.click(710, 370); await pause(700); assert.equal(await a.evaluate(() => tide.balance()), before, '水下点击消耗了配额'); await a.mouse.click(710, 243); await a.keyboard.press('Escape');
   await until(async () => (await b.evaluate(() => Object.values(tide.world.data.chars).some(c => c.kind === 'food'))), '水面食物未同步');
-  assert.equal(await b.evaluate(() => Object.values(tide.world.data.chars).some(c => c.kind === 'food' && c.ch === '粮' && c.color === '#ff9933')), true, '自定义鱼食字符或颜色未同步');
+  assert.equal(await b.evaluate(() => Object.values(tide.world.data.chars).some(c => c.kind === 'food' && c.ch === '粮' && c.color === '#ff9933')), true, '自定义鱼食鱼元或颜色未同步');
   const foodY = await b.evaluate(() => Object.values(tide.world.data.chars).find(c => c.kind === 'food').y); assert(foodY <= 2, '食物未从水面开始');
   const c = await page(chrome, 39083, '第三个同事'); await createFish(c, ['水', '。'], 1000, 400);
   await until(async () => (await a.evaluate(() => tide.network.leader)) === (await b.evaluate(() => tide.network.leader)), '协调者未统一');

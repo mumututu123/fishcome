@@ -20,7 +20,7 @@ test('公母性别随创建、恢复及合流保存，旧鱼仍可恢复', () =>
   }
 });
 
-test('无效性别被拒绝且不扣字符、不创建鱼', () => {
+test('无效性别被拒绝且不扣鱼元、不创建鱼', () => {
   for (const gender of ['unknown', '', null, 0, {}]) {
     const world = new World(), id = crypto.randomUUID();
     const result = world.apply({ id, actor: 'alice', t: Date.now(), kind: 'fish', gender, x: 20, y: 20, cells: [0, 1].map(x => ({ x, y: 0, ch: 'o', color: '#8be7df' })), cost: 2 });

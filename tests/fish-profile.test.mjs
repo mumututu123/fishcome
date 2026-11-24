@@ -9,7 +9,7 @@ test('默认名按新增后的序号生成并按鱼身字数截短，扩展汉�
   assert.equal(defaultFishName('小林', 1, 15), '小林的第1条鱼'); assert.equal(defaultFishName('小林', 2, 2), '小林');
   assert.equal(defaultFishName('𠮷林', 1, 1), '𠮷'); assert.equal(defaultFishName('鱼人', 3, 0), '');
 });
-test('鱼名按Unicode字符计长，超长、空白或换行拒绝，旧版没有名字仍兼容', () => {
+test('鱼名按Unicode鱼元计长，超长、空白或换行拒绝，旧版没有名字仍兼容', () => {
   const world = new World(now);
   const operation = name => ({ id: crypto.randomUUID(), actor: 'alice', t: now, kind: 'fish', x: 20 + Object.keys(world.data.fishes).length * 3, y: 20, cells: glyphs(2), cost: 2, name });
   for (const name of ['', '   ', '三字名', 'a\nb', null, 123]) { assert.equal(world.apply(operation(name)).ok, false); assert.equal(world.wallet('alice'), 20); }

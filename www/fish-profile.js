@@ -2,7 +2,7 @@ export function defaultFishName(account, number, size) { return Array.from(`${ac
 export function fishNameError(name, size) {
   if (name === undefined) return ''; // Existing fish have no stored name.
   if (typeof name !== 'string' || !name.trim() || name !== name.trim() || /[\u0000-\u001f\u007f]/u.test(name)) return '请输入不含换行的鱼名';
-  return Array.from(name).length > size ? `鱼名最多 ${size} 字，不能超过鱼身字符数` : '';
+  return Array.from(name).length > size ? `鱼名最多 ${size} 字，不能超过鱼身鱼元数` : '';
 }
 export function fishCatalog(data) {
   const entries = new Map();
