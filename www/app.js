@@ -1,4 +1,4 @@
-import { World, CONFIG, clone, EYES, bounds, validGlyph, displayNick, hash } from './engine.js';
+import { World, CONFIG, clone, EYES, bounds, validGlyph, displayNick, hash, sceneryCount } from './engine.js';
 import { get, set, putMany, newIdentity, verifyEnvelope, actorId, download } from './storage.js';
 import { Network } from './network.js';
 import { Renderer } from './renderer.js';
@@ -374,7 +374,7 @@ function historyDialog() {
   $('historyDialog').showModal();
 }
 function localPicture() { return { id: world.id, roots: world.roots, image: renderer.snapshot(world), at: Date.now(), counts: world.counts(), participants: Object.keys(world.data.participants).length || 1 }; }
-function endedCard(checkpoint, endedAt) { const roots = Object.keys(checkpoint.world.roots).sort(); return { ...checkpoint.picture, id: roots[0], roots, chats: checkpoint.world.chats || {}, status: 'ended', endedAt }; }
+function endedCard(checkpoint, endedAt) { const roots = Object.keys(checkpoint.world.roots).sort(); return { ...checkpoint.picture, counts: { ...checkpoint.picture?.counts, scene: sceneryCount(checkpoint.world) }, id: roots[0], roots, chats: checkpoint.world.chats || {}, status: 'ended', endedAt }; }
 function currentCheckpoint() { return { world: world.serialize(), picture: lastPicture || localPicture(), at: Date.now(), lastOnlineAt }; }
 async function save() { if (!identity) return; if (!lastPicture || JSON.stringify(lastPicture.counts) !== JSON.stringify(world.counts()) || lastPicture.roots.length !== world.roots.length || !world.roots.every(root => lastPicture.roots.includes(root)) || lastPicture.participants !== (Object.keys(world.data.participants).length || 1)) lastPicture = localPicture(); await putMany([['identity', identity], ['histories', histories], ['known', known], ['checkpoint', currentCheckpoint()]]); }
 async function takePicture() { if (!amLeader()) return; lastPicture = localPicture(); await network.broadcast('picture', lastPicture); }
