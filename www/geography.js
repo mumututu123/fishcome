@@ -1,0 +1,23 @@
+export const WORLD_WIDTH = 1000;
+export const MIN_FLOOR = 80, MAX_FLOOR = 100;
+export const wrapX = x => ((x % WORLD_WIDTH) + WORLD_WIDTH) % WORLD_WIDTH;
+export const worldKey = (x, y) => `${wrapX(x)},${y}`;
+export const deltaX = (x, reference) => wrapX(x - reference + WORLD_WIDTH / 2) - WORLD_WIDTH / 2;
+export const nearX = (x, reference) => reference + deltaX(x, reference);
+function random(seed) { let value = 2166136261; for (const ch of seed) value = Math.imul(value ^ ch.codePointAt(0), 16777619); return value >>> 0; }
+export function makeTerrain(seed, createdAt) {
+  const span = 50, anchors = Array.from({ length: WORLD_WIDTH / span }, (_, i) => MIN_FLOOR + random(`seabed:${seed}:${i}`) % (MAX_FLOOR - MIN_FLOOR + 1));
+  const depths = Array.from({ length: WORLD_WIDTH }, (_, x) => { const index = Math.floor(x / span), fraction = (x % span) / span; return Math.round(anchors[index] * (1 - fraction) + anchors[(index + 1) % anchors.length] * fraction); });
+  return { version: 1, seed, createdAt, depths };
+}
+export function terrainOf(data) {
+  if (data.terrain) return data.terrain;
+  const roots = Object.entries(data.roots || {}).sort(([a, at], [b, bt]) => at - bt || a.localeCompare(b));
+  const [seed, at] = roots[0] || ['legacy-sea', 0]; return makeTerrain(seed, at);
+}
+export function validTerrain(terrain, roots) {
+  return !!terrain && terrain.version === 1 && typeof terrain.seed === 'string' && roots?.[terrain.seed] === terrain.createdAt && JSON.stringify(terrain) === JSON.stringify(makeTerrain(terrain.seed, terrain.createdAt));
+}
+export function chooseTerrain(left, right) { return left.createdAt < right.createdAt || left.createdAt === right.createdAt && left.seed <= right.seed ? left : right; }
+export function floorAt(data, x) { return terrainOf(data).depths[Math.floor(wrapX(x))]; }
+export function waterAt(data, x, y) { return Number.isFinite(x) && Number.isFinite(y) && y >= 0 && y < floorAt(data, x); }
