@@ -17,6 +17,7 @@ import { wrapX, nearX, validTerrain } from './geography.js';
 import { initialSources, validInitialOp } from './genesis.js';
 import { validateLife, validPlankton, weatherAt, fishLifeText, storiesFor, storyText, returnStory } from './life.js';
 import { validEcology } from './ecology.js';
+import { memoryForCell, ancestralGlyph, ancestralText } from './easter-eggs.js';
 import { ARCHIVE, ARCHIVE_FIELDS, ArchiveStore, archivePlan, archiveChunks, decodeArchive, assembleFragments, validArchiveState, emptyArchiveState, mergeArchiveState, compactKnown } from './archive.js';
 const $ = id => document.getElementById(id);
 const renderer = new Renderer($('sea'));
@@ -229,7 +230,7 @@ async function onMessage(message, peer) {
   if (members.has(message.from) && members.get(message.from).actor !== message.actor) return;
   const body = message.body;
   if (message.kind === 'hello') {
-    if (!body.world?.terrain || body.rules?.genesis !== 1 || body.rules?.life !== 1 || body.rules?.feeding !== 1 || body.rules?.ecology !== 1 || body.rules?.archives !== 1) { status = '对方使用旧版世界规则，请双方刷新游戏页面后再连接'; toast(status); network.close(peer); update(); return; }
+    if (!body.world?.terrain || body.rules?.genesis !== 1 || body.rules?.life !== 2 || body.rules?.feeding !== 1 || body.rules?.ecology !== 1 || body.rules?.archives !== 1) { status = '对方使用旧版世界规则，请双方刷新游戏页面后再连接'; toast(status); network.close(peer); update(); return; }
     if (message.from !== peer.node || body.member?.id !== message.from || body.member.actor !== message.actor) return;
     const own = body.member; members.set(own.id, { ...own, url: peer.url, at: Date.now() }); remember(peer.url);
     rememberAuthor(message.actor, own.nick);
@@ -288,7 +289,7 @@ async function completeReferral(peer, peerActor) {
 async function networkChange(error) {
   if (!started) return; if (error) { status = error; update(); return; }
   const live = network.live();
-  for (const p of live) if (!lastHello.has(p.id)) { lastHello.add(p.id); await network.direct(p, 'hello', { rules: { genesis: 1, life: 1, feeding: 1, ecology: 1, archives: 1 }, member: member(), members: active(), world: world.serialize(), cards: Object.values(histories).slice(0, 3), historyIndex: Object.keys(histories) }); }
+  for (const p of live) if (!lastHello.has(p.id)) { lastHello.add(p.id); await network.direct(p, 'hello', { rules: { genesis: 1, life: 2, feeding: 1, ecology: 1, archives: 1 }, member: member(), members: active(), world: world.serialize(), cards: Object.values(histories).slice(0, 3), historyIndex: Object.keys(histories) }); }
   const ids = new Set(live.map(p => p.node)); for (const m of active()) if (m.id !== network.node && m.direct && !ids.has(m.id)) { m.direct = false; probeGone(m.id, m.url); } for (const id of ids) if (members.has(id)) members.get(id).direct = true;
   network.presence(active().filter(m => m.id !== network.node).map(m => ({ id: m.id, url: m.url }))).catch(() => {}); update();
 }
@@ -390,6 +391,8 @@ function setMyFishView(view) {
 function renderPedigree(catalog) {
   const owned = [...catalog.values()].filter(entry => entry.actor === identity.actor).sort((a, b) => a.created - b.created || a.id.localeCompare(b.id));
   if (!owned.some(entry => entry.id === pedigreeFish)) pedigreeFish = (owned.find(entry => entry.alive) || owned[0])?.id;
+  const heirloom = ancestralGlyph(world.data, pedigreeFish);
+  $('pedigreeHeirloom').textContent = ancestralText(heirloom, id => displayFishName(catalog.get(id), identity)); $('pedigreeHeirloom').hidden = !heirloom;
   const key = JSON.stringify([pedigreeFish, [...catalog.values()].map(entry => [entry.id, displayFishName(entry, identity), entry.nick, entry.gender, entry.alive, entry.parents])]);
   if (pedigreeKey === key) return; pedigreeKey = key;
   $('pedigreeRoot').replaceChildren(...owned.map(entry => { const option = document.createElement('option'); option.value = entry.id; option.textContent = `${displayFishName(entry, identity)} · ${shortFishId(entry.id)}${entry.alive ? '' : '（已消失）'}`; return option; }));
@@ -405,7 +408,17 @@ function inspect(hit, show = true) {
   const object = hit.kind === 'fish' ? world.data.fishes[hit.id] : world.data.scenes[hit.id]; if (!object) { $('inspector').hidden = true; selected = null; renderer.observedFish = null; return; }
   const cells = hit.kind === 'fish' ? world.fishCells(hit.id) : world.sceneCells(hit.id), ownFish = hit.kind === 'fish' && world.fishOrigin(hit.id)?.actor === identity.actor, catalog = hit.kind === 'fish' ? fishCatalog(world.data) : null; $('objectTitle').textContent = hit.kind === 'fish' ? displayFishName(catalog.get(hit.id), identity) : `${authorNick(object.actor, object.nick || '自然沉积')} 的造景`;
   $('fishDetails').hidden = hit.kind !== 'fish'; renderer.observedFish = hit.kind === 'fish' ? hit.id : null;
+  const memory = hit.kind === 'scene' ? memoryForCell(world.data, hit.cell) : null;
+  $('chatMemory').hidden = !memory; renderer.selectedCell = memory ? hit.cell : null;
+  if (memory) {
+    $('objectTitle').textContent = `海底的「${memory.ch}」`;
+    $('memoryOrigin').textContent = `这句话来自很久以前的一片海。${memory.nick} · ${fishDate.format(memory.at)}`;
+    $('memoryText').textContent = memory.text;
+    if (show) $('memoryDetails').open = false;
+  }
   if (hit.kind === 'fish') {
+    const heirloom = ancestralGlyph(world.data, hit.id);
+    $('fishHeirloom').textContent = ancestralText(heirloom, id => displayFishName(catalog.get(id), identity)); $('fishHeirloom').hidden = !heirloom;
     renderFishGender($('fishGender'), object);
     renderBreeding($('fishBreeding'), object);
     $('fishParentage').hidden = !object.birth; $('fishParentage').textContent = object.birth ? `自然出生 · 父鱼 ${displayFishName(catalog.get(object.parents[0]), identity)}（${shortFishId(object.parents[0])}） · 母鱼 ${displayFishName(catalog.get(object.parents[1]), identity)}（${shortFishId(object.parents[1])}）` : '';

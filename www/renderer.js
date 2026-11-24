@@ -1,8 +1,9 @@
 import { CONFIG, cellPosition, EYES, MONUMENT } from './engine.js';
 import { wrapX, deltaX, nearX, worldKey } from './geography.js';
-import { bubbleState, BUBBLE_GLYPH, BUBBLE_COLOR } from './bubbles.js';
+import { bubbleState, bubbleGlyph, BUBBLE_COLOR } from './bubbles.js';
 import { weatherAt, lightDepth } from './life.js';
 import { weedAlpha } from './ecology.js';
+import { echoCells, friendSignals } from './easter-eggs.js';
 const FONT = "'Microsoft YaHei',Consolas,monospace";
 export { MONUMENT } from './engine.js';
 export class Renderer {
@@ -31,14 +32,19 @@ export class Renderer {
     const left = this.camera.x - this.width / 2 / size - 2, right = this.camera.x + this.width / 2 / size + 2, top = this.camera.y - this.height / 2 / size - 2, bottom = this.camera.y + this.height / 2 / size + 2;
     this.weather(world, size);
     const visible = p => Math.abs(deltaX(p.x, this.camera.x)) <= (right - left) / 2 && p.y >= top && p.y <= bottom;
-    if (this.cachedWorld !== world || world.dirty || !this.characters) { this.characters = Object.values(world.data.chars); this.cachedWorld = world; world.dirty = false; }
+    if (this.cachedWorld !== world || world.dirty || !this.characters || this.echoTick !== world.data.tick) { this.characters = Object.values(world.data.chars); this.echoes = echoCells(world.data, this.characters); this.echoTick = world.data.tick; this.cachedWorld = world; world.dirty = false; }
     const characters = this.characters;
-    for (const c of characters) if (c.kind === 'scene') { const s = world.data.scenes[c.entity]; if (!s) continue; const p = { x: s.x + c.x, y: s.y + c.y }; if (!visible(p)) continue; const pixel = this.screen(p.x, p.y); this.glyph(ctx, c.ch, c.color, pixel.x, pixel.y, size, this.selected === c.entity ? 1 : .85); if (this.selected === c.entity) { ctx.strokeStyle = '#b7f7de55'; ctx.strokeRect(pixel.x, pixel.y, size, size); } }
+    for (const c of characters) if (c.kind === 'scene') { const s = world.data.scenes[c.entity]; if (!s) continue; const p = { x: s.x + c.x, y: s.y + c.y }; if (!visible(p)) continue; const pixel = this.screen(p.x, p.y), selected = this.selected === c.entity && (!c.chat || this.selectedCell === c.id), echo = this.echoes.has(c.id); this.glyph(ctx, c.ch, echo ? '#d7efe1' : c.color, pixel.x, pixel.y, size, selected ? 1 : echo ? .8 + .2 * Math.sin(Date.now() / 450) : .85, echo); if (selected) { ctx.strokeStyle = '#b7f7de55'; ctx.strokeRect(pixel.x, pixel.y, size, size); } }
     for (const c of characters) if (c.kind === 'fish' && c.entity !== this.observedFish) { const f = world.data.fishes[c.entity]; if (!f) continue; const p = cellPosition(f, c); if (!visible(p)) continue; const pixel = this.screen(p.x, p.y); this.glyph(ctx, c.ch, c.color, pixel.x, pixel.y, size, 1, EYES.has(c.ch)); }
     if (this.observedFish) for (const c of characters) if (c.kind === 'fish' && c.entity === this.observedFish) { const f = world.data.fishes[c.entity]; if (!f) continue; const p = cellPosition(f, c); if (!visible(p)) continue; const pixel = this.screen(p.x, p.y); ctx.fillStyle = '#9aeee015'; ctx.fillRect(pixel.x, pixel.y, size, size); this.glyph(ctx, c.ch, c.color, pixel.x, pixel.y, size, 1, EYES.has(c.ch)); ctx.strokeStyle = '#9aeee077'; ctx.lineWidth = 1; ctx.strokeRect(pixel.x, pixel.y, size, size); }
     for (const c of characters) if ((c.kind === 'food' || c.kind === 'seaweed') && visible(c)) { const pixel = c.kind === 'seaweed' ? this.seaweedScreen(c) : this.screen(c.x, c.y); this.glyph(ctx, c.ch, c.color, pixel.x, pixel.y, size, c.kind === 'seaweed' ? weedAlpha(c, world.data.ecology, Date.now()) : 1); if (c.kind === 'food' && world.data.tick - c.born >= CONFIG.foodLife) { ctx.strokeStyle = '#84a2b355'; ctx.strokeRect(pixel.x + size * .2, pixel.y + size * .2, size * .6, size * .6); } }
     const bubbleNow = Date.now();
-    for (const bubble of Object.values(world.data.bubbles || {})) { const state = bubbleState(bubble, bubbleNow); if (!state || state.y > bottom || state.y + state.size < top || Math.abs(deltaX(state.x + state.size / 2, this.camera.x)) > (right - left) / 2 + state.size) continue; for (let y = 0; y < state.size; y++) for (let x = 0; x < state.size; x++) { const p = { x: state.x + x, y: state.y + y }; if (visible(p)) { const pixel = this.screen(p.x, p.y); this.glyph(ctx, BUBBLE_GLYPH, BUBBLE_COLOR, pixel.x, pixel.y, size); } } }
+    for (const bubble of Object.values(world.data.bubbles || {})) { const state = bubbleState(bubble, bubbleNow); if (!state || state.y > bottom || state.y + state.size < top || Math.abs(deltaX(state.x + state.size / 2, this.camera.x)) > (right - left) / 2 + state.size) continue; for (let y = 0; y < state.size; y++) for (let x = 0; x < state.size; x++) { const p = { x: state.x + x, y: state.y + y }; if (visible(p)) { const pixel = this.screen(p.x, p.y); this.glyph(ctx, bubbleGlyph(bubble), BUBBLE_COLOR, pixel.x, pixel.y, size); } } }
+    for (const signal of friendSignals(world.data, bubbleNow)) {
+      const fish = world.data.fishes[signal.fish], cells = characters.filter(c => c.kind === 'fish' && c.entity === signal.fish); if (!cells.length) continue;
+      const xs = cells.map(c => fish.facing * c.x), p = { x: fish.x + (Math.min(...xs) + Math.max(...xs)) / 2, y: fish.y + Math.min(...cells.map(c => c.y)) - 1.4 }; if (!visible(p)) continue;
+      const pixel = this.screen(p.x, p.y); this.glyph(ctx, signal.ch, '#d5eee0', pixel.x, pixel.y, size, signal.alpha, true);
+    }
     const monument = world.monument; monument.rows.forEach((row, dy) => Array.from(row).forEach((ch, dx) => { if (ch === ' ') return; const p = { x: monument.x + dx, y: monument.y + dy }; if (visible(p)) { const pixel = this.screen(p.x, p.y); this.glyph(ctx, ch, '#b8b797', pixel.x, pixel.y, size); } }));
     if (this.preview) { const p = this.preview; for (const c of p.cells || [{ x: 0, y: 0, ch: p.ch, color: p.color }]) { const pixel = this.screen(p.x + c.x, p.y + c.y); ctx.fillStyle = '#9fecd918'; ctx.fillRect(pixel.x, pixel.y, size, size); this.glyph(ctx, c.ch, p.valid === false ? '#efaa99' : c.color, pixel.x, pixel.y, size, .65); } }
   }
@@ -62,7 +68,7 @@ export class Renderer {
   snapshot(world) {
     const canvas = document.createElement('canvas'); const size = 6; canvas.width = CONFIG.width * size; canvas.height = CONFIG.depth * size; const ctx = canvas.getContext('2d'); this.background(ctx, canvas.width, canvas.height, { x: CONFIG.width / 2, y: CONFIG.depth / 2 }, size, world);
     for (const c of Object.values(world.data.chars)) { let p; if (c.kind === 'scene') { const s = world.data.scenes[c.entity]; if (s) p = { x: s.x + c.x, y: s.y + c.y }; } else if (c.kind === 'fish') { const f = world.data.fishes[c.entity]; if (f) p = cellPosition(f, c); } else if (c.kind === 'food' || c.kind === 'seaweed') p = c; if (p) this.glyph(ctx, c.ch, c.color, wrapX(p.x) * size, p.y * size, size); }
-    for (const bubble of Object.values(world.data.bubbles || {})) { const state = bubbleState(bubble, world.data.tick); if (!state) continue; for (let y = 0; y < state.size; y++) for (let x = 0; x < state.size; x++) this.glyph(ctx, BUBBLE_GLYPH, BUBBLE_COLOR, wrapX(state.x + x) * size, (state.y + y) * size, size); }
+    for (const bubble of Object.values(world.data.bubbles || {})) { const state = bubbleState(bubble, world.data.tick); if (!state) continue; for (let y = 0; y < state.size; y++) for (let x = 0; x < state.size; x++) this.glyph(ctx, bubbleGlyph(bubble), BUBBLE_COLOR, wrapX(state.x + x) * size, (state.y + y) * size, size); }
     return canvas.toDataURL('image/webp', .82);
   }
 }

@@ -21,6 +21,7 @@ export function archiveDependencies(data) {
   }
   for (const r of Object.values(data.life?.bonds || {})) { fish(r.a); fish(r.b); }
   for (const [id, r] of Object.entries(data.life?.places || {})) { fish(id); keep.ops.add(r.scene); }
+  for (const [id, r] of Object.entries(data.life?.haunts || {})) { fish(id); keep.ops.add(r.scene); }
   for (const r of Object.values(data.life?.stories || {})) { fish(r.fish); fish(r.other); for (const id of r.parents || []) fish(id); if (r.scene) keep.ops.add(r.scene); }
   for (const id of Object.keys(data.chatSources || {})) keep.chats.add(id);
   for (const message of Object.values(data.chats || {}).sort((a, b) => b.body.t - a.body.t || a.id.localeCompare(b.id)).slice(0, 80)) keep.chats.add(message.id);
