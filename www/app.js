@@ -678,7 +678,9 @@ async function setScene3d(enabled) {
   } catch {
     applyScene3d(null);
     toast('立体海景加载失败，当前使用平面海景');
-  } finally { scene3dToggle.removeAttribute('aria-busy'); }
+  } finally {
+    scene3dToggle.removeAttribute('aria-busy');
+  }
 }
 scene3dToggle.onclick = () => setScene3d(!renderer.scene3d);
 try { if (localStorage.getItem(scene3dPreference) === '1') setScene3d(true); } catch {}
@@ -722,9 +724,19 @@ document.addEventListener('keydown', e => {
 document.addEventListener('keyup', e => heldShortcuts.delete(e.code || e.key.toLowerCase()));
 window.addEventListener('blur', () => heldShortcuts.clear());
 function render(now) {
-  if (trackedFish) { const fish = world.data.fishes[trackedFish]; if (fish && followBounds) moveCameraToFish(fish, followBounds); else { trackedFish = null; toast('这条鱼已不再存活'); } }
+  if (trackedFish) {
+    const fish = world.data.fishes[trackedFish];
+    if (fish && followBounds) moveCameraToFish(fish, followBounds);
+    else { trackedFish = null; toast('这条鱼已不再存活'); }
+  }
   try { renderer.draw(world, now); }
-  catch (error) { if (!renderer.scene3d) throw error; applyScene3d(null); renderer.resize(); toast('立体海景绘制失败，当前使用平面海景'); renderer.draw(world, now); }
+  catch (error) {
+    if (!renderer.scene3d) throw error;
+    applyScene3d(null);
+    renderer.resize();
+    toast('立体海景绘制失败，当前使用平面海景');
+    renderer.draw(world, now);
+  }
   requestAnimationFrame(render);
 }
 render(); start().catch(e => { toast(e.message); status = e.message; const label = $('networkStatus'); if (label) label.textContent = e.message; });
