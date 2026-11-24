@@ -10,12 +10,14 @@ import { HOUR, validWildCell } from './seaweed.js';
 import { fishOrigin, validBreedingRecord, inheritedGlyph } from './breeding.js';
 import { defaultFishName, displayFishName, fishCatalog } from './fish-profile.js';
 import { drawPedigree } from './pedigree.js';
-import { normalizeInvite } from './invite.js';
+import { normalizeInvite, encodeInvite, decodeInvite, inviteDetails } from './invite.js';
+import { verifyReferral } from './referral.js';
 const $ = id => document.getElementById(id);
 const renderer = new Renderer($('sea'));
 let world = new World(), identity, network, meta, creator, mode = null, selected = null, dragging, histories = {}, known = [], members = new Map(), pending = new Map(), inbox = new Map(), lastPicture = null, priorCheckpoint = null;
 let chatLimit = 80, renderedChatWorld, renderedChatCount = -1, renderedChatLimit = -1;
 let trackedFish = null, followBounds = null, myFishListKey = '';
+let referralBusy = false;
 const myFishCards = new Map();
 let myFishView = 'list', pedigreeFish = null, pedigreeKey = '';
 const fishDate = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
@@ -57,7 +59,7 @@ async function verifyChats(messages = {}) {
 }
 async function verifyReplica(data) {
   if (!data || data.protocol !== 1 || !data.roots || !data.chars || !data.fishes || !data.scenes || !data.ops || Object.keys(data.chars).length > 100000 || Object.keys(data.ops).length > 500000) throw new Error('世界快照不兼容或超出首版规模');
-  for (const [id, op] of Object.entries(data.ops)) { if (world.data.ops[id]) { if (JSON.stringify(opBody(world.data.ops[id])) !== JSON.stringify(opBody(op))) throw new Error('已有消费记录不可覆盖'); } else { const { proof, ...clean } = op; if (id !== op.id || !proof || proof.kind !== 'op' || JSON.stringify(clean) !== JSON.stringify(proof.body) || proof.actor !== op.actor || !await verifyEnvelope(proof) || world.validOp(op)) throw new Error('世界包含无效操作凭据'); } }
+  for (const [id, op] of Object.entries(data.ops)) { if (world.data.ops[id] && JSON.stringify(opBody(world.data.ops[id])) === JSON.stringify(opBody(op))) continue; if (world.data.ops[id] && !(op.kind === 'referral' && world.data.ops[id].kind === 'referral')) throw new Error('已有消费记录不可覆盖'); const { proof, ...clean } = op; if (id !== op.id || !proof || proof.kind !== 'op' || JSON.stringify(clean) !== JSON.stringify(proof.body) || proof.actor !== op.actor || !await verifyEnvelope(proof) || world.validOp(op) || (op.kind === 'referral' && !await verifyReferral(op))) throw new Error('世界包含无效操作凭据'); }
   for (const [root, at] of Object.entries(data.roots)) if (!/^[0-9a-f-]{36}$/i.test(root) || !Number.isFinite(at)) throw new Error('世界起源无效');
   if (data.seaweedHour !== undefined && (!Number.isInteger(data.seaweedHour) || data.seaweedHour < 0 || data.seaweedHour > Math.floor((Date.now() + 60000) / HOUR))) throw new Error('海草生长时钟无效');
   await verifyChats(data.chats); await verifyChats(data.chatSources);
@@ -141,6 +143,7 @@ async function onMessage(message, peer) {
     for (const card of body.cards || []) { await verifyChats(card.chats); acceptHistory(card); }
     await save();
     const missing = (body.historyIndex || []).filter(id => !histories[id]); if (missing.length) { historyQueues.set(peer.id, missing); await requestHistory(peer); }
+    await completeReferral(peer, message.actor);
     status = ''; toast('已接入伙伴，两个世界正在合流'); update();
   } else if (message.kind === 'beat') {
     if (body.member?.id === message.from && body.member.actor === message.actor) { const direct = network.live().find(p => p.node === message.from); members.set(message.from, { ...body.member, direct: !!direct, url: await normalizeInvite(direct?.url || body.member.url), at: Date.now() }); remember(body.member.url); if (Date.now() - lastRepair > 5000 && (body.rootCount > world.roots.length || body.opCount > Object.keys(world.data.ops).length || body.chatCount > Object.keys(world.data.chats).length || body.chatSourceCount > Object.keys(world.data.chatSources).length)) { lastRepair = Date.now(); network.broadcast('replicaRequest', { to: message.from }).catch(() => {}); } }
@@ -152,6 +155,7 @@ async function onMessage(message, peer) {
     if (message.from !== leader()) return; await mergeReplica(body.world); syncIncomeSerial(); for (const id of pending.keys()) if (world.data.ops[id]) pending.delete(id); reconcileHistory(); update();
   } else if (message.kind === 'op') {
     if (body.actor !== message.actor || !Array.isArray(body.roots) || !body.roots.some(r => world.roots.includes(r))) return;
+    if (body.kind === 'referral' && !await verifyReferral(body)) return;
     inbox.set(body.id, clone(message));
     if (amLeader()) { const result = world.apply({ ...clone(body), proof: clone(message) }); if (result.ok) await save(); await network.broadcast('ack', { id: body.id, result }); if (result.ok) await broadcastWorld(); }
   } else if (message.kind === 'ack') {
@@ -166,6 +170,21 @@ async function onMessage(message, peer) {
   } else if (message.kind === 'history') { await verifyChats(body.card?.chats); acceptHistory(body.card); await save(); }
   else if (message.kind === 'historyEnd') { historyQueues.set(peer.id, (historyQueues.get(peer.id) || []).filter(id => !body.ids?.includes(id))); await requestHistory(peer); }
   else if (message.kind === 'lost') probeGone(body.id, body.url);
+}
+async function completeReferral(peer, peerActor) {
+  const registration = identity.registration;
+  if (!registration || registration.joined || referralBusy) return;
+  if (!peer.entryInvite) { registration.joined = true; await save(); return; }
+  // Serialize hellos without saving a consumed registration before its reward exists.
+  referralBusy = true;
+  try {
+    const invitation = peer.entryInvite, details = await inviteDetails(invitation), inviter = details.actor || peerActor;
+    if (inviter === identity.actor) { registration.joined = true; await save(); return; }
+    const op = { id: `${identity.actor}:referral`, actor: identity.actor, nick: maskNick(identity.nick), t: Date.now(), roots: [world.id], cost: 0, kind: 'referral', inviter, registeredAt: registration.at, invitation };
+    const message = await network.makeEnvelope('op', op);
+    const result = world.apply({ ...op, proof: message }); if (!result.ok) throw new Error(result.error);
+    registration.joined = true; registration.referral = message; await save(); await network.broadcastEnvelope(message);
+  } finally { referralBusy = false; }
 }
 async function networkChange(error) {
   if (!started) return; if (error) { status = error; update(); return; }
@@ -340,11 +359,13 @@ function endedCard(checkpoint, endedAt) { const roots = Object.keys(checkpoint.w
 function currentCheckpoint() { return { world: world.serialize(), picture: lastPicture || localPicture(), at: Date.now(), lastOnlineAt }; }
 async function save() { if (!identity) return; if (!lastPicture || JSON.stringify(lastPicture.counts) !== JSON.stringify(world.counts()) || lastPicture.roots.length !== world.roots.length || !world.roots.every(root => lastPicture.roots.includes(root)) || lastPicture.participants !== (Object.keys(world.data.participants).length || 1)) lastPicture = localPicture(); await putMany([['identity', identity], ['histories', histories], ['known', known], ['checkpoint', currentCheckpoint()]]); }
 async function takePicture() { if (!amLeader()) return; lastPicture = localPicture(); await network.broadcast('picture', lastPicture); }
-async function reconnect() { const params = new URLSearchParams(location.search), input = params.get('join') || meta.joinUrl; if (params.has('join')) { params.delete('join'); history.replaceState(null, '', location.pathname + (params.size ? '?' + params.toString() : '') + location.hash); } const urls = [...new Set([input, ...known].filter(Boolean))]; for (const url of urls.slice(0, 12)) { if (network.live().length) break; try { await network.connect(url); remember(url); } catch { } } }
+async function reconnect() { const params = new URLSearchParams(location.search), input = params.get('join') || meta.joinUrl; if (params.has('join')) { params.delete('join'); history.replaceState(null, '', location.pathname + (params.size ? '?' + params.toString() : '') + location.hash); } const urls = [...new Set([input, ...known].filter(Boolean))]; for (const url of urls.slice(0, 12)) { if (network.live().length) break; try { await network.connectInvite(url); remember(url); } catch { } } }
 async function start() {
   meta = await (await fetch('/local/meta')).json(); if (!meta.token) throw new Error('请运行自己的启动器，从固定本地地址进入');
   meta.url = await normalizeInvite(meta.url);
   identity = await get('identity'); if (!identity) { $('welcomeDialog').showModal(); await new Promise(resolve => $('welcomeForm').onsubmit = async e => { e.preventDefault(); const nick = $('nickInput').value.trim(); if (!nick) return; identity = await newIdentity(nick); $('welcomeDialog').close(); resolve(); }); }
+  meta.url = await encodeInvite(await decodeInvite(meta.url), identity.actor);
+  $('downloadPackage').href = '/download.zip?invite=' + encodeURIComponent(meta.url);
   histories = await get('histories') || {}; known = await get('known') || []; const previous = await get('checkpoint'), now = Date.now();
   const migrated = await Promise.allSettled((Array.isArray(known) ? known : []).map(normalizeInvite)); known = [...new Set(migrated.filter(result => result.status === 'fulfilled').map(result => result.value))]; await set('known', known);
   await verifyChats(previous?.world?.chats);
@@ -397,7 +418,7 @@ $('foodForm').onsubmit = e => {
 $('surface').onclick = () => { trackedFish = null; surfaceCamera(); update(); }; $('seabed').onclick = () => { trackedFish = null; renderer.camera = { x: MONUMENT.x + 4, y: CONFIG.depth - 15 }; update(); };
 $('zoomIn').onclick = () => { renderer.zoom(renderer.scale + .15); update(); }; $('zoomOut').onclick = () => { renderer.zoom(renderer.scale - .15); update(); };
 $('connect').onclick = () => $('connectionDialog').showModal(); $('closeConnection').onclick = () => $('connectionDialog').close();
-$('connectionForm').onsubmit = async e => { e.preventDefault(); status = '正在自动配对…'; update(); try { const code = await normalizeInvite($('peerUrl').value); $('peerUrl').value = code; await network.connect(code); await remember(code); $('connectionDialog').close(); } catch (e) { status = e.message; toast(e.message); } update(); };
+$('connectionForm').onsubmit = async e => { e.preventDefault(); status = '正在自动配对…'; update(); try { const code = await normalizeInvite($('peerUrl').value); $('peerUrl').value = code; await network.connectInvite(code); await remember(code); $('connectionDialog').close(); } catch (e) { status = e.message; toast(e.message); } update(); };
 $('copyUrl').onclick = async () => { await navigator.clipboard.writeText(meta.url); toast('邀请码已复制'); };
 $('backup').onclick = () => download('鱼来-身份与记忆备份.json', { format: 'tide-backup-1', identity, histories, known, checkpoint: currentCheckpoint() });
 $('importBackup').onchange = async e => { try { const data = JSON.parse(await e.target.files[0].text()); if (data.format !== 'tide-backup-1' || !data.identity?.secret || await actorId(data.identity.pub) !== data.identity.actor) throw new Error('备份无效'); const entries = [['identity', data.identity], ['histories', data.histories || {}], ['known', data.known || []]]; if (data.checkpoint) { await verifyReplica(data.checkpoint.world); entries.push(['checkpoint', data.checkpoint]); } await putMany(entries); await network.stop(); location.reload(); } catch (e) { toast(e.message); } };

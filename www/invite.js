@@ -12,15 +12,16 @@ function endpoint(text) {
   catch { throw new Error('邀请码中的接入信息无效'); }
 }
 async function checksum(url) { return base64(new Uint8Array(await crypto.subtle.digest('SHA-256', encoder.encode(DOMAIN + url))).slice(0, 8)); }
-export async function encodeInvite(url) { const canonical = endpoint(url); return `YL1.${base64(encoder.encode(canonical))}.${await checksum(canonical)}`; }
-export async function decodeInvite(value) {
+export async function encodeInvite(url, actor) { const canonical = endpoint(url); if (actor !== undefined && !/^[0-9a-f]{64}$/.test(actor)) throw new Error('邀请码的发码账号无效'); const payload = actor ? JSON.stringify({ url: canonical, actor }) : canonical; return `YL1.${base64(encoder.encode(payload))}.${await checksum(payload)}`; }
+export async function inviteDetails(value) {
   try {
     if (typeof value !== 'string' || value.length > 1024) throw new Error();
     const code = value.replace(/\s/g, ''), parts = code.split('.'); if (parts.length !== 3 || parts[0] !== 'YL1') throw new Error();
-    const raw = decoder.decode(unbase64(parts[1])), url = endpoint(raw);
-    if (raw !== url || parts[2] !== await checksum(url)) throw new Error(); return url;
+    const raw = decoder.decode(unbase64(parts[1])), data = raw.startsWith('{') ? JSON.parse(raw) : { url: raw }, url = endpoint(data.url);
+    if (data.url !== url || (raw.startsWith('{') && (!/^[0-9a-f]{64}$/.test(data.actor) || raw !== JSON.stringify({ url, actor: data.actor }))) || parts[2] !== await checksum(raw)) throw new Error(); return { url, actor: data.actor };
   } catch { throw new Error('邀请码无效或不完整，请重新复制'); }
 }
+export async function decodeInvite(value) { return (await inviteDetails(value)).url; }
 export async function normalizeInvite(value) {
   if (typeof value !== 'string' || !value.trim()) throw new Error('请粘贴同事的邀请码');
   const input = value.trim();

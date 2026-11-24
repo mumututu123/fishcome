@@ -2,6 +2,7 @@ import { CHAT_FLOOR, validChatMessage, buildChatFloor, chatGlyphs } from './chat
 import { shanghaiDay, mealIndex, fishStatus, mergeTravel } from './fish-status.js';
 import { HOUR, updateSeaweed } from './seaweed.js';
 import { fishNameError } from './fish-profile.js';
+import { REFERRAL_REWARD, referralError, chooseReferral } from './referral.js';
 import { fishOrigin, activeBreeding, finishBreeding, updateContacts, motionUnits, commitUnit, mergeBreeding, normalizeBreeding, normalizeBirthCells } from './breeding.js';
 export const CONFIG = Object.freeze({ width: 800, depth: 120, shallow: 60, step: 500, speed: 2, foodLife: 300000, hunger: 86400000, initial: 20, offlineLife: 240 * 60 * 60 * 1000 });
 export const MONUMENT = { x: 610, y: CONFIG.depth - 5, rows: ['  ____  ', ' /记忆\\ ', ' | 口 | ', ' |____| ', '________'] };
@@ -115,7 +116,7 @@ export class World {
   fishCells(id) { return Object.values(this.data.chars).filter(c => c.kind === 'fish' && c.entity === id); }
   sceneCells(id) { return Object.values(this.data.chars).filter(c => c.kind === 'scene' && c.entity === id); }
   fishGroups() { const map = new Map(); for (const c of Object.values(this.data.chars)) if (c.kind === 'fish') { if (!map.has(c.entity)) map.set(c.entity, []); map.get(c.entity).push(c); } return map; }
-  wallet(actor) { let income = CONFIG.initial, cost = 0; for (const op of Object.values(this.data.ops)) if (op.actor === actor) { if (op.kind === 'earn') income++; else cost += op.cost || 0; } return income - cost; }
+  wallet(actor) { let income = CONFIG.initial, cost = 0; for (const op of Object.values(this.data.ops)) { if (op.kind === 'referral' && !referralError(op) && op.inviter === actor) income += REFERRAL_REWARD; if (op.actor === actor) { if (op.kind === 'earn') income++; else cost += op.cost || 0; } } return income - cost; }
   sceneryMap() {
     const map = new Map(); for (const c of Object.values(this.data.chars)) if (c.kind === 'scene') { const s = this.data.scenes[c.entity]; if (s) map.set(key(s.x + c.x, s.y + c.y), { scene: s, cell: c }); } return map;
   }
@@ -144,19 +145,20 @@ export class World {
     return { waiting };
   }
   validOp(op) {
-    if (!op || typeof op.id !== 'string' || typeof op.actor !== 'string' || !Number.isFinite(op.t) || !['fish', 'scene', 'food', 'sceneMove', 'sceneDelete', 'sceneRotate', 'sceneScale', 'sceneEdit', 'earn'].includes(op.kind)) return '不支持的操作';
+    if (!op || typeof op.id !== 'string' || typeof op.actor !== 'string' || !Number.isFinite(op.t) || !['fish', 'scene', 'food', 'sceneMove', 'sceneDelete', 'sceneRotate', 'sceneScale', 'sceneEdit', 'earn', 'referral'].includes(op.kind)) return '不支持的操作';
     if (op.t > Date.now() + 60000) return '操作时间无效';
-    if (op.kind !== 'earn' && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(op.id)) return '操作标识无效';
+    if (!['earn', 'referral'].includes(op.kind) && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(op.id)) return '操作标识无效';
     if (!Number.isInteger(op.cost) || op.cost < 0 || (!['fish', 'scene', 'food', 'sceneScale'].includes(op.kind) && op.cost !== 0)) return '字符费用无效';
     if (['fish', 'scene'].includes(op.kind)) { const e = validateDrawing(op.cells, op.kind); if (e) return e; if (op.cost !== op.cells.length) return '字符费用不一致'; }
     if (op.kind === 'fish' && op.gender !== undefined && !['male', 'female'].includes(op.gender)) return '鱼的性别无效';
     if (op.kind === 'fish' && fishNameError(op.name, op.cells.length)) return fishNameError(op.name, op.cells.length);
     if (op.kind === 'food' && (!validGlyph(op.ch) || !/^#[0-9a-f]{6}$/i.test(op.color) || op.cost !== 1 || op.y !== 0)) return '鱼食只能从水面投放';
     if (op.kind === 'earn' && (op.cost !== 0 || !Number.isInteger(op.serial) || op.serial < 1 || op.id !== `${op.actor}:hour:${op.serial}`)) return '在线奖励无效';
+    if (op.kind === 'referral') return referralError(op);
     return '';
   }
   apply(op) {
-    if (this.data.ops[op.id]) return { ok: true, duplicate: true };
+    if (this.data.ops[op.id]) { if (op.kind === 'referral' && this.data.ops[op.id].kind === 'referral') { const invalid = this.validOp(op); if (invalid) return { ok: false, error: invalid }; this.data.ops[op.id] = clone(chooseReferral(this.data.ops[op.id], op)); } return { ok: true, duplicate: true }; }
     const invalid = this.validOp(op); if (invalid) return { ok: false, error: invalid };
     if (op.cost > 0 && op.cost > this.wallet(op.actor)) return { ok: false, error: '字符余额不足，合并超支需由在线奖励抵扣' };
     const scenery = this.sceneryMap(), fishMap = this.fishMap(), seaweedMap = new Set(Object.values(this.data.chars).filter(c => c.kind === 'seaweed').map(c => key(c.x, c.y)));
@@ -286,7 +288,7 @@ export class World {
   }
   merge(other) {
     if (!other || other.protocol !== 1 || !other.chars || !other.fishes || !other.scenes || !other.ops) throw new Error('世界协议不兼容');
-    Object.assign(this.data.roots, other.roots); for (const [id, op] of Object.entries(other.ops)) if (!this.data.ops[id]) this.data.ops[id] = clone(op); Object.assign(this.data.participants, other.participants);
+    Object.assign(this.data.roots, other.roots); for (const [id, op] of Object.entries(other.ops)) { if (op.kind === 'referral' && (id !== op.id || this.validOp(op))) throw new Error('推广奖励记录无效'); if (!this.data.ops[id]) this.data.ops[id] = clone(op); else if (op.kind === 'referral' && this.data.ops[id].kind === 'referral') this.data.ops[id] = clone(chooseReferral(this.data.ops[id], op)); } Object.assign(this.data.participants, other.participants);
     this.data.seaweedHour = Math.max(this.data.seaweedHour ?? Math.floor(this.data.tick / HOUR), other.seaweedHour ?? Math.floor(other.tick / HOUR));
     mergeBreeding(this, other);
     for (const [id, record] of Object.entries(other.travel || {})) this.data.travel[id] = mergeTravel(this.data.travel[id], record);

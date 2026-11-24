@@ -18,7 +18,7 @@ using System.Security.Cryptography;
 
 namespace Tide {
   sealed class Client {
-    public string Id, Nick; public int Peers, Generation; public volatile bool Active; public DateTime Updated;
+    public string Id, Nick, Actor; public int Peers, Generation; public volatile bool Active; public DateTime Updated;
     public object[] Hints = new object[0];
     public readonly ConcurrentQueue<string> Queue = new ConcurrentQueue<string>();
   }
@@ -29,7 +29,6 @@ namespace Tide {
     static int Port = 39241; static bool Loopback, Headless, NoOpen;
     static string Root, Www, Token, Published, JoinUrl = "";
     static string[] Urls; static TcpListener Listener; static volatile bool Running = true;
-    static byte[] Package;
     static readonly ConcurrentDictionary<string, Client> Clients = new ConcurrentDictionary<string, Client>();
     static JavaScriptSerializer Json() { return new JavaScriptSerializer { MaxJsonLength = 131072, RecursionLimit = 32 }; }
     static string Encode(object o) { return Json().Serialize(o); }
@@ -58,7 +57,7 @@ namespace Tide {
         graphics.Clear(Color.FromArgb(11, 51, 86)); using (var font = new Font("Consolas", 16, FontStyle.Bold)) graphics.DrawString("o>", font, Brushes.Aquamarine, -1, 2);
         using (var tray = new NotifyIcon { Icon = Icon.FromHandle(bitmap.GetHicon()), Text = "鱼来 · 字符水世界", Visible = true }) {
           var menu = new ContextMenuStrip(); menu.Items.Add("打开鱼来", null, delegate { Open(); });
-          menu.Items.Add("复制我的邀请码", null, delegate { Clipboard.SetText(Invite(Published)); });
+          menu.Items.Add("复制我的邀请码", null, delegate { Clipboard.SetText(PublishedInvite()); });
           menu.Items.Add("退出启动器", null, delegate { Running = false; Listener.Stop(); Application.Exit(); });
           tray.ContextMenuStrip = menu; tray.DoubleClick += delegate { Open(); }; if (!NoOpen) Open(); Application.Run(); tray.Visible = false;
         }
@@ -88,12 +87,14 @@ namespace Tide {
     static bool Private(IPAddress ip) { byte[] b = ip.GetAddressBytes(); return IPAddress.IsLoopback(ip) || (b.Length == 4 && (b[0] == 10 || (b[0] == 172 && b[1] >= 16 && b[1] <= 31) || (b[0] == 192 && b[1] == 168) || (b[0] == 169 && b[1] == 254) || (b[0] == 100 && b[1] >= 64 && b[1] <= 127))); }
     static string B64(byte[] bytes) { return Convert.ToBase64String(bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_'); }
     static string CanonicalEndpoint(string text) { Uri uri; if (text == null || text.Length > 512 || !Uri.TryCreate(text, UriKind.Absolute, out uri) || uri.Scheme != "http" || uri.Port < 1024 || uri.Port > 65535 || uri.UserInfo != "") throw new Exception("邀请码中的接入信息无效"); return uri.GetLeftPart(UriPartial.Authority); }
-    static string Invite(string url) { string canonical = CanonicalEndpoint(url); using (var sha = SHA256.Create()) return "YL1." + B64(Encoding.UTF8.GetBytes(canonical)) + "." + B64(sha.ComputeHash(Encoding.UTF8.GetBytes("fish-invite-v1:" + canonical)).Take(8).ToArray()); }
+    static string Invite(string url, string actor = "") { string canonical = CanonicalEndpoint(url); if (actor != "" && !System.Text.RegularExpressions.Regex.IsMatch(actor, "^[0-9a-f]{64}$")) throw new Exception("邀请码的发码账号无效"); string payload = actor == "" ? canonical : Encode(new { url = canonical, actor }); using (var sha = SHA256.Create()) return "YL1." + B64(Encoding.UTF8.GetBytes(payload)) + "." + B64(sha.ComputeHash(Encoding.UTF8.GetBytes("fish-invite-v1:" + payload)).Take(8).ToArray()); }
+    static string PublishedInvite() { var client = Clients.Values.Where(c => c.Active && !string.IsNullOrEmpty(c.Actor)).OrderBy(c => c.Id).FirstOrDefault(); return Invite(Published, client == null ? "" : client.Actor); }
     static string DecodeInvite(string code) {
-      try { if (code == null || code.Length > 1024) throw new Exception(); code = new string(code.Where(c => !char.IsWhiteSpace(c)).ToArray()); string[] parts = code.Split('.'); if (parts.Length != 3 || parts[0] != "YL1" || parts[1].Any(c => !(char.IsLetterOrDigit(c) && c < 128) && c != '-' && c != '_')) throw new Exception(); string payload = parts[1].Replace('-', '+').Replace('_', '/'); payload += new string('=', (4 - payload.Length % 4) % 4); string url = new UTF8Encoding(false, true).GetString(Convert.FromBase64String(payload)); if (CanonicalEndpoint(url) != url || Invite(url) != code) throw new Exception(); return url; }
+      try { if (code == null || code.Length > 1024) throw new Exception(); code = new string(code.Where(c => !char.IsWhiteSpace(c)).ToArray()); string[] parts = code.Split('.'); if (parts.Length != 3 || parts[0] != "YL1" || parts[1].Any(c => !(char.IsLetterOrDigit(c) && c < 128) && c != '-' && c != '_')) throw new Exception(); string payload = parts[1].Replace('-', '+').Replace('_', '/'); payload += new string('=', (4 - payload.Length % 4) % 4); string raw = new UTF8Encoding(false, true).GetString(Convert.FromBase64String(payload)), url = raw, actor = ""; if (raw.StartsWith("{", StringComparison.Ordinal)) { var data = Json().Deserialize<Dictionary<string, object>>(raw); url = Str(data, "url"); actor = Str(data, "actor"); if (actor == "" || raw != Encode(new { url, actor })) throw new Exception(); } if (CanonicalEndpoint(url) != url || Invite(url, actor) != code) throw new Exception(); return url; }
       catch { throw new Exception("邀请码无效或不完整，请重新复制"); }
     }
-    static string NormalizeInvite(string value) { if (string.IsNullOrWhiteSpace(value)) return ""; return Invite(value.Trim().StartsWith("YL1.", StringComparison.Ordinal) ? DecodeInvite(value.Trim()) : value.Trim()); }
+    static string NormalizeInvite(string value) { if (string.IsNullOrWhiteSpace(value)) return ""; value = value.Trim(); if (!value.StartsWith("YL1.", StringComparison.Ordinal)) return Invite(value); DecodeInvite(value); return new string(value.Where(c => !char.IsWhiteSpace(c)).ToArray()); }
+    static string RequestInvite(Request request) { string value = System.Web.HttpUtility.ParseQueryString(request.Query)["invite"]; if (string.IsNullOrWhiteSpace(value)) return PublishedInvite(); string code = NormalizeInvite(value); if (!Urls.Contains(DecodeInvite(code))) throw new Exception("邀请码不属于此入口"); return code; }
     static object[] InviteHints(object[] hints) { var result = new List<object>(); foreach (var value in (hints ?? new object[0]).Take(20)) { var hint = value as IDictionary<string, object>; if (hint == null) continue; try { string code = NormalizeInvite(Str(hint, "url")); if (code != "") result.Add(new Dictionary<string, object> { { "id", Str(hint, "id") }, { "url", code } }); } catch { } } return result.ToArray(); }
     static async Task<Uri> PeerUri(string text) { string address = text != null && text.Trim().StartsWith("YL1.", StringComparison.Ordinal) ? DecodeInvite(text) : text; var uri = new Uri(CanonicalEndpoint(address)); var ips = await Dns.GetHostAddressesAsync(uri.Host); if (ips.Length == 0 || ips.Any(ip => !Private(ip))) throw new Exception("邀请码只支持内网或本机直连"); return uri; }
     static async Task<object> Fetch(Uri peer, string path, object data) {
@@ -113,8 +114,8 @@ namespace Tide {
         var r = await Read(stream, ((IPEndPoint)socket.Client.RemoteEndPoint).Address);
         if (r.Path == "/health" && r.Method == "GET") { await J(stream, 200, new { ok = true, name = "tide", version = "0.1.0" }); return; }
         if (r.Path == "/status" && r.Method == "GET") { await J(stream, 200, Status()); return; }
-        if (r.Path == "/invite" && r.Method == "GET") { await J(stream, 200, new { invite = Invite(Published) }); return; }
-        if (r.Path == "/local/meta" && r.Method == "GET") { if (!Local(r)) { await J(stream, 403, new { ok = false }); return; } await J(stream, 200, new { token = Token, url = Invite(Published), urls = Urls.Select(Invite).ToArray(), joinUrl = JoinUrl, version = "0.1.0" }); return; }
+        if (r.Path == "/invite" && r.Method == "GET") { await J(stream, 200, new { invite = RequestInvite(r) }); return; }
+        if (r.Path == "/local/meta" && r.Method == "GET") { if (!Local(r)) { await J(stream, 403, new { ok = false }); return; } await J(stream, 200, new { token = Token, url = Invite(Published), urls = Urls.Select(url => Invite(url)).ToArray(), joinUrl = JoinUrl, version = "0.1.0" }); return; }
         if (r.Path == "/local/events" && r.Method == "GET") {
           var query = System.Web.HttpUtility.ParseQueryString(r.Query); Client client;
           if (!Local(r) || query["token"] != Token || !Clients.TryGetValue(query["node"], out client)) { await J(stream, 403, new { ok = false }); return; }
@@ -125,7 +126,7 @@ namespace Tide {
         if (r.Path.StartsWith("/local/") && r.Method == "POST") {
           var body = Parse(r.Body); if (!Authorized(r, body)) { await J(stream, 403, new { ok = false, error = "本地通道未授权" }); return; }
           string id = Str(body, "node"); Client client;
-          if (r.Path == "/local/register") { if (id.Length != 36 || Str(body, "nick").Length > 30) throw new Exception("标识无效"); Clients[id] = new Client { Id = id, Nick = Str(body, "nick"), Updated = DateTime.UtcNow }; await J(stream, 200, new { ok = true }); return; }
+          if (r.Path == "/local/register") { string actor = Str(body, "actor"); if (id.Length != 36 || Str(body, "nick").Length > 30 || (actor != "" && (!System.Text.RegularExpressions.Regex.IsMatch(actor, "^[0-9a-f]{64}$") || !id.StartsWith(actor.Substring(0, 16) + "-", StringComparison.Ordinal)))) throw new Exception("标识无效"); Clients[id] = new Client { Id = id, Nick = Str(body, "nick"), Actor = actor, Updated = DateTime.UtcNow }; await J(stream, 200, new { ok = true }); return; }
           if (r.Path == "/local/presence") { if (Clients.TryGetValue(id, out client)) { client.Peers = Math.Max(0, Math.Min(16, Int(body, "peers"))); client.Updated = DateTime.UtcNow; if (body.ContainsKey("hints")) { var list = body["hints"] as System.Collections.IEnumerable; if (list != null && !(body["hints"] is string)) client.Hints = InviteHints(list.Cast<object>().Take(12).ToArray()); } } await J(stream, 200, new { ok = true }); return; }
           if (r.Path == "/local/unregister") { if (Clients.TryGetValue(id, out client)) { Interlocked.Increment(ref client.Generation); client.Active = false; } await J(stream, 200, new { ok = true }); return; }
           if (r.Path == "/local/probe") { var uri = await PeerUri(Str(body, "url")); await J(stream, 200, await Fetch(uri, "/status", null)); return; }
@@ -142,7 +143,7 @@ namespace Tide {
           if (!new string[] { "offer", "answer", "reject" }.Contains(type) || Str(signal, "connection").Length != 36 || Str(signal, "from").Length != 36) throw new Exception("信令格式无效");
           signal["fromUrl"] = Invite(sender.GetLeftPart(UriPartial.Authority)); destination.Queue.Enqueue(Encode(signal)); await J(stream, 200, new { ok = true, to = destination.Id }); return;
         }
-        if (r.Path == "/download.zip" && r.Method == "GET") { if (Package == null) Package = MakePackage(); await Reply(stream, 200, Package, "application/zip", "Content-Disposition: attachment; filename=Tide-0.1.0.zip\r\n"); return; }
+        if (r.Path == "/download.zip" && r.Method == "GET") { await Reply(stream, 200, MakePackage(RequestInvite(r)), "application/zip", "Content-Disposition: attachment; filename=Tide-0.1.0.zip\r\n"); return; }
         if (r.Method != "GET" || r.Path.Contains("\\") || r.Path.Contains("\0")) { await J(stream, 400, new { ok = false }); return; }
         string requested = r.Path == "/" ? (IPAddress.IsLoopback(r.Remote) ? "index.html" : "welcome.html") : r.Path.TrimStart('/'); var file = Path.GetFullPath(Path.Combine(Www, requested));
         if (!file.StartsWith(Path.GetFullPath(Www) + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase) || !File.Exists(file)) { await J(stream, 404, new { ok = false }); return; }
@@ -150,9 +151,9 @@ namespace Tide {
         await Reply(stream, 200, File.ReadAllBytes(file), types.ContainsKey(ext) ? types[ext] : "application/octet-stream", "Cache-Control: no-cache\r\n");
       } catch (Exception ex) { try { J(stream, 400, new { ok = false, error = ex is WebException || ex is SocketException ? "邀请码暂时无法连接，请确认同事在线且网络可达" : ex.Message }).GetAwaiter().GetResult(); } catch { } }
     }
-    static byte[] MakePackage() {
+    static byte[] MakePackage(string invitation) {
       using (var memory = new MemoryStream()) { using (var archive = new ZipArchive(memory, ZipArchiveMode.Create, true)) {
-        var join = archive.CreateEntry("join.json"); using (var writer = new StreamWriter(join.Open(), new UTF8Encoding(false))) writer.Write(Encode(new { invite = Invite(Published) }));
+        var join = archive.CreateEntry("join.json"); using (var writer = new StreamWriter(join.Open(), new UTF8Encoding(false))) writer.Write(Encode(new { invite = invitation }));
         var exe = Process.GetCurrentProcess().MainModule.FileName; var entry = archive.CreateEntry("鱼来.exe"); using (var stream = entry.Open()) { var bytes = File.ReadAllBytes(exe); stream.Write(bytes, 0, bytes.Length); }
         foreach (var file in Directory.GetFiles(Www, "*", SearchOption.AllDirectories)) { var item = archive.CreateEntry("www/" + file.Substring(Www.Length + 1).Replace('\\', '/'), CompressionLevel.Optimal); using (var stream = item.Open()) { var bytes = File.ReadAllBytes(file); stream.Write(bytes, 0, bytes.Length); } }
         var readme = archive.CreateEntry("使用说明.txt"); using (var writer = new StreamWriter(readme.Open(), new UTF8Encoding(true))) writer.Write("鱼来 0.1.0\r\n解压整个文件夹，双击 鱼来.exe。\r\n浏览器进入固定本地地址 http://127.0.0.1:39241。\r\n支持 Chrome、Edge 和 Firefox。\r\n包内带有下载者的邀请码，自动尝试配对；也可在游戏中粘贴同事的邀请码。\r\n关闭游戏页即退出世界，托盘右键可退出启动器。\r\n世界数据仅保存在浏览器，请按需导出身份和记忆备份。\r\n");

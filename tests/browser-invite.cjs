@@ -21,18 +21,19 @@ function zipEntry(bytes, name) {
   throw new Error('发行包缺少 ' + name);
 }
 async function main() {
-  const { encodeInvite, decodeInvite } = await import(pathToFileURL(path.join(project, 'www', 'invite.js')).href);
+  const { encodeInvite, decodeInvite, inviteDetails } = await import(pathToFileURL(path.join(project, 'www', 'invite.js')).href);
   await helper(39341); await helper(39342); const urlA = 'http://127.0.0.1:39341', urlB = 'http://127.0.0.1:39342';
   const metaA = await (await fetch(urlA + '/local/meta')).json(); assert.equal(await decodeInvite(metaA.url), urlA); assert(!JSON.stringify(metaA).includes('http://')); assert(metaA.urls.every(code => code.startsWith('YL1.')));
   browser = await chromium.launch({ executablePath: 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe', headless: true });
   const first = await browser.newContext({ viewport: { width: 1440, height: 900 }, permissions: ['clipboard-read', 'clipboard-write'] }), second = await browser.newContext({ viewport: { width: 1440, height: 900 } });
   const a = await open(first, 39341, '邀请甲'); let b = await open(second, 39342, '邀请乙');
-  await a.locator('#connect').click(); const codeA = await a.locator('#myUrl').inputValue(); assert.equal(codeA, metaA.url); assert.equal(await decodeInvite(codeA), urlA);
+  await a.locator('#connect').click(); const codeA = await a.locator('#myUrl').inputValue(); assert.equal((await inviteDetails(codeA)).actor, await a.evaluate(() => tide.identity.actor)); assert.equal(await decodeInvite(codeA), urlA);
   assert(!(await a.locator('#connectionDialog').textContent()).includes('发布地址')); await a.locator('#copyUrl').click(); assert.equal(await a.evaluate(() => navigator.clipboard.readText()), codeA);
   fs.mkdirSync(output, { recursive: true }); await a.screenshot({ path: path.join(output, 'invitation-dialog.png') }); await a.locator('#closeConnection').click();
-  await b.locator('#connect').click(); await b.locator('#peerUrl').fill('YL1.invalid.invalid'); await b.locator('#connectionForm .primary').click(); await b.waitForFunction(() => document.getElementById('toast').textContent.includes('邀请码')); assert.equal(await b.evaluate(() => tide.network.peers.length), 0);
+  await b.locator('#connect').click(); await b.locator('#peerUrl').fill('YL1.invalid.invalid'); await b.locator('#connectionForm .primary').click(); await b.waitForFunction(() => document.getElementById('toast').textContent.includes('邀请码')); assert.equal(await b.evaluate(() => tide.network.peers.length), 0); assert.equal(await a.evaluate(() => tide.balance()), 20);
   await b.locator('#peerUrl').fill(codeA); await b.locator('#connectionForm .primary').click();
   for (const page of [a, b]) await page.waitForFunction(() => tide.network.peers.length === 1 && Object.keys(tide.world.data.roots).length === 2);
+  await a.waitForFunction(() => tide.balance() === 30); assert.equal(await b.evaluate(() => tide.balance()), 20);
   const peers = await b.evaluate(() => tide.network.peers); assert(peers.every(peer => peer.url.startsWith('YL1.')));
   const known = await b.evaluate(async () => (await import('./storage.js')).get('known')); assert(known.every(code => code.startsWith('YL1.')));
   await until(async () => { const status = await (await fetch(urlA + '/status')).json(); return status.hints.length > 0; }, '邻居邀请码未传播');
@@ -41,10 +42,12 @@ async function main() {
   const bytes = Buffer.from(await (await fetch(urlA + '/download.zip')).arrayBuffer()); fs.writeFileSync(path.join(output, 'invitation-download.zip'), bytes); const join = JSON.parse(zipEntry(bytes, 'join.json').toString('utf8')); assert.equal(join.invite, codeA); assert.equal(join.url, undefined); assert(!JSON.stringify(join).includes('127.0.0.1'));
   // An old downloaded package upgrades its join.json on startup.
   const legacyRoot = path.join(output, 'invite-legacy-preview'); fs.mkdirSync(legacyRoot, { recursive: true }); fs.copyFileSync(exe, path.join(legacyRoot, '鱼来.exe')); fs.cpSync(path.join(project, 'www'), path.join(legacyRoot, 'www'), { recursive: true }); fs.writeFileSync(path.join(legacyRoot, 'join.json'), JSON.stringify({ url: urlA }));
-  await helper(39344, path.join(legacyRoot, '鱼来.exe')); const legacyMeta = await (await fetch('http://127.0.0.1:39344/local/meta')).json(); assert.equal(legacyMeta.joinUrl, codeA); assert.equal(JSON.parse(fs.readFileSync(path.join(legacyRoot, 'join.json'), 'utf8')).invite, codeA);
+  await helper(39344, path.join(legacyRoot, '鱼来.exe')); const legacyMeta = await (await fetch('http://127.0.0.1:39344/local/meta')).json(); assert.equal(legacyMeta.joinUrl, metaA.url); assert.equal(JSON.parse(fs.readFileSync(path.join(legacyRoot, 'join.json'), 'utf8')).invite, metaA.url);
   const third = await browser.newContext(), c = await open(third, 39344, '邀请丙', '/?join=' + encodeURIComponent(urlA)); await c.waitForFunction(() => tide.network.peers.length > 0); assert(!c.url().includes('join='));
+  await a.waitForFunction(() => tide.balance() === 40);
   // An old browser cache is rewritten as codes before automatic reconnect.
   await b.close(); const setup = await second.newPage(); await setup.goto(urlB + '/welcome.html'); await setup.evaluate(async values => (await import('./storage.js')).set('known', values), [urlA, codeA, 'invalid']); await setup.close(); b = await open(second, 39342); await b.waitForFunction(() => tide.network.peers.length > 0); const upgraded = await b.evaluate(async () => (await import('./storage.js')).get('known')); assert(upgraded.length > 0 && upgraded.every(code => code.startsWith('YL1.'))); assert.equal(upgraded.filter(code => code === codeA).length, 1);
+  assert.equal(await a.evaluate(() => tide.balance()), 40); assert.equal(await b.evaluate(() => tide.balance()), 20);
   for (const code of ['YL1.invalid.invalid', await encodeInvite('http://8.8.8.8:39241')]) { const response = await fetch(urlA + '/local/probe', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: metaA.token, node: 'test', url: code }) }); assert.equal(response.status, 400); const result = await response.json(); assert(!result.error.includes('8.8.8.8')); }
   assert.deepEqual(errors, []); console.log('邀请码复制、非明文接口/缓存/下载配置、旧入口迁移、三浏览器P2P连接与非法代码拒绝通过');
 }

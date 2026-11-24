@@ -6,18 +6,19 @@ async function inflateBounded(bytes) { const reader = new Blob([bytes]).stream()
 export class Network {
   constructor(identity, meta, onMessage, onChange) { this.identity = identity; this.meta = meta; this.node = identity.actor.slice(0, 16) + '-' + crypto.randomUUID().replace(/-/g, '').slice(0, 19); this.onMessage = onMessage; this.onChange = onChange; this.connections = new Map(); this.seen = new Map(); this.pending = new Map(); this.stats = { sent: 0, received: 0, rejected: 0 }; }
   async local(route, payload = {}) { const response = await fetch('/local/' + route, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: this.meta.token, node: this.node, ...payload }) }); const result = await response.json(); if (!response.ok) throw new Error(result.error || '本地配对通道不可用'); return result; }
-  async start(nick) { this.sign = await signer(this.identity); await this.local('register', { nick }); this.events = new EventSource(`/local/events?node=${this.node}&token=${encodeURIComponent(this.meta.token)}`); this.events.onmessage = e => { try { this.signal(JSON.parse(e.data)).catch(error => this.onChange(error.message)); } catch { } }; }
+  async start(nick) { this.sign = await signer(this.identity); await this.local('register', { nick, actor: this.identity.actor }); this.events = new EventSource(`/local/events?node=${this.node}&token=${encodeURIComponent(this.meta.token)}`); this.events.onmessage = e => { try { this.signal(JSON.parse(e.data)).catch(error => this.onChange(error.message)); } catch { } }; }
   live() { return [...this.connections.values()].filter(p => p.dc?.readyState === 'open'); }
   has(node) { return [...this.connections.values()].some(p => p.node === node && !['closed', 'failed'].includes(p.pc.connectionState)); }
-  async connect(url, requestedNode = '', visited = new Set()) {
+  async connectInvite(value) { const code = await normalizeInvite(value); return this.connect(code, '', new Set(), code); }
+  async connect(url, requestedNode = '', visited = new Set(), entryInvite = '') {
     url = await normalizeInvite(url);
     if (this.connections.size >= MAX_PEERS) return;
     if (visited.has(url + requestedNode)) return; visited.add(url + requestedNode);
     const status = await this.local('probe', { url });
     const possible = (status.clients || []).filter(c => c.id !== this.node && !this.has(c.id) && c.peers < MAX_PEERS && (!requestedNode || c.id === requestedNode));
     const target = possible.sort((a, b) => a.peers - b.peers)[0];
-    if (!target) { for (const hint of (status.hints || []).slice(0, 8)) { if (hint.id !== this.node && !this.has(hint.id)) { try { await this.connect(hint.url, hint.id, visited); if (this.live().length) return; } catch { } } } throw new Error('入口可访问，但暂时没有正在玩的伙伴或空位'); }
-    const id = crypto.randomUUID(), p = this.make(id, url, target.id); this.attach(p, p.pc.createDataChannel('tide'));
+    if (!target) { for (const hint of (status.hints || []).slice(0, 8)) { if (hint.id !== this.node && !this.has(hint.id)) { try { await this.connect(hint.url, hint.id, visited, entryInvite); if (this.live().length) return; } catch { } } } throw new Error('入口可访问，但暂时没有正在玩的伙伴或空位'); }
+    const id = crypto.randomUUID(), p = this.make(id, url, target.id); p.entryInvite = entryInvite; this.attach(p, p.pc.createDataChannel('tide'));
     try { await p.pc.setLocalDescription(await p.pc.createOffer()); await this.ice(p.pc); const result = await this.local('relay', { url, signal: { type: 'offer', from: this.node, to: target.id, connection: id, sdp: p.pc.localDescription.toJSON() } }); if (!result.ok) throw new Error(result.error || '配对入口繁忙'); } catch (e) { this.close(p); throw e; }
   }
   make(id, url, node) {
