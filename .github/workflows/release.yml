@@ -1,0 +1,80 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '已有版本标签，例如 v0.1.0'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ inputs.tag || github.ref_name }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate version tag
+        run: |
+          if ($env:RELEASE_TAG -notmatch '^v\d+\.\d+\.\d+(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?$') { throw 'Use a version tag such as v0.1.0.' }
+          git rev-parse --verify "refs/tags/$env:RELEASE_TAG"
+          if ($LASTEXITCODE -ne 0) { throw 'The release tag must already exist.' }
+          "RELEASE_VERSION=$($env:RELEASE_TAG.Substring(1))" >> $env:GITHUB_ENV
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Test game rules
+        run: npm test
+
+      - name: Build minimal Windows ZIP
+        run: ./build.ps1 -Version $env:RELEASE_VERSION -OutputDirectory ./dist/release
+
+      - name: Verify extracted package starts
+        run: ./scripts/test-release.ps1 -ArchivePath "./dist/鱼来-$env:RELEASE_VERSION.zip"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $archive = "./dist/鱼来-$env:RELEASE_VERSION.zip"
+          gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --json tagName 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:RELEASE_TAG $archive --repo $env:GITHUB_REPOSITORY --clobber
+          } else {
+            $notes = Join-Path $env:RUNNER_TEMP 'release-notes.md'
+            @"
+          下载下方的 **鱼来-$env:RELEASE_VERSION.zip**，完整解压后双击文件夹根目录的 **鱼来.exe**。
+
+          适用于 Windows 10/11，无需安装 Node.js 或 Python。保留程序旁的 www 文件夹。首次进入设置昵称，在「连接同事」中粘贴邀请码。
+
+          [用户简明手册](https://github.com/$env:GITHUB_REPOSITORY/blob/$env:RELEASE_TAG/游戏简介.md)
+          "@ | Set-Content -LiteralPath $notes -Encoding utf8
+            $arguments = @('release', 'create', $env:RELEASE_TAG, $archive, '--repo', $env:GITHUB_REPOSITORY, '--verify-tag', '--title', "鱼来 $env:RELEASE_TAG", '--notes-file', $notes)
+            if ($env:RELEASE_VERSION.Contains('-')) { $arguments += '--prerelease' }
+            gh @arguments
+          }
+          if ($LASTEXITCODE -ne 0) { throw 'GitHub Release publication failed.' }
