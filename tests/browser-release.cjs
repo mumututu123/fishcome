@@ -21,8 +21,15 @@ async function main() {
     assert.equal(await page.evaluate(() => tide.balance()), 20);
     assert.equal(await page.locator('#sceneCount').textContent(), '1');
     const roots = await page.evaluate(() => tide.world.data.roots);
+    await page.locator('#chatInput').focus(); await page.keyboard.press('h');
+    assert.equal(await page.locator('#helpDialog').evaluate(element => element.open), false, 'Typing in visible chat input must not open help');
+    assert.equal(await page.locator('#chatInput').inputValue(), 'h');
+    await page.locator('#chatInput').fill(''); await page.locator('#help').focus();
     for (const [key, dialog] of [['h', 'helpDialog'], ['f', 'creatorDialog'], ['s', 'creatorDialog'], ['e', 'foodDialog'], ['p', 'myFishDialog']]) {
-      await page.keyboard.press(key); assert(await page.locator('#' + dialog).evaluate(element => element.open)); await page.keyboard.press('Escape');
+      await page.keyboard.press(key);
+      assert(await page.locator('#' + dialog).evaluate(element => element.open), `Shortcut ${key} did not open ${dialog}: ${JSON.stringify(await page.evaluate(() => ({ focus: document.activeElement?.outerHTML.slice(0, 300), openDialogs: [...document.querySelectorAll('dialog[open]')].map(element => element.id) })))}`);
+      await page.keyboard.press('Escape');
+      await page.locator('#' + dialog).waitFor({ state: 'hidden' });
     }
     const beforeFish = await page.evaluate(() => tide.world.counts.fish);
     await page.locator('#makeFish').click();

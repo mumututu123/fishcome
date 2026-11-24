@@ -468,7 +468,8 @@ document.addEventListener('keydown', e => {
   if (heldShortcuts.has(heldKey)) { e.preventDefault(); return; }
   if (e.isComposing || e.keyCode === 229) return;
   if (e.key === 'Escape') { cancelMode(); return; }
-  if (e.ctrlKey || e.metaKey || e.altKey || e.repeat || e.target.matches('input,textarea,select') || e.target.isContentEditable || document.querySelector('dialog[open]')) return;
+  const editing = (e.target.matches('input,textarea,select') || e.target.isContentEditable) && e.target.getClientRects().length > 0;
+  if (e.ctrlKey || e.metaKey || e.altKey || e.repeat || editing || document.querySelector('dialog[open]')) return;
   const button = shortcutButtons[key]; if (!button) return;
   // Cancel text insertion before the click transfers focus into the new editor.
   e.preventDefault(); heldShortcuts.add(heldKey); $(button).click();
