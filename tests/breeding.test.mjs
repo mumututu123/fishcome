@@ -4,6 +4,8 @@ import { World, CONFIG, EYES, cellPosition, components, velocities, clone, hash 
 import { CONTACT_TIME, BREEDING_TIME, updateContacts, finishBreeding, chooseOwner, motionUnits, commitUnit, validBreedingRecord, inheritedGlyph } from '../www/breeding.js';
 import { restoreCheckpoint } from '../www/lifecycle.js';
 import { HOUR, GREENS, growthRoll, weedId, validWildCell } from '../www/seaweed.js';
+import { storiesFor } from '../www/life.js';
+import { fishCatalog } from '../www/fish-profile.js';
 const t = Date.now() - 2 * BREEDING_TIME;
 const cell = (x, y, ch = 'Q') => ({ x, y, ch, color: '#88aacc' });
 function fish(world, gender, x, y, cells = [cell(0, 0), cell(1, 0), cell(2, 0)], actor = gender, suppliedId) {
@@ -66,6 +68,7 @@ test('1小时后只转移进入繁殖时的接触鱼元，父母各保留至少�
   const { world, male, female } = pair(), record = bind(world), ids = Object.keys(world.data.chars), positions = new Map(Object.values(world.data.chars).map(c => [c.id, cellPosition(world.data.fishes[c.entity], c)]));
   finishBreeding(world, record.ends - 1, transition); assert.equal(world.counts().fish, 2);
   finishBreeding(world, record.ends, transition); assert.equal(record.status, 'born'); assert.equal(world.counts().fish, 3); assert.deepEqual(Object.keys(world.data.chars), ids);
+  for (const actor of ['male', 'female']) assert.equal(storiesFor(world.data, fishCatalog(world.data), actor).filter(story => story.kind === 'birth').length, 1);
   const baby = world.data.fishes[record.baby.id], cells = world.fishCells(baby.id);
   assert.equal(cells.length, 2); assert(cells.some(c => EYES.has(c.ch))); assert.equal(cells.filter(c => EYES.has(c.ch)).length, 1);
   for (const c of cells) { assert.deepEqual(cellPosition(baby, c), positions.get(c.id)); assert.equal(c.color, '#88aacc'); assert.equal(inheritedGlyph(c, 'Q', world.data), c.ch); }

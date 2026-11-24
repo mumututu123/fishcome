@@ -4,6 +4,7 @@ import { HOUR, updateSeaweed } from './seaweed.js';
 import { MINUTE, updateBubbles, mergeBubbles } from './bubbles.js';
 import { initialLife, initialSources, validInitialOp } from './genesis.js';
 import { fishNameError } from './fish-profile.js';
+import { LIFE, newLife, lifeContext, updateLife, idleMotion, spawnPlankton, recordStory, mergeLife, validateLife, freshPlankton } from './life.js';
 import { REFERRAL_REWARD, referralError, chooseReferral } from './referral.js';
 import { WORLD_WIDTH, MAX_FLOOR, wrapX, worldKey, deltaX, nearX, makeTerrain, terrainOf, validTerrain, chooseTerrain, floorAt, waterAt } from './geography.js';
 import { fishOrigin, activeBreeding, finishBreeding, updateContacts, motionUnits, commitUnit, mergeBreeding, normalizeBreeding, normalizeBirthCells } from './breeding.js';
@@ -73,8 +74,10 @@ export function chooseClaim(a, b) {
 function transition(c, next, record) { Object.assign(c, next); c.path.push({ ...record, target: next.entity || '', x: next.x, y: next.y }); }
 
 export class World {
-  constructor(now = Date.now(), id = crypto.randomUUID(), { populate = true } = {}) {
+  constructor(now = Date.now(), id = crypto.randomUUID(), { populate = true, ambient = true } = {}) {
     this.data = { protocol: 1, roots: { [id]: now }, terrain: makeTerrain(id, now), tick: now, seaweedHour: Math.floor(now / HOUR), bubbleMinute: Math.floor(now / MINUTE), bubbles: {}, chars: {}, fishes: {}, breeding: {}, contacts: {}, contactAt: now, scenes: {}, ops: {}, participants: {}, notices: [], chats: {}, chatSources: {}, pendingChatGlyphs: 0, travel: {} };
+    this.data.life = newLife(now);
+    this.ambient = ambient;
     this.dirty = true; this.foodRevision = 0;
     if (populate) {
       const life = initialLife(id, now); Object.assign(this.data.chars, life.chars);
@@ -237,18 +240,23 @@ export class World {
         if (new Set(next.map(n => key(s.x + n.x, s.y + n.y))).size !== next.length) return { ok: false, error: '造景跨越整圈后会重叠，不能继续放大' };
         if (next.some(n => !this.waterAt(s.x + n.x, s.y + n.y) || fishMap.has(key(s.x + n.x, s.y + n.y)) || seaweedMap.has(key(s.x + n.x, s.y + n.y)) || (scenery.has(key(s.x + n.x, s.y + n.y)) && scenery.get(key(s.x + n.x, s.y + n.y)).scene.id !== s.id))) return { ok: false, error: '变形会覆盖鱼、海草或其他造景' };
         const retained = new Set(next.filter(n => !n.fresh).map(n => n.c.id)); for (const c of cells) if (!retained.has(c.id)) transition(c, { kind: 'burn', entity: '' }, { id: op.id, t: op.t, reason: 'delete' });
-        next.forEach((n, i) => { if (n.fresh) { const { wild, ...copied } = clone(n.c); this.data.chars[`${op.id}:${i}`] = { ...copied, id: `${op.id}:${i}`, payer: op.actor, x: n.x, y: n.y, path: [], created: op.t, editAt: op.t }; } else Object.assign(n.c, { x: n.x, y: n.y, editAt: op.t }); }); s.posAt = op.t; s.poseId = op.id;
+        next.forEach((n, i) => { if (n.fresh) { const { wild, plankton, ...copied } = clone(n.c); this.data.chars[`${op.id}:${i}`] = { ...copied, id: `${op.id}:${i}`, payer: op.actor, x: n.x, y: n.y, path: [], created: op.t, editAt: op.t }; } else Object.assign(n.c, { x: n.x, y: n.y, editAt: op.t }); }); s.posAt = op.t; s.poseId = op.id;
       }
     }
-    this.data.ops[op.id] = clone(op); this.data.participants[op.actor] = op.nick || this.data.participants[op.actor] || '匿名'; this.dirty = true; return { ok: true };
+    this.data.ops[op.id] = clone(op); this.data.participants[op.actor] = op.nick || this.data.participants[op.actor] || '匿名';
+    if (op.kind === 'fish' && op.genesis === undefined) recordStory(this, 'arrive', op.id, op.t);
+    this.dirty = true; return { ok: true };
   }
   step(now) {
     this.initializeTracking(now);
     finishBreeding(this, now, transition);
     updateSeaweed(this, now, CONFIG, this.monument, hash, transition);
     updateBubbles(this, now);
+    if (this.ambient) spawnPlankton(this, now);
     const dt = Math.min(1, Math.max(0, (now - this.data.tick) / 1000)); this.data.tick = now;
     let scenery = this.sceneryMap(), groups = this.fishGroups(); const fishOccupancy = this.fishMap();
+    const ambient = this.ambient ? lifeContext(this, now, scenery, groups) : null; if (ambient) updateLife(this, now, ambient);
+    for (const c of Object.values(this.data.chars)) if (freshPlankton(c) && c.kind === 'food' && now - c.born >= LIFE.planktonLife) { transition(c, { kind: 'burn', entity: '' }, { id: `dissolve:${c.id}`, t: c.born + LIFE.planktonLife, reason: 'dissolve' }); this.dirty = true; }
     const foods = Object.values(this.data.chars).filter(c => c.kind === 'food').sort((a, b) => a.born - b.born || a.id.localeCompare(b.id));
     const foodCount = new Map(); for (const c of foods) foodCount.set(key(c.x, c.y), (foodCount.get(key(c.x, c.y)) || 0) + 1);
     const fishAt = new Map(), occupiedByFish = new Map();
@@ -296,6 +304,7 @@ export class World {
       const center = bounds(cells), midX = f.x + f.facing * (center.minX + center.maxX) / 2, midY = f.y + (center.minY + center.maxY) / 2;
       visible.sort((a, b) => (Math.abs(deltaX(a.x, midX)) + Math.abs(a.y - midY)) - (Math.abs(deltaX(b.x, midX)) + Math.abs(b.y - midY)) || a.id.localeCompare(b.id));
       let dx, dy; if (visible.length) { dx = Math.sign(deltaX(visible[0].x, midX)); dy = Math.sign(visible[0].y - midY); }
+      else if (ambient) { const motion = idleMotion(this, f, now, ambient, { x: midX, y: midY }); dx = motion.dx; dy = motion.dy; }
       else { const phase = Math.floor((now - f.created) / 12000), r = hash(`${id}:${phase}`); dx = [-1, 0, 1][r % 3]; dy = [-1, 0, 1][Math.floor(r / 3) % 3]; }
       this.updateFishOccupants(movingOccupants, unit.members, groups, true);
       if (dx && dx !== f.facing) this.turn(f, cells, turningObstacles, movingOccupants);
@@ -309,6 +318,8 @@ export class World {
     }
     // Rank uses this step's pre-consumption size for every simultaneous contest.
     const sizes = new Map([...groups].map(([id, cs]) => [id, cs.length]));
+    const pastMeals = new Set(), pastGrass = new Set();
+    for (const c of Object.values(this.data.chars)) for (const event of c.path) if (event.reason === 'eat') { pastMeals.add(event.target); if (c.wild) pastGrass.add(event.target); }
     const bids = new Map(), bodyOccupancy = new Map();
     for (const [id, cs] of groups) { const f = this.data.fishes[id]; if (!f) continue; const occupied = new Set(cs.map(c => { const p = cellPosition(f, c); return key(p.x, p.y); })); bodyOccupancy.set(id, occupied); for (const c of cs) { const p = cellPosition(f, c); for (const [dx, dy] of NEIGHBORS) for (const food of atFood.get(key(p.x + dx, p.y + dy)) || []) if (!occupied.has(key(food.x, food.y))) { if (!bids.has(food.id)) bids.set(food.id, new Set()); bids.get(food.id).add(id); } } }
     for (const food of edible) {
@@ -316,7 +327,11 @@ export class World {
       const candidates = [...(bids.get(food.id) || [])].filter(id => !bodyOccupancy.get(id).has(key(food.x, food.y)) && touching(this.data.fishes[id], groups.get(id), food, scenery)).map(id => [id, groups.get(id)]);
       candidates.sort(([a], [b]) => sizes.get(b) - sizes.get(a) || hash(`${food.id}:${b}`) - hash(`${food.id}:${a}`) || a.localeCompare(b));
       if (candidates.length) {
+        const winner = candidates[0][0], grass = food.kind === 'seaweed';
+        const previouslyAte = (grass ? pastGrass : pastMeals).has(winner);
         const [id, cs] = candidates[0], f = this.data.fishes[id]; bodyOccupancy.get(id).add(key(food.x, food.y)); movingOccupants.set(key(food.x, food.y), new Set([id])); transition(food, { kind: 'fish', entity: id, x: deltaX(food.x, f.x) * f.facing, y: food.y - f.y }, { id: `eat:${food.id}:${food.path.length}`, t: now, reason: 'eat', rank: sizes.get(id) }); cs.push(food); f.lastFed = now; f.hungerAt = now + CONFIG.hunger; this.foodRevision++; this.dirty = true;
+        if (!previouslyAte) recordStory(this, grass ? 'grass' : 'meal', id, now);
+        pastMeals.add(id); if (grass) pastGrass.add(id);
       }
     }
     for (const [id, cells] of groups) { const f = this.data.fishes[id]; if (f && now >= f.hungerAt) this.starve(id, f.hungerAt); }
@@ -336,7 +351,7 @@ export class World {
     const remaining = cells.filter(c => c !== removed), parts = components(remaining).sort((a, b) => b.length - a.length || hash(`${event}:${a.map(c => c.id).sort()[0]}`) - hash(`${event}:${b.map(c => c.id).sort()[0]}`));
     const kept = parts[0]?.length >= 2 ? new Set(parts[0].map(c => c.id)) : new Set();
     for (const c of remaining) if (!kept.has(c.id)) { const p = cellPosition(f, c); transition(c, { kind: 'food', entity: '', x: wrapX(p.x), y: p.y, born: at, fall: 0 }, { id: event, t: at, reason: 'shed' }); }
-    if (!kept.size) delete this.data.fishes[id]; else f.hungerAt = at + CONFIG.hunger;
+    if (!kept.size) { delete this.data.fishes[id]; recordStory(this, 'depart', id, at); } else f.hungerAt = at + CONFIG.hunger;
     this.dirty = true;
   }
   merge(other) {
@@ -344,6 +359,7 @@ export class World {
     if (other.terrain && !validTerrain(other.terrain, other.roots)) throw new Error('固定海底地形被修改或无效');
     for (const [root, at] of Object.entries(other.roots || {})) if (this.data.roots[root] !== undefined && this.data.roots[root] !== at) throw new Error('世界起源时间不能修改');
     const initial = initialSources({ ...this.data.roots, ...other.roots });
+    if (!validateLife(other.life, { roots: { ...this.data.roots, ...other.roots }, ops: { ...this.data.ops, ...other.ops }, breeding: { ...this.data.breeding, ...other.breeding } }, Math.max(Date.now() + 60000, this.data.tick, other.tick))) throw new Error('鱼生记录无效');
     for (const op of Object.values(other.ops)) if (op.genesis !== undefined && !validInitialOp(op, initial)) throw new Error('初始鱼记录被修改或无效');
     this.data.terrain = clone(chooseTerrain(terrainOf(this.data), terrainOf(other)));
     Object.assign(this.data.roots, other.roots); for (const [id, op] of Object.entries(other.ops)) { if (op.kind === 'referral' && (id !== op.id || this.validOp(op))) throw new Error('推广奖励记录无效'); if (!this.data.ops[id]) this.data.ops[id] = clone(op); else if (op.kind === 'referral' && this.data.ops[id].kind === 'referral') this.data.ops[id] = clone(chooseReferral(this.data.ops[id], op)); } Object.assign(this.data.participants, other.participants);
@@ -373,6 +389,7 @@ export class World {
     if (!this.sceneCells(CHAT_FLOOR).length) delete this.data.scenes[CHAT_FLOOR];
     this.data.pendingChatGlyphs = Math.max(0, Object.values(this.data.chatSources).reduce((sum, message) => sum + chatGlyphs(message.body.text).length, 0) - Object.values(this.data.chars).filter(c => c.chat).length);
     this.data.tick = Math.max(this.data.tick, other.tick);
+    this.data.life = mergeLife(this.data.life, other.life, this.data);
     this.data.bubbles = mergeBubbles(this.data.bubbles, other.bubbles, this.data.tick, this.data.chars); this.data.bubbleMinute = Math.max(this.data.bubbleMinute ?? Math.floor(this.data.tick / MINUTE), other.bubbleMinute ?? Math.floor(other.tick / MINUTE));
     normalizeBreeding(this, this.data.tick); this.foodRevision++; this.dirty = true;
   }

@@ -1,6 +1,7 @@
 import { CONFIG, cellPosition, EYES, MONUMENT } from './engine.js';
 import { wrapX, deltaX, nearX, worldKey } from './geography.js';
 import { bubbleState, BUBBLE_GLYPH, BUBBLE_COLOR } from './bubbles.js';
+import { weatherAt, lightDepth } from './life.js';
 const FONT = "'Microsoft YaHei',Consolas,monospace";
 export { MONUMENT } from './engine.js';
 export class Renderer {
@@ -27,6 +28,7 @@ export class Renderer {
   draw(world) {
     this.world = world; const ctx = this.ctx, size = this.cell * this.scale; this.background(ctx, this.width, this.height, this.camera, size);
     const left = this.camera.x - this.width / 2 / size - 2, right = this.camera.x + this.width / 2 / size + 2, top = this.camera.y - this.height / 2 / size - 2, bottom = this.camera.y + this.height / 2 / size + 2;
+    this.weather(world, size);
     const visible = p => Math.abs(deltaX(p.x, this.camera.x)) <= (right - left) / 2 && p.y >= top && p.y <= bottom;
     if (this.cachedWorld !== world || world.dirty || !this.characters) { this.characters = Object.values(world.data.chars); this.cachedWorld = world; world.dirty = false; }
     const characters = this.characters;
@@ -38,6 +40,22 @@ export class Renderer {
     for (const bubble of Object.values(world.data.bubbles || {})) { const state = bubbleState(bubble, bubbleNow); if (!state || state.y > bottom || state.y + state.size < top || Math.abs(deltaX(state.x + state.size / 2, this.camera.x)) > (right - left) / 2 + state.size) continue; for (let y = 0; y < state.size; y++) for (let x = 0; x < state.size; x++) { const p = { x: state.x + x, y: state.y + y }; if (visible(p)) { const pixel = this.screen(p.x, p.y); this.glyph(ctx, BUBBLE_GLYPH, BUBBLE_COLOR, pixel.x, pixel.y, size); } } }
     const monument = world.monument; monument.rows.forEach((row, dy) => Array.from(row).forEach((ch, dx) => { if (ch === ' ') return; const p = { x: monument.x + dx, y: monument.y + dy }; if (visible(p)) { const pixel = this.screen(p.x, p.y); this.glyph(ctx, ch, '#b8b797', pixel.x, pixel.y, size); } }));
     if (this.preview) { const p = this.preview; for (const c of p.cells || [{ x: 0, y: 0, ch: p.ch, color: p.color }]) { const pixel = this.screen(p.x + c.x, p.y + c.y); ctx.fillStyle = '#9fecd918'; ctx.fillRect(pixel.x, pixel.y, size, size); this.glyph(ctx, c.ch, p.valid === false ? '#efaa99' : c.color, pixel.x, pixel.y, size, .65); } }
+  }
+  weather(world, size) {
+    const weather = weatherAt(world.data, Date.now()); if (!weather.active) return;
+    const ctx = this.ctx, progress = (Date.now() - weather.started) / 1000;
+    ctx.save();
+    // A faint backdrop leaves characters legible, including on small screens.
+    if (weather.type === 'light') {
+      const y = this.screen(0, lightDepth(weather)).y, reach = 6 * size, gradient = ctx.createLinearGradient(0, y - reach, 0, y + reach);
+      gradient.addColorStop(0, '#dbecbd00'); gradient.addColorStop(.5, '#dbecbd24'); gradient.addColorStop(1, '#dbecbd00'); ctx.fillStyle = gradient; ctx.fillRect(0, y - reach, this.width, reach * 2);
+      const x = this.width * (.25 + .5 * progress / 55), surface = this.screen(0, 0).y; ctx.fillStyle = '#dbecbd0c'; ctx.beginPath(); ctx.moveTo(x, surface); ctx.lineTo(x + 34, surface); ctx.lineTo(x + 200, y + reach); ctx.lineTo(x + 100, y + reach); ctx.closePath(); ctx.fill();
+    }
+    if (weather.type === 'current') {
+      ctx.strokeStyle = '#a5d8e32b'; ctx.lineWidth = 1;
+      for (let row = 0; row < 8; row++) { const y = this.screen(0, 8 + row * 9).y; if (y < 0 || y > this.height) continue; for (let column = 0; column < 5; column++) { const x = ((column * this.width / 4 + progress * size * weather.direction) % (this.width + 80) + this.width + 80) % (this.width + 80) - 40; ctx.beginPath(); ctx.moveTo(x, y); ctx.quadraticCurveTo(x + 14, y - 4, x + 30, y); ctx.stroke(); } }
+    }
+    ctx.restore();
   }
   hit(x, y) { if (!this.world) return null; const p = this.point(x, y), monument = this.world.monument; if (p.x >= monument.x && p.x < monument.x + 8 && p.y >= monument.y && p.y < monument.y + 5) return { kind: 'monument' }; for (const c of Object.values(this.world.data.chars).reverse()) { if (c.kind === 'fish') { const f = this.world.data.fishes[c.entity]; if (!f) continue; const at = cellPosition(f, c); if (worldKey(at.x, at.y) === worldKey(p.x, p.y)) return { kind: 'fish', id: f.id }; } else if (c.kind === 'scene') { const s = this.world.data.scenes[c.entity]; if (s && worldKey(s.x + c.x, s.y + c.y) === worldKey(p.x, p.y)) return { kind: 'scene', id: s.id, cell: c.id }; } } return null; }
   snapshot(world) {

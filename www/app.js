@@ -15,6 +15,7 @@ import { normalizeInvite, encodeInvite, decodeInvite, inviteDetails } from './in
 import { verifyReferral } from './referral.js';
 import { wrapX, nearX, validTerrain } from './geography.js';
 import { initialSources, validInitialOp } from './genesis.js';
+import { validateLife, validPlankton, weatherAt, fishLifeText, storiesFor, storyText, returnStory } from './life.js';
 const $ = id => document.getElementById(id);
 const renderer = new Renderer($('sea'));
 let world = new World(undefined, undefined, { populate: false }), identity, network, meta, creator, mode = null, selected = null, dragging, histories = {}, known = [], members = new Map(), pending = new Map(), inbox = new Map(), lastPicture = null, priorCheckpoint = null;
@@ -22,6 +23,7 @@ let chatLimit = 80, renderedChatWorld, renderedChatCount = -1, renderedChatLimit
 let trackedFish = null, followBounds = null, myFishListKey = '';
 let referralBusy = false;
 const myFishCards = new Map();
+let lifeSince = Date.now(), returnVisit = false, lifeMessage = null;
 let myFishView = 'list', pedigreeFish = null, pedigreeKey = '';
 const fishDate = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
 let lastSnapshot = 0, snapshotBusy = false, lastHello = new Set(), lastMeter = Date.now(), lastSave = 0, lastPictureTime = 0, lastChat = 0, selfBeat = 0, lastLeader = '', status = '', started = false, lastRepair = 0;
@@ -52,6 +54,7 @@ function update() {
   if ($('creatorDialog').open) creator?.render();
   if ($('myFishDialog').open) renderMyFishes();
   if (selected) inspect(selected, false);
+  renderLife();
 }
 async function remember(url) { try { if (!url) return; url = await normalizeInvite(url); if (url === meta?.url) return; if (!known.includes(url)) { known.push(url); set('known', known).catch(() => {}); } } catch { } }
 function syncIncomeSerial() { for (const op of Object.values(world.data.ops)) if (op.kind === 'earn' && op.actor === identity.actor) identity.serial = Math.max(identity.serial || 0, op.serial); }
@@ -78,7 +81,8 @@ async function verifyReplica(data) {
   // Check branch-local structure here; reconcile the source's final history during merge.
   for (const [id, bubble] of Object.entries(data.bubbles || {})) if (id !== bubble.id || !validBubble(bubble, bubbleSources, false) || bubble.born > Date.now() + 60000) throw new Error('气泡缺少合法海草来源');
   await verifyChats(data.chats); await verifyChats(data.chatSources);
-  const sources = { ops: { ...world.data.ops, ...data.ops }, breeding: { ...world.data.breeding, ...data.breeding } };
+  const sources = { ops: { ...world.data.ops, ...data.ops }, breeding: { ...world.data.breeding, ...data.breeding }, roots: { ...world.data.roots, ...data.roots } };
+  if (!validateLife(data.life, sources)) throw new Error('鱼生记录无效');
   if (data.breeding !== undefined && (!data.breeding || typeof data.breeding !== 'object' || Array.isArray(data.breeding) || Object.keys(data.breeding).length > 500000)) throw new Error('繁殖记录无效');
   for (const [id, record] of Object.entries(data.breeding || {})) if (record.id !== id || !validBreedingRecord(record, sources) || record.at > Date.now() + 60000) throw new Error('繁殖记录缺少合法来源');
   if (data.contacts !== undefined && (!data.contacts || typeof data.contacts !== 'object' || Array.isArray(data.contacts) || Object.keys(data.contacts).length > 500000 || !Number.isFinite(data.contactAt) || data.contactAt > Date.now() + 60000)) throw new Error('接触计时无效');
@@ -94,6 +98,10 @@ async function verifyReplica(data) {
       const message = data.chatSources?.[c.chat] || world.data.chatSources[c.chat], floor = data.scenes[CHAT_FLOOR] || world.data.scenes[CHAT_FLOOR];
       if (message && !sourceGlyphs.has(c.chat)) sourceGlyphs.set(c.chat, new Map(chatGlyphs(message.body.text).map(glyph => [glyph.index, glyph.ch])));
       if (!message || id !== chatCellId(message, c.chatIndex) || sourceGlyphs.get(c.chat).get(c.chatIndex) !== c.ch || c.color !== chatColor(hash(message.actor)) || c.payer !== '' || c.kind !== 'scene' || c.entity !== CHAT_FLOOR || c.path.length || c.x < 0 || c.x >= CONFIG.width || c.y < 0 || c.y >= CONFIG.depth || floor?.x !== 0 || floor?.y !== 0 || !floor.fixed) throw new Error('聊天沉积缺少合法来源或被修改');
+      continue;
+    }
+    if (c.plankton) {
+      if (!validPlankton(c, sources.roots) || (!['scene', 'burn'].includes(c.kind) && inheritedGlyph(c, '*', sources) !== c.ch) || c.created > Date.now() + 60000 || (c.kind === 'fish' && (!c.path.some(event => ['eat', 'birth'].includes(event.reason) && event.target === c.entity) || !(data.fishes[c.entity] || world.data.fishes[c.entity])))) throw new Error('浮游食物缺少合法生态来源');
       continue;
     }
     if (c.wild || c.kind === 'seaweed') {
@@ -149,7 +157,7 @@ async function onMessage(message, peer) {
   if (members.has(message.from) && members.get(message.from).actor !== message.actor) return;
   const body = message.body;
   if (message.kind === 'hello') {
-    if (!body.world?.terrain || body.rules?.genesis !== 1) { status = '对方使用旧版世界规则，请双方刷新游戏页面后再连接'; toast(status); network.close(peer); update(); return; }
+    if (!body.world?.terrain || body.rules?.genesis !== 1 || body.rules?.life !== 1) { status = '对方使用旧版世界规则，请双方刷新游戏页面后再连接'; toast(status); network.close(peer); update(); return; }
     if (message.from !== peer.node || body.member?.id !== message.from || body.member.actor !== message.actor) return;
     const own = body.member; members.set(own.id, { ...own, url: peer.url, at: Date.now() }); remember(peer.url);
     rememberAuthor(message.actor, own.nick);
@@ -208,7 +216,7 @@ async function completeReferral(peer, peerActor) {
 async function networkChange(error) {
   if (!started) return; if (error) { status = error; update(); return; }
   const live = network.live();
-  for (const p of live) if (!lastHello.has(p.id)) { lastHello.add(p.id); await network.direct(p, 'hello', { rules: { genesis: 1 }, member: member(), members: active(), world: world.serialize(), cards: Object.values(histories).slice(0, 3), historyIndex: Object.keys(histories) }); }
+  for (const p of live) if (!lastHello.has(p.id)) { lastHello.add(p.id); await network.direct(p, 'hello', { rules: { genesis: 1, life: 1 }, member: member(), members: active(), world: world.serialize(), cards: Object.values(histories).slice(0, 3), historyIndex: Object.keys(histories) }); }
   const ids = new Set(live.map(p => p.node)); for (const m of active()) if (m.id !== network.node && m.direct && !ids.has(m.id)) { m.direct = false; probeGone(m.id, m.url); } for (const id of ids) if (members.has(id)) members.get(id).direct = true;
   network.presence(active().filter(m => m.id !== network.node).map(m => ({ id: m.id, url: m.url }))).catch(() => {}); update();
 }
@@ -222,7 +230,7 @@ async function broadcastWorld() {
     for (const [id, message] of Object.entries(data.chats)) if (full || !sentChats.has(id)) chats[id] = message;
     for (const [id, message] of Object.entries(data.chatSources)) if (full || !sentChatSources.has(id)) chatSources[id] = message;
     for (const [id, record] of Object.entries(data.travel)) { const mark = JSON.stringify(record); travelMarks.set(id, mark); if (full || sentTravel.get(id) !== mark) travel[id] = record; }
-    await network.broadcast('world', { delta: !full, world: { protocol: 1, roots: data.roots, terrain: data.terrain, tick: data.tick, seaweedHour: data.seaweedHour, bubbleMinute: data.bubbleMinute, bubbles: data.bubbles, chars, fishes: data.fishes, breeding: data.breeding, contacts: data.contacts, contactAt: data.contactAt, scenes: data.scenes, participants: data.participants, ops, notices: [], chats, chatSources, travel } });
+    await network.broadcast('world', { delta: !full, world: { protocol: 1, roots: data.roots, terrain: data.terrain, tick: data.tick, seaweedHour: data.seaweedHour, bubbleMinute: data.bubbleMinute, bubbles: data.bubbles, chars, fishes: data.fishes, breeding: data.breeding, contacts: data.contacts, contactAt: data.contactAt, scenes: data.scenes, participants: data.participants, ops, notices: [], chats, chatSources, travel, life: data.life } });
     sentChars = nextMarks; sentOps = new Set(Object.keys(data.ops)); sentChats = new Set(Object.keys(data.chats)); sentChatSources = new Set(Object.keys(data.chatSources)); sentTravel = travelMarks; if (full) lastFull = Date.now();
   } catch (e) { status = e.message; } finally { snapshotBusy = false; }
 }
@@ -294,7 +302,7 @@ function renderMyFishes() {
     entry.title.textContent = displayFishName(catalog.get(fish.id), identity); renderFishGender(entry.gender, fish); entry.health.textContent = status.hungry ? '饥饿' : '未饥饿'; entry.health.classList.toggle('hungry', status.hungry);
     renderBreeding(entry.breeding, fish, now);
     entry.info.textContent = `${identity.nick} · ${shortFishId(fish.id)} · ${cells.length} 鱼元 · ${fish.birth ? '自然出生于' : '创建于'} ${fishDate.format(fish.created)}`;
-    entry.metrics.textContent = `今日运动 ${status.trackedSince === undefined ? '待同步' : status.movement.toFixed(1) + ' 格'} · 近24小时进食 ${status.meals24} 颗`;
+    entry.metrics.textContent = `${fishLifeText(world.data, fish.id, now).habit} · 今日运动 ${status.trackedSince === undefined ? '待同步' : status.movement.toFixed(1) + ' 格'} · 近24小时进食 ${status.meals24} 颗`;
     drawFishThumbnail(entry.canvas, fish, cells);
   }
   if (myFishListKey !== key) { $('myFishList').replaceChildren(...fishes.map(fish => myFishCards.get(fish.id).card)); myFishListKey = key; }
@@ -331,6 +339,9 @@ function inspect(hit, show = true) {
     $('fishParentage').hidden = !object.birth; $('fishParentage').textContent = object.birth ? `自然出生 · 父鱼 ${displayFishName(catalog.get(object.parents[0]), identity)}（${shortFishId(object.parents[0])}） · 母鱼 ${displayFishName(catalog.get(object.parents[1]), identity)}（${shortFishId(object.parents[1])}）` : '';
     const v = world.swimVelocities(hit.id), eyes = cells.filter(c => EYES.has(c.ch)).length, now = Date.now(), status = world.fishStatus(hit.id, now), travel = world.data.travel[hit.id];
     $('objectInfo').textContent = `${authorNick(object.actor, object.nick)} · ${cells.length} 鱼元 · ${eyes ? eyes + ' 个眼睛' : '盲鱼'} · ${world.breedingState(hit.id) ? '合体游速 · ' : ''}水平 ${v.x.toFixed(2)} 格/秒 · 垂直 ${v.y.toFixed(2)} 格/秒`;
+    const life = fishLifeText(world.data, hit.id, now);
+    $('fishHabit').textContent = `${life.habit}${life.haunt ? '，' + life.haunt : ''}。`;
+    $('fishCompany').textContent = life.friend ? `正在和「${displayFishName(fishCatalog(world.data).get(life.friend), identity)}」同游。` : life.company + '。';
     $('fishMovement').textContent = status.trackedSince === undefined ? '待同步' : `${status.movement.toFixed(1)} 格`; $('fishMeals24').textContent = `${status.meals24} 颗`; $('fishHunger').textContent = status.hungry ? '饥饿' : '未饥饿'; $('fishHunger').classList.toggle('hungry', status.hungry);
     const minutes = Math.floor(status.hoursSinceFed * 60);
     $('fishLastMeal').textContent = `${status.neverFed ? '尚未进食 · 投放已' : '距上次进食'} ${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分钟`;
@@ -344,6 +355,32 @@ function inspect(hit, show = true) {
 }
 function chatLine(message) {
   const p = document.createElement('p'); p.className = 'message'; const n = document.createElement('span'); n.className = 'name'; n.textContent = authorNick(message.actor, message.body.nick); n.style.color = chatColor(hash(message.actor)); p.append(n, document.createTextNode(message.body.text)); return p;
+}
+function ownStories() { const catalog = fishCatalog(world.data); return { catalog, stories: storiesFor(world.data, catalog, identity.actor) }; }
+function renderLife() {
+  if (!identity) return;
+  $('weatherLabel').textContent = weatherAt(world.data, Date.now()).label;
+  const { catalog, stories } = ownStories(), latest = returnStory(stories, lifeSince);
+  if (latest) lifeMessage = latest;
+  if (lifeMessage && !world.data.life?.stories[lifeMessage.id]) lifeMessage = null;
+  $('lifeNote').hidden = !lifeMessage || !!selected || !!mode || !!document.querySelector('dialog[open]');
+  if (lifeMessage) {
+    $('lifeHeading').textContent = returnVisit ? '你不在的时候，海里发生了…' : '海里的小故事';
+    $('lifeText').textContent = storyText(lifeMessage, id => displayFishName(catalog.get(id), identity));
+  }
+  // Seen time is local to this identity, without acknowledgements or unread counts.
+  if (!document.hidden) identity.lifeSeenAt = Math.max(identity.lifeSeenAt || 0, Date.now());
+}
+function lifeDialog() {
+  const { catalog, stories } = ownStories(), list = $('lifeStories'); list.replaceChildren();
+  if (!stories.length) { const empty = document.createElement('p'); empty.className = 'quiet'; empty.textContent = '鱼正在慢慢认识这片海。以后的小故事会留在这里。'; list.append(empty); }
+  for (const story of stories.slice(0, 40)) {
+    const row = document.createElement('article'), time = document.createElement('small'), text = document.createElement('p');
+    row.className = 'lifeStory'; time.textContent = fishDate.format(story.at); text.textContent = storyText(story, id => displayFishName(catalog.get(id), identity)); row.append(time, text);
+    if (world.data.fishes[story.fish]) { const watch = document.createElement('button'); watch.type = 'button'; watch.textContent = '看看它'; watch.onclick = () => { $('lifeDialog').close(); focusFish(story.fish); }; row.append(watch); }
+    list.append(row);
+  }
+  $('lifeDialog').showModal(); $('lifeNote').hidden = true;
 }
 function renderChat(earlier = false) {
   const count = Object.keys(world.data.chats).length;
@@ -383,6 +420,7 @@ async function start() {
   meta = await (await fetch('/local/meta')).json(); if (!meta.token) throw new Error('请运行自己的启动器，从固定本地地址进入');
   meta.url = await normalizeInvite(meta.url);
   identity = await get('identity'); if (!identity) { $('welcomeDialog').showModal(); await new Promise(resolve => $('welcomeForm').onsubmit = async e => { e.preventDefault(); const nick = $('nickInput').value.trim(); if (!nick) return; identity = await newIdentity(nick); $('welcomeDialog').close(); resolve(); }); }
+  lifeSince = Number.isFinite(identity.lifeSeenAt) ? identity.lifeSeenAt : Date.now(); returnVisit = Date.now() - lifeSince > 60000;
   meta.url = await encodeInvite(await decodeInvite(meta.url), identity.actor);
   $('downloadPackage').href = '/download.zip?invite=' + encodeURIComponent(meta.url);
   histories = await get('histories') || {}; known = await get('known') || []; const previous = await get('checkpoint'), now = Date.now();
@@ -398,7 +436,7 @@ async function start() {
   syncIncomeSerial(); renderChat(); await save();
   reconnect().catch(() => {}); update(); lastPictureTime = Date.now(); takePicture().catch(() => {});
   setInterval(tick, CONFIG.step); setInterval(() => { network.presence(active().filter(m => m.id !== network.node).map(m => ({ id: m.id, url: m.url }))).catch(() => {}); if (network.connections.size < 6) { const candidate = active().filter(m => m.id !== network.node && !network.has(m.id)).sort((a, b) => hash(`${network.node}:${a.id}`) - hash(`${network.node}:${b.id}`))[0]; if (candidate) network.connect(candidate.url, candidate.id).catch(() => {}); } }, 6000);
-  document.addEventListener('visibilitychange', () => { resumeAfterInactivity(); network.broadcast('beat', { member: member() }).catch(() => {}); save().catch(() => {}); });
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) { lifeSince = identity.lifeSeenAt || Date.now(); returnVisit = Date.now() - lifeSince > 60000; lifeMessage = null; } resumeAfterInactivity(); network.broadcast('beat', { member: member() }).catch(() => {}); save().catch(() => {}); });
   window.addEventListener('pagehide', () => { const blob = new Blob([JSON.stringify({ node: network.node, token: meta.token })], { type: 'application/json' }); navigator.sendBeacon('/local/unregister', blob); lastPicture = localPicture(); save().catch(() => {}); });
   // Exposes read-only diagnostics for the project's automated browser checks.
   window.tide = { get world() { return { data: world.serialize(), counts: world.counts() }; }, get network() { return { node: network.node, leader: leader(), peers: network.live().map(p => ({ node: p.node, url: p.url })), stats: clone(network.stats) }; }, get identity() { return { actor: identity.actor, nick: displayNick(identity.nick) }; }, get histories() { return clone(histories); }, get view() { return { camera: clone(renderer.camera), scale: renderer.scale, followingFish: trackedFish, selected: clone(selected) }; }, balance };
@@ -419,6 +457,9 @@ async function tick() {
   if (amLeader() && now - lastPictureTime > 30000) { lastPictureTime = now; takePicture().catch(() => {}); }
   update();
 }
+$('lifePeek').onclick = lifeDialog;
+$('closeLife').onclick = () => $('lifeDialog').close();
+$('myFishStories').onclick = () => { $('myFishDialog').close(); lifeDialog(); };
 
 $('makeFish').onclick = () => { stopObserving(); cancelMode(); creator?.open('fish'); }; $('makeScene').onclick = () => { stopObserving(); cancelMode(); creator?.open('scene'); }; $('feed').onclick = () => feedMode();
 $('myFish').onclick = () => { if (!identity) return; setMyFishView('list'); $('myFishDialog').showModal(); };

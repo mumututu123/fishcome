@@ -1,6 +1,7 @@
 import { CONFIG, EYES, NEIGHBORS, bounds, cellPosition, components, hash, clone, key } from './engine.js';
 import { defaultFishName, fishNameError } from './fish-profile.js';
 import { wrapX, nearX, deltaX } from './geography.js';
+import { recordStory } from './life.js';
 
 export const CONTACT_TIME = 5000;
 export const BREEDING_TIME = 3600000;
@@ -69,6 +70,7 @@ export function finishBreeding(world, now, transition) {
     world.data.fishes[id] = { id, actor: record.baby.actor, nick: record.baby.nick, gender, birth: record.id, parents: record.baby.parents, x: wrapX(body.minX), y: body.minY, facing: 1, created: now, lastFed: now, hungerAt: now + CONFIG.hunger, cx: 0, cy: 0, posAt: now };
     world.data.fishes[id].name = record.baby.name;
     world.data.travel[id] = { since: now, days: {} };
+    recordStory(world, 'birth', id, now, { parents: record.baby.parents });
     father.cx = father.cy = mother.cx = mother.cy = 0; father.posAt = mother.posAt = now;
     world.foodRevision++; world.dirty = true;
   }
