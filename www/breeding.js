@@ -2,6 +2,7 @@ import { CONFIG, EYES, NEIGHBORS, bounds, cellPosition, components, hash, clone,
 import { defaultFishName, fishNameError } from './fish-profile.js';
 import { wrapX, nearX, deltaX } from './geography.js';
 import { recordStory } from './life.js';
+import { densityField, contactTime } from './ecology.js';
 
 export const CONTACT_TIME = 5000;
 export const BREEDING_TIME = 3600000;
@@ -9,7 +10,7 @@ export function breedingId(male, female, started) { const pair = `${male}:${fema
 export function fishOrigin(data, id) {
   const op = data.ops[id]; if (op?.kind === 'fish') return { actor: op.actor, nick: op.nick, gender: op.gender, created: op.t, name: op.name, size: op.cells.length };
   const record = typeof id === 'string' && id.startsWith('born:') ? data.breeding?.[id.slice(5)] : null;
-  return record?.status === 'born' && record.baby?.id === id ? record.baby : undefined;
+  return record?.status === 'born' && record.baby?.id === id ? record.baby : data.archivedCatalog?.[id];
 }
 export function activeBreeding(data, id) { return Object.values(data.breeding || {}).find(record => record.status === 'active' && (record.male === id || record.female === id)); }
 export function contactCells(male, mc, female, fc, scenery) {
@@ -95,12 +96,14 @@ export function updateContacts(world, now, groups, scenery) {
       }
     }
   }
-  const contacts = {};
+  const contacts = {}, density = world.ambient ? densityField(world, scenery) : null;
   for (const [key, pair] of [...pairs].sort(([a], [b]) => a.localeCompare(b))) {
     if (taken.has(pair.male) || taken.has(pair.female)) continue;
+    const f = world.data.fishes[pair.male], m = world.data.fishes[pair.female], wait = density ? contactTime(density((f.x + nearX(m.x, f.x)) / 2, (f.y + m.y) / 2)) : CONTACT_TIME;
+    if (!Number.isFinite(wait)) continue;
     const prior = world.data.contacts[key], since = prior && now >= prior.lastAt && now - prior.lastAt <= CONFIG.step * 2 ? prior.since : now;
     contacts[key] = { ...pair, since, lastAt: now };
-    if (now - since < CONTACT_TIME) continue;
+    if (now - since < wait) continue;
     const father = world.data.fishes[pair.male], mother = world.data.fishes[pair.female], fc = groups.get(pair.male), mc = groups.get(pair.female), all = [...fc.map(cell => cellPosition(father, cell)), ...mc.map(cell => cellPosition(mother, cell))];
     if (new Set(all.map(p => `${p.x},${p.y}`)).size !== all.length) continue;
     const started = now, id = breedingId(pair.male, pair.female, started), initialPose = { male: pose(father), female: pose(mother) };

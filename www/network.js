@@ -77,7 +77,7 @@ export class Network {
     this.seen.set(id, Date.now()); if (this.seen.size > 20000) { for (const [k, at] of this.seen) if (Date.now() - at > 120000) this.seen.delete(k); }
     await this.onMessage(message, p);
     // Hello carries a replica for this edge only; other packets travel over the bounded mesh.
-    if (!['hello', 'historyRequest', 'history', 'historyEnd'].includes(message.kind)) await Promise.allSettled(this.live().filter(peer => peer.id !== p.id).map(peer => this.send(peer, id, bytes)));
+    if (!['hello', 'historyRequest', 'history', 'historyEnd', 'archiveRequest', 'archiveChunk', 'archiveMissing'].includes(message.kind)) await Promise.allSettled(this.live().filter(peer => peer.id !== p.id).map(peer => this.send(peer, id, bytes)));
   }
   async presence(hints = []) { await this.local('presence', { peers: this.live().length, hints: hints.slice(0, 12) }); }
   async stop() { this.events?.close(); for (const p of [...this.connections.values()]) this.close(p); await this.local('unregister').catch(() => {}); }

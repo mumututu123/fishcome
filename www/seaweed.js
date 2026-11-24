@@ -1,5 +1,6 @@
 import { WORLD_WIDTH, worldKey, wrapX, deltaX, nearX } from './geography.js';
 import { validInitialWeed } from './genesis.js';
+import { densityField, growthChance } from './ecology.js';
 export const HOUR = 3600000;
 export const GREENS = ['#3d9854', '#48aa5d', '#55bc68', '#66cb74', '#79da84', '#92e59a'];
 const neighbors = [-1, 0, 1].flatMap(x => [-1, 0, 1].map(y => [x, y])).filter(([x, y]) => x || y);
@@ -31,6 +32,7 @@ export function updateSeaweed(world, now, config, monument, hash, transition) {
   const scenery = world.sceneryMap(), groups = plants(world.data.chars), blocked = occupied(world, config, monument);
   const circular = config.width === WORLD_WIDTH, canonical = x => circular ? wrapX(x) : x, bottom = x => circular ? world.floorAt(x) : config.depth;
   const fits = (x, y) => (circular || x >= 0 && x < config.width) && y >= 0 && y < bottom(x) && !blocked.has(key(x, y));
+  const density = world.ambient ? densityField(world, scenery) : null;
   // A severed stem or removed support becomes loose, edible food.
   for (const cells of groups.values()) {
     const root = cells[0], source = root.wild.source, candidate = source.startsWith('cell:') ? world.data.chars[source.slice(5)] : null, support = candidate?.kind === 'scene' ? candidate : null;
@@ -52,6 +54,7 @@ export function updateSeaweed(world, now, config, monument, hash, transition) {
     sources.sort((a, b) => a.id.localeCompare(b.id));
     for (const source of sources) {
       if (source.created > at - HOUR || !growthRoll(source.id, hour, hash)) continue;
+      if (density && hash(`seaweed-roll:${source.id}:${hour}`) % 10000 >= growthChance(density(source.x, source.y)) * 10000) continue;
       const id = weedId(source.id, hour, hash); if (world.data.chars[id]) continue;
       const choices = (source.plant ? [[-1, -1], [0, -1], [1, -1]] : neighbors).map(([dx, dy]) => ({ x: canonical(source.x + dx), y: source.y + dy })).filter(p => fits(p.x, p.y));
       if (!choices.length) continue;
