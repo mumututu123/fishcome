@@ -111,7 +111,9 @@ git push origin v0.1.0
 
 工作流在 Windows runner 上运行规则测试、编译启动器，再解压 ZIP 实际启动程序并校验所有网页资源，全部通过才创建 Release。用户下载 Release 附件「鱼来-0.1.0.zip」，完整解压后双击根目录「鱼来.exe」即可；包内只包含程序和必需的 `www`，不含源码、测试或验证文档。用户手册可在 Release 说明中打开。
 
-已存在的版本标签也可在 GitHub 的 Actions → Release → Run workflow 中填写标签手动重发；工作流构建该标签对应的代码，重复执行更新同名 ZIP 附件。带后缀的版本（如 `v0.2.0-beta.1`）会发布为预发行版。发布使用 GitHub 自动提供的令牌，无需另配个人令牌。日常推送 master 不自动发布。
+也可在 GitHub 的 Actions → Release → Run workflow 中选择分支（通常为 master），填写版本标签直接发布，例如 `v0.1.0`。标签不存在时，工作流构建本次所选分支的提交，测试与打包通过后才自动创建标签和 Release，不用事先手工打标签。标签已存在时，工作流构建其对应的原提交；重复执行更新同名 ZIP 附件，不移动原标签。大小写 `v`／`V` 都支持，推荐使用小写。
+
+带后缀的版本（如 `v0.2.0-beta.1`）会发布为预发行版。发布使用 GitHub 自动提供的令牌，无需另配个人令牌。日常推送 master 不自动发布。修复工作流后请从 Run workflow 创建一次新运行；旧运行的 Re-run jobs 仍会使用旧版工作流。
 
 本地可用 `./build.ps1 -Version 0.1.0 -OutputDirectory ./dist/release` 构建，再用 `./scripts/test-release.ps1 -ArchivePath ./dist/鱼来-0.1.0.zip` 检查解压后的发行包。每次打包从独立的新目录收集文件，已有输出目录中的旧文件不会混进 ZIP。
 

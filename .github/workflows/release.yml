@@ -4,10 +4,12 @@ on:
   push:
     tags:
       - 'v*'
+      - 'V*'
   workflow_dispatch:
     inputs:
       tag:
-        description: '已有版本标签，例如 v0.1.0'
+        description: '版本标签，例如 v0.1.0；不存在时发布所选分支并创建标签'
+        default: 'v0.1.0'
         required: true
         type: string
 
@@ -26,24 +28,24 @@ jobs:
       contents: write
     env:
       RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+      RELEASE_EVENT: ${{ github.event_name }}
     defaults:
       run:
         shell: pwsh
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
-          ref: refs/tags/${{ inputs.tag || github.ref_name }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Validate version tag
-        run: |
-          if ($env:RELEASE_TAG -notmatch '^v\d+\.\d+\.\d+(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?$') { throw 'Use a version tag such as v0.1.0.' }
-          git rev-parse --verify "refs/tags/$env:RELEASE_TAG"
-          if ($LASTEXITCODE -ne 0) { throw 'The release tag must already exist.' }
-          "RELEASE_VERSION=$($env:RELEASE_TAG.Substring(1))" >> $env:GITHUB_ENV
+      - name: Test release selection
+        run: ./tests/release-workflow.ps1
 
-      - uses: actions/setup-node@v4
+      - name: Resolve release version and commit
+        run: ./scripts/resolve-release.ps1 -Tag $env:RELEASE_TAG -EventName $env:RELEASE_EVENT
+
+      - uses: actions/setup-node@v6
         with:
           node-version: '22'
 
@@ -73,7 +75,8 @@ jobs:
 
           [用户简明手册](https://github.com/$env:GITHUB_REPOSITORY/blob/$env:RELEASE_TAG/游戏简介.md)
           "@ | Set-Content -LiteralPath $notes -Encoding utf8
-            $arguments = @('release', 'create', $env:RELEASE_TAG, $archive, '--repo', $env:GITHUB_REPOSITORY, '--verify-tag', '--title', "鱼来 $env:RELEASE_TAG", '--notes-file', $notes)
+            $arguments = @('release', 'create', $env:RELEASE_TAG, $archive, '--repo', $env:GITHUB_REPOSITORY, '--target', $env:RELEASE_COMMIT, '--title', "鱼来 $env:RELEASE_TAG", '--notes-file', $notes)
+            if ($env:RELEASE_TAG_EXISTS -eq 'true') { $arguments += '--verify-tag' }
             if ($env:RELEASE_VERSION.Contains('-')) { $arguments += '--prerelease' }
             gh @arguments
           }
