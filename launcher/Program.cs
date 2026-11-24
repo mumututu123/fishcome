@@ -120,7 +120,7 @@ namespace Tide {
           var query = System.Web.HttpUtility.ParseQueryString(r.Query); Client client;
           if (!Local(r) || query["token"] != Token || !Clients.TryGetValue(query["node"], out client)) { await J(stream, 403, new { ok = false }); return; }
           int generation = Interlocked.Increment(ref client.Generation); client.Active = true;
-          var header = Encoding.ASCII.GetBytes("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: keep-alive\r\n\r\n"); await stream.WriteAsync(header, 0, header.Length);
+          var header = Encoding.ASCII.GetBytes("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: keep-alive\r\n\r\n: ready\n\n"); await stream.WriteAsync(header, 0, header.Length);
           try { int loops = 0; while (Running && generation == client.Generation && client.Active) { string message; if (client.Queue.TryDequeue(out message)) { var bytes = Encoding.UTF8.GetBytes("data: " + message + "\n\n"); await stream.WriteAsync(bytes, 0, bytes.Length); } else if (++loops % 60 == 0) { var ping = Encoding.ASCII.GetBytes(": heartbeat\n\n"); await stream.WriteAsync(ping, 0, ping.Length); } await Task.Delay(250); } } finally { if (generation == client.Generation) client.Active = false; } return;
         }
         if (r.Path.StartsWith("/local/") && r.Method == "POST") {

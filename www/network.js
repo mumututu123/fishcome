@@ -2,6 +2,7 @@ import { signer, verifyEnvelope } from './storage.js';
 import { normalizeInvite } from './invite.js';
 const CHUNK = 16000, MAX_PEERS = 8, MAX_RAW = 32 * 1024 * 1024, encoder = new TextEncoder(), decoder = new TextDecoder();
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+const DIRECT_ERROR = '入口可访问，但浏览器直连未建立，请检查双方网络及防火墙后重试';
 async function inflateBounded(bytes) { const reader = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip')).getReader(), chunks = []; let size = 0; while (true) { const { done, value } = await reader.read(); if (done) break; size += value.length; if (size > MAX_RAW) { await reader.cancel(); throw new Error('解压数据过大'); } chunks.push(value); } const result = new Uint8Array(size); let offset = 0; for (const chunk of chunks) { result.set(chunk, offset); offset += chunk.length; } return result; }
 export class Network {
   constructor(identity, meta, onMessage, onChange) { this.identity = identity; this.meta = meta; this.node = identity.actor.slice(0, 16) + '-' + crypto.randomUUID().replace(/-/g, '').slice(0, 19); this.onMessage = onMessage; this.onChange = onChange; this.connections = new Map(); this.seen = new Map(); this.pending = new Map(); this.stats = { sent: 0, received: 0, rejected: 0 }; }
@@ -12,20 +13,23 @@ export class Network {
   async connectInvite(value) { const code = await normalizeInvite(value); return this.connect(code, '', new Set(), code); }
   async connect(url, requestedNode = '', visited = new Set(), entryInvite = '') {
     url = await normalizeInvite(url);
-    if (this.connections.size >= MAX_PEERS) return;
     if (visited.has(url + requestedNode)) return; visited.add(url + requestedNode);
     const status = await this.local('probe', { url });
+    const existing = [...this.connections.values()].find(p => (status.clients || []).some(c => c.id === p.node && (!requestedNode || c.id === requestedNode)));
+    if (existing) return this.waitForConnection(existing);
+    if (this.connections.size >= MAX_PEERS) throw new Error('你的直接连接已达上限，请稍后重试');
     const possible = (status.clients || []).filter(c => c.id !== this.node && !this.has(c.id) && c.peers < MAX_PEERS && (!requestedNode || c.id === requestedNode));
     const target = possible.sort((a, b) => a.peers - b.peers)[0];
     if (!target) { for (const hint of (status.hints || []).slice(0, 8)) { if (hint.id !== this.node && !this.has(hint.id)) { try { await this.connect(hint.url, hint.id, visited, entryInvite); if (this.live().length) return; } catch { } } } throw new Error('入口可访问，但暂时没有正在玩的伙伴或空位'); }
     const id = crypto.randomUUID(), p = this.make(id, url, target.id); p.entryInvite = entryInvite; this.attach(p, p.pc.createDataChannel('tide'));
-    try { await p.pc.setLocalDescription(await p.pc.createOffer()); await this.ice(p.pc); const result = await this.local('relay', { url, signal: { type: 'offer', from: this.node, to: target.id, connection: id, sdp: p.pc.localDescription.toJSON() } }); if (!result.ok) throw new Error(result.error || '配对入口繁忙'); } catch (e) { this.close(p); throw e; }
+    try { await p.pc.setLocalDescription(await p.pc.createOffer()); await this.ice(p.pc); const result = await this.local('relay', { url, signal: { type: 'offer', from: this.node, to: target.id, connection: id, sdp: p.pc.localDescription.toJSON() } }); if (!result.ok) throw new Error(result.error || '配对入口繁忙'); await this.waitForConnection(p); } catch (e) { this.close(p, e); throw e; }
   }
+  waitForConnection(p) { if (p.dc?.readyState === 'open') return Promise.resolve(); if (!this.connections.has(p.id)) return Promise.reject(p.error || new Error(DIRECT_ERROR)); return new Promise((resolve, reject) => p.waiters.add({ resolve, reject })); }
   make(id, url, node) {
-    const p = { id, url, node, pc: new RTCPeerConnection({ iceServers: [] }), packets: new Map(), sendQueue: Promise.resolve(), queued: 0, created: Date.now() };
+    const p = { id, url, node, pc: new RTCPeerConnection({ iceServers: [] }), packets: new Map(), sendQueue: Promise.resolve(), queued: 0, created: Date.now(), waiters: new Set() };
     this.connections.set(id, p); p.pc.ondatachannel = event => this.attach(p, event.channel);
     p.pc.onconnectionstatechange = () => { if (['closed', 'failed'].includes(p.pc.connectionState)) this.close(p); };
-    setTimeout(() => { if (p.dc?.readyState !== 'open') this.close(p); }, 30000); return p;
+    p.timeout = setTimeout(() => { if (p.dc?.readyState !== 'open') this.close(p, new Error(DIRECT_ERROR)); }, 30000); return p;
   }
   async ice(pc) { if (pc.iceGatheringState === 'complete') return; await new Promise(resolve => { const done = () => { if (pc.iceGatheringState === 'complete') { pc.removeEventListener('icegatheringstatechange', done); resolve(); } }; pc.addEventListener('icegatheringstatechange', done); setTimeout(() => { pc.removeEventListener('icegatheringstatechange', done); resolve(); }, 5000); }); }
   async signal(s) {
@@ -34,15 +38,15 @@ export class Network {
     if (s.type === 'offer') {
       if (this.connections.size >= MAX_PEERS || this.has(s.from)) { await this.local('relay', { url: s.fromUrl, signal: { type: 'reject', from: this.node, to: s.from, connection: s.connection } }); return; }
       const p = this.make(s.connection, s.fromUrl, s.from); try { await p.pc.setRemoteDescription(s.sdp); await p.pc.setLocalDescription(await p.pc.createAnswer()); await this.ice(p.pc); await this.local('relay', { url: p.url, signal: { type: 'answer', from: this.node, to: s.from, connection: s.connection, sdp: p.pc.localDescription.toJSON() } }); } catch (e) { this.close(p); throw e; }
-    } else { const p = this.connections.get(s.connection); if (!p) return; if (s.type === 'reject') { this.close(p); return; } p.node = s.from; p.url = s.fromUrl; await p.pc.setRemoteDescription(s.sdp); }
+    } else { const p = this.connections.get(s.connection); if (!p) return; if (s.type === 'reject') { this.close(p, new Error('对方暂时无法接受连接，请稍后重试')); return; } p.node = s.from; p.url = s.fromUrl; await p.pc.setRemoteDescription(s.sdp); }
   }
   attach(p, dc) {
     p.dc = dc; dc.binaryType = 'arraybuffer'; dc.bufferedAmountLowThreshold = 65536;
-    dc.onopen = () => { const duplicates = this.live().filter(x => x.node === p.node).sort((a, b) => a.id.localeCompare(b.id)); for (const extra of duplicates.slice(1)) this.close(extra); this.onChange(); };
+    dc.onopen = () => { clearTimeout(p.timeout); for (const waiter of p.waiters) waiter.resolve(); p.waiters.clear(); const duplicates = this.live().filter(x => x.node === p.node).sort((a, b) => a.id.localeCompare(b.id)); for (const extra of duplicates.slice(1)) this.close(extra); this.onChange(); };
     dc.onclose = () => this.close(p);
     dc.onmessage = e => { this.receive(p, e.data).catch(() => { this.stats.rejected++; }); };
   }
-  close(p) { if (!this.connections.has(p.id)) return; this.connections.delete(p.id); p.pc.onconnectionstatechange = null; if (p.dc) p.dc.onclose = null; p.pc.close(); this.onChange(); }
+  close(p, error = new Error(DIRECT_ERROR)) { if (!this.connections.has(p.id)) return; this.connections.delete(p.id); clearTimeout(p.timeout); p.error = error; for (const waiter of p.waiters) waiter.reject(error); p.waiters.clear(); p.pc.onconnectionstatechange = null; if (p.dc) p.dc.onclose = null; p.pc.close(); this.onChange(); }
   async makeEnvelope(kind, body) { const message = { id: crypto.randomUUID(), kind, from: this.node, actor: this.identity.actor, key: this.identity.pub, body }; return { ...message, signature: await this.sign(message) }; }
   async encode(message) { const raw = encoder.encode(JSON.stringify(message)); if (raw.byteLength > 32 * 1024 * 1024) throw new Error('世界快照过大'); if (raw.byteLength > 2048 && typeof CompressionStream !== 'undefined') { const bytes = new Uint8Array(await new Response(new Blob([raw]).stream().pipeThrough(new CompressionStream('gzip'))).arrayBuffer()); const result = new Uint8Array(bytes.length + 1); result[0] = 1; result.set(bytes, 1); return result; } const result = new Uint8Array(raw.length + 1); result.set(raw, 1); return result; }
   async broadcastEnvelope(message) { this.seen.set(message.id, Date.now()); const bytes = await this.encode(message); await Promise.allSettled(this.live().map(p => this.send(p, message.id, bytes))); return message; }
