@@ -19,6 +19,22 @@ async function main() {
   const page = await browser.newPage({ viewport: { width: 1440, height: 900 } }); page.on('pageerror', e => errors.push(e.message));
   await page.goto(origin); await page.locator('#nickInput').fill('键盘测试'); await page.locator('#welcomeForm .primary').click(); await page.waitForFunction(() => window.tide);
   const input = page.locator('#gridCellInput'), count = page.locator('#drawingCount');
+  const unfocus = () => page.evaluate(() => document.activeElement.blur());
+  for (const shortcut of ['f', 'Shift+F', 's', 'Shift+S']) {
+    const brush = await page.locator('#glyphInput').inputValue(); await unfocus(); await page.keyboard.press(shortcut);
+    assert(await page.locator('#creatorDialog').isVisible()); assert.equal(await count.textContent(), '0'); assert.equal(await input.inputValue(), ''); assert.equal(await page.locator('#fishNameInput').inputValue(), ''); assert.equal(await page.locator('#glyphInput').inputValue(), brush);
+    await page.keyboard.type('o'); assert.equal(await count.textContent(), '1'); await page.locator('#closeCreator').click();
+  }
+  await unfocus(); await page.keyboard.down('f'); await page.keyboard.down('f'); assert.equal(await count.textContent(), '0'); await page.keyboard.up('f'); await page.keyboard.type('f'); assert.equal(await count.textContent(), '1'); await page.locator('#closeCreator').click();
+  for (const shortcut of ['e', 'Shift+E']) {
+    const glyph = await page.locator('#foodGlyphInput').inputValue(); await unfocus(); await page.keyboard.press(shortcut); assert(await page.locator('#foodDialog').isVisible()); assert.equal(await page.locator('#foodGlyphInput').inputValue(), glyph); await page.locator('#closeFood').click();
+  }
+  const foodGlyph = await page.locator('#foodGlyphInput').inputValue(); await unfocus(); await page.keyboard.down('e'); await page.keyboard.down('e'); assert.equal(await page.locator('#foodGlyphInput').inputValue(), foodGlyph); await page.keyboard.up('e'); await page.locator('#foodGlyphInput').fill(''); await page.keyboard.type('e'); assert.equal(await page.locator('#foodGlyphInput').inputValue(), 'e'); await page.locator('#foodGlyphInput').fill(foodGlyph); await page.locator('#closeFood').click();
+  for (const shortcut of ['l', 'Shift+L']) { await unfocus(); await page.keyboard.press(shortcut); assert(await page.locator('#connectionDialog').isVisible()); assert.equal(await page.locator('#peerUrl').inputValue(), ''); await page.locator('#closeConnection').click(); }
+  for (const shortcut of ['h', 'Shift+H']) { await unfocus(); await page.keyboard.press(shortcut); assert(await page.locator('#helpDialog').isVisible()); await page.locator('#closeHelp').click(); }
+  for (const shortcut of ['o', 'Shift+O']) { await unfocus(); await page.keyboard.press('m'); const deep = await page.evaluate(() => tide.view.camera.y); await page.keyboard.press(shortcut); assert((await page.evaluate(() => tide.view.camera.y)) < deep); }
+  for (const [id, key] of [['surface', 'O'], ['connect', 'L'], ['help', 'H']]) { assert.equal(await page.locator(`#${id} kbd`).textContent(), key); assert.equal(await page.locator(`#${id}`).getAttribute('aria-keyshortcuts'), key); }
+  await page.locator('#chatInput').fill(''); await page.keyboard.type('fseolh'); assert.equal(await page.locator('#chatInput').inputValue(), 'fseolh'); assert.equal(await page.locator('dialog[open]').count(), 0); await page.locator('#chatInput').fill('');
   async function cell(x, y) { assert.equal(await input.getAttribute('aria-label'), `鱼元画板第 ${y + 1} 行，第 ${x + 1} 列`); }
   async function glyph(x, y, ch, color) {
     assert(await page.locator('#gridCanvas').evaluate((canvas, { x, y, ch, color }) => {
@@ -57,6 +73,6 @@ async function main() {
   await page.locator('#drawTab').click(); assert(!/眼睛|盲鱼/.test(await page.locator('#creatorDialog').innerText())); await page.locator('#gridTab').click();
   await page.setViewportSize({ width: 390, height: 844 }); await page.screenshot({ path: path.join(project, 'test-output', 'creator-keyboard-scene-mobile.png') });
   await page.locator('#closeCreator').click(); await page.locator('#makeFish').click(); assert(await page.locator('#drawingEyesLabel').isVisible()); await cell(0, 0); assert.equal(await count.textContent(), '0');
-  assert.deepEqual(errors, []); console.log('方向键选格及边界、ASCII/中文/扩展汉字、IME组合输入、高亮、覆盖/擦除/撤销、鼠标衔接、模式切换与造景无眼睛提示通过');
+  assert.deepEqual(errors, []); console.log('O/L/H快捷键、F/S/E打开时不输入按键字符、大小写及长按防误输入、正常编辑、方向键/IME/撤销和造景提示回归通过');
 }
 main().catch(error => { console.error(error); process.exitCode = 1; }).finally(async () => { if (browser) await browser.close(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); });

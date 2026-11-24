@@ -10,7 +10,7 @@ async function main() {
   const script = await fetch(base + '/app.js', { cache: 'no-store', signal: AbortSignal.timeout(5000) });
   assert(script.ok, '实际入口 app.js 无法加载'); const app = await script.text();
   assert(app.includes("$('myFish').onclick"), '实际入口缺少「我的鱼」事件绑定');
-  assert(app.includes("e.key.toLowerCase() === 'p'"), '实际入口缺少 P 键绑定');
+  assert(app.includes("p: 'myFish'"), '实际入口缺少 P 键绑定');
   assert(app.includes('${identity.nick} · ${shortFishId') && app.includes('renderFishGender(entry.gender, fish)'), '实际入口缺少完整昵称或性别展示');
   const stats = await fetch(base + '/fish-status.js', { cache: 'no-store', signal: AbortSignal.timeout(5000) });
   assert(stats.ok, '实际入口缺少鱼况统计模块');

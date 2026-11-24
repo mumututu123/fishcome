@@ -453,5 +453,17 @@ $('sea').addEventListener('pointerdown', e => { if (e.button !== 0) return; if (
 $('sea').addEventListener('pointermove', e => { if (mode) { const p = renderer.point(e.clientX, e.clientY), b = bounds(mode.cells || []); renderer.preview = { ...mode, x: mode.kind === 'food' ? p.x : wrapX(p.x - b.minX), y: mode.kind === 'food' ? 0 : p.y - b.minY }; if (mode.kind === 'fish') renderer.preview.valid = world.canOccupy({ id: '', x: renderer.preview.x, y: renderer.preview.y, facing: 1 }, mode.cells); } else if (dragging) { const s = renderer.cell * renderer.scale; renderer.camera.x = wrapX(dragging.x - (e.clientX - dragging.startX) / s); renderer.camera.y = Math.min(CONFIG.depth, Math.max(0, dragging.y - (e.clientY - dragging.startY) / s)); dragging.moved ||= Math.hypot(e.clientX - dragging.startX, e.clientY - dragging.startY) > 4; if (dragging.moved) trackedFish = null; update(); } });
 $('sea').addEventListener('pointerup', e => { if (dragging && !dragging.moved) { const hit = renderer.hit(e.clientX, e.clientY); if (hit) inspect(hit); else { selected = null; renderer.selected = null; $('inspector').hidden = true; } } dragging = null; });
 $('sea').addEventListener('wheel', e => { e.preventDefault(); renderer.zoom(renderer.scale * (e.deltaY < 0 ? 1.1 : .9)); update(); }, { passive: false });
-document.addEventListener('keydown', e => { if (e.key === 'Escape') { cancelMode(); return; } if (e.target.matches('input,textarea') || document.querySelector('dialog[open]')) return; if (e.key.toLowerCase() === 'f') $('makeFish').click(); else if (e.key.toLowerCase() === 's') $('makeScene').click(); else if (e.key.toLowerCase() === 'e') feedMode(); else if (e.key.toLowerCase() === 'm') $('seabed').click(); else if (e.key.toLowerCase() === 'p') $('myFish').click(); });
+const shortcutButtons = { f: 'makeFish', s: 'makeScene', e: 'feed', m: 'seabed', p: 'myFish', o: 'surface', l: 'connect', h: 'help' }, heldShortcuts = new Set();
+document.addEventListener('keydown', e => {
+  const key = e.key.toLowerCase(), heldKey = e.code || key;
+  if (heldShortcuts.has(heldKey)) { e.preventDefault(); return; }
+  if (e.isComposing || e.keyCode === 229) return;
+  if (e.key === 'Escape') { cancelMode(); return; }
+  if (e.ctrlKey || e.metaKey || e.altKey || e.repeat || e.target.matches('input,textarea,select') || e.target.isContentEditable || document.querySelector('dialog[open]')) return;
+  const button = shortcutButtons[key]; if (!button) return;
+  // Cancel text insertion before the click transfers focus into the new editor.
+  e.preventDefault(); heldShortcuts.add(heldKey); $(button).click();
+});
+document.addEventListener('keyup', e => heldShortcuts.delete(e.code || e.key.toLowerCase()));
+window.addEventListener('blur', () => heldShortcuts.clear());
 function render() { if (trackedFish) { const fish = world.data.fishes[trackedFish]; if (fish && followBounds) moveCameraToFish(fish, followBounds); else { trackedFish = null; toast('这条鱼已不再存活'); } } renderer.draw(world); requestAnimationFrame(render); } render(); start().catch(e => { toast(e.message); status = e.message; $('networkStatus').textContent = e.message; });
