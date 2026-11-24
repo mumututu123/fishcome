@@ -31,6 +31,9 @@ export function archiveDependencies(data) {
     }
   }
   for (const r of Object.values(data.life?.stories || {})) { fish(r.fish); fish(r.other); for (const id of r.parents || []) fish(id); if (r.scene) keep.ops.add(r.scene); }
+  for (const [id] of Object.entries(data.legends?.deaths || {})) fish(id);
+  for (const p of Object.values(data.legends?.burns || {})) fish(p.fish);
+  for (const e of Object.values(data.legends?.events || {})) for (const c of Object.values(e.arms)) { fish(c.fish); for (const id of c.cells) keep.chars.add(id); }
   for (const id of Object.keys(data.chatSources || {})) keep.chats.add(id);
   for (const message of Object.values(data.chats || {}).sort((a, b) => b.body.t - a.body.t || a.id.localeCompare(b.id)).slice(0, 80)) keep.chats.add(message.id);
   for (const op of Object.values(data.ops)) if (op.kind === 'sceneEdit' && data.chars[op.cell]?.kind !== 'burn') keep.ops.add(op.id);
@@ -58,7 +61,7 @@ function description(raw, id, size) {
 }
 export async function encodeArchive(records, roots, fragment) {
   const referenced = new Set(); for (const op of Object.values(records.ops || {})) { for (const root of op.roots || []) referenced.add(root); if (op.genesis) referenced.add(op.genesis); }
-  for (const cell of Object.values(records.chars || {})) { if (cell.wild?.origin) referenced.add(cell.wild.origin); if (cell.plankton?.seed) referenced.add(cell.plankton.seed); }
+  for (const cell of Object.values(records.chars || {})) { if (cell.wild?.origin) referenced.add(cell.wild.origin); if (cell.plankton?.seed) referenced.add(cell.plankton.seed); if (cell.ghost?.seed) referenced.add(cell.ghost.seed); for (const e of cell.path || []) if (e.reason === 'legendBurn') referenced.add(e.seed); }
   for (const m of [...Object.values(records.chats || {}), ...Object.values(records.chatSources || {})]) for (const root of m.body.roots) referenced.add(root);
   const compactRoots = Object.fromEntries(Object.entries(roots).filter(([root]) => referenced.has(root))); if (!Object.keys(compactRoots).length && Object.keys(roots).length) { const root = Object.keys(roots).sort()[0]; compactRoots[root] = roots[root]; }
   const bytes = encoder.encode(json({ version: 1, roots: compactRoots, records, ...(fragment ? { fragment } : {}) })); if (bytes.length > ARCHIVE.maxChunk) throw new Error('单份归档过大'); const raw = JSON.parse(decoder.decode(bytes));
@@ -182,6 +185,9 @@ export class ArchiveStore {
       for (const [id, r] of Object.entries(data.life?.haunts || {})) { fish(id); need('ops', r.scene); }
       for (const event of Object.values(data.life?.events || {})) { for (const id of event.fishes) fish(id); for (const id of event.plants) need('chars', id); }
       for (const r of Object.values(data.life?.stories || {})) { fish(r.fish); fish(r.other); for (const id of r.parents || []) fish(id); if (r.scene) need('ops', r.scene); }
+      for (const id of Object.keys(data.legends?.deaths || {})) fish(id);
+      for (const p of Object.values(data.legends?.burns || {})) fish(p.fish);
+      for (const e of Object.values(data.legends?.events || {})) for (const c of Object.values(e.arms)) { fish(c.fish); for (const id of c.cells) need('chars', id); }
     };
     refs(incoming);
     while (pending.length) {

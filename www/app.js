@@ -19,6 +19,7 @@ import { validateLife, validPlankton, weatherAt, fishLifeText, storiesFor, story
 import { validEcology } from './ecology.js';
 import { memoryForCell, ancestralGlyph, ancestralText } from './easter-eggs.js';
 import { activeEvent, eventSchedule, eventTitle, eventPosition, eventLetter, radioTranscript, eventNarration } from './random-events.js';
+import { activeLegend, legendSchedule, legendTitle, legendPosition, validLegends, validGhostCell, capturedFish } from './legends.js';
 import { ARCHIVE, ARCHIVE_FIELDS, ArchiveStore, archivePlan, archiveChunks, decodeArchive, assembleFragments, validArchiveState, emptyArchiveState, mergeArchiveState, compactKnown } from './archive.js';
 const $ = id => document.getElementById(id);
 const renderer = new Renderer($('sea'));
@@ -151,6 +152,7 @@ async function verifyReplica(data, extra = {}, store = archiveStore) {
   await verifyChats(data.chats, store); await verifyChats(data.chatSources, store);
   const sources = { ops: { ...extra.ops, ...world.data.ops, ...data.ops }, breeding: { ...extra.breeding, ...world.data.breeding, ...data.breeding }, roots: { ...world.data.roots, ...data.roots }, chars: { ...extra.chars, ...world.data.chars, ...data.chars } };
   if (!validateLife(data.life, sources)) throw new Error('鱼生记录无效');
+  if (!validLegends(data.legends, sources)) throw new Error('稀有异象记录无效');
   if (data.breeding !== undefined && (!data.breeding || typeof data.breeding !== 'object' || Array.isArray(data.breeding) || Object.keys(data.breeding).length > 500000)) throw new Error('繁殖记录无效');
   for (const [id, record] of Object.entries(data.breeding || {})) if (record.id !== id || !validBreedingRecord(record, sources) || record.at > Date.now() + 60000) throw new Error('繁殖记录缺少合法来源');
   if (data.contacts !== undefined && (!data.contacts || typeof data.contacts !== 'object' || Array.isArray(data.contacts) || Object.keys(data.contacts).length > 500000 || !Number.isFinite(data.contactAt) || data.contactAt > Date.now() + 60000)) throw new Error('接触计时无效');
@@ -167,6 +169,10 @@ async function verifyReplica(data, extra = {}, store = archiveStore) {
       const message = data.chatSources?.[c.chat] || world.data.chatSources[c.chat] || extra.chatSources?.[c.chat] || extra.chats?.[c.chat], floor = data.scenes[CHAT_FLOOR] || world.data.scenes[CHAT_FLOOR] || extra.scenes?.[CHAT_FLOOR];
       if (message && !sourceGlyphs.has(c.chat)) sourceGlyphs.set(c.chat, new Map(chatGlyphs(message.body.text).map(glyph => [glyph.index, glyph.ch])));
       if (!message || id !== chatCellId(message, c.chatIndex) || sourceGlyphs.get(c.chat).get(c.chatIndex) !== c.ch || c.color !== chatColor(hash(message.actor)) || c.payer !== '' || c.kind !== 'scene' || c.entity !== CHAT_FLOOR || c.path.length || c.x < 0 || c.x >= CONFIG.width || c.y < 0 || c.y >= CONFIG.depth || floor?.x !== 0 || floor?.y !== 0 || !floor.fixed) throw new Error('聊天沉积缺少合法来源或被修改');
+      continue;
+    }
+    if (c.ghost) {
+      if (!validGhostCell(c, sources.roots) || !['scene', 'burn'].includes(c.kind) && inheritedGlyph(c, '蛆', sources) !== c.ch || c.created > Date.now() + 60000 || c.kind === 'fish' && (!c.path.some(e => ['eat', 'birth'].includes(e.reason) && e.target === c.entity) || !(data.fishes[c.entity] || world.data.fishes[c.entity] || extra.fishes?.[c.entity]))) throw new Error('船蛆缺少合法幽灵船来源');
       continue;
     }
     if (c.plankton) {
@@ -208,7 +214,7 @@ async function resumeWorld(now) {
       archiveStore = newArchiveStore(); world.attachArchives(archiveStore); olderChats = {}; acceptHistory(card);
       chatLimit = 80; renderChat();
       lastPicture = null; pending.clear(); inbox.clear(); selected = null; trackedFish = null; renderer.selected = null; renderer.observedFish = null; $('inspector').hidden = true; cancelMode();
-    } else world.data.tick = now;
+    } else { world.resolveLegends(now); world.data.tick = now; }
     members.clear(); members.set(network.node, member()); lastHello.clear(); lastLeader = ''; lastFull = 0; sentChars.clear(); sentOps.clear(); sentChats.clear(); sentChatSources.clear(); sentTravel.clear(); lastPictureTime = 0;
   }
   lastOnlineAt = Math.max(lastOnlineAt, now);
@@ -231,7 +237,7 @@ async function onMessage(message, peer) {
   if (members.has(message.from) && members.get(message.from).actor !== message.actor) return;
   const body = message.body;
   if (message.kind === 'hello') {
-    if (!body.world?.terrain || body.rules?.genesis !== 1 || body.rules?.life !== 3 || body.rules?.feeding !== 1 || body.rules?.ecology !== 1 || body.rules?.archives !== 1) { status = '对方使用旧版世界规则，请双方刷新游戏页面后再连接'; toast(status); network.close(peer); update(); return; }
+    if (!body.world?.terrain || body.rules?.genesis !== 1 || body.rules?.life !== 4 || body.rules?.legends !== 1 || body.rules?.feeding !== 1 || body.rules?.ecology !== 1 || body.rules?.archives !== 1) { status = '对方使用旧版世界规则，请双方刷新游戏页面后再连接'; toast(status); network.close(peer); update(); return; }
     if (message.from !== peer.node || body.member?.id !== message.from || body.member.actor !== message.actor) return;
     const own = body.member; members.set(own.id, { ...own, url: peer.url, at: Date.now() }); remember(peer.url);
     rememberAuthor(message.actor, own.nick);
@@ -290,7 +296,7 @@ async function completeReferral(peer, peerActor) {
 async function networkChange(error) {
   if (!started) return; if (error) { status = error; update(); return; }
   const live = network.live();
-  for (const p of live) if (!lastHello.has(p.id)) { lastHello.add(p.id); await network.direct(p, 'hello', { rules: { genesis: 1, life: 3, feeding: 1, ecology: 1, archives: 1 }, member: member(), members: active(), world: world.serialize(), cards: Object.values(histories).slice(0, 3), historyIndex: Object.keys(histories) }); }
+  for (const p of live) if (!lastHello.has(p.id)) { lastHello.add(p.id); await network.direct(p, 'hello', { rules: { genesis: 1, life: 4, legends: 1, feeding: 1, ecology: 1, archives: 1 }, member: member(), members: active(), world: world.serialize(), cards: Object.values(histories).slice(0, 3), historyIndex: Object.keys(histories) }); }
   const ids = new Set(live.map(p => p.node)); for (const m of active()) if (m.id !== network.node && m.direct && !ids.has(m.id)) { m.direct = false; probeGone(m.id, m.url); } for (const id of ids) if (members.has(id)) members.get(id).direct = true;
   network.presence(active().filter(m => m.id !== network.node).map(m => ({ id: m.id, url: m.url }))).catch(() => {}); update();
 }
@@ -304,7 +310,7 @@ async function broadcastWorld() {
     for (const [id, message] of Object.entries(data.chats)) if (full || !sentChats.has(id)) chats[id] = message;
     for (const [id, message] of Object.entries(data.chatSources)) if (full || !sentChatSources.has(id)) chatSources[id] = message;
     for (const [id, record] of Object.entries(data.travel)) { const mark = JSON.stringify(record); travelMarks.set(id, mark); if (full || sentTravel.get(id) !== mark) travel[id] = record; }
-    await network.broadcast('world', { delta: !full, world: { protocol: 1, roots: data.roots, terrain: data.terrain, tick: data.tick, seaweedHour: data.seaweedHour, bubbleMinute: data.bubbleMinute, bubbles: data.bubbles, chars, fishes: data.fishes, breeding: data.breeding, contacts: data.contacts, contactAt: data.contactAt, scenes: data.scenes, participants: data.participants, ops, notices: [], chats, chatSources, travel, life: data.life, ecology: data.ecology, archives: data.archives } });
+    await network.broadcast('world', { delta: !full, world: { protocol: 1, roots: data.roots, terrain: data.terrain, tick: data.tick, seaweedHour: data.seaweedHour, bubbleMinute: data.bubbleMinute, bubbles: data.bubbles, chars, fishes: data.fishes, breeding: data.breeding, contacts: data.contacts, contactAt: data.contactAt, scenes: data.scenes, participants: data.participants, ops, notices: [], chats, chatSources, travel, life: data.life, legends: data.legends, ecology: data.ecology, archives: data.archives } });
     sentChars = nextMarks; sentOps = new Set(Object.keys(data.ops)); sentChats = new Set(Object.keys(data.chats)); sentChatSources = new Set(Object.keys(data.chatSources)); sentTravel = travelMarks; if (full) lastFull = Date.now();
   } catch (e) { status = e.message; } finally { snapshotBusy = false; }
 }
@@ -406,6 +412,14 @@ function renderPedigree(catalog) {
 function inspect(hit, show = true) {
   if (show || trackedFish && (hit.kind !== 'fish' || hit.id !== trackedFish)) trackedFish = null;
   selected = hit; if (hit.kind === 'monument') { renderer.observedFish = null; renderer.selected = null; $('inspector').hidden = true; historyDialog(); selected = null; return; }
+  if (hit.kind === 'legend') {
+    const record = world.data.legends?.events[hit.id], schedule = record && legendSchedule(world.data.roots, record.seed, record.slot); if (!schedule) { stopObserving(); return; }
+    const seconds = Math.max(0, Math.ceil((schedule.ends - Date.now()) / 1000));
+    renderer.observedFish = renderer.selected = renderer.selectedCell = null; $('fishDetails').hidden = $('chatMemory').hidden = $('sceneActions').hidden = true; $('eventDetails').hidden = false;
+    $('objectTitle').textContent = legendTitle(schedule.kind); $('objectInfo').textContent = `稀有异象 · 剩余 ${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
+    $('eventText').textContent = schedule.kind === 'cthulhu' ? `八条触须正在深处挥动。\n\n已缠住 ${Object.keys(record.arms).length} 条鱼；这些鱼会随它沉回深海。` : schedule.kind === 'godzilla' ? '背脊亮起之后，原子吐息会沿水域展开。\n\n被照到的鱼身鱼元会消失，造景可以挡住吐息。' : `破帆随水流摇晃，船身已经脱落 ${record.drops.length} 个字。\n\n落水的字会变成「蛆」，沿水域慢慢下沉。`;
+    $('objectFootnote').textContent = seconds ? '这次相遇，会留在海的记忆里。' : '异象已经远去。'; if (show) $('inspector').hidden = false; return;
+  }
   if (hit.kind === 'event') {
     const record = world.data.life?.events?.[hit.id], schedule = record && eventSchedule(world.data.roots, record.seed, record.slot);
     if (!schedule) { stopObserving(); return; }
@@ -442,9 +456,11 @@ function inspect(hit, show = true) {
     const life = fishLifeText(world.data, hit.id, now);
     $('fishHabit').textContent = `${life.habit}${life.haunt ? '，' + life.haunt : ''}。`;
     $('fishCompany').textContent = life.friend ? `正在和「${displayFishName(fishCatalog(world.data).get(life.friend), identity)}」同游。` : life.company + '。';
+    const capture = capturedFish(world.data, hit.id, now); if (capture) $('fishCompany').textContent = `被克苏鲁的第 ${capture.arm + 1} 条触须缠住，将随它在 ${Math.max(0, Math.ceil((capture.schedule.ends - now) / 1000))} 秒后沉回深海。`;
     $('fishMovement').textContent = status.trackedSince === undefined ? '待同步' : `${status.movement.toFixed(1)} 格`; $('fishMeals24').textContent = `${status.meals24} 颗`; $('fishHunger').textContent = status.hungry ? '饥饿' : '未饥饿'; $('fishHunger').classList.toggle('hungry', status.hungry);
     const minutes = Math.floor(status.hoursSinceFed * 60);
     $('fishLastMeal').textContent = `${status.neverFed ? '尚未进食 · 投放已' : '距上次进食'} ${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分钟${status.canEat ? ' · 可以进食' : ' · 已吃饱，约 ' + Math.ceil((status.nextMealAt - now) / 60000) + ' 分钟后可再进食'}`;
+    if (capture) $('fishLastMeal').textContent = '被触须缠住，暂不进食；饥饿时钟仍在继续。';
     $('followFish').textContent = trackedFish === hit.id ? '停止跟随' : '跟随观察'; if (trackedFish === hit.id) followBounds = bounds(cells);
     $('fishTrackingNote').textContent = !travel ? '运动记录尚未同步。' : status.partialMovement ? `旧版运动量未记录，从 ${fishDate.format(status.trackedSince)} 起累计。` : '';
     const rows = []; for (let index = 0; index < 7; index++) { const day = shanghaiDay(now - index * DAY), row = document.createElement('p'); row.textContent = `${day} · ${travel && day >= shanghaiDay(travel.since) ? (travel.days[day] || 0).toFixed(1) + ' 格' : '未记录'}`; rows.push(row); } $('fishDailyRows').replaceChildren(...rows);
@@ -460,9 +476,10 @@ function ownStories() { const catalog = fishCatalog(world.data); return { catalo
 function renderLife() {
   if (!identity) return;
   $('weatherLabel').textContent = weatherAt(world.data, Date.now()).label;
-  const occasion = activeEvent(world.data, Date.now());
-  $('ambientPeek').hidden = !occasion || !!selected || !!mode || !!document.querySelector('dialog[open]');
-  if (occasion) $('ambientPeek').textContent = `${eventTitle(occasion.kind)} · 看看 ›`;
+  const myth = activeLegend(world.data, Date.now()), occasion = activeEvent(world.data, Date.now());
+  $('ambientPeek').hidden = !myth && !occasion || !!selected || !!mode || !!document.querySelector('dialog[open]');
+  if (myth) $('ambientPeek').textContent = `${Date.now() - myth.started < 20000 && myth.kind !== 'ship' ? '海床传来异动' : legendTitle(myth.kind)} · 看看 ›`;
+  else if (occasion) $('ambientPeek').textContent = `${eventTitle(occasion.kind)} · 看看 ›`;
   const { catalog, stories } = ownStories(), latest = returnStory(stories, lifeSince);
   if (latest) lifeMessage = latest;
   if (lifeMessage && !world.data.life?.stories[lifeMessage.id]) lifeMessage = null;
@@ -615,6 +632,7 @@ async function tick() {
 }
 $('lifePeek').onclick = lifeDialog;
 $('ambientPeek').onclick = () => {
+  const myth = activeLegend(world.data, Date.now()); if (myth) { cancelMode(); stopObserving(); const p = legendPosition(world.data.roots, myth, Date.now()); renderer.camera.x = p.x; renderer.camera.y = myth.kind === 'ship' ? 5 : Math.max(0, world.floorAt(p.x) - 13); inspect({ kind: 'legend', id: myth.id }); update(); return; }
   const event = activeEvent(world.data, Date.now()); if (!event) return;
   cancelMode(); stopObserving(); const p = eventPosition(event, Date.now());
   renderer.camera.x = p.x; renderer.camera.y = Math.max(0, Math.min(CONFIG.depth, p.y));
@@ -644,6 +662,26 @@ $('foodForm').onsubmit = e => {
 };
 $('surface').onclick = () => { trackedFish = null; surfaceCamera(); update(); }; $('seabed').onclick = () => { trackedFish = null; renderer.camera = { x: world.monument.x + 4, y: world.floorAt(world.monument.x + 4) - 15 }; update(); };
 $('zoomIn').onclick = () => { renderer.zoom(renderer.scale + .15); update(); }; $('zoomOut').onclick = () => { renderer.zoom(renderer.scale - .15); update(); };
+const scene3dToggle = $('scene3dToggle'), scene3dPreference = 'tide.scene3d';
+function applyScene3d(scene) {
+  renderer.scene3d = scene;
+  scene3dToggle.setAttribute('aria-pressed', String(Boolean(scene)));
+  try { if (scene) localStorage.setItem(scene3dPreference, '1'); else localStorage.removeItem(scene3dPreference); } catch {}
+}
+async function setScene3d(enabled) {
+  if (scene3dToggle.getAttribute('aria-busy') === 'true') return;
+  if (!enabled) { applyScene3d(null); return; }
+  scene3dToggle.setAttribute('aria-busy', 'true');
+  try {
+    const { Scene3D } = await import('./scene-3d.js');
+    applyScene3d(new Scene3D());
+  } catch {
+    applyScene3d(null);
+    toast('立体海景加载失败，当前使用平面海景');
+  } finally { scene3dToggle.removeAttribute('aria-busy'); }
+}
+scene3dToggle.onclick = () => setScene3d(!renderer.scene3d);
+try { if (localStorage.getItem(scene3dPreference) === '1') setScene3d(true); } catch {}
 $('connect').onclick = () => $('connectionDialog').showModal(); $('closeConnection').onclick = () => $('connectionDialog').close();
 $('connectionForm').onsubmit = async e => { e.preventDefault(); status = '正在自动配对…'; update(); try { const code = await normalizeInvite($('peerUrl').value); $('peerUrl').value = code; await network.connectInvite(code); await remember(code); $('connectionDialog').close(); } catch (e) { status = e.message; toast(e.message); } update(); };
 $('copyUrl').onclick = async () => { await navigator.clipboard.writeText(meta.url); toast('邀请码已复制'); };
@@ -683,4 +721,10 @@ document.addEventListener('keydown', e => {
 });
 document.addEventListener('keyup', e => heldShortcuts.delete(e.code || e.key.toLowerCase()));
 window.addEventListener('blur', () => heldShortcuts.clear());
-function render() { if (trackedFish) { const fish = world.data.fishes[trackedFish]; if (fish && followBounds) moveCameraToFish(fish, followBounds); else { trackedFish = null; toast('这条鱼已不再存活'); } } renderer.draw(world); requestAnimationFrame(render); } render(); start().catch(e => { toast(e.message); status = e.message; const label = $('networkStatus'); if (label) label.textContent = e.message; });
+function render(now) {
+  if (trackedFish) { const fish = world.data.fishes[trackedFish]; if (fish && followBounds) moveCameraToFish(fish, followBounds); else { trackedFish = null; toast('这条鱼已不再存活'); } }
+  try { renderer.draw(world, now); }
+  catch (error) { if (!renderer.scene3d) throw error; applyScene3d(null); renderer.resize(); toast('立体海景绘制失败，当前使用平面海景'); renderer.draw(world, now); }
+  requestAnimationFrame(render);
+}
+render(); start().catch(e => { toast(e.message); status = e.message; const label = $('networkStatus'); if (label) label.textContent = e.message; });

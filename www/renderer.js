@@ -6,9 +6,11 @@ import { weedAlpha } from './ecology.js';
 import { echoCells, friendSignals } from './easter-eggs.js';
 import { activeEvent, eventPosition } from './random-events.js';
 import { eventGlyphs } from './random-event-visuals.js';
+import { activeLegend, legendGeometry } from './legends.js';
 const FONT = "'Microsoft YaHei',Consolas,monospace";
 export { MONUMENT } from './engine.js';
 export class Renderer {
+  scene3d = null;
   constructor(canvas) { this.canvas = canvas; this.ctx = canvas.getContext('2d'); this.camera = { x: 380, y: 23 }; this.scale = 1; this.cell = 18; this.pointer = { x: 0, y: 0 }; this.preview = null; this.selected = null; this.world = null; this.resize(); window.addEventListener('resize', () => this.resize()); }
   resize() { this.width = innerWidth; this.height = innerHeight; this.dpr = Math.min(2, devicePixelRatio || 1); this.canvas.width = this.width * this.dpr; this.canvas.height = this.height * this.dpr; this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0); }
   point(x, y) { const s = this.cell * this.scale; return { x: wrapX(Math.floor(this.camera.x + (x - this.width / 2) / s)), y: Math.floor(this.camera.y + (y - this.height / 2) / s) }; }
@@ -29,29 +31,46 @@ export class Renderer {
       if (py > -size && py < h) this.glyph(ctx, '底', '#527d72', px, py, size, .8);
     }
   }
-  draw(world) {
-    this.world = world; const ctx = this.ctx, size = this.cell * this.scale; this.background(ctx, this.width, this.height, this.camera, size);
+  draw(world, now = performance.now()) {
+    this.world = world; const ctx = this.ctx, size = this.cell * this.scale, paint = this.scene3d || this;
+    if (this.scene3d) this.scene3d.background(this, world, size, now);
+    else this.background(ctx, this.width, this.height, this.camera, size);
     const left = this.camera.x - this.width / 2 / size - 2, right = this.camera.x + this.width / 2 / size + 2, top = this.camera.y - this.height / 2 / size - 2, bottom = this.camera.y + this.height / 2 / size + 2;
     this.weather(world, size);
     const visible = p => Math.abs(deltaX(p.x, this.camera.x)) <= (right - left) / 2 && p.y >= top && p.y <= bottom;
     if (this.cachedWorld !== world || world.dirty || !this.characters || this.echoTick !== world.data.tick) { this.characters = Object.values(world.data.chars); this.echoes = echoCells(world.data, this.characters); this.echoTick = world.data.tick; this.cachedWorld = world; world.dirty = false; }
     const characters = this.characters;
+    const legend = activeLegend(world.data, Date.now());
+    if (legend) this.drawLegend(world, legend, Date.now(), size, visible, false);
     const occasion = activeEvent(world.data, Date.now());
     if (occasion?.kind === 'whale') this.drawEvent(world, occasion, Date.now(), size, visible);
-    for (const c of characters) if (c.kind === 'scene') { const s = world.data.scenes[c.entity]; if (!s) continue; const p = { x: s.x + c.x, y: s.y + c.y }; if (!visible(p)) continue; const pixel = this.screen(p.x, p.y), selected = this.selected === c.entity && (!c.chat || this.selectedCell === c.id), echo = this.echoes.has(c.id); this.glyph(ctx, c.ch, echo ? '#d7efe1' : c.color, pixel.x, pixel.y, size, selected ? 1 : echo ? .8 + .2 * Math.sin(Date.now() / 450) : .85, echo); if (selected) { ctx.strokeStyle = '#b7f7de55'; ctx.strokeRect(pixel.x, pixel.y, size, size); } }
-    for (const c of characters) if (c.kind === 'fish' && c.entity !== this.observedFish) { const f = world.data.fishes[c.entity]; if (!f) continue; const p = cellPosition(f, c); if (!visible(p)) continue; const pixel = this.screen(p.x, p.y); this.glyph(ctx, c.ch, c.color, pixel.x, pixel.y, size, 1, EYES.has(c.ch)); }
-    if (this.observedFish) for (const c of characters) if (c.kind === 'fish' && c.entity === this.observedFish) { const f = world.data.fishes[c.entity]; if (!f) continue; const p = cellPosition(f, c); if (!visible(p)) continue; const pixel = this.screen(p.x, p.y); ctx.fillStyle = '#9aeee015'; ctx.fillRect(pixel.x, pixel.y, size, size); this.glyph(ctx, c.ch, c.color, pixel.x, pixel.y, size, 1, EYES.has(c.ch)); ctx.strokeStyle = '#9aeee077'; ctx.lineWidth = 1; ctx.strokeRect(pixel.x, pixel.y, size, size); }
-    for (const c of characters) if ((c.kind === 'food' || c.kind === 'seaweed') && visible(c)) { const pixel = c.kind === 'seaweed' ? this.seaweedScreen(c) : this.screen(c.x, c.y); this.glyph(ctx, c.ch, c.color, pixel.x, pixel.y, size, c.kind === 'seaweed' ? weedAlpha(c, world.data.ecology, Date.now()) : 1); if (c.kind === 'food' && world.data.tick - c.born >= CONFIG.foodLife) { ctx.strokeStyle = '#84a2b355'; ctx.strokeRect(pixel.x + size * .2, pixel.y + size * .2, size * .6, size * .6); } }
+    for (const c of characters) if (c.kind === 'scene') { const s = world.data.scenes[c.entity]; if (!s) continue; const p = { x: s.x + c.x, y: s.y + c.y }; if (!visible(p)) continue; const pixel = this.screen(p.x, p.y), selected = this.selected === c.entity && (!c.chat || this.selectedCell === c.id), echo = this.echoes.has(c.id); paint.glyph(ctx, c.ch, echo ? '#d7efe1' : c.color, pixel.x, pixel.y, size, selected ? 1 : echo ? .8 + .2 * Math.sin(Date.now() / 450) : .85, echo); if (selected) { ctx.strokeStyle = '#b7f7de55'; ctx.strokeRect(pixel.x, pixel.y, size, size); } }
+    for (const c of characters) if (c.kind === 'fish' && c.entity !== this.observedFish) { const f = world.data.fishes[c.entity]; if (!f) continue; const p = cellPosition(f, c); if (!visible(p)) continue; const pixel = this.screen(p.x, p.y); paint.glyph(ctx, c.ch, c.color, pixel.x, pixel.y, size, 1, EYES.has(c.ch), c.kind); }
+    if (this.observedFish) for (const c of characters) if (c.kind === 'fish' && c.entity === this.observedFish) { const f = world.data.fishes[c.entity]; if (!f) continue; const p = cellPosition(f, c); if (!visible(p)) continue; const pixel = this.screen(p.x, p.y); ctx.fillStyle = '#9aeee015'; ctx.fillRect(pixel.x, pixel.y, size, size); paint.glyph(ctx, c.ch, c.color, pixel.x, pixel.y, size, 1, EYES.has(c.ch), c.kind); ctx.strokeStyle = '#9aeee077'; ctx.lineWidth = 1; ctx.strokeRect(pixel.x, pixel.y, size, size); }
+    for (const c of characters) if ((c.kind === 'food' || c.kind === 'seaweed') && visible(c)) { const pixel = c.kind === 'seaweed' ? this.seaweedScreen(c) : this.screen(c.x, c.y); paint.glyph(ctx, c.ch, c.color, pixel.x, pixel.y, size, c.kind === 'seaweed' ? weedAlpha(c, world.data.ecology, Date.now()) : 1, false, c.kind); if (c.kind === 'food' && world.data.tick - c.born >= CONFIG.foodLife) { ctx.strokeStyle = '#84a2b355'; ctx.strokeRect(pixel.x + size * .2, pixel.y + size * .2, size * .6, size * .6); } }
     const bubbleNow = Date.now();
-    for (const bubble of Object.values(world.data.bubbles || {})) { const state = bubbleState(bubble, bubbleNow); if (!state || state.y > bottom || state.y + state.size < top || Math.abs(deltaX(state.x + state.size / 2, this.camera.x)) > (right - left) / 2 + state.size) continue; for (let y = 0; y < state.size; y++) for (let x = 0; x < state.size; x++) { const p = { x: state.x + x, y: state.y + y }; if (visible(p)) { const pixel = this.screen(p.x, p.y); this.glyph(ctx, bubbleGlyph(bubble), BUBBLE_COLOR, pixel.x, pixel.y, size); } } }
+    if (legend) this.drawLegend(world, legend, bubbleNow, size, visible, true);
+    for (const bubble of Object.values(world.data.bubbles || {})) { const state = bubbleState(bubble, bubbleNow); if (!state || state.y > bottom || state.y + state.size < top || Math.abs(deltaX(state.x + state.size / 2, this.camera.x)) > (right - left) / 2 + state.size) continue; for (let y = 0; y < state.size; y++) for (let x = 0; x < state.size; x++) { const p = { x: state.x + x, y: state.y + y }; if (visible(p)) { const pixel = this.screen(p.x, p.y); paint.glyph(ctx, bubbleGlyph(bubble), BUBBLE_COLOR, pixel.x, pixel.y, size, 1, false, 'bubble'); } } }
     for (const signal of friendSignals(world.data, bubbleNow)) {
       const fish = world.data.fishes[signal.fish], cells = characters.filter(c => c.kind === 'fish' && c.entity === signal.fish); if (!cells.length) continue;
       const xs = cells.map(c => fish.facing * c.x), p = { x: fish.x + (Math.min(...xs) + Math.max(...xs)) / 2, y: fish.y + Math.min(...cells.map(c => c.y)) - 1.4 }; if (!visible(p)) continue;
       const pixel = this.screen(p.x, p.y); this.glyph(ctx, signal.ch, '#d5eee0', pixel.x, pixel.y, size, signal.alpha, true);
     }
     if (occasion && occasion.kind !== 'whale') this.drawEvent(world, occasion, bubbleNow, size, visible);
-    const monument = world.monument; monument.rows.forEach((row, dy) => Array.from(row).forEach((ch, dx) => { if (ch === ' ') return; const p = { x: monument.x + dx, y: monument.y + dy }; if (visible(p)) { const pixel = this.screen(p.x, p.y); this.glyph(ctx, ch, '#b8b797', pixel.x, pixel.y, size); } }));
-    if (this.preview) { const p = this.preview; for (const c of p.cells || [{ x: 0, y: 0, ch: p.ch, color: p.color }]) { const pixel = this.screen(p.x + c.x, p.y + c.y); ctx.fillStyle = '#9fecd918'; ctx.fillRect(pixel.x, pixel.y, size, size); this.glyph(ctx, c.ch, p.valid === false ? '#efaa99' : c.color, pixel.x, pixel.y, size, .65); } }
+    const monument = world.monument; monument.rows.forEach((row, dy) => Array.from(row).forEach((ch, dx) => { if (ch === ' ') return; const p = { x: monument.x + dx, y: monument.y + dy }; if (visible(p)) { const pixel = this.screen(p.x, p.y); paint.glyph(ctx, ch, '#b8b797', pixel.x, pixel.y, size, 1, false, 'monument'); } }));
+    if (this.preview) { const p = this.preview; for (const c of p.cells || [{ x: 0, y: 0, ch: p.ch, color: p.color }]) { const pixel = this.screen(p.x + c.x, p.y + c.y); ctx.fillStyle = '#9fecd918'; ctx.fillRect(pixel.x, pixel.y, size, size); paint.glyph(ctx, c.ch, p.valid === false ? '#efaa99' : c.color, pixel.x, pixel.y, size, .65); } }
+  }
+  drawLegend(world, legend, now, size, visible, beam) {
+    const paint = this.scene3d || this;
+    const colors = { cthulhu: { 克: '#a1b998', 苏: '#8db2a0', 鲁: '#6e988e' }, godzilla: { 哥: '#a3bb9d', 斯: '#719d92', 拉: '#a5c8bc' }, ship: { 幽: '#899f9c', 灵: '#c2d3ce', 船: '#a6bcb1' } };
+    const scenery = this.legendSceneryTick === world.data.tick && this.legendSceneryWorld === world ? this.legendScenery : world.sceneryMap(); this.legendScenery = scenery; this.legendSceneryTick = world.data.tick; this.legendSceneryWorld = world;
+    const age = now - legend.started, fade = Math.max(0, Math.min(1, (legend.ends - now) / (legend.kind === 'ship' ? 8000 : 30000)));
+    if (!beam && legend.kind !== 'ship' && age < 10000) for (let dx = -1; dx <= 1; dx++) { const p = { x: legend.x + dx, y: legend.floor - 1 }; if (visible(p)) { const pixel = this.screen(p.x, p.y); this.glyph(this.ctx, Array.from(legend.kind === 'cthulhu' ? '克苏鲁' : '哥斯拉')[dx + 1], '#a2beb4', pixel.x, pixel.y, size, .35 + .25 * Math.sin(age / 500), true); } }
+    for (const cell of legendGeometry(world.data, legend, now, scenery)) {
+      if ((cell.role === 'beam') !== beam || !visible(cell) || legend.kind !== 'ship' && !world.waterAt(cell.x, cell.y)) continue;
+      const pixel = this.screen(cell.x, cell.y), glow = cell.role === 'beam' || cell.role === 'charge';
+      paint.glyph(this.ctx, cell.ch, cell.role === 'beam' ? '#a8e5ff' : cell.role === 'charge' ? '#d0f0ff' : colors[legend.kind][cell.ch], pixel.x, pixel.y, size, fade * (legend.kind === 'ship' ? .82 : 1), glow, cell.role === 'beam' ? 'breath' : 'legend');
+    }
   }
   drawEvent(world, event, now, size, visible) {
     for (const glyph of eventGlyphs(world.data, event, now, this.characters)) {
@@ -60,6 +79,8 @@ export class Renderer {
     }
   }
   eventHit(x, y) {
+    const legend = activeLegend(this.world.data, Date.now());
+    if (legend) for (const c of legendGeometry(this.world.data, legend, Date.now(), this.world.sceneryMap())) { const p = this.screen(c.x, c.y), size = this.cell * this.scale; if (x >= p.x && x <= p.x + size && y >= p.y && y <= p.y + size) return { kind: 'legend', id: legend.id }; }
     const event = activeEvent(this.world.data, Date.now()); if (event?.kind !== 'bottle') return null;
     const p = this.screen(eventPosition(event, Date.now()).x, eventPosition(event, Date.now()).y), size = this.cell * this.scale;
     return x >= p.x - size && x <= p.x + 2 * size && y >= p.y - size && y <= p.y + 1.5 * size ? { kind: 'event', id: event.id } : null;
@@ -83,6 +104,7 @@ export class Renderer {
   hit(x, y) { if (!this.world) return null; const p = this.point(x, y), monument = this.world.monument; if (p.x >= monument.x && p.x < monument.x + 8 && p.y >= monument.y && p.y < monument.y + 5) return { kind: 'monument' }; for (const c of Object.values(this.world.data.chars).reverse()) { if (c.kind === 'fish') { const f = this.world.data.fishes[c.entity]; if (!f) continue; const at = cellPosition(f, c); if (worldKey(at.x, at.y) === worldKey(p.x, p.y)) return { kind: 'fish', id: f.id }; } else if (c.kind === 'scene') { const s = this.world.data.scenes[c.entity]; if (s && worldKey(s.x + c.x, s.y + c.y) === worldKey(p.x, p.y)) return { kind: 'scene', id: s.id, cell: c.id }; } } return this.eventHit(x, y); }
   snapshot(world) {
     const canvas = document.createElement('canvas'); const size = 6; canvas.width = CONFIG.width * size; canvas.height = CONFIG.depth * size; const ctx = canvas.getContext('2d'); this.background(ctx, canvas.width, canvas.height, { x: CONFIG.width / 2, y: CONFIG.depth / 2 }, size, world);
+    const legend = activeLegend(world.data, world.data.tick); if (legend) for (const c of legendGeometry(world.data, legend, world.data.tick, world.sceneryMap())) if (legend.kind === 'ship' || world.waterAt(c.x, c.y)) this.glyph(ctx, c.ch, c.role === 'beam' ? '#a8e5ff' : '#91b3a4', c.x * size, c.y * size, size);
     for (const c of Object.values(world.data.chars)) { let p; if (c.kind === 'scene') { const s = world.data.scenes[c.entity]; if (s) p = { x: s.x + c.x, y: s.y + c.y }; } else if (c.kind === 'fish') { const f = world.data.fishes[c.entity]; if (f) p = cellPosition(f, c); } else if (c.kind === 'food' || c.kind === 'seaweed') p = c; if (p) this.glyph(ctx, c.ch, c.color, wrapX(p.x) * size, p.y * size, size); }
     for (const bubble of Object.values(world.data.bubbles || {})) { const state = bubbleState(bubble, world.data.tick); if (!state) continue; for (let y = 0; y < state.size; y++) for (let x = 0; x < state.size; x++) this.glyph(ctx, bubbleGlyph(bubble), BUBBLE_COLOR, wrapX(state.x + x) * size, (state.y + y) * size, size); }
     return canvas.toDataURL('image/webp', .82);

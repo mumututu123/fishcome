@@ -1,4 +1,5 @@
 import { wrapX, deltaX } from './geography.js';
+import { activeLegend } from './legends.js';
 
 export const EVENTS = Object.freeze({ period: 360000, opening: 2000, limit: 32, chance: 45 });
 export const EVENT_KINDS = Object.freeze(['whale', 'hiccup', 'bottle', 'meeting', 'blossom', 'meteor', 'radio', 'parade']);
@@ -82,7 +83,7 @@ export function updateEvents(world, now, context, continuous, record) {
     // Mark even an empty/unsuitable slot: refreshing cannot retry a quiet sea.
     life.eventThrough[seed] = slot; world.dirty = true;
     const schedule = eventSchedule(world.data.roots, seed, slot);
-    if (continuous && now - started < EVENTS.opening && schedule) {
+    if (continuous && now - started < EVENTS.opening && schedule && !activeLegend(world.data, now)) {
       const event = planEvent(world, schedule, now, context);
       if (event) {
         life.events[event.id] = event;

@@ -2,6 +2,7 @@ import { CONFIG, EYES, NEIGHBORS, bounds, cellPosition, components, hash, clone,
 import { defaultFishName, fishNameError } from './fish-profile.js';
 import { wrapX, nearX, deltaX } from './geography.js';
 import { recordStory } from './life.js';
+import { capturedFish } from './legends.js';
 import { densityField, contactTime } from './ecology.js';
 
 export const CONTACT_TIME = 5000;
@@ -82,7 +83,7 @@ export function updateContacts(world, now, groups, scenery) {
   const at = new Map(), eligible = new Map(), pairs = new Map();
   for (const [id, cells] of groups) {
     const fish = world.data.fishes[id], gender = fishOrigin(world.data, id)?.gender;
-    if (!fish || taken.has(id) || !['male', 'female'].includes(gender)) continue;
+    if (!fish || taken.has(id) || capturedFish(world.data, id, now) || !['male', 'female'].includes(gender)) continue;
     eligible.set(id, { fish, gender, cells });
     for (const cell of cells) { const p = cellPosition(fish, cell), k = key(p.x, p.y); if (!at.has(k)) at.set(k, new Set()); at.get(k).add(id); }
   }
