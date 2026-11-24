@@ -78,7 +78,7 @@ async function main() {
   await a.mouse.click(711, 675); await a.locator('#historyCards details summary').first().click();
   await a.waitForFunction(() => document.querySelector('.archivedChat')?.textContent.includes('海底🐟'));
   assert.equal(await a.locator('.archivedChat script').count(), 0); await a.locator('#closeHistory').click();
-  const point = await a.evaluate(() => { const cell = Object.values(tide.world.data.chars).find(cell => cell.chat && Math.abs(cell.x - 614) < 30 && !(cell.x >= 610 && cell.x < 618 && cell.y >= 115)); return { x: 720 + (cell.x - 614 + .5) * 18, y: 450 + (cell.y - 105 + .5) * 18 }; });
+  const point = await a.evaluate(() => { const cell = Object.values(tide.world.data.chars).find(cell => cell.chat && Math.abs(cell.x - 614) < 30 && !(cell.x >= 610 && cell.x < 618 && cell.y >= Math.min(...tide.world.data.terrain.depths.slice(610, 618)) - 5)); return { x: innerWidth / 2 + (cell.x - tide.view.camera.x + .5) * 18 * tide.view.scale, y: innerHeight / 2 + (cell.y - tide.view.camera.y + .5) * 18 * tide.view.scale }; });
   await a.mouse.click(point.x, point.y); assert.equal(await a.locator('#sceneActions').isVisible(), false); assert((await a.locator('#objectFootnote').textContent()).includes('不能编辑'));
   await a.close(); await b.close(); await pause(300); a = await open(aContext); assert.equal(await a.evaluate(() => Object.values(tide.world.data.chars).filter(cell => cell.chat).length), expected);
   await a.locator('#connect').click(); const downloadPromise = a.waitForEvent('download'); await a.locator('#backup').click(); const download = await downloadPromise, backupBytes = fs.readFileSync(await download.path());

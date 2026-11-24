@@ -46,9 +46,10 @@ test('重复祖先只展示一个节点，缺失祖先和循环记录有明确�
   const missing = new Map([['child', { id: 'child', parents: ['unknown'], created: 1 }]]); assert(familyTree(missing, 'child').nodes.some(node => node.missing));
   const cycle = new Map([['a', { id: 'a', parents: ['b'] }], ['b', { id: 'b', parents: ['a'] }]]); assert(familyTree(cycle, 'a').error); assert.equal(familyTree(related, 'absent').nodes.length, 0);
 });
-test('旧鱼和自然出生的小鱼得到适合鱼身长度的显示名，完整账号仅用于本人显示', () => {
+test('旧鱼和自然出生的小鱼沿用保存昵称，已知完整昵称可用于所有作者显示', () => {
   const mine = { actor: 'alice', nick: 'a＊＊e', nameAuto: true, name: 'a＊', nameOrdinal: 2, size: 2 };
   assert.equal(displayFishName(mine, { actor: 'alice', nick: '小林' }), '小林'); assert.equal(displayFishName(mine, { actor: 'bob', nick: '小王' }), 'a＊');
   const data = { ops: { f: { id: 'f', kind: 'fish', actor: 'alice', nick: 'a＊＊e', cells: glyphs(2), t: 1 } }, fishes: {}, breeding: {} };
   assert.equal(displayFishName(fishCatalog(data).get('f'), { actor: 'alice', nick: '小林' }), '小林');
+  data.participants = { alice: '小林' }; assert.equal(displayFishName(fishCatalog(data).get('f'), { actor: 'bob', nick: '小王' }), '小林');
 });

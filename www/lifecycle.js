@@ -1,4 +1,5 @@
 import { World, CONFIG, clone } from './engine.js';
+import { terrainOf } from './geography.js';
 
 // Older checkpoints have only at (save time), or tick (last simulation time).
 export function restoreCheckpoint(checkpoint, now = Date.now()) {
@@ -7,7 +8,7 @@ export function restoreCheckpoint(checkpoint, now = Date.now()) {
   const lastOnlineAt = [checkpoint.lastOnlineAt, checkpoint.at, checkpoint.world.tick].find(Number.isFinite);
   const expiresAt = Number.isFinite(lastOnlineAt) ? lastOnlineAt + CONFIG.offlineLife : undefined;
   const expired = !Number.isFinite(expiresAt) || now >= expiresAt;
-  if (!expired) { world.data = { ...world.data, ...clone(checkpoint.world) }; world.data.tick = now; world.initializeTracking(now); }
+  if (!expired) { world.data = { ...world.data, ...clone(checkpoint.world), terrain: clone(terrainOf(checkpoint.world)) }; world.data.tick = now; world.initializeTracking(now); }
   else { world.data.chatSources = clone(checkpoint.world.chats || {}); world.reconcileChatFloor(now); }
   return { world, expired, expiresAt };
 }

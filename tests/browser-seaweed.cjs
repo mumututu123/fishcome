@@ -15,7 +15,7 @@ async function open(context, port, nick) {
 }
 async function main() {
   for (const port of ports) {
-    const child = spawn(path.join(project, 'dist', '鱼来', '鱼来.exe'), ['--headless', '--loopback', '--port', String(port)], { windowsHide: true, stdio: 'ignore' }); children.push(child);
+    const child = spawn(process.env.TIDE_TEST_LAUNCHER || path.join(project, 'dist', '鱼来', '鱼来.exe'), ['--headless', '--loopback', '--port', String(port)], { windowsHide: true, stdio: 'ignore' }); children.push(child);
     await until(async () => { try { return (await fetch(`http://127.0.0.1:${port}/health`)).ok; } catch { return false; } }, '启动器没有就绪');
   }
   browser = await chromium.launch({ executablePath: 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe', headless: true });
@@ -29,11 +29,11 @@ async function main() {
     for (let index = 0; index < 4; index++) {
       while (!growthRoll(source, ++hour, hash)) {}
       const id = weedId(source, hour, hash); plant ||= id;
-      world.data.chars[id] = { id, kind: 'seaweed', entity: plant, payer: '', ch: '草', color: GREENS[hash(id) % GREENS.length], x: 600, y: CONFIG.depth - 1 - index, created: hour * HOUR, path: [], moveAt: now, wild: { source, hour, plant, index, x: 600, y: CONFIG.depth - 1 - index } };
+      world.data.chars[id] = { id, kind: 'seaweed', entity: plant, payer: '', ch: '草', color: GREENS[hash(id) % GREENS.length], x: 600, y: world.floorAt(600) - 1 - index, created: hour * HOUR, path: [], moveAt: now, wild: { source, hour, plant, index, x: 600, y: world.floorAt(600) - 1 - index } };
       ids.push(id); source = `tip:${id}`;
     }
     const network = new Network(identity, {}, () => {}, () => {}); network.sign = await signer(identity);
-    const op = { id: crypto.randomUUID(), actor: identity.actor, nick: '海＊试', t: now, roots: [world.id], kind: 'scene', x: 601, y: 115, cells: Array.from({ length: 4 }, (_, y) => ({ x: 0, y, ch: '#', color: '#aabbcc' })), cost: 4 };
+    const op = { id: crypto.randomUUID(), actor: identity.actor, nick: '海＊试', t: now, roots: [world.id], kind: 'scene', x: 601, y: Math.min(world.floorAt(600), world.floorAt(601)) - 5, cells: Array.from({ length: 4 }, (_, y) => ({ x: 0, y, ch: '#', color: '#aabbcc' })), cost: 4 };
     const result = world.apply({ ...op, proof: await network.makeEnvelope('op', op) }); if (!result.ok) throw new Error(result.error);
     checkpoint.world = world.serialize(); checkpoint.lastOnlineAt = now; await set('checkpoint', checkpoint); return ids;
   }); await setup.close();
@@ -47,7 +47,7 @@ async function main() {
   await a.locator('#makeFish').click(); const grid = await a.locator('#gridCanvas').boundingBox();
   for (const x of [7.5, 8.5]) await a.mouse.click(grid.x + x * grid.width / 15, grid.y + 7.5 * grid.height / 15);
   await a.locator('#placeDrawing').click();
-  const point = await a.evaluate(() => { const view = tide.view, size = 18 * view.scale; return { x: innerWidth / 2 + (598.5 - view.camera.x) * size, y: innerHeight / 2 + (118.5 - view.camera.y) * size }; });
+  const point = await a.evaluate(() => { const view = tide.view, size = 18 * view.scale; return { x: innerWidth / 2 + (598.5 - view.camera.x) * size, y: innerHeight / 2 + (Math.min(tide.world.data.terrain.depths[598], tide.world.data.terrain.depths[600]) - 1.5 - view.camera.y) * size }; });
   await a.mouse.click(point.x, point.y);
   for (const page of [a, b]) await page.waitForFunction(ids => ids.some(id => tide.world.data.chars[id]?.kind === 'fish'), ids, { timeout: 20000 });
   const fed = await a.evaluate(ids => ids.map(id => tide.world.data.chars[id]).filter(c => c.kind === 'fish').map(c => ({ id: c.id, entity: c.entity, ch: c.ch, color: c.color, eats: c.path.filter(p => p.reason === 'eat').length })), ids);

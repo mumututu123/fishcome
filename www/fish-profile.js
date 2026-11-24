@@ -8,6 +8,7 @@ export function fishCatalog(data) {
   const entries = new Map();
   for (const op of Object.values(data.ops)) if (op.kind === 'fish') entries.set(op.id, { id: op.id, actor: op.actor, nick: op.nick, gender: op.gender, name: op.name, created: op.t, size: op.cells.length, parents: [], alive: !!data.fishes[op.id] });
   for (const record of Object.values(data.breeding || {})) if (record.status === 'born') { const baby = record.baby; entries.set(baby.id, { ...baby, size: baby.cells.length, alive: !!data.fishes[baby.id] }); }
+  for (const entry of entries.values()) entry.nick = data.participants?.[entry.actor] || entry.nick;
   const numbers = new Map();
   for (const entry of [...entries.values()].sort((a, b) => a.created - b.created || a.id.localeCompare(b.id))) { const number = (numbers.get(entry.actor) || 0) + 1; numbers.set(entry.actor, number); entry.number = entry.nameOrdinal || number; }
   return entries;

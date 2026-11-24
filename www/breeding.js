@@ -1,5 +1,6 @@
 import { CONFIG, EYES, NEIGHBORS, bounds, cellPosition, components, hash, clone, key } from './engine.js';
 import { defaultFishName, fishNameError } from './fish-profile.js';
+import { wrapX, nearX, deltaX } from './geography.js';
 
 export const CONTACT_TIME = 5000;
 export const BREEDING_TIME = 3600000;
@@ -47,7 +48,7 @@ export function finishBreeding(world, now, transition) {
     const father = world.data.fishes[record.male], mother = world.data.fishes[record.female], fatherCells = world.fishCells(record.male), motherCells = world.fishCells(record.female);
     const selectedFather = fatherCells.filter(cell => record.contact.male.includes(cell.id)), selectedMother = motherCells.filter(cell => record.contact.female.includes(cell.id));
     const selected = [...selectedFather, ...selectedMother], removed = new Set(selected.map(cell => cell.id)), remainingFather = fatherCells.filter(cell => !removed.has(cell.id)), remainingMother = motherCells.filter(cell => !removed.has(cell.id));
-    const placed = selected.map(cell => ({ ...cell, ...cellPosition(cell.entity === father.id ? father : mother, cell) }));
+    const placed = selected.map(cell => { const p = cellPosition(cell.entity === father.id ? father : mother, cell); return { ...cell, x: nearX(p.x, father.x), y: p.y }; });
     const occupants = world.fishOccupants(), parents = new Set([father.id, mother.id]);
     const viable = remainingFather.length >= 2 && remainingMother.length >= 2 && components(remainingFather).length === 1 && components(remainingMother).length === 1 && selectedFather.length > 0 && selectedMother.length > 0 && selected.length >= 2 && new Set(placed.map(cell => key(cell.x, cell.y))).size === placed.length && components(placed).length === 1 && placed.every(cell => [...(occupants.get(key(cell.x, cell.y)) || [])].every(id => parents.has(id)));
     if (!viable) { cancel(record, now, 'incomplete-bodies'); father.cx = father.cy = mother.cx = mother.cy = 0; world.dirty = true; continue; }
@@ -57,7 +58,7 @@ export function finishBreeding(world, now, transition) {
     const eyes = [...EYES], eyeGlyph = eyes[hash(`eye-glyph:${id}`) % eyes.length];
     const bornCells = [];
     for (const cell of selected) {
-      const p = cellPosition(cell.entity === father.id ? father : mother, cell), from = cell.entity, before = cell.ch, after = cell.id === eye ? eyeGlyph : before;
+      const raw = cellPosition(cell.entity === father.id ? father : mother, cell), p = { x: nearX(raw.x, father.x), y: raw.y }, from = cell.entity, before = cell.ch, after = cell.id === eye ? eyeGlyph : before;
       bornCells.push({ id: cell.id, parent: from, before, after, color: cell.color, x: p.x - body.minX, y: p.y - body.minY });
       transition(cell, { kind: 'fish', entity: id, x: p.x - body.minX, y: p.y - body.minY, ch: after, editAt: now }, { id: `birth:${record.id}:${cell.id}`, t: now, reason: 'birth', birth: record.id, from, before, after });
     }
@@ -65,7 +66,7 @@ export function finishBreeding(world, now, transition) {
     const number = Object.values(world.data.fishes).filter(fish => fishOrigin(world.data, fish.id)?.actor === record.baby.actor).length + 1;
     Object.assign(record.baby, { name: defaultFishName(parent.nick || '鱼', number, selected.length), nameAuto: true, nameOrdinal: number });
     record.status = 'born'; record.at = now;
-    world.data.fishes[id] = { id, actor: record.baby.actor, nick: record.baby.nick, gender, birth: record.id, parents: record.baby.parents, x: body.minX, y: body.minY, facing: 1, created: now, lastFed: now, hungerAt: now + CONFIG.hunger, cx: 0, cy: 0, posAt: now };
+    world.data.fishes[id] = { id, actor: record.baby.actor, nick: record.baby.nick, gender, birth: record.id, parents: record.baby.parents, x: wrapX(body.minX), y: body.minY, facing: 1, created: now, lastFed: now, hungerAt: now + CONFIG.hunger, cx: 0, cy: 0, posAt: now };
     world.data.fishes[id].name = record.baby.name;
     world.data.travel[id] = { since: now, days: {} };
     father.cx = father.cy = mother.cx = mother.cy = 0; father.posAt = mother.posAt = now;
@@ -113,9 +114,9 @@ export function motionUnits(world, groups) {
     if (record.status !== 'active') continue;
     const members = [world.data.fishes[record.male], world.data.fishes[record.female]];
     if (members.some(fish => !fish)) continue;
-    const placed = members.flatMap(fish => (groups.get(fish.id) || []).map(cell => ({ ...cell, ...cellPosition(fish, cell) }))), b = bounds(placed);
+    const placed = members.flatMap(fish => (groups.get(fish.id) || []).map(cell => { const p = cellPosition(fish, cell); return { ...cell, x: nearX(p.x, members[0].x), y: p.y }; })), b = bounds(placed);
     const fish = { id: record.id, x: b.minX, y: b.minY, facing: 1, created: record.started, ...record.motion };
-    result.push({ id: record.id, fish, cells: placed.map(cell => ({ ...cell, x: cell.x - b.minX, y: cell.y - b.minY })), members, offsets: members.map(member => ({ x: member.x - b.minX, y: member.y - b.minY, facing: member.facing })), record });
+    result.push({ id: record.id, fish, cells: placed.map(cell => ({ ...cell, x: cell.x - b.minX, y: cell.y - b.minY })), members, offsets: members.map(member => ({ x: nearX(member.x, members[0].x) - b.minX, y: member.y - b.minY, facing: member.facing })), record });
     for (const member of members) paired.add(member.id);
   }
   for (const [id, cells] of groups) if (!paired.has(id) && world.data.fishes[id]) result.push({ id, cells, fish: world.data.fishes[id], members: [world.data.fishes[id]] });
@@ -123,10 +124,10 @@ export function motionUnits(world, groups) {
 }
 export function commitUnit(unit, now) {
   if (unit.record) {
-    unit.members.forEach((fish, index) => { const offset = unit.offsets[index]; fish.x = unit.fish.x + unit.fish.facing * offset.x; fish.y = unit.fish.y + offset.y; fish.facing = unit.fish.facing * offset.facing; });
+    unit.members.forEach((fish, index) => { const offset = unit.offsets[index]; fish.x = wrapX(unit.fish.x + unit.fish.facing * offset.x); fish.y = unit.fish.y + offset.y; fish.facing = unit.fish.facing * offset.facing; });
     unit.record.pose = { male: pose(unit.members[0]), female: pose(unit.members[1]) }; unit.record.motion = { cx: unit.fish.cx, cy: unit.fish.cy }; unit.record.at = now;
   }
-  for (const fish of unit.members) fish.posAt = now;
+  for (const fish of unit.members) { fish.x = wrapX(fish.x); fish.posAt = now; }
 }
 export function mergeBreeding(world, other) {
   world.data.breeding ||= {};
@@ -154,7 +155,7 @@ export function validBreedingRecord(record, data) {
     if (!Array.isArray(ids) || !ids.length || new Set(ids).size !== ids.length || ids.some(id => typeof id !== 'string') || !initial || !current || ![initial.x, initial.y, current.x, current.y].every(Number.isInteger) || ![initial.facing, current.facing].every(facing => facing === 1 || facing === -1)) return false;
   }
   const initial = record.initialPose, current = record.pose, reflection = current.male.facing * initial.male.facing;
-  if (current.female.facing * initial.female.facing !== reflection || current.male.x - current.female.x !== reflection * (initial.male.x - initial.female.x) || current.male.y - current.female.y !== initial.male.y - initial.female.y) return false;
+  if (current.female.facing * initial.female.facing !== reflection || deltaX(current.male.x, current.female.x) !== reflection * deltaX(initial.male.x, initial.female.x) || current.male.y - current.female.y !== initial.male.y - initial.female.y) return false;
   if (!record.motion || ![record.motion.cx, record.motion.cy].every(value => Number.isFinite(value) && value >= 0 && value <= 2)) return false;
   if (record.status !== 'born') return record.baby === undefined;
   const baby = record.baby;

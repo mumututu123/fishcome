@@ -42,7 +42,7 @@ async function main() {
   assert.equal(await a.evaluate(() => tide.network.peers.length) >= 1, true);
   await b.locator('#chatInput').fill('你好，中文鱼元世界 <script>不会执行</script>'); await b.locator('#chatForm button').click();
   await until(async () => (await a.locator('#chatMessages').textContent()).includes('你好，中文鱼元世界'), '聊天未同步');
-  assert.equal((await a.locator('#chatMessages').textContent()).includes('浏览器乙'), false, '未打码昵称暴露');
+  assert.equal((await a.locator('#chatMessages').textContent()).includes('浏览器乙'), true, '完整昵称没有显示');
   await until(async () => (await b.evaluate(() => { const d = tide.world.data, cs = Object.values(d.chars).filter(c => c.kind === 'scene'); return cs.length === 4 && new Set(cs.map(c => `${d.scenes[c.entity].x + c.x},${d.scenes[c.entity].y + c.y}`)).size === 4; })), '合流造景重叠');
   const before = await a.evaluate(() => tide.balance()); await a.locator('#feed').click(); await a.locator('#foodGlyphInput').fill('粮'); await a.locator('#foodColorInput').fill('#ff9933'); await a.locator('#placeFood').click(); await a.mouse.click(710, 370); await pause(700); assert.equal(await a.evaluate(() => tide.balance()), before, '水下点击消耗了配额'); await a.mouse.click(710, 243); await a.keyboard.press('Escape');
   await until(async () => (await b.evaluate(() => Object.values(tide.world.data.chars).some(c => c.kind === 'food'))), '水面食物未同步');
@@ -98,7 +98,7 @@ async function main() {
   assert.equal(await fresh.evaluate(() => tide.balance()), 20);
   assert.equal(await fresh.evaluate(roots => Object.values(tide.histories).some(c => c.status !== 'corrected' && c.roots.every(r => roots.includes(r))), beforeSleep), true, '休眠过期合影未保存');
   assert.equal(errors.length, 0, '浏览器错误: ' + errors.join('\n'));
-  const result = { chrome: chromeExecutable ? 'passed' : 'not installed (used isolated Edge instance)', edge: 'passed', firefox: ff, checks: ['Chinese creation and billing', 'automatic WebRTC pairing', 'independent-world merge through non-coordinator', 'masked XSS-safe chat', 'scenery collision repair', 'surface-only food sync', 'actual coordinator failover', 'expired checkpoint correction from live world', 'short offline preserves world and wallet', '239-hour legacy checkpoint migration', '240-hour extinction and retained monument', 'short sleep preserves world', '240-hour sleep extinction', 'portable ZIP'], errors };
+  const result = { chrome: chromeExecutable ? 'passed' : 'not installed (used isolated Edge instance)', edge: 'passed', firefox: ff, checks: ['Chinese creation and billing', 'automatic WebRTC pairing', 'independent-world merge through non-coordinator', 'full-nickname XSS-safe chat', 'scenery collision repair', 'surface-only food sync', 'actual coordinator failover', 'expired checkpoint correction from live world', 'short offline preserves world and wallet', '239-hour legacy checkpoint migration', '240-hour extinction and retained monument', 'short sleep preserves world', '240-hour sleep extinction', 'portable ZIP'], errors };
   fs.writeFileSync(path.join(project, 'test-output', 'browser-results.json'), JSON.stringify(result, null, 2)); console.log(JSON.stringify(result, null, 2));
 }
 main().catch(e => { console.error(e.stack); process.exitCode = 1; }).finally(async () => { for (const b of browsers) await b.close().catch(() => {}); for (const c of children) c.kill(); });

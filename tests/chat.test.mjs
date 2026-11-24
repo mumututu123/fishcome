@@ -41,15 +41,15 @@ test('240小时到期后聊天形成海底地形，下一轮聊天室清空且�
   assert.equal(Object.keys(world.data.chats).length, 0); assert.equal(Object.keys(world.data.chatSources).length, 1);
   const cells = world.sceneCells(CHAT_FLOOR); assert.equal(cells.length, 6);
   assert.deepEqual(cells.map(cell => cell.ch), chatGlyphs(chat.body.text).map(glyph => glyph.ch));
-  assert(cells.every(cell => cell.y >= CONFIG.depth - 12 && cell.y < CONFIG.depth));
+  assert(cells.every(cell => cell.y >= world.floorAt(cell.x) - 12 && cell.y < world.floorAt(cell.x)));
   assert.equal(new Set(cells.map(cell => `${cell.x},${cell.y}`)).size, 6);
   assert.equal(world.wallet('alice'), 20); assert.equal(world.data.scenes[CHAT_FLOOR].fixed, true);
 });
 test('同一轮的多个浏览器分别重开，沉积随机位置一致且合流不复制鱼元', () => {
   const { checkpoint, world } = ended('一句话，留在下一片海里');
   const other = restoreCheckpoint(checkpoint, at + CONFIG.offlineLife).world;
-  assert.deepEqual(world.data.chars, other.data.chars);
-  const count = world.counts().characters; world.merge(other.serialize()); world.reconcileGeometry();
+  assert.deepEqual(Object.keys(world.data.chars), Object.keys(other.data.chars));
+  const count = world.counts().characters, before = world.serialize(); world.merge(other.serialize()); other.merge(before); world.reconcileGeometry(); other.reconcileGeometry(); assert.deepEqual(world.data.chars, other.data.chars);
   assert.equal(world.counts().characters, count);
 });
 test('聊天沉积协议拒绝编辑、移动、旋转、缩放和删除', () => {

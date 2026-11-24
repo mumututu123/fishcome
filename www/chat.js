@@ -18,10 +18,10 @@ export function mergeChatRecords(left = {}, right = {}) {
 }
 export function chatColor(seed) { return '#' + [0, 8, 16].map(shift => (128 + ((seed >>> shift) & 95)).toString(16)).join(''); }
 export function chatCellId(message, index) { return `chat:${message.id}:${index}`; }
-export function buildChatFloor(messages, { width, depth }, occupied, hash) {
+export function buildChatFloor(messages, { width, depth, floorAt = () => depth }, occupied, hash) {
   const chars = {}, rows = new Map(); let waiting = 0;
   const row = level => {
-    if (!rows.has(level)) rows.set(level, Array.from({ length: width }, (_, x) => x).filter(x => !occupied.has(`${x},${depth - 1 - level}`)));
+    if (!rows.has(level)) rows.set(level, Array.from({ length: width }, (_, x) => x).filter(x => floorAt(x) - 1 - level >= 0 && !occupied.has(`${x},${floorAt(x) - 1 - level}`)));
     return rows.get(level);
   };
   for (const message of orderedChats(messages)) for (const { ch, index } of chatGlyphs(message.body.text)) {
@@ -30,7 +30,7 @@ export function buildChatFloor(messages, { width, depth }, occupied, hash) {
     for (let offset = 1; !columns.length && offset < depth; offset++) { level = (preferred + offset) % depth; columns = row(level); }
     if (!columns.length) { waiting++; continue; }
     const choice = hash(id) % columns.length, x = columns[choice]; columns[choice] = columns.at(-1); columns.pop();
-    chars[id] = { id, payer: '', ch, color: chatColor(hash(message.actor)), kind: 'scene', entity: CHAT_FLOOR, x, y: depth - 1 - level, path: [], created: message.body.t, chat: message.id, chatIndex: index };
+    chars[id] = { id, payer: '', ch, color: chatColor(hash(message.actor)), kind: 'scene', entity: CHAT_FLOOR, x, y: floorAt(x) - 1 - level, path: [], created: message.body.t, chat: message.id, chatIndex: index };
   }
   return { chars, waiting };
 }

@@ -14,7 +14,7 @@ function stem(world, x, length = 1) {
   for (let index = 0; index < length; index++) {
     while (!growthRoll(source, ++hour, hash)) {}
     const id = weedId(source, hour, hash); plant ||= id;
-    const cell = { id, kind: 'seaweed', entity: plant, payer: '', ch: '草', color: GREENS[hash(id) % GREENS.length], x, y: CONFIG.depth - 1 - index, created: hour * HOUR, path: [], moveAt: now, wild: { source, hour, plant, index, x, y: CONFIG.depth - 1 - index } };
+    const cell = { id, kind: 'seaweed', entity: plant, payer: '', ch: '草', color: GREENS[hash(id) % GREENS.length], x, y: world.floorAt(x) - 1 - index, created: hour * HOUR, path: [], moveAt: now, wild: { source, hour, plant, index, x, y: world.floorAt(x) - 1 - index } };
     world.data.chars[id] = cell; cells.push(cell); source = `tip:${id}`;
   }
   return cells;
@@ -54,7 +54,7 @@ test('海底和造景八方向的空格才发芽，排除鱼、食物、地形�
 });
 test('顶端长出连续草茎，短海草不摆动，三字以上根部固定且不穿地形', () => {
   const world = new World(now), cells = stem(world, 40, 3), root = { x: cells[0].x, y: cells[0].y };
-  const wall = crypto.randomUUID(); assert(world.apply({ id: wall, actor: 'wall', t: now, kind: 'scene', x: 41, y: 116, cells: [glyph(0, 0, '#'), glyph(0, 1, '#'), glyph(0, 2, '#')], cost: 3 }).ok);
+  const wall = crypto.randomUUID(); assert(world.apply({ id: wall, actor: 'wall', t: now, kind: 'scene', x: 41, y: Math.min(world.floorAt(40), world.floorAt(41)) - 4, cells: [glyph(0, 0, '#'), glyph(0, 1, '#'), glyph(0, 2, '#')], cost: 3 }).ok);
   const poses = new Set();
   for (let i = 0; i < 40; i++) {
     updateSeaweed(world, now + i * 2000, CONFIG, noMonument, hash, transition);
@@ -78,21 +78,21 @@ test('鱼眼海草视距与食物一致，浅水10格、深水5格，盲鱼只�
     for (const distance of [radius, radius + 1]) assert.equal(canSee(fish, [glyph(0, 0)], { x: 20 + distance, y, kind: 'seaweed' }), distance === radius);
     assert.equal(canSee(fish, [glyph(0, 0, 'Q')], { x: 21, y, kind: 'seaweed' }), false);
   }
-  const world = new World(now), weed = stem(world, 30)[0], fishId = addFish(world, 28, 118, [glyph(0, 0, 'Q'), glyph(1, 0, '8')]);
+  const world = new World(now), weed = stem(world, 30)[0], fishId = addFish(world, 28, world.floorAt(30) - 2, [glyph(0, 0, 'Q'), glyph(1, 0, '8')]);
   world.step(now + 500);
   assert.equal(weed.kind, 'fish'); assert.equal(weed.entity, fishId); assert.equal(weed.ch, '草'); assert.equal(world.data.fishes[fishId].lastFed, now + 500); assert.equal(world.fishStatus(fishId, now + 500).meals24, 1);
-  assert.deepEqual(cellPosition(world.data.fishes[fishId], weed), { x: 30, y: 119 });
+  assert.deepEqual(cellPosition(world.data.fishes[fishId], weed), { x: 30, y: world.floorAt(30) - 1 });
 });
 test('鱼主动追寻可见海草，海草不会五分钟后沉积，大鱼争食只吃一次', () => {
-  const chase = new World(now), target = stem(chase, 30)[0], fishId = addFish(chase, 25, 119);
+  const chase = new World(now), target = stem(chase, 30)[0], fishId = addFish(chase, 25, Math.min(chase.floorAt(25), chase.floorAt(30)) - 1);
   chase.step(now + 500); assert.equal(chase.data.fishes[fishId].x, 26); assert.equal(target.kind, 'seaweed');
   const growing = new World(now), plant = stem(growing, 30)[0]; growing.step(now + CONFIG.foodLife + 1); assert.equal(plant.kind, 'seaweed');
-  const contest = new World(now), food = stem(contest, 30)[0]; addFish(contest, 28, 118, [glyph(0, 0, 'Q'), glyph(1, 0, '8')]);
-  const large = addFish(contest, 31, 117, [glyph(0, 0, 'Q'), glyph(0, 1, '8'), glyph(0, 2, '8')], 'bob');
+  const contest = new World(now), food = stem(contest, 30)[0]; addFish(contest, 28, contest.floorAt(30) - 2, [glyph(0, 0, 'Q'), glyph(1, 0, '8')]);
+  const large = addFish(contest, 31, Math.min(contest.floorAt(30), contest.floorAt(31)) - 3, [glyph(0, 0, 'Q'), glyph(0, 1, '8'), glyph(0, 2, '8')], 'bob');
   contest.step(now + 500); assert.equal(food.entity, large); assert.equal(food.path.filter(p => p.reason === 'eat').length, 1);
 });
 test('吃掉根部或中间草茎后，上方断开的海草脱落为鱼食', () => {
-  const world = new World(now), cells = stem(world, 30, 3); addFish(world, 28, 119, [glyph(0, 0, 'Q'), glyph(1, 0, '8')]);
+  const world = new World(now), cells = stem(world, 30, 3); addFish(world, 28, Math.min(world.floorAt(28), world.floorAt(30)) - 1, [glyph(0, 0, 'Q'), glyph(1, 0, '8')]);
   world.step(now + 500); assert.equal(cells[0].kind, 'fish');
   world.step(now + 1000); assert(cells.slice(1).every(c => c.kind !== 'seaweed'));
 });
@@ -107,11 +107,11 @@ test('生长时钟、海草、随机绿色与进食来源跨存档、合流和�
 });
 test('不能通过投放、搬动或缩放造景覆盖海草，也不扣鱼元', () => {
   const world = new World(now), weed = stem(world, 30)[0];
-  const sceneId = crypto.randomUUID(); assert(world.apply({ id: sceneId, actor: 'builder', t: now, kind: 'scene', x: 32, y: 118, cells: [glyph(0, 0, '#'), glyph(0, 1, '#')], cost: 2 }).ok);
-  const move = world.apply({ id: crypto.randomUUID(), actor: 'builder', t: now, kind: 'sceneMove', scene: sceneId, x: 30, y: 118, cost: 0 }); assert.equal(move.ok, false);
+  const sceneId = crypto.randomUUID(); assert(world.apply({ id: sceneId, actor: 'builder', t: now, kind: 'scene', x: 32, y: Math.min(world.floorAt(30), world.floorAt(32)) - 2, cells: [glyph(0, 0, '#'), glyph(0, 1, '#')], cost: 2 }).ok);
+  const move = world.apply({ id: crypto.randomUUID(), actor: 'builder', t: now, kind: 'sceneMove', scene: sceneId, x: 30, y: world.floorAt(30) - 2, cost: 0 }); assert.equal(move.ok, false);
   const spawn = world.apply({ id: crypto.randomUUID(), actor: 'alice', t: now, kind: 'scene', x: weed.x, y: weed.y, cells: [glyph(0, 0, '#'), glyph(1, 0, '#')], cost: 2 }); assert.equal(spawn.ok, false); assert.equal(world.wallet('alice'), 20);
   const scaleWorld = new World(now); stem(scaleWorld, 30);
-  const scaleId = crypto.randomUUID(); assert(scaleWorld.apply({ id: scaleId, actor: 'builder', t: now, kind: 'scene', x: 29, y: 118, cells: [glyph(0, 0, '#'), glyph(1, 0, '#')], cost: 2 }).ok);
+  const scaleId = crypto.randomUUID(); assert(scaleWorld.apply({ id: scaleId, actor: 'builder', t: now, kind: 'scene', x: 29, y: Math.min(scaleWorld.floorAt(29), scaleWorld.floorAt(30)) - 2, cells: [glyph(0, 0, '#'), glyph(1, 0, '#')], cost: 2 }).ok);
   assert.equal(scaleWorld.apply({ id: crypto.randomUUID(), actor: 'builder', t: now, kind: 'sceneScale', scene: scaleId, factor: 2, cost: 6 }).ok, false);
   assert.equal(scaleWorld.wallet('builder'), 18);
 });
@@ -123,7 +123,7 @@ test('脱落海草沉积、编辑和付费造景复制后仍有有效来源', ()
   world.step(now + 500); assert.equal(cell.kind, 'scene'); assert(validWildCell(cell, CONFIG, hash));
   const actor = 'builder', edit = { id: crypto.randomUUID(), actor, t: now + 500, kind: 'sceneEdit', scene: cell.entity, cell: cell.id, ch: '木', color: '#aabbcc', cost: 0 };
   assert(world.apply(edit).ok); assert(validWildCell(cell, CONFIG, hash));
-  const move = { id: crypto.randomUUID(), actor, t: now + 500, kind: 'sceneMove', scene: cell.entity, x: 30, y: 100, cost: 0 }; assert(world.apply(move).ok);
+  const move = { id: crypto.randomUUID(), actor, t: now + 500, kind: 'sceneMove', scene: cell.entity, x: 30, y: Math.min(world.floorAt(30), world.floorAt(31)) - 4, cost: 0 }; assert(world.apply(move).ok);
   assert(world.apply({ id: crypto.randomUUID(), actor, t: now + 500, kind: 'sceneScale', scene: cell.entity, factor: 2, cost: 3 }).ok);
   assert(world.sceneCells(cell.entity).filter(c => c.id !== cell.id).every(c => !c.wild && c.payer === actor));
 });

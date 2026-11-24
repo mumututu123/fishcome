@@ -1,7 +1,7 @@
-import { World, CONFIG, clone, EYES, bounds, validGlyph, maskNick, hash } from './engine.js';
+import { World, CONFIG, clone, EYES, bounds, validGlyph, displayNick, hash } from './engine.js';
 import { get, set, putMany, newIdentity, verifyEnvelope, actorId, download } from './storage.js';
 import { Network } from './network.js';
-import { Renderer, MONUMENT } from './renderer.js';
+import { Renderer } from './renderer.js';
 import { Creator } from './creator.js';
 import { restoreCheckpoint } from './lifecycle.js';
 import { CHAT_FLOOR, validChatMessage, orderedChats, chatGlyphs, chatColor, chatCellId, mergeChatRecords } from './chat.js';
@@ -12,6 +12,7 @@ import { defaultFishName, displayFishName, fishCatalog } from './fish-profile.js
 import { drawPedigree } from './pedigree.js';
 import { normalizeInvite, encodeInvite, decodeInvite, inviteDetails } from './invite.js';
 import { verifyReferral } from './referral.js';
+import { wrapX, nearX, validTerrain } from './geography.js';
 const $ = id => document.getElementById(id);
 const renderer = new Renderer($('sea'));
 let world = new World(), identity, network, meta, creator, mode = null, selected = null, dragging, histories = {}, known = [], members = new Map(), pending = new Map(), inbox = new Map(), lastPicture = null, priorCheckpoint = null;
@@ -29,8 +30,10 @@ function rejectOperation(id) { rejectedOps.add(id); inbox.delete(id); }
 let lastOnlineAt = Date.now();
 const historyQueues = new Map();
 const opBody = op => { const { proof, ...body } = op; return body; };
+function authorNick(actor, fallback) { return actor === identity?.actor ? identity.nick : active().find(member => member.actor === actor)?.nick || world.data.participants[actor] || displayNick(fallback) || '匿名'; }
+function rememberAuthor(actor, nick) { if (typeof nick === 'string' && world.data.participants[actor] !== nick) { world.data.participants[actor] = nick; renderedChatCount = -1; renderChat(); } }
 function toast(text) { $('toast').textContent = text; $('toast').hidden = false; clearTimeout(toast.timer); toast.timer = setTimeout(() => $('toast').hidden = true, 5000); }
-function member() { return { id: network.node, actor: identity.actor, nick: maskNick(identity.nick), url: meta.url, at: Date.now(), visible: !document.hidden, peers: network.live().length }; }
+function member() { return { id: network.node, actor: identity.actor, nick: displayNick(identity.nick), url: meta.url, at: Date.now(), visible: !document.hidden, peers: network.live().length }; }
 function active() { return [...members.values()].filter(m => Date.now() - m.at < 120000); }
 function leader() { return active().sort((a, b) => +b.visible - +a.visible || a.id.localeCompare(b.id))[0]?.id || network.node; }
 function amLeader() { return !!network && leader() === network.node; }
@@ -61,6 +64,7 @@ async function verifyChats(messages = {}) {
 }
 async function verifyReplica(data) {
   if (!data || data.protocol !== 1 || !data.roots || !data.chars || !data.fishes || !data.scenes || !data.ops || Object.keys(data.chars).length > 100000 || Object.keys(data.ops).length > 500000) throw new Error('世界快照不兼容或超出首版规模');
+  if (data.terrain && !validTerrain(data.terrain, data.roots)) throw new Error('固定海底地形被修改或无效');
   for (const [id, op] of Object.entries(data.ops)) { if (world.data.ops[id] && JSON.stringify(opBody(world.data.ops[id])) === JSON.stringify(opBody(op))) continue; if (world.data.ops[id] && !(op.kind === 'referral' && world.data.ops[id].kind === 'referral')) throw new Error('已有消费记录不可覆盖'); const { proof, ...clean } = op; if (id !== op.id || !proof || proof.kind !== 'op' || JSON.stringify(clean) !== JSON.stringify(proof.body) || proof.actor !== op.actor || !await verifyEnvelope(proof) || world.validOp(op) || (op.kind === 'referral' && !await verifyReferral(op))) throw new Error('世界包含无效操作凭据'); }
   for (const [root, at] of Object.entries(data.roots)) if (!/^[0-9a-f-]{36}$/i.test(root) || !Number.isFinite(at)) throw new Error('世界起源无效');
   if (data.seaweedHour !== undefined && (!Number.isInteger(data.seaweedHour) || data.seaweedHour < 0 || data.seaweedHour > Math.floor((Date.now() + 60000) / HOUR))) throw new Error('海草生长时钟无效');
@@ -94,7 +98,8 @@ async function verifyReplica(data) {
   }
 }
 async function mergeReplica(data) {
-  await verifyReplica(data); world.merge(data);
+  await verifyReplica(data); const previousTerrain = world.data.terrain.seed; world.merge(data); if (world.data.terrain.seed !== previousTerrain) geometryRepair = true;
+  for (const member of active()) world.data.participants[member.actor] = member.nick; if (identity) world.data.participants[identity.actor] = identity.nick;
   // An expired local copy can be restored only after hearing its roots from a live peer.
   const checkpoint = priorCheckpoint; let recovered = false;
   if (checkpoint?.world?.roots && Object.keys(checkpoint.world.roots).some(r => world.roots.includes(r))) {
@@ -135,8 +140,10 @@ async function onMessage(message, peer) {
   if (members.has(message.from) && members.get(message.from).actor !== message.actor) return;
   const body = message.body;
   if (message.kind === 'hello') {
+    if (!body.world?.terrain) { status = '对方使用旧版世界规则，请双方刷新游戏页面后再连接'; toast(status); network.close(peer); update(); return; }
     if (message.from !== peer.node || body.member?.id !== message.from || body.member.actor !== message.actor) return;
     const own = body.member; members.set(own.id, { ...own, url: peer.url, at: Date.now() }); remember(peer.url);
+    rememberAuthor(message.actor, own.nick);
     for (const m of body.members || []) remember(m.url);
     const newKnowledge = Object.keys(body.world.roots || {}).some(r => !world.data.roots[r]) || Object.keys(body.world.ops || {}).some(id => !world.data.ops[id]) || Object.keys(body.world.chats || {}).some(id => !world.data.chats[id]) || Object.keys(body.world.chatSources || {}).some(id => !world.data.chatSources[id]);
     await mergeReplica(body.world); geometryRepair = true;
@@ -148,7 +155,7 @@ async function onMessage(message, peer) {
     await completeReferral(peer, message.actor);
     status = ''; toast('已接入伙伴，两个世界正在合流'); update();
   } else if (message.kind === 'beat') {
-    if (body.member?.id === message.from && body.member.actor === message.actor) { const direct = network.live().find(p => p.node === message.from); members.set(message.from, { ...body.member, direct: !!direct, url: await normalizeInvite(direct?.url || body.member.url), at: Date.now() }); remember(body.member.url); if (Date.now() - lastRepair > 5000 && (body.rootCount > world.roots.length || body.opCount > Object.keys(world.data.ops).length || body.chatCount > Object.keys(world.data.chats).length || body.chatSourceCount > Object.keys(world.data.chatSources).length)) { lastRepair = Date.now(); network.broadcast('replicaRequest', { to: message.from }).catch(() => {}); } }
+    if (body.member?.id === message.from && body.member.actor === message.actor) { const direct = network.live().find(p => p.node === message.from); members.set(message.from, { ...body.member, direct: !!direct, url: await normalizeInvite(direct?.url || body.member.url), at: Date.now() }); remember(body.member.url); rememberAuthor(message.actor, body.member.nick); if (Date.now() - lastRepair > 5000 && (body.rootCount > world.roots.length || body.opCount > Object.keys(world.data.ops).length || body.chatCount > Object.keys(world.data.chats).length || body.chatSourceCount > Object.keys(world.data.chatSources).length)) { lastRepair = Date.now(); network.broadcast('replicaRequest', { to: message.from }).catch(() => {}); } }
   } else if (message.kind === 'merge') {
     await mergeReplica(body.world); geometryRepair = true; reconcileHistory(); syncIncomeSerial(); update();
   } else if (message.kind === 'replicaRequest') {
@@ -183,7 +190,7 @@ async function completeReferral(peer, peerActor) {
   try {
     const invitation = peer.entryInvite, details = await inviteDetails(invitation), inviter = details.actor || peerActor;
     if (inviter === identity.actor) { registration.joined = true; await save(); return; }
-    const op = { id: `${identity.actor}:referral`, actor: identity.actor, nick: maskNick(identity.nick), t: Date.now(), roots: [world.id], cost: 0, kind: 'referral', inviter, registeredAt: registration.at, invitation };
+    const op = { id: `${identity.actor}:referral`, actor: identity.actor, nick: displayNick(identity.nick), t: Date.now(), roots: [world.id], cost: 0, kind: 'referral', inviter, registeredAt: registration.at, invitation };
     const message = await network.makeEnvelope('op', op);
     const result = world.apply({ ...op, proof: message }); if (!result.ok) throw new Error(result.error);
     registration.joined = true; registration.referral = message; await save(); await network.broadcastEnvelope(message);
@@ -206,13 +213,13 @@ async function broadcastWorld() {
     for (const [id, message] of Object.entries(data.chats)) if (full || !sentChats.has(id)) chats[id] = message;
     for (const [id, message] of Object.entries(data.chatSources)) if (full || !sentChatSources.has(id)) chatSources[id] = message;
     for (const [id, record] of Object.entries(data.travel)) { const mark = JSON.stringify(record); travelMarks.set(id, mark); if (full || sentTravel.get(id) !== mark) travel[id] = record; }
-    await network.broadcast('world', { delta: !full, world: { protocol: 1, roots: data.roots, tick: data.tick, seaweedHour: data.seaweedHour, chars, fishes: data.fishes, breeding: data.breeding, contacts: data.contacts, contactAt: data.contactAt, scenes: data.scenes, participants: data.participants, ops, notices: [], chats, chatSources, travel } });
+    await network.broadcast('world', { delta: !full, world: { protocol: 1, roots: data.roots, terrain: data.terrain, tick: data.tick, seaweedHour: data.seaweedHour, chars, fishes: data.fishes, breeding: data.breeding, contacts: data.contacts, contactAt: data.contactAt, scenes: data.scenes, participants: data.participants, ops, notices: [], chats, chatSources, travel } });
     sentChars = nextMarks; sentOps = new Set(Object.keys(data.ops)); sentChats = new Set(Object.keys(data.chats)); sentChatSources = new Set(Object.keys(data.chatSources)); sentTravel = travelMarks; if (full) lastFull = Date.now();
   } catch (e) { status = e.message; } finally { snapshotBusy = false; }
 }
 async function submit(payload) {
   if (started) resumeAfterInactivity();
-  if (!identity) return; const op = { id: payload.kind === 'earn' ? `${identity.actor}:hour:${payload.serial}` : crypto.randomUUID(), actor: identity.actor, nick: maskNick(identity.nick), t: Date.now(), roots: [world.id], cost: 0, ...payload };
+  if (!identity) return; const op = { id: payload.kind === 'earn' ? `${identity.actor}:hour:${payload.serial}` : crypto.randomUUID(), actor: identity.actor, nick: displayNick(identity.nick), t: Date.now(), roots: [world.id], cost: 0, ...payload };
   if (op.cost > 0 && op.cost > balance()) { toast('鱼元余额不足'); return; } pending.set(op.id, op); update();
   try { const message = await network.broadcast('op', op); if (rejectedOps.has(op.id)) { pending.delete(op.id); update(); return; } inbox.set(op.id, clone(message)); if (amLeader()) { const result = world.apply({ ...clone(op), proof: message }); pending.delete(op.id); if (!result.ok) { rejectOperation(op.id); toast(result.error); } else await save(); await broadcastWorld(); } else { setTimeout(() => { if (pending.has(op.id)) toast('这次投放仍在等待确认，连接恢复后同步'); }, 12000); } } catch (e) { pending.delete(op.id); toast(e.message); } update();
 }
@@ -238,7 +245,7 @@ function observationRect() {
 }
 function moveCameraToFish(fish, body) {
   const rect = observationRect(), size = renderer.cell * renderer.scale, x = (rect.left + rect.right) / 2, y = (rect.top + rect.bottom) / 2;
-  renderer.camera = { x: fish.x + fish.facing * (body.minX + body.maxX) / 2 + (renderer.width / 2 - x) / size, y: fish.y + (body.minY + body.maxY) / 2 + (renderer.height / 2 - y) / size };
+  renderer.camera = { x: nearX(fish.x + fish.facing * (body.minX + body.maxX) / 2, renderer.camera.x) + (renderer.width / 2 - x) / size, y: fish.y + (body.minY + body.maxY) / 2 + (renderer.height / 2 - y) / size };
 }
 function focusFish(id) {
   const fish = world.data.fishes[id]; if (!fish) { toast('这条鱼已不再存活'); renderMyFishes(); return; }
@@ -294,7 +301,7 @@ function setMyFishView(view) {
 function renderPedigree(catalog) {
   const owned = [...catalog.values()].filter(entry => entry.actor === identity.actor).sort((a, b) => a.created - b.created || a.id.localeCompare(b.id));
   if (!owned.some(entry => entry.id === pedigreeFish)) pedigreeFish = (owned.find(entry => entry.alive) || owned[0])?.id;
-  const key = JSON.stringify([pedigreeFish, [...catalog.values()].map(entry => [entry.id, displayFishName(entry, identity), entry.gender, entry.alive, entry.parents])]);
+  const key = JSON.stringify([pedigreeFish, [...catalog.values()].map(entry => [entry.id, displayFishName(entry, identity), entry.nick, entry.gender, entry.alive, entry.parents])]);
   if (pedigreeKey === key) return; pedigreeKey = key;
   $('pedigreeRoot').replaceChildren(...owned.map(entry => { const option = document.createElement('option'); option.value = entry.id; option.textContent = `${displayFishName(entry, identity)} · ${shortFishId(entry.id)}${entry.alive ? '' : '（已消失）'}`; return option; }));
   $('pedigreeRoot').disabled = !owned.length; if (pedigreeFish) $('pedigreeRoot').value = pedigreeFish;
@@ -307,14 +314,14 @@ function inspect(hit, show = true) {
   if (trackedFish && (hit.kind !== 'fish' || hit.id !== trackedFish)) trackedFish = null;
   selected = hit; if (hit.kind === 'monument') { renderer.observedFish = null; renderer.selected = null; $('inspector').hidden = true; historyDialog(); selected = null; return; }
   const object = hit.kind === 'fish' ? world.data.fishes[hit.id] : world.data.scenes[hit.id]; if (!object) { $('inspector').hidden = true; selected = null; renderer.observedFish = null; return; }
-  const cells = hit.kind === 'fish' ? world.fishCells(hit.id) : world.sceneCells(hit.id), ownFish = hit.kind === 'fish' && world.fishOrigin(hit.id)?.actor === identity.actor, catalog = hit.kind === 'fish' ? fishCatalog(world.data) : null; $('objectTitle').textContent = hit.kind === 'fish' ? displayFishName(catalog.get(hit.id), identity) : `${object.nick || '自然沉积'} 的造景`;
+  const cells = hit.kind === 'fish' ? world.fishCells(hit.id) : world.sceneCells(hit.id), ownFish = hit.kind === 'fish' && world.fishOrigin(hit.id)?.actor === identity.actor, catalog = hit.kind === 'fish' ? fishCatalog(world.data) : null; $('objectTitle').textContent = hit.kind === 'fish' ? displayFishName(catalog.get(hit.id), identity) : `${authorNick(object.actor, object.nick || '自然沉积')} 的造景`;
   $('fishDetails').hidden = hit.kind !== 'fish'; renderer.observedFish = hit.kind === 'fish' ? hit.id : null;
   if (hit.kind === 'fish') {
     renderFishGender($('fishGender'), object);
     renderBreeding($('fishBreeding'), object);
     $('fishParentage').hidden = !object.birth; $('fishParentage').textContent = object.birth ? `自然出生 · 父鱼 ${displayFishName(catalog.get(object.parents[0]), identity)}（${shortFishId(object.parents[0])}） · 母鱼 ${displayFishName(catalog.get(object.parents[1]), identity)}（${shortFishId(object.parents[1])}）` : '';
     const v = world.swimVelocities(hit.id), eyes = cells.filter(c => EYES.has(c.ch)).length, now = Date.now(), status = world.fishStatus(hit.id, now), travel = world.data.travel[hit.id];
-    $('objectInfo').textContent = `${ownFish ? identity.nick : object.nick} · ${cells.length} 鱼元 · ${eyes ? eyes + ' 个眼睛' : '盲鱼'} · ${world.breedingState(hit.id) ? '合体游速 · ' : ''}水平 ${v.x.toFixed(2)} 格/秒 · 垂直 ${v.y.toFixed(2)} 格/秒`;
+    $('objectInfo').textContent = `${authorNick(object.actor, object.nick)} · ${cells.length} 鱼元 · ${eyes ? eyes + ' 个眼睛' : '盲鱼'} · ${world.breedingState(hit.id) ? '合体游速 · ' : ''}水平 ${v.x.toFixed(2)} 格/秒 · 垂直 ${v.y.toFixed(2)} 格/秒`;
     $('fishMovement').textContent = status.trackedSince === undefined ? '待同步' : `${status.movement.toFixed(1)} 格`; $('fishMeals24').textContent = `${status.meals24} 颗`; $('fishHunger').textContent = status.hungry ? '饥饿' : '未饥饿'; $('fishHunger').classList.toggle('hungry', status.hungry);
     const minutes = Math.floor(status.hoursSinceFed * 60);
     $('fishLastMeal').textContent = `${status.neverFed ? '尚未进食 · 投放已' : '距上次进食'} ${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分钟`;
@@ -327,7 +334,7 @@ function inspect(hit, show = true) {
   if (show) $('inspector').hidden = false;
 }
 function chatLine(message) {
-  const p = document.createElement('p'); p.className = 'message'; const n = document.createElement('span'); n.className = 'name'; n.textContent = maskNick(message.body.nick) || '匿名'; n.style.color = chatColor(hash(message.actor)); p.append(n, document.createTextNode(message.body.text)); return p;
+  const p = document.createElement('p'); p.className = 'message'; const n = document.createElement('span'); n.className = 'name'; n.textContent = authorNick(message.actor, message.body.nick); n.style.color = chatColor(hash(message.actor)); p.append(n, document.createTextNode(message.body.text)); return p;
 }
 function renderChat(earlier = false) {
   const count = Object.keys(world.data.chats).length;
@@ -374,10 +381,10 @@ async function start() {
   await verifyChats(previous?.world?.chats);
   const restored = restoreCheckpoint(previous, now);
   if (previous?.world && !restored.expired) await verifyReplica(previous.world);
-  world = restored.world; lastOnlineAt = now; lastMeter = now;
+  world = restored.world; world.data.participants[identity.actor] = identity.nick; lastOnlineAt = now; lastMeter = now;
   if (restored.expired) { priorCheckpoint = previous; if (previous.picture) acceptHistory(endedCard(previous, restored.expiresAt)); }
   else reconcileHistory();
-  network = new Network(identity, meta, onMessage, networkChange); await network.start(maskNick(identity.nick)); started = true; members.set(network.node, member());
+  network = new Network(identity, meta, onMessage, networkChange); await network.start(displayNick(identity.nick)); started = true; members.set(network.node, member());
   $('myUrl').value = meta.url; creator = new Creator(placement, balance, size => defaultFishName(identity.nick, world.myFishes(identity.actor).length + 1, size));
   syncIncomeSerial(); renderChat(); await save();
   reconnect().catch(() => {}); update(); lastPictureTime = Date.now(); takePicture().catch(() => {});
@@ -385,7 +392,7 @@ async function start() {
   document.addEventListener('visibilitychange', () => { resumeAfterInactivity(); network.broadcast('beat', { member: member() }).catch(() => {}); save().catch(() => {}); });
   window.addEventListener('pagehide', () => { const blob = new Blob([JSON.stringify({ node: network.node, token: meta.token })], { type: 'application/json' }); navigator.sendBeacon('/local/unregister', blob); lastPicture = localPicture(); save().catch(() => {}); });
   // Exposes read-only diagnostics for the project's automated browser checks.
-  window.tide = { get world() { return { data: world.serialize(), counts: world.counts() }; }, get network() { return { node: network.node, leader: leader(), peers: network.live().map(p => ({ node: p.node, url: p.url })), stats: clone(network.stats) }; }, get identity() { return { actor: identity.actor, nick: maskNick(identity.nick) }; }, get histories() { return clone(histories); }, get view() { return { camera: clone(renderer.camera), scale: renderer.scale, followingFish: trackedFish, selected: clone(selected) }; }, balance };
+  window.tide = { get world() { return { data: world.serialize(), counts: world.counts() }; }, get network() { return { node: network.node, leader: leader(), peers: network.live().map(p => ({ node: p.node, url: p.url })), stats: clone(network.stats) }; }, get identity() { return { actor: identity.actor, nick: displayNick(identity.nick) }; }, get histories() { return clone(histories); }, get view() { return { camera: clone(renderer.camera), scale: renderer.scale, followingFish: trackedFish, selected: clone(selected) }; }, balance };
 }
 async function tick() {
   const now = Date.now(), elapsed = now - lastMeter; lastMeter = now;
@@ -419,7 +426,7 @@ $('foodForm').onsubmit = e => {
   $('modeBanner').textContent = `选择水面上的位置投食「${mode.ch}」 · 每颗 1 鱼元 · Esc 取消`;
   $('modeBanner').hidden = false; $('sea').style.cursor = 'crosshair'; update();
 };
-$('surface').onclick = () => { trackedFish = null; surfaceCamera(); update(); }; $('seabed').onclick = () => { trackedFish = null; renderer.camera = { x: MONUMENT.x + 4, y: CONFIG.depth - 15 }; update(); };
+$('surface').onclick = () => { trackedFish = null; surfaceCamera(); update(); }; $('seabed').onclick = () => { trackedFish = null; renderer.camera = { x: world.monument.x + 4, y: world.floorAt(world.monument.x + 4) - 15 }; update(); };
 $('zoomIn').onclick = () => { renderer.zoom(renderer.scale + .15); update(); }; $('zoomOut').onclick = () => { renderer.zoom(renderer.scale - .15); update(); };
 $('connect').onclick = () => $('connectionDialog').showModal(); $('closeConnection').onclick = () => $('connectionDialog').close();
 $('connectionForm').onsubmit = async e => { e.preventDefault(); status = '正在自动配对…'; update(); try { const code = await normalizeInvite($('peerUrl').value); $('peerUrl').value = code; await network.connectInvite(code); await remember(code); $('connectionDialog').close(); } catch (e) { status = e.message; toast(e.message); } update(); };
@@ -432,7 +439,7 @@ $('loadEarlierChat').onclick = () => { chatLimit += 80; renderChat(true); };
 $('chatForm').onsubmit = async e => {
   e.preventDefault(); const text = $('chatInput').value.trim(); if (!identity || !text || text.length > 160 || Date.now() - lastChat < 1500) return;
   resumeAfterInactivity(); lastChat = Date.now();
-  try { const message = await network.makeEnvelope('chat', { nick: maskNick(identity.nick), text, t: Date.now(), roots: [world.id] }); const result = world.addChat(message); if (!result.ok) throw new Error(result.error); renderChat(); $('chatInput').value = ''; await save(); await network.broadcastEnvelope(message); }
+  try { const message = await network.makeEnvelope('chat', { nick: displayNick(identity.nick), text, t: Date.now(), roots: [world.id] }); const result = world.addChat(message); if (!result.ok) throw new Error(result.error); renderChat(); $('chatInput').value = ''; await save(); await network.broadcastEnvelope(message); }
   catch (error) { toast('聊天保存或发送失败：' + error.message); }
 };
 $('closeInspector').onclick = stopObserving;
@@ -442,8 +449,8 @@ $('scaleScene').onclick = () => selected && submit({ kind: 'sceneScale', scene: 
 $('shrinkScene').onclick = () => selected && submit({ kind: 'sceneScale', scene: selected.id, factor: .5, cost: 0 });
 $('deleteScene').onclick = () => { if (!selected) return; submit({ kind: 'sceneDelete', scene: selected.id, cost: 0 }); selected = null; renderer.selected = null; $('inspector').hidden = true; };
 $('sea').oncontextmenu = e => { e.preventDefault(); cancelMode(); };
-$('sea').addEventListener('pointerdown', e => { if (e.button !== 0) return; if (mode) { const p = renderer.point(e.clientX, e.clientY); if (mode.kind === 'food') { if (p.y !== 0) { toast('请在亮蓝色水面行点击投食'); return; } submit({ kind: 'food', ch: mode.ch, color: mode.color, x: p.x, y: 0, cost: 1 }); } else { const b = bounds(mode.cells), x = p.x - b.minX, y = p.y - b.minY; submit({ kind: mode.kind, cells: mode.cells, ...(mode.kind === 'fish' ? { gender: mode.gender, name: mode.name } : {}), scene: mode.scene, x, y, cost: mode.kind === 'sceneMove' ? 0 : mode.cells.length }); cancelMode(); } return; } dragging = { startX: e.clientX, startY: e.clientY, x: renderer.camera.x, y: renderer.camera.y, moved: false }; $('sea').setPointerCapture(e.pointerId); });
-$('sea').addEventListener('pointermove', e => { if (mode) { const p = renderer.point(e.clientX, e.clientY), b = bounds(mode.cells || []); renderer.preview = { ...mode, x: mode.kind === 'food' ? p.x : p.x - b.minX, y: mode.kind === 'food' ? 0 : p.y - b.minY }; if (mode.kind === 'fish') renderer.preview.valid = world.canOccupy({ id: '', x: renderer.preview.x, y: renderer.preview.y, facing: 1 }, mode.cells); } else if (dragging) { const s = renderer.cell * renderer.scale; renderer.camera.x = Math.min(CONFIG.width, Math.max(0, dragging.x - (e.clientX - dragging.startX) / s)); renderer.camera.y = Math.min(CONFIG.depth, Math.max(0, dragging.y - (e.clientY - dragging.startY) / s)); dragging.moved ||= Math.hypot(e.clientX - dragging.startX, e.clientY - dragging.startY) > 4; if (dragging.moved) trackedFish = null; update(); } });
+$('sea').addEventListener('pointerdown', e => { if (e.button !== 0) return; if (mode) { const p = renderer.point(e.clientX, e.clientY); if (mode.kind === 'food') { if (p.y !== 0) { toast('请在亮蓝色水面行点击投食'); return; } submit({ kind: 'food', ch: mode.ch, color: mode.color, x: p.x, y: 0, cost: 1 }); } else { const b = bounds(mode.cells), x = wrapX(p.x - b.minX), y = p.y - b.minY; submit({ kind: mode.kind, cells: mode.cells, ...(mode.kind === 'fish' ? { gender: mode.gender, name: mode.name } : {}), scene: mode.scene, x, y, cost: mode.kind === 'sceneMove' ? 0 : mode.cells.length }); cancelMode(); } return; } dragging = { startX: e.clientX, startY: e.clientY, x: renderer.camera.x, y: renderer.camera.y, moved: false }; $('sea').setPointerCapture(e.pointerId); });
+$('sea').addEventListener('pointermove', e => { if (mode) { const p = renderer.point(e.clientX, e.clientY), b = bounds(mode.cells || []); renderer.preview = { ...mode, x: mode.kind === 'food' ? p.x : wrapX(p.x - b.minX), y: mode.kind === 'food' ? 0 : p.y - b.minY }; if (mode.kind === 'fish') renderer.preview.valid = world.canOccupy({ id: '', x: renderer.preview.x, y: renderer.preview.y, facing: 1 }, mode.cells); } else if (dragging) { const s = renderer.cell * renderer.scale; renderer.camera.x = wrapX(dragging.x - (e.clientX - dragging.startX) / s); renderer.camera.y = Math.min(CONFIG.depth, Math.max(0, dragging.y - (e.clientY - dragging.startY) / s)); dragging.moved ||= Math.hypot(e.clientX - dragging.startX, e.clientY - dragging.startY) > 4; if (dragging.moved) trackedFish = null; update(); } });
 $('sea').addEventListener('pointerup', e => { if (dragging && !dragging.moved) { const hit = renderer.hit(e.clientX, e.clientY); if (hit) inspect(hit); else { selected = null; renderer.selected = null; $('inspector').hidden = true; } } dragging = null; });
 $('sea').addEventListener('wheel', e => { e.preventDefault(); renderer.zoom(renderer.scale * (e.deltaY < 0 ? 1.1 : .9)); update(); }, { passive: false });
 document.addEventListener('keydown', e => { if (e.key === 'Escape') { cancelMode(); return; } if (e.target.matches('input,textarea') || document.querySelector('dialog[open]')) return; if (e.key.toLowerCase() === 'f') $('makeFish').click(); else if (e.key.toLowerCase() === 's') $('makeScene').click(); else if (e.key.toLowerCase() === 'e') feedMode(); else if (e.key.toLowerCase() === 'm') $('seabed').click(); else if (e.key.toLowerCase() === 'p') $('myFish').click(); });
