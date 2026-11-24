@@ -157,7 +157,7 @@ async function onMessage(message, peer) {
   if (members.has(message.from) && members.get(message.from).actor !== message.actor) return;
   const body = message.body;
   if (message.kind === 'hello') {
-    if (!body.world?.terrain || body.rules?.genesis !== 1 || body.rules?.life !== 1) { status = '对方使用旧版世界规则，请双方刷新游戏页面后再连接'; toast(status); network.close(peer); update(); return; }
+    if (!body.world?.terrain || body.rules?.genesis !== 1 || body.rules?.life !== 1 || body.rules?.feeding !== 1) { status = '对方使用旧版世界规则，请双方刷新游戏页面后再连接'; toast(status); network.close(peer); update(); return; }
     if (message.from !== peer.node || body.member?.id !== message.from || body.member.actor !== message.actor) return;
     const own = body.member; members.set(own.id, { ...own, url: peer.url, at: Date.now() }); remember(peer.url);
     rememberAuthor(message.actor, own.nick);
@@ -216,7 +216,7 @@ async function completeReferral(peer, peerActor) {
 async function networkChange(error) {
   if (!started) return; if (error) { status = error; update(); return; }
   const live = network.live();
-  for (const p of live) if (!lastHello.has(p.id)) { lastHello.add(p.id); await network.direct(p, 'hello', { rules: { genesis: 1, life: 1 }, member: member(), members: active(), world: world.serialize(), cards: Object.values(histories).slice(0, 3), historyIndex: Object.keys(histories) }); }
+  for (const p of live) if (!lastHello.has(p.id)) { lastHello.add(p.id); await network.direct(p, 'hello', { rules: { genesis: 1, life: 1, feeding: 1 }, member: member(), members: active(), world: world.serialize(), cards: Object.values(histories).slice(0, 3), historyIndex: Object.keys(histories) }); }
   const ids = new Set(live.map(p => p.node)); for (const m of active()) if (m.id !== network.node && m.direct && !ids.has(m.id)) { m.direct = false; probeGone(m.id, m.url); } for (const id of ids) if (members.has(id)) members.get(id).direct = true;
   network.presence(active().filter(m => m.id !== network.node).map(m => ({ id: m.id, url: m.url }))).catch(() => {}); update();
 }
@@ -344,7 +344,7 @@ function inspect(hit, show = true) {
     $('fishCompany').textContent = life.friend ? `正在和「${displayFishName(fishCatalog(world.data).get(life.friend), identity)}」同游。` : life.company + '。';
     $('fishMovement').textContent = status.trackedSince === undefined ? '待同步' : `${status.movement.toFixed(1)} 格`; $('fishMeals24').textContent = `${status.meals24} 颗`; $('fishHunger').textContent = status.hungry ? '饥饿' : '未饥饿'; $('fishHunger').classList.toggle('hungry', status.hungry);
     const minutes = Math.floor(status.hoursSinceFed * 60);
-    $('fishLastMeal').textContent = `${status.neverFed ? '尚未进食 · 投放已' : '距上次进食'} ${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分钟`;
+    $('fishLastMeal').textContent = `${status.neverFed ? '尚未进食 · 投放已' : '距上次进食'} ${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分钟${status.canEat ? ' · 可以进食' : ' · 已吃饱，约 ' + Math.ceil((status.nextMealAt - now) / 60000) + ' 分钟后可再进食'}`;
     $('followFish').textContent = trackedFish === hit.id ? '停止跟随' : '跟随观察'; if (trackedFish === hit.id) followBounds = bounds(cells);
     $('fishTrackingNote').textContent = !travel ? '运动记录尚未同步。' : status.partialMovement ? `旧版运动量未记录，从 ${fishDate.format(status.trackedSince)} 起累计。` : '';
     const rows = []; for (let index = 0; index < 7; index++) { const day = shanghaiDay(now - index * DAY), row = document.createElement('p'); row.textContent = `${day} · ${travel && day >= shanghaiDay(travel.since) ? (travel.days[day] || 0).toFixed(1) + ' 格' : '未记录'}`; rows.push(row); } $('fishDailyRows').replaceChildren(...rows);

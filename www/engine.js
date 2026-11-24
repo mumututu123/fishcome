@@ -1,5 +1,5 @@
 import { CHAT_FLOOR, validChatMessage, buildChatFloor, chatGlyphs } from './chat.js';
-import { shanghaiDay, mealIndex, fishStatus, mergeTravel } from './fish-status.js';
+import { shanghaiDay, mealIndex, fishStatus, mergeTravel, feedingStatus, lastMealAt } from './fish-status.js';
 import { HOUR, updateSeaweed } from './seaweed.js';
 import { MINUTE, updateBubbles, mergeBubbles } from './bubbles.js';
 import { initialLife, initialSources, validInitialOp } from './genesis.js';
@@ -255,13 +255,17 @@ export class World {
     if (this.ambient) spawnPlankton(this, now);
     const dt = Math.min(1, Math.max(0, (now - this.data.tick) / 1000)); this.data.tick = now;
     let scenery = this.sceneryMap(), groups = this.fishGroups(); const fishOccupancy = this.fishMap();
+    const pastMeals = new Set(), pastGrass = new Set(), latestMeals = new Map();
+    for (const c of Object.values(this.data.chars)) for (const event of c.path) if (event.reason === 'eat') { pastMeals.add(event.target); if (c.wild) pastGrass.add(event.target); if (Number.isFinite(event.t)) latestMeals.set(event.target, Math.max(latestMeals.get(event.target) ?? -Infinity, event.t)); }
+    for (const f of Object.values(this.data.fishes)) { const at = lastMealAt(f, latestMeals.get(f.id)); if (at !== undefined) f.lastMealAt = at; }
+    const canEat = id => !!this.data.fishes[id] && feedingStatus(this.data.fishes[id], now).canEat;
     const ambient = this.ambient ? lifeContext(this, now, scenery, groups) : null; if (ambient) updateLife(this, now, ambient);
     for (const c of Object.values(this.data.chars)) if (freshPlankton(c) && c.kind === 'food' && now - c.born >= LIFE.planktonLife) { transition(c, { kind: 'burn', entity: '' }, { id: `dissolve:${c.id}`, t: c.born + LIFE.planktonLife, reason: 'dissolve' }); this.dirty = true; }
     const foods = Object.values(this.data.chars).filter(c => c.kind === 'food').sort((a, b) => a.born - b.born || a.id.localeCompare(b.id));
     const foodCount = new Map(); for (const c of foods) foodCount.set(key(c.x, c.y), (foodCount.get(key(c.x, c.y)) || 0) + 1);
     const fishAt = new Map(), occupiedByFish = new Map();
     for (const [id, cs] of groups) { const f = this.data.fishes[id], occupied = new Set(); for (const c of cs) { const p = cellPosition(f, c), k = key(p.x, p.y); occupied.add(k); if (!fishAt.has(k)) fishAt.set(k, new Set()); fishAt.get(k).add(id); } occupiedByFish.set(id, occupied); }
-    const contact = food => { if (scenery.has(key(food.x, food.y))) return []; const ids = new Set(); for (const [dx, dy] of NEIGHBORS) for (const id of fishAt.get(key(food.x + dx, food.y + dy)) || []) ids.add(id); return [...ids].filter(id => !occupiedByFish.get(id).has(key(food.x, food.y)) && touching(this.data.fishes[id], groups.get(id), food, scenery)); };
+    const contact = food => { if (scenery.has(key(food.x, food.y))) return []; const ids = new Set(); for (const [dx, dy] of NEIGHBORS) for (const id of fishAt.get(key(food.x + dx, food.y + dy)) || []) ids.add(id); return [...ids].filter(id => canEat(id) && !occupiedByFish.get(id).has(key(food.x, food.y)) && touching(this.data.fishes[id], groups.get(id), food, scenery)); };
     for (const c of foods) {
       if (now - c.born >= CONFIG.foodLife && scenery.has(key(c.x, c.y))) {
         // Stacked food may expire in the same cell. Preserve it in the nearest free supported slot.
@@ -284,7 +288,7 @@ export class World {
       while (c.fall >= 1 && c.y + 1 < this.floorAt(c.x) && !scenery.has(key(c.x, c.y + 1)) && !fishOccupancy.has(key(c.x, c.y + 1)) && !(foodCount.get(key(c.x, c.y + 1)) > 0)) { const old = key(c.x, c.y); foodCount.set(old, Math.max(0, foodCount.get(old) - 1)); c.y++; c.fall--; foodCount.set(key(c.x, c.y), (foodCount.get(key(c.x, c.y)) || 0) + 1); }
       c.moveAt = now;
     }
-    const edible = [...foods.filter(c => c.kind === 'food' && now - c.born < CONFIG.foodLife), ...Object.values(this.data.chars).filter(c => c.kind === 'seaweed')], foodPositions = new Set([...foods.filter(c => c.kind === 'food'), ...edible].map(c => key(c.x, c.y)));
+    const edible = [...foods.filter(c => c.kind === 'food' && now - c.born < CONFIG.foodLife), ...Object.values(this.data.chars).filter(c => c.kind === 'seaweed')].sort((a, b) => (a.born ?? a.created) - (b.born ?? b.created) || a.id.localeCompare(b.id)), foodPositions = new Set([...foods.filter(c => c.kind === 'food'), ...edible].map(c => key(c.x, c.y)));
     const turningObstacles = new Map(scenery); for (const cell of edible) if (cell.kind === 'seaweed') turningObstacles.set(key(cell.x, cell.y), {});
     const waitingToEat = new Set(); for (const food of edible) for (const id of contact(food)) waitingToEat.add(id);
     const bins = new Map(), atFood = new Map();
@@ -294,7 +298,8 @@ export class World {
       const { id, cells, fish: f } = unit; if (!cells.length) continue;
       if (unit.members.some(member => waitingToEat.has(member.id))) { commitUnit(unit, now); continue; }
       const found = new Map();
-      for (const eye of cells) if (EYES.has(eye.ch)) {
+      const seeking = unit.members.some(member => canEat(member.id));
+      for (const eye of cells) if (EYES.has(eye.ch) && seeking) {
         const p = cellPosition(f, eye), r = sightRadius(p.y), binWidth = CONFIG.width / 10;
         for (let bx = Math.floor((p.x - r) / 10); bx <= Math.floor((p.x + r) / 10); bx++) for (let by = Math.floor((p.y - r) / 10); by <= Math.floor((p.y + r) / 10); by++) {
           for (const food of bins.get(key((bx % binWidth + binWidth) % binWidth, by)) || []) if (Math.max(Math.abs(deltaX(food.x, p.x)), Math.abs(food.y - p.y)) <= r) found.set(food.id, food);
@@ -318,20 +323,18 @@ export class World {
     }
     // Rank uses this step's pre-consumption size for every simultaneous contest.
     const sizes = new Map([...groups].map(([id, cs]) => [id, cs.length]));
-    const pastMeals = new Set(), pastGrass = new Set();
-    for (const c of Object.values(this.data.chars)) for (const event of c.path) if (event.reason === 'eat') { pastMeals.add(event.target); if (c.wild) pastGrass.add(event.target); }
     const bids = new Map(), bodyOccupancy = new Map();
     for (const [id, cs] of groups) { const f = this.data.fishes[id]; if (!f) continue; const occupied = new Set(cs.map(c => { const p = cellPosition(f, c); return key(p.x, p.y); })); bodyOccupancy.set(id, occupied); for (const c of cs) { const p = cellPosition(f, c); for (const [dx, dy] of NEIGHBORS) for (const food of atFood.get(key(p.x + dx, p.y + dy)) || []) if (!occupied.has(key(food.x, food.y))) { if (!bids.has(food.id)) bids.set(food.id, new Set()); bids.get(food.id).add(id); } } }
     for (const food of edible) {
       if (!['food', 'seaweed'].includes(food.kind) || !this.waterAt(food.x, food.y) || scenery.has(key(food.x, food.y)) || movingOccupants.has(key(food.x, food.y))) continue;
-      const candidates = [...(bids.get(food.id) || [])].filter(id => !bodyOccupancy.get(id).has(key(food.x, food.y)) && touching(this.data.fishes[id], groups.get(id), food, scenery)).map(id => [id, groups.get(id)]);
+      const candidates = [...(bids.get(food.id) || [])].filter(id => canEat(id) && !bodyOccupancy.get(id).has(key(food.x, food.y)) && touching(this.data.fishes[id], groups.get(id), food, scenery)).map(id => [id, groups.get(id)]);
       candidates.sort(([a], [b]) => sizes.get(b) - sizes.get(a) || hash(`${food.id}:${b}`) - hash(`${food.id}:${a}`) || a.localeCompare(b));
       if (candidates.length) {
         const winner = candidates[0][0], grass = food.kind === 'seaweed';
         const previouslyAte = (grass ? pastGrass : pastMeals).has(winner);
         const [id, cs] = candidates[0], f = this.data.fishes[id]; bodyOccupancy.get(id).add(key(food.x, food.y)); movingOccupants.set(key(food.x, food.y), new Set([id])); transition(food, { kind: 'fish', entity: id, x: deltaX(food.x, f.x) * f.facing, y: food.y - f.y }, { id: `eat:${food.id}:${food.path.length}`, t: now, reason: 'eat', rank: sizes.get(id) }); cs.push(food); f.lastFed = now; f.hungerAt = now + CONFIG.hunger; this.foodRevision++; this.dirty = true;
         if (!previouslyAte) recordStory(this, grass ? 'grass' : 'meal', id, now);
-        pastMeals.add(id); if (grass) pastGrass.add(id);
+        f.lastMealAt = now; pastMeals.add(id); if (grass) pastGrass.add(id);
       }
     }
     for (const [id, cells] of groups) { const f = this.data.fishes[id]; if (f && now >= f.hungerAt) this.starve(id, f.hungerAt); }
@@ -380,6 +383,7 @@ export class World {
       const f = this.data.fishes[id], cs = groups.get(id) || []; if (!cs.length) { delete this.data.fishes[id]; continue; }
       let fed = Math.max(f.created, latestFeed.get(id) || 0);
       f.lastFed = fed; f.hungerAt = Math.max(f.hungerAt, fed + CONFIG.hunger);
+      const mealAt = lastMealAt(f, latestFeed.get(id)); if (mealAt !== undefined) f.lastMealAt = mealAt;
       if (cs.length === 1) { const c = cs[0], p = cellPosition(f, c); transition(c, { kind: 'food', entity: '', x: wrapX(p.x), y: p.y, born: Math.max(this.data.tick, other.tick), fall: 0 }, { id: `normalize:${id}`, t: Math.max(this.data.tick, other.tick), reason: 'shed' }); delete this.data.fishes[id]; }
     }
     for (const id of Object.keys(this.data.scenes)) if (!this.sceneCells(id).length) delete this.data.scenes[id];

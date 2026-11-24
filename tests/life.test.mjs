@@ -66,7 +66,7 @@ test('免费浮游食物最多10颗，出生位置与来源固定，重复和旧
 test('离线不会补造历史浮游食物，出生避开鱼与造景', () => {
   const w = world(), at = weatherTime(w, 'plankton'), weather = weatherAt(w.data, at), initial = planktonSource(w.data, weather.seed, weather.slot, 0);
   fish(w, initial.x, initial.y, 'alice'); spawnPlankton(w, at); assert(!w.data.chars[initial.id]);
-  const quiet = world(), time = weatherTime(quiet, 'plankton'); quiet.step(time + LIFE.weatherDuration); assert.equal(Object.keys(quiet.data.chars).length, 0);
+  const quiet = world(), time = weatherTime(quiet, 'plankton'); quiet.step(time + LIFE.weatherDuration); assert.equal(Object.values(quiet.data.chars).filter(c => c.plankton).length, 0);
 });
 test('每种性格都优先吃可见食物，完整环境模拟不穿鱼和地形，消费不改变', () => {
   for (const trait of ['quiet', 'social', 'deep', 'curious']) {
