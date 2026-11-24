@@ -374,7 +374,7 @@ export class World {
     for (const [root, at] of Object.entries(other.roots || {})) if (this.data.roots[root] !== undefined && this.data.roots[root] !== at) throw new Error('世界起源时间不能修改');
     const initial = initialSources({ ...this.data.roots, ...other.roots });
     if (!validEcology(other.ecology, Math.max(Date.now() + 60000, other.tick))) throw new Error('生态更替时钟无效');
-    if (!validateLife(other.life, { roots: { ...this.data.roots, ...other.roots }, ops: { ...archived.ops, ...this.data.ops, ...other.ops }, breeding: { ...archived.breeding, ...this.data.breeding, ...other.breeding } }, Math.max(Date.now() + 60000, this.data.tick, other.tick))) throw new Error('鱼生记录无效');
+    if (!validateLife(other.life, { roots: { ...this.data.roots, ...other.roots }, ops: { ...archived.ops, ...this.data.ops, ...other.ops }, breeding: { ...archived.breeding, ...this.data.breeding, ...other.breeding }, chars: { ...archived.chars, ...this.data.chars, ...other.chars } }, Math.max(Date.now() + 60000, this.data.tick, other.tick))) throw new Error('鱼生记录无效');
     for (const op of Object.values(other.ops)) if (op.genesis !== undefined && !validInitialOp(op, initial)) throw new Error('初始鱼记录被修改或无效');
     this.data.terrain = clone(chooseTerrain(terrainOf(this.data), terrainOf(other)));
     Object.assign(this.data.roots, other.roots);

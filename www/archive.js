@@ -22,6 +22,14 @@ export function archiveDependencies(data) {
   for (const r of Object.values(data.life?.bonds || {})) { fish(r.a); fish(r.b); }
   for (const [id, r] of Object.entries(data.life?.places || {})) { fish(id); keep.ops.add(r.scene); }
   for (const [id, r] of Object.entries(data.life?.haunts || {})) { fish(id); keep.ops.add(r.scene); }
+  for (const event of Object.values(data.life?.events || {})) {
+    for (const id of event.fishes) fish(id);
+    for (const id of event.plants) {
+      keep.chars.add(id); const c = data.chars[id];
+      for (const step of c?.path || []) if (step.birth) birth(step.birth);
+      if (c?.wild?.source.startsWith('cell:')) { const source = c.wild.source.slice(5); keep.chars.add(source); keep.ops.add(source.slice(0, 36)); }
+    }
+  }
   for (const r of Object.values(data.life?.stories || {})) { fish(r.fish); fish(r.other); for (const id of r.parents || []) fish(id); if (r.scene) keep.ops.add(r.scene); }
   for (const id of Object.keys(data.chatSources || {})) keep.chats.add(id);
   for (const message of Object.values(data.chats || {}).sort((a, b) => b.body.t - a.body.t || a.id.localeCompare(b.id)).slice(0, 80)) keep.chats.add(message.id);
@@ -171,6 +179,8 @@ export class ArchiveStore {
       for (const id of Object.keys(data.travel || {})) fish(id);
       for (const r of Object.values(data.life?.bonds || {})) { fish(r.a); fish(r.b); }
       for (const [id, r] of Object.entries(data.life?.places || {})) { fish(id); need('ops', r.scene); }
+      for (const [id, r] of Object.entries(data.life?.haunts || {})) { fish(id); need('ops', r.scene); }
+      for (const event of Object.values(data.life?.events || {})) { for (const id of event.fishes) fish(id); for (const id of event.plants) need('chars', id); }
       for (const r of Object.values(data.life?.stories || {})) { fish(r.fish); fish(r.other); for (const id of r.parents || []) fish(id); if (r.scene) need('ops', r.scene); }
     };
     refs(incoming);

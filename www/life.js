@@ -1,10 +1,11 @@
 import { wrapX, deltaX, worldKey } from './geography.js';
+import { EVENTS, updateEvents, validEvent, eventSchedule, eventNarration, eventMotion } from './random-events.js';
 
 // Ambient life has no player commands. All randomness is tied to world/fish IDs.
 export const LIFE = Object.freeze({ weatherPeriod: 180000, weatherDuration: 55000, familiar: 45, haunt: 45, reunion: 180000, storyLimit: 512, bondLimit: 4096, planktonLife: 75000 });
 const TYPES = ['quiet', 'social', 'deep', 'curious'];
 const HABITS = { quiet: '喜欢独自慢慢游', social: '喜欢往热闹的地方凑', deep: '喜欢在海底附近闲逛', curious: '喜欢绕着造景探索' };
-const KINDS = new Set(['arrive', 'meal', 'grass', 'friend', 'reunion', 'haunt', 'birth', 'depart', 'revisit', 'rediscover']);
+const KINDS = new Set(['arrive', 'meal', 'grass', 'friend', 'reunion', 'haunt', 'birth', 'depart', 'revisit', 'rediscover', 'ambient']);
 const hash = text => { let n = 2166136261; for (const c of text) n = Math.imul(n ^ c.codePointAt(0), 16777619); return n >>> 0; };
 const choose = (a, b) => !a ? b : !b ? a : JSON.stringify(a) < JSON.stringify(b) ? a : b;
 const trim = (map, limit, score = r => r.at) => Object.fromEntries(Object.entries(map).sort(([a, x], [b, y]) => score(y) - score(x) || a.localeCompare(b)).slice(0, limit));
@@ -13,7 +14,7 @@ export const personality = id => TYPES[hash(`habit:${id}`) % TYPES.length];
 export const personalityText = id => HABITS[personality(id)];
 export const lightDepth = weather => 18 + hash(`light:${weather.seed}:${weather.slot}`) % 22;
 export const pairKey = (a, b) => [a, b].sort().join('|');
-export function newLife(now) { return { at: now, bonds: {}, places: {}, haunts: {}, stories: {}, bloomThrough: {} }; }
+export function newLife(now) { return { at: now, bonds: {}, places: {}, haunts: {}, stories: {}, bloomThrough: {}, events: {}, eventThrough: {} }; }
 function state(world, now) { return world.data.life ||= newLife(now); }
 export function weatherAt(data, now = data.tick) {
   const seed = data.terrain?.seed || Object.keys(data.roots).sort()[0], slot = Math.floor(now / LIFE.weatherPeriod), started = slot * LIFE.weatherPeriod;
@@ -33,7 +34,7 @@ export function validPlankton(cell, roots) {
 }
 export const freshPlankton = cell => !!cell.plankton && !cell.path.some(event => event.reason === 'eat');
 export function recordStory(world, kind, fish, at, extra = {}) {
-  const life = state(world, at), id = `${kind}:${fish}${extra.other ? ':' + extra.other : ''}${extra.scene ? ':' + extra.scene : ''}${kind === 'reunion' ? ':' + Math.floor(at / 600000) : ''}${extra.visit !== undefined ? ':' + extra.visit : ''}`;
+  const life = state(world, at), id = `${kind}:${fish}${extra.other ? ':' + extra.other : ''}${extra.scene ? ':' + extra.scene : ''}${kind === 'reunion' ? ':' + Math.floor(at / 600000) : ''}${extra.visit !== undefined ? ':' + extra.visit : ''}${extra.event ? ':' + extra.event : ''}`;
   const story = { id, kind, fish, at, ...extra };
   life.stories[id] = choose(life.stories[id], story);
   if (Object.keys(life.stories).length > LIFE.storyLimit) life.stories = trim(life.stories, LIFE.storyLimit); world.dirty = true;
@@ -106,6 +107,7 @@ export function updateLife(world, now, context) {
     if (memory.exists) { delete home.displaced; home.away = home.visited = home.found = false; }
     home.at = now; world.dirty = true;
   }
+  updateEvents(world, now, context, dt > 0, recordStory);
   life.at = now;
   life.bonds = trim(life.bonds, LIFE.bondLimit);
   for (const id of Object.keys(life.places)) if (!world.data.fishes[id] || !world.data.scenes[life.places[id].scene]) delete life.places[id];
@@ -115,6 +117,7 @@ export function idleMotion(world, fish, now, context, center) {
   const life = state(world, now), neighbors = context.neighbors.get(fish.id) || [], phase = Math.floor((now - fish.created) / 12000), r = hash(`${fish.id}:${phase}`);
   let dx = [-1, 0, 1][r % 3], dy = [-1, 0, 1][Math.floor(r / 3) % 3];
   if (now - fish.lastFed >= 86400000) return { dx, dy };
+  if (!world.breedingState(fish.id)) { const motion = eventMotion(world.data, fish.id, now, context); if (motion) return motion; }
   const school = context.school.get(fish.id); if (school) return school;
   const familiar = neighbors.find(q => life.bonds[pairKey(fish.id, q.id)]?.seconds >= LIFE.familiar);
   if (familiar && now % 180000 < 45000) {
@@ -158,6 +161,13 @@ export function validateLife(life, sources, now = Date.now() + 60000) {
   for (const [id, r] of Object.entries(life.haunts || {})) if (!r || !fish(id) || sources.ops[r.scene]?.kind !== 'scene' || !Number.isFinite(r.x) || r.x < 0 || r.x >= 1000 || !Number.isFinite(r.y) || r.y < 0 || r.y > 101 || !time(r.at) || (r.displaced !== undefined && (!time(r.displaced) || r.displaced > r.at)) || ['away', 'visited', 'found'].some(k => typeof r[k] !== 'boolean')) return false;
   for (const [id, r] of Object.entries(life.stories)) if (!r || id !== r.id || !KINDS.has(r.kind) || !fish(r.fish) || (r.other && !fish(r.other)) || (r.parents && (!Array.isArray(r.parents) || r.parents.length !== 2 || !r.parents.every(fish))) || (r.scene && sources.ops[r.scene]?.kind !== 'scene') || (['revisit', 'rediscover'].includes(r.kind) && (!r.scene || !time(r.visit) || r.visit > r.at)) || !time(r.at)) return false;
   for (const [seed, slot] of Object.entries(life.bloomThrough)) if (sources.roots[seed] === undefined || !Number.isInteger(slot) || slot < 0 || slot > Math.floor(now / LIFE.weatherPeriod)) return false;
+  if (life.events !== undefined && !map(life.events, EVENTS.limit) || life.eventThrough !== undefined && !map(life.eventThrough, 100000)) return false;
+  for (const [id, event] of Object.entries(life.events || {})) if (id !== event?.id || !validEvent(event, sources.roots, fish, now, sources.chars)) return false;
+  for (const [seed, slot] of Object.entries(life.eventThrough || {})) if (!Object.hasOwn(sources.roots, seed) || !Number.isInteger(slot) || slot < 0 || slot > Math.floor(now / EVENTS.period)) return false;
+  for (const story of Object.values(life.stories)) if (story.kind === 'ambient') {
+    const schedule = eventSchedule(sources.roots, story.eventSeed, story.eventSlot);
+    if (!schedule || story.event !== schedule.id || story.at < schedule.started || story.at >= schedule.started + EVENTS.opening) return false;
+  }
   return true;
 }
 export function mergeLife(left, right, data) {
@@ -178,6 +188,9 @@ export function mergeLife(left, right, data) {
   for (const id of new Set([...Object.keys(a.stories), ...Object.keys(b.stories)])) result.stories[id] = choose(a.stories[id], b.stories[id]);
   result.stories = trim(result.stories, LIFE.storyLimit);
   for (const seed of new Set([...Object.keys(a.bloomThrough), ...Object.keys(b.bloomThrough)])) result.bloomThrough[seed] = Math.max(a.bloomThrough[seed] ?? -1, b.bloomThrough[seed] ?? -1);
+  for (const id of new Set([...Object.keys(a.events || {}), ...Object.keys(b.events || {})])) result.events[id] = { ...choose(a.events?.[id], b.events?.[id]) };
+  result.events = trim(result.events, EVENTS.limit);
+  for (const seed of new Set([...Object.keys(a.eventThrough || {}), ...Object.keys(b.eventThrough || {})])) result.eventThrough[seed] = Math.max(a.eventThrough?.[seed] ?? -1, b.eventThrough?.[seed] ?? -1);
   return result;
 }
 export function fishLifeText(data, id, now = data.tick) {
@@ -190,9 +203,10 @@ export function storiesFor(data, catalog, actor) {
 }
 export function storyText(story, name) {
   const fish = `「${name(story.fish)}」`, other = story.other ? `「${name(story.other)}」` : '';
+  if (story.kind === 'ambient') { const schedule = eventSchedule({ [story.eventSeed]: 0 }, story.eventSeed, story.eventSlot); return `${fish}${eventNarration(schedule?.kind)}`; }
   return { arrive: `${fish}开始了自己的鱼生`, meal: `${fish}第一次吃到了鱼食`, grass: `${fish}第一次吃到了草`, friend: `${fish}和${other}成了熟鱼`, reunion: `${fish}又遇见了熟鱼${other}${hash(`greeting:${story.id}`) % 3 === 0 ? '，它们用自己的暗号打了招呼' : ''}`, haunt: `${fish}有了常去的造景`, birth: `${fish}出生了，海里多了一位小邻居`, depart: `${fish}的鱼生结束了，记忆还在鱼谱里`, revisit: `${fish}来看看常去的地方，发现风景换了`, rediscover: `${fish}又认出了那处造景：原来你搬到这里了` }[story.kind];
 }
 export function returnStory(stories, since) {
-  const rank = { birth: 8, friend: 6, reunion: 5, rediscover: 5, revisit: 4, grass: 4, haunt: 3, meal: 2, depart: 1, arrive: 0 };
+  const rank = { birth: 8, friend: 6, reunion: 5, rediscover: 5, revisit: 4, grass: 4, haunt: 3, ambient: 3, meal: 2, depart: 1, arrive: 0 };
   return stories.filter(r => r.at > since).sort((a, b) => rank[b.kind] - rank[a.kind] || b.at - a.at || a.id.localeCompare(b.id))[0];
 }

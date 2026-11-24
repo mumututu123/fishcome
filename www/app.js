@@ -18,6 +18,7 @@ import { initialSources, validInitialOp } from './genesis.js';
 import { validateLife, validPlankton, weatherAt, fishLifeText, storiesFor, storyText, returnStory } from './life.js';
 import { validEcology } from './ecology.js';
 import { memoryForCell, ancestralGlyph, ancestralText } from './easter-eggs.js';
+import { activeEvent, eventSchedule, eventTitle, eventPosition, eventLetter, radioTranscript, eventNarration } from './random-events.js';
 import { ARCHIVE, ARCHIVE_FIELDS, ArchiveStore, archivePlan, archiveChunks, decodeArchive, assembleFragments, validArchiveState, emptyArchiveState, mergeArchiveState, compactKnown } from './archive.js';
 const $ = id => document.getElementById(id);
 const renderer = new Renderer($('sea'));
@@ -148,7 +149,7 @@ async function verifyReplica(data, extra = {}, store = archiveStore) {
   // Check branch-local structure here; reconcile the source's final history during merge.
   for (const [id, bubble] of Object.entries(data.bubbles || {})) if (id !== bubble.id || !validBubble(bubble, bubbleSources, false) || bubble.born > Date.now() + 60000) throw new Error('气泡缺少合法海草来源');
   await verifyChats(data.chats, store); await verifyChats(data.chatSources, store);
-  const sources = { ops: { ...extra.ops, ...world.data.ops, ...data.ops }, breeding: { ...extra.breeding, ...world.data.breeding, ...data.breeding }, roots: { ...world.data.roots, ...data.roots } };
+  const sources = { ops: { ...extra.ops, ...world.data.ops, ...data.ops }, breeding: { ...extra.breeding, ...world.data.breeding, ...data.breeding }, roots: { ...world.data.roots, ...data.roots }, chars: { ...extra.chars, ...world.data.chars, ...data.chars } };
   if (!validateLife(data.life, sources)) throw new Error('鱼生记录无效');
   if (data.breeding !== undefined && (!data.breeding || typeof data.breeding !== 'object' || Array.isArray(data.breeding) || Object.keys(data.breeding).length > 500000)) throw new Error('繁殖记录无效');
   for (const [id, record] of Object.entries(data.breeding || {})) if (record.id !== id || !validBreedingRecord(record, sources) || record.at > Date.now() + 60000) throw new Error('繁殖记录缺少合法来源');
@@ -230,7 +231,7 @@ async function onMessage(message, peer) {
   if (members.has(message.from) && members.get(message.from).actor !== message.actor) return;
   const body = message.body;
   if (message.kind === 'hello') {
-    if (!body.world?.terrain || body.rules?.genesis !== 1 || body.rules?.life !== 2 || body.rules?.feeding !== 1 || body.rules?.ecology !== 1 || body.rules?.archives !== 1) { status = '对方使用旧版世界规则，请双方刷新游戏页面后再连接'; toast(status); network.close(peer); update(); return; }
+    if (!body.world?.terrain || body.rules?.genesis !== 1 || body.rules?.life !== 3 || body.rules?.feeding !== 1 || body.rules?.ecology !== 1 || body.rules?.archives !== 1) { status = '对方使用旧版世界规则，请双方刷新游戏页面后再连接'; toast(status); network.close(peer); update(); return; }
     if (message.from !== peer.node || body.member?.id !== message.from || body.member.actor !== message.actor) return;
     const own = body.member; members.set(own.id, { ...own, url: peer.url, at: Date.now() }); remember(peer.url);
     rememberAuthor(message.actor, own.nick);
@@ -289,7 +290,7 @@ async function completeReferral(peer, peerActor) {
 async function networkChange(error) {
   if (!started) return; if (error) { status = error; update(); return; }
   const live = network.live();
-  for (const p of live) if (!lastHello.has(p.id)) { lastHello.add(p.id); await network.direct(p, 'hello', { rules: { genesis: 1, life: 2, feeding: 1, ecology: 1, archives: 1 }, member: member(), members: active(), world: world.serialize(), cards: Object.values(histories).slice(0, 3), historyIndex: Object.keys(histories) }); }
+  for (const p of live) if (!lastHello.has(p.id)) { lastHello.add(p.id); await network.direct(p, 'hello', { rules: { genesis: 1, life: 3, feeding: 1, ecology: 1, archives: 1 }, member: member(), members: active(), world: world.serialize(), cards: Object.values(histories).slice(0, 3), historyIndex: Object.keys(histories) }); }
   const ids = new Set(live.map(p => p.node)); for (const m of active()) if (m.id !== network.node && m.direct && !ids.has(m.id)) { m.direct = false; probeGone(m.id, m.url); } for (const id of ids) if (members.has(id)) members.get(id).direct = true;
   network.presence(active().filter(m => m.id !== network.node).map(m => ({ id: m.id, url: m.url }))).catch(() => {}); update();
 }
@@ -405,6 +406,20 @@ function renderPedigree(catalog) {
 function inspect(hit, show = true) {
   if (show || trackedFish && (hit.kind !== 'fish' || hit.id !== trackedFish)) trackedFish = null;
   selected = hit; if (hit.kind === 'monument') { renderer.observedFish = null; renderer.selected = null; $('inspector').hidden = true; historyDialog(); selected = null; return; }
+  if (hit.kind === 'event') {
+    const record = world.data.life?.events?.[hit.id], schedule = record && eventSchedule(world.data.roots, record.seed, record.slot);
+    if (!schedule) { stopObserving(); return; }
+    const event = { ...record, ...schedule }, ended = Date.now() >= event.started + event.duration;
+    renderer.observedFish = renderer.selected = renderer.selectedCell = null;
+    $('fishDetails').hidden = $('chatMemory').hidden = $('sceneActions').hidden = true; $('eventDetails').hidden = false;
+    $('objectTitle').textContent = eventTitle(event.kind);
+    const letter = event.kind === 'bottle' ? eventLetter(event) : null;
+    $('objectInfo').textContent = letter ? `海洋来信 · ${letter.author}` : `一阵路过的海底信号 · ${fishDate.format(event.started)}`;
+    $('eventText').textContent = letter ? letter.text : event.kind === 'radio' ? radioTranscript(event, Date.now()).join('\n\n') : eventNarration(event.kind);
+    $('objectFootnote').textContent = ended ? event.kind === 'radio' ? '这阵信号已经远去了，听到的文字还在这里。' : '它已经漂向远方，读到的文字还在这里。' : '水流还在继续，可以慢慢读。';
+    if (show) $('inspector').hidden = false; return;
+  }
+  $('eventDetails').hidden = true;
   const object = hit.kind === 'fish' ? world.data.fishes[hit.id] : world.data.scenes[hit.id]; if (!object) { $('inspector').hidden = true; selected = null; renderer.observedFish = null; return; }
   const cells = hit.kind === 'fish' ? world.fishCells(hit.id) : world.sceneCells(hit.id), ownFish = hit.kind === 'fish' && world.fishOrigin(hit.id)?.actor === identity.actor, catalog = hit.kind === 'fish' ? fishCatalog(world.data) : null; $('objectTitle').textContent = hit.kind === 'fish' ? displayFishName(catalog.get(hit.id), identity) : `${authorNick(object.actor, object.nick || '自然沉积')} 的造景`;
   $('fishDetails').hidden = hit.kind !== 'fish'; renderer.observedFish = hit.kind === 'fish' ? hit.id : null;
@@ -445,6 +460,9 @@ function ownStories() { const catalog = fishCatalog(world.data); return { catalo
 function renderLife() {
   if (!identity) return;
   $('weatherLabel').textContent = weatherAt(world.data, Date.now()).label;
+  const occasion = activeEvent(world.data, Date.now());
+  $('ambientPeek').hidden = !occasion || !!selected || !!mode || !!document.querySelector('dialog[open]');
+  if (occasion) $('ambientPeek').textContent = `${eventTitle(occasion.kind)} · 看看 ›`;
   const { catalog, stories } = ownStories(), latest = returnStory(stories, lifeSince);
   if (latest) lifeMessage = latest;
   if (lifeMessage && !world.data.life?.stories[lifeMessage.id]) lifeMessage = null;
@@ -596,6 +614,13 @@ async function tick() {
   archiveWorld(now).catch(() => {});
 }
 $('lifePeek').onclick = lifeDialog;
+$('ambientPeek').onclick = () => {
+  const event = activeEvent(world.data, Date.now()); if (!event) return;
+  cancelMode(); stopObserving(); const p = eventPosition(event, Date.now());
+  renderer.camera.x = p.x; renderer.camera.y = Math.max(0, Math.min(CONFIG.depth, p.y));
+  if (event.kind === 'bottle' || event.kind === 'radio') inspect({ kind: 'event', id: event.id });
+  update();
+};
 $('closeLife').onclick = () => $('lifeDialog').close();
 $('closeArchive').onclick = () => { $('archiveDialog').close(); archiveView = null; };
 $('openArchives').onclick = () => { $('myFishDialog').close(); archiveViewer(); };
