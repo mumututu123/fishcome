@@ -28,7 +28,15 @@ async function main() {
   await page.locator('#placeDrawing').click(); await page.mouse.click(600, 370); await page.waitForFunction(() => tide.world.counts.fish === 1);
   assert.equal(await page.evaluate(() => Object.values(tide.world.data.fishes)[0].name), '阿鱼');
   await page.locator('#myFish').click(); assert.equal(await page.locator('#myFishList strong').textContent(), '阿鱼'); assert((await page.locator('#myFishList .fishCardInfo').textContent()).includes('鱼谱测试'));
-  await page.locator('#myFishList .fishCard').click(); assert.equal(await page.locator('#objectTitle').textContent(), '阿鱼'); await page.locator('#closeInspector').click();
+  await page.locator('#myFishList .fishCard').click(); assert.equal(await page.locator('#objectTitle').textContent(), '阿鱼'); assert.equal(await page.evaluate(() => tide.view.followingFish), null); assert.equal(await page.locator('#followFish').textContent(), '跟随观察');
+  const ownFish = await page.evaluate(() => tide.view.selected.id), opCount = await page.evaluate(() => Object.keys(tide.world.data.ops).length);
+  await page.locator('#followFish').click(); assert.equal(await page.evaluate(() => tide.view.followingFish), ownFish);
+  for (let attempt = 0; attempt < 5 && await page.evaluate(() => tide.view.followingFish !== null); attempt++) {
+    const point = await page.evaluate(id => { const data = tide.world.data, fish = data.fishes[id], cells = Object.values(data.chars).filter(c => c.kind === 'fish' && c.entity === id), cell = cells[Math.floor(cells.length / 2)], view = tide.view, size = 18 * view.scale; return { x: innerWidth / 2 + (fish.x + fish.facing * cell.x - view.camera.x + .5) * size, y: innerHeight / 2 + (fish.y + cell.y - view.camera.y + .5) * size }; }, ownFish); await page.mouse.click(point.x, point.y);
+  }
+  assert.equal(await page.evaluate(() => tide.view.followingFish), null); assert.equal(await page.evaluate(() => tide.view.selected?.id), ownFish); assert.equal(await page.locator('#followFish').textContent(), '跟随观察');
+  await page.locator('#followFish').click(); assert.equal(await page.evaluate(() => tide.view.followingFish), ownFish); await page.locator('#myFish').click(); await page.locator('#myFishList .fishCard').click(); assert.equal(await page.evaluate(() => tide.view.followingFish), null);
+  assert.equal(await page.evaluate(() => Object.keys(tide.world.data.ops).length), opCount); await page.locator('#closeInspector').click();
   await page.locator('#makeFish').click(); const second = await page.locator('#gridCanvas').boundingBox(); for (let x = 2.5; x < 12; x++) await page.mouse.click(second.x + x * second.width / 15, second.y + 7.5 * second.height / 15);
   assert.equal(await page.locator('#fishNameInput').inputValue(), '鱼谱测试的第2条鱼'); await page.locator('#closeCreator').click(); await page.locator('#makeScene').click(); assert(await page.locator('#fishNameLabel').isHidden()); await page.locator('#closeCreator').click(); await page.close();
   const setup = await context.newPage(); await setup.goto(origin + '/welcome.html');

@@ -97,7 +97,7 @@ async function main() {
   fishPage = await open(fishContext); await ready(fishPage); await fishPage.keyboard.press('p');
   assert.equal(await fishPage.locator('#myFishList [data-fish]').count(), 1, '我的鱼混入其他作者'); assert.equal(await fishPage.locator('#myFishList [data-fish]').getAttribute('data-fish'), ownId);
   await fishPage.screenshot({ path: path.join(project, 'test-output', 'my-fish-list.png') });
-  await fishPage.locator('#myFishList [data-fish]').click(); await fishPage.waitForFunction(id => tide.view.followingFish === id, ownId);
+  await fishPage.locator('#myFishList [data-fish]').click(); assert.equal(await fishPage.evaluate(() => tide.view.followingFish), null); await fishPage.locator('#followFish').click(); await fishPage.waitForFunction(id => tide.view.followingFish === id, ownId);
   assert.equal(await fishPage.locator('#fishMeals24').textContent(), '1 颗'); assert.equal(await fishPage.locator('#fishHunger').textContent(), '未饥饿'); assert(parseFloat(await fishPage.locator('#fishMovement').textContent()) >= 12.5);
   await fishPage.screenshot({ path: path.join(project, 'test-output', 'fish-observation.png') });
   await fishPage.setViewportSize({ width: 390, height: 844 }); await fishPage.locator('#myFish').click(); assert.equal(await fishPage.locator('#myFishDialog').evaluate(element => element.scrollWidth <= element.clientWidth), true);
@@ -107,6 +107,7 @@ async function main() {
   const beforeFeeding = await fishPage.evaluate(() => tide.balance()); await fishPage.locator('#feed').click(); assert.equal(await fishPage.locator('#inspector').isVisible(), false); await fishPage.locator('#placeFood').click();
   await fishPage.mouse.click(220, 844 * .27); await fishPage.waitForFunction(balance => tide.balance() === balance - 1, beforeFeeding); await fishPage.keyboard.press('Escape');
   await fishPage.locator('#myFish').click(); await fishPage.locator('#myFishList [data-fish]').click();
+  assert.equal(await fishPage.evaluate(() => tide.view.followingFish), null); await fishPage.locator('#followFish').click();
   const operationCount = await fishPage.evaluate(() => Object.keys(tide.world.data.ops).length);
   await fishPage.evaluate(() => { const original = Date.now; Date.now = () => original() + 2 * 3600000; });
   await fishPage.waitForFunction(() => document.getElementById('fishHunger').textContent === '饥饿'); assert.equal(await fishPage.locator('#fishMeals24').textContent(), '0 颗');

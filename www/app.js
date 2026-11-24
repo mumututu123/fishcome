@@ -247,9 +247,9 @@ function moveCameraToFish(fish, body) {
   const rect = observationRect(), size = renderer.cell * renderer.scale, x = (rect.left + rect.right) / 2, y = (rect.top + rect.bottom) / 2;
   renderer.camera = { x: nearX(fish.x + fish.facing * (body.minX + body.maxX) / 2, renderer.camera.x) + (renderer.width / 2 - x) / size, y: fish.y + (body.minY + body.maxY) / 2 + (renderer.height / 2 - y) / size };
 }
-function focusFish(id) {
+function focusFish(id, follow = false) {
   const fish = world.data.fishes[id]; if (!fish) { toast('这条鱼已不再存活'); renderMyFishes(); return; }
-  cancelMode(); trackedFish = id; inspect({ kind: 'fish', id });
+  cancelMode(); trackedFish = null; inspect({ kind: 'fish', id }); trackedFish = follow ? id : null;
   if (innerWidth <= 700) { document.querySelector('.chat').classList.add('collapsed'); $('collapseChat').textContent = '+'; }
   const rect = observationRect(), body = followBounds = bounds(world.fishCells(id));
   renderer.zoom(Math.min(1.25, Math.max(1, renderer.scale), Math.max(80, rect.right - rect.left) / (renderer.cell * (body.width + 4)), Math.max(80, rect.bottom - rect.top) / (renderer.cell * (body.height + 4))));
@@ -294,7 +294,7 @@ function renderMyFishes() {
 function setMyFishView(view) {
   $('myFishDialog').classList.toggle('pedigreeView', view === 'pedigree');
   myFishView = view; $('myFishList').hidden = view !== 'list'; $('pedigreePane').hidden = view !== 'pedigree';
-  $('myFishIntro').textContent = view === 'list' ? '点击鱼卡即可定位并跟随观察。这里只列出当前世界中属于你的存活鱼。' : '父母在上，后代在下。鱼谱包含血缘相关的其他作者鱼，已消失的亲鱼仍保留在家谱中。';
+  $('myFishIntro').textContent = view === 'list' ? '点击鱼卡即可定位并观察，默认不跟随；可在观察面板手动开启跟随。这里只列出当前世界中属于你的存活鱼。' : '父母在上，后代在下。鱼谱包含血缘相关的其他作者鱼，已消失的亲鱼仍保留在家谱中。';
   for (const [id, selected] of [['myFishListTab', view === 'list'], ['pedigreeTab', view === 'pedigree']]) { $(id).classList.toggle('active', selected); $(id).setAttribute('aria-pressed', String(selected)); }
   renderMyFishes();
 }
@@ -311,7 +311,7 @@ function renderPedigree(catalog) {
   $('pedigreeCount').textContent = tree.nodes.length ? `${tree.nodes.length} 条鱼 · ${tree.generations} 代` : '暂无鱼谱'; viewport.scrollLeft = scroll.left; viewport.scrollTop = scroll.top;
 }
 function inspect(hit, show = true) {
-  if (trackedFish && (hit.kind !== 'fish' || hit.id !== trackedFish)) trackedFish = null;
+  if (show || trackedFish && (hit.kind !== 'fish' || hit.id !== trackedFish)) trackedFish = null;
   selected = hit; if (hit.kind === 'monument') { renderer.observedFish = null; renderer.selected = null; $('inspector').hidden = true; historyDialog(); selected = null; return; }
   const object = hit.kind === 'fish' ? world.data.fishes[hit.id] : world.data.scenes[hit.id]; if (!object) { $('inspector').hidden = true; selected = null; renderer.observedFish = null; return; }
   const cells = hit.kind === 'fish' ? world.fishCells(hit.id) : world.sceneCells(hit.id), ownFish = hit.kind === 'fish' && world.fishOrigin(hit.id)?.actor === identity.actor, catalog = hit.kind === 'fish' ? fishCatalog(world.data) : null; $('objectTitle').textContent = hit.kind === 'fish' ? displayFishName(catalog.get(hit.id), identity) : `${authorNick(object.actor, object.nick || '自然沉积')} 的造景`;
@@ -416,7 +416,7 @@ $('myFish').onclick = () => { if (!identity) return; setMyFishView('list'); $('m
 $('myFishListTab').onclick = () => setMyFishView('list'); $('pedigreeTab').onclick = () => setMyFishView('pedigree');
 $('pedigreeRoot').onchange = () => { pedigreeFish = $('pedigreeRoot').value; pedigreeKey = ''; renderPedigree(fishCatalog(world.data)); };
 $('closeMyFish').onclick = () => $('myFishDialog').close(); $('createFromMyFish').onclick = () => { $('myFishDialog').close(); $('makeFish').click(); };
-$('followFish').onclick = () => { if (selected?.kind !== 'fish') return; if (trackedFish === selected.id) { trackedFish = null; update(); } else focusFish(selected.id); };
+$('followFish').onclick = () => { if (selected?.kind !== 'fish') return; if (trackedFish === selected.id) { trackedFish = null; update(); } else focusFish(selected.id, true); };
 $('closeFood').onclick = () => $('foodDialog').close();
 $('foodGlyphInput').oninput = updateFoodBrush; $('foodColorInput').oninput = updateFoodBrush;
 $('foodForm').onsubmit = e => {
