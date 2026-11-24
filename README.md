@@ -1,10 +1,10 @@
-# 鱼来 0.1.0
+# 鱼来 0.1.1
 
 中文与 ASCII 字符组成的浏览器多人鱼来世界。每台电脑运行便携启动器，浏览器通过 WebRTC 组成网络。游戏状态、身份和记忆使用浏览器 IndexedDB 保存；启动器只提供网页文件与临时配对通道。
 
 ## 开始玩
 
-1. 解压整个「鱼来-0.1.0.zip」，保留 `www` 文件夹与程序在一起。
+1. 解压整个「fishcome-0.1.1-windows.zip」，保留 `www` 文件夹与程序在一起。
 2. Windows 10/11 双击「鱼来.exe」。游戏打开固定本地地址 `http://127.0.0.1:39241`。
 3. 第一次设置昵称。聊天、作品和鱼谱公开展示完整昵称；每个浏览器配置文件拥有独立身份。
 4. 点击「连接同事」，复制自己的「邀请码」给同事。首次使用的同事需要便携启动包：可以从本机游戏中下载 ZIP 后分享给同事，包中带有邀请码，启动后自动尝试配对。
@@ -105,17 +105,19 @@
 GitHub Release 工作流位于 `.github/workflows/release.yml`。将工作流和构建脚本提交、推送到 master 后，在要发布的提交上创建并推送版本标签，例如：
 
 ```powershell
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.1.1
+git push origin v0.1.1
 ```
 
-工作流在 Windows runner 上运行规则测试、编译启动器，再解压 ZIP 实际启动程序并校验所有网页资源，全部通过才创建 Release。用户下载 Release 附件「鱼来-0.1.0.zip」，完整解压后双击根目录「鱼来.exe」即可；包内只包含程序和必需的 `www`，不含源码、测试或验证文档。用户手册可在 Release 说明中打开。
+工作流在 Windows runner 上运行规则测试、编译启动器，再解压 ZIP 实际启动程序、校验所有网页资源，并用 Chromium 检查首次注册、弹窗、下载名称和刷新恢复，全部通过才创建 Release。用户下载 Release 附件「fishcome-0.1.1-windows.zip」，完整解压后双击根目录「鱼来.exe」即可；包内只包含程序和必需的 `www`，不含源码、测试或验证文档。用户手册可在 Release 说明中打开。ZIP 使用英文名称避免 GitHub 删除中文文件名前缀；发布说明与下载链接直接使用实际附件名称。更新时先从托盘退出旧启动器，再运行新包，浏览器仍从原本的固定本地地址恢复身份和存档。
 
-也可在 GitHub 的 Actions → Release → Run workflow 中选择分支（通常为 master），填写版本标签直接发布，例如 `v0.1.0`。标签不存在时，工作流构建本次所选分支的提交，测试与打包通过后才自动创建标签和 Release，不用事先手工打标签。标签已存在时，工作流构建其对应的原提交；重复执行更新同名 ZIP 附件，不移动原标签。大小写 `v`／`V` 都支持，推荐使用小写。
+也可在 GitHub 的 Actions → Release → Run workflow 中选择分支（通常为 master），填写版本标签直接发布，例如 `v0.1.1`。标签不存在时，工作流构建本次所选分支的提交，测试与打包通过后才自动创建标签和 Release，不用事先手工打标签。标签已存在时，工作流构建其对应的原提交；重复执行更新同名 ZIP 附件，不移动原标签。大小写 `v`／`V` 都支持，推荐使用小写。
 
 带后缀的版本（如 `v0.2.0-beta.1`）会发布为预发行版。发布使用 GitHub 自动提供的令牌，无需另配个人令牌。日常推送 master 不自动发布。修复工作流后请从 Run workflow 创建一次新运行；旧运行的 Re-run jobs 仍会使用旧版工作流。
 
-本地可用 `./build.ps1 -Version 0.1.0 -OutputDirectory ./dist/release` 构建，再用 `./scripts/test-release.ps1 -ArchivePath ./dist/鱼来-0.1.0.zip` 检查解压后的发行包。每次打包从独立的新目录收集文件，已有输出目录中的旧文件不会混进 ZIP。
+本地浏览器发布验证需先运行 `npm ci` 和 `npx playwright install chromium`；也可用 `TIDE_TEST_BROWSER_PATH` 指定本机 Chrome／Edge。CI 会固定当前工作流的构建、验证工具，再切换发行标签代码；旧标签的旧验证脚本不会绕过新版检查。
+
+本地可用 `./build.ps1 -Version 0.1.1 -OutputDirectory ./dist/release` 构建，再用 `./scripts/test-release.ps1 -ArchivePath ./dist/fishcome-0.1.1-windows.zip` 检查解压后的发行包。每次打包从独立的新目录收集文件，已有输出目录中的旧文件不会混进 ZIP。
 
 如果已有 `dist/潮生` 兼容目录，构建会同时更新其中的 `www`、使用说明与验证记录，同步更新对应启动器以支持邀请码。已打开的旧页面需要刷新才能载入更新；固定本地地址和 IndexedDB 数据库保持不变。`node tests/served-ui.cjs` 可检查当前 `http://127.0.0.1:39241` 实际发布的“我的鱼”入口、快捷键绑定及鱼况模块，其他测试地址可通过 `TIDE_UI_URL` 指定。
 

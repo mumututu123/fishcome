@@ -475,4 +475,4 @@ document.addEventListener('keydown', e => {
 });
 document.addEventListener('keyup', e => heldShortcuts.delete(e.code || e.key.toLowerCase()));
 window.addEventListener('blur', () => heldShortcuts.clear());
-function render() { if (trackedFish) { const fish = world.data.fishes[trackedFish]; if (fish && followBounds) moveCameraToFish(fish, followBounds); else { trackedFish = null; toast('这条鱼已不再存活'); } } renderer.draw(world); requestAnimationFrame(render); } render(); start().catch(e => { toast(e.message); status = e.message; $('networkStatus').textContent = e.message; });
+function render() { if (trackedFish) { const fish = world.data.fishes[trackedFish]; if (fish && followBounds) moveCameraToFish(fish, followBounds); else { trackedFish = null; toast('这条鱼已不再存活'); } } renderer.draw(world); requestAnimationFrame(render); } render(); start().catch(e => { toast(e.message); status = e.message; const label = $('networkStatus'); if (label) label.textContent = e.message; });

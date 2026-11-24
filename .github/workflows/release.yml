@@ -8,8 +8,8 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: '版本标签，例如 v0.1.0；不存在时发布所选分支并创建标签'
-        default: 'v0.1.0'
+        description: '版本标签，例如 v0.1.1；不存在时发布所选分支并创建标签'
+        default: 'v0.1.1'
         required: true
         type: string
 
@@ -29,6 +29,7 @@ jobs:
     env:
       RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
       RELEASE_EVENT: ${{ github.event_name }}
+      TIDE_TEST_MODULES: ${{ github.workspace }}/node_modules
     defaults:
       run:
         shell: pwsh
@@ -42,39 +43,59 @@ jobs:
       - name: Test release selection
         run: ./tests/release-workflow.ps1
 
-      - name: Resolve release version and commit
-        run: ./scripts/resolve-release.ps1 -Tag $env:RELEASE_TAG -EventName $env:RELEASE_EVENT
-
       - uses: actions/setup-node@v6
         with:
           node-version: '22'
+          cache: npm
+
+      - name: Prepare release tooling and browser
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { throw 'Dependency installation failed.' }
+          npx playwright install chromium
+          if ($LASTEXITCODE -ne 0) { throw 'Browser installation failed.' }
+          $tools = Join-Path $env:RUNNER_TEMP 'fishcome-release-tools'
+          New-Item -ItemType Directory -Path $tools -Force | Out-Null
+          foreach ($file in @('build.ps1', 'scripts/test-release.ps1', 'tests/browser-release.cjs')) {
+            Copy-Item -LiteralPath (Join-Path $env:GITHUB_WORKSPACE $file) -Destination $tools -Force
+          }
+          "RELEASE_TOOL_ROOT=$tools" >> $env:GITHUB_ENV
+
+      - name: Resolve release version and commit
+        run: ./scripts/resolve-release.ps1 -Tag $env:RELEASE_TAG -EventName $env:RELEASE_EVENT
 
       - name: Test game rules
         run: npm test
 
       - name: Build minimal Windows ZIP
-        run: ./build.ps1 -Version $env:RELEASE_VERSION -OutputDirectory ./dist/release
+        run: '& "$env:RELEASE_TOOL_ROOT/build.ps1" -Version $env:RELEASE_VERSION -OutputDirectory ./dist/release -SourceDirectory $env:GITHUB_WORKSPACE'
 
       - name: Verify extracted package starts
-        run: ./scripts/test-release.ps1 -ArchivePath "./dist/鱼来-$env:RELEASE_VERSION.zip"
+        run: '& "$env:RELEASE_TOOL_ROOT/test-release.ps1" -ArchivePath $env:RELEASE_ARCHIVE -SourceDirectory $env:GITHUB_WORKSPACE -BrowserTestPath "$env:RELEASE_TOOL_ROOT/browser-release.cjs"'
 
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $archive = "./dist/鱼来-$env:RELEASE_VERSION.zip"
-          gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --json tagName 2>$null
-          if ($LASTEXITCODE -eq 0) {
-            gh release upload $env:RELEASE_TAG $archive --repo $env:GITHUB_REPOSITORY --clobber
-          } else {
-            $notes = Join-Path $env:RUNNER_TEMP 'release-notes.md'
-            @"
-          下载下方的 **鱼来-$env:RELEASE_VERSION.zip**，完整解压后双击文件夹根目录的 **鱼来.exe**。
+          $archive = $env:RELEASE_ARCHIVE
+          $assetName = (Get-Item -LiteralPath $archive).Name
+          if ($assetName -ne $env:RELEASE_ASSET_NAME -or $assetName -notmatch '^[a-zA-Z0-9.-]+$') { throw 'Release asset filename is inconsistent or not ASCII.' }
+          $notes = Join-Path $env:RUNNER_TEMP 'release-notes.md'
+          @"
+          下载下方的 **$assetName**，完整解压后双击文件夹根目录的 **鱼来.exe**。
+
+          [直接下载发布包](https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:RELEASE_TAG/$assetName)
 
           适用于 Windows 10/11，无需安装 Node.js 或 Python。保留程序旁的 www 文件夹。首次进入设置昵称，在「连接同事」中粘贴邀请码。
 
           [用户简明手册](https://github.com/$env:GITHUB_REPOSITORY/blob/$env:RELEASE_TAG/游戏简介.md)
           "@ | Set-Content -LiteralPath $notes -Encoding utf8
+          gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --json tagName 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:RELEASE_TAG $archive --repo $env:GITHUB_REPOSITORY --clobber
+            if ($LASTEXITCODE -ne 0) { throw 'Release asset upload failed.' }
+            gh release edit $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --notes-file $notes
+          } else {
             $arguments = @('release', 'create', $env:RELEASE_TAG, $archive, '--repo', $env:GITHUB_REPOSITORY, '--target', $env:RELEASE_COMMIT, '--title', "鱼来 $env:RELEASE_TAG", '--notes-file', $notes)
             if ($env:RELEASE_TAG_EXISTS -eq 'true') { $arguments += '--verify-tag' }
             if ($env:RELEASE_VERSION.Contains('-')) { $arguments += '--prerelease' }

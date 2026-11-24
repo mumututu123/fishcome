@@ -108,14 +108,14 @@ namespace Tide {
       }
     }
     static string RouteUrl(Uri peer) { try { var ip = Dns.GetHostAddresses(peer.Host).First(a => a.AddressFamily == AddressFamily.InterNetwork); using (var route = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp)) { route.Connect(new IPEndPoint(ip, peer.Port)); return "http://" + ((IPEndPoint)route.LocalEndPoint).Address + ":" + Port; } } catch { return Published; } }
-    static object Status() { return new { ok = true, version = "0.1.0", clients = Clients.Values.Where(c => c.Active).Select(c => new { id = c.Id, nick = c.Nick, peers = c.Peers, url = Invite(Published) }).ToArray(), hints = InviteHints(Clients.Values.Where(c => c.Active).SelectMany(c => c.Hints).Take(20).ToArray()) }; }
+    static object Status() { return new { ok = true, version = BuildInfo.Version, clients = Clients.Values.Where(c => c.Active).Select(c => new { id = c.Id, nick = c.Nick, peers = c.Peers, url = Invite(Published) }).ToArray(), hints = InviteHints(Clients.Values.Where(c => c.Active).SelectMany(c => c.Hints).Take(20).ToArray()) }; }
     static async Task Handle(TcpClient socket) {
       using (socket) using (var stream = socket.GetStream()) try {
         var r = await Read(stream, ((IPEndPoint)socket.Client.RemoteEndPoint).Address);
-        if (r.Path == "/health" && r.Method == "GET") { await J(stream, 200, new { ok = true, name = "tide", version = "0.1.0" }); return; }
+        if (r.Path == "/health" && r.Method == "GET") { await J(stream, 200, new { ok = true, name = "tide", version = BuildInfo.Version }); return; }
         if (r.Path == "/status" && r.Method == "GET") { await J(stream, 200, Status()); return; }
         if (r.Path == "/invite" && r.Method == "GET") { await J(stream, 200, new { invite = RequestInvite(r) }); return; }
-        if (r.Path == "/local/meta" && r.Method == "GET") { if (!Local(r)) { await J(stream, 403, new { ok = false }); return; } await J(stream, 200, new { token = Token, url = Invite(Published), urls = Urls.Select(url => Invite(url)).ToArray(), joinUrl = JoinUrl, version = "0.1.0" }); return; }
+        if (r.Path == "/local/meta" && r.Method == "GET") { if (!Local(r)) { await J(stream, 403, new { ok = false }); return; } await J(stream, 200, new { token = Token, url = Invite(Published), urls = Urls.Select(url => Invite(url)).ToArray(), joinUrl = JoinUrl, version = BuildInfo.Version }); return; }
         if (r.Path == "/local/events" && r.Method == "GET") {
           var query = System.Web.HttpUtility.ParseQueryString(r.Query); Client client;
           if (!Local(r) || query["token"] != Token || !Clients.TryGetValue(query["node"], out client)) { await J(stream, 403, new { ok = false }); return; }
@@ -143,7 +143,7 @@ namespace Tide {
           if (!new string[] { "offer", "answer", "reject" }.Contains(type) || Str(signal, "connection").Length != 36 || Str(signal, "from").Length != 36) throw new Exception("信令格式无效");
           signal["fromUrl"] = Invite(sender.GetLeftPart(UriPartial.Authority)); destination.Queue.Enqueue(Encode(signal)); await J(stream, 200, new { ok = true, to = destination.Id }); return;
         }
-        if (r.Path == "/download.zip" && r.Method == "GET") { await Reply(stream, 200, MakePackage(RequestInvite(r)), "application/zip", "Content-Disposition: attachment; filename=Tide-0.1.0.zip\r\n"); return; }
+        if (r.Path == "/download.zip" && r.Method == "GET") { await Reply(stream, 200, MakePackage(RequestInvite(r)), "application/zip", "Content-Disposition: attachment; filename=" + BuildInfo.PackageName + "\r\n"); return; }
         if (r.Method != "GET" || r.Path.Contains("\\") || r.Path.Contains("\0")) { await J(stream, 400, new { ok = false }); return; }
         string requested = r.Path == "/" ? (IPAddress.IsLoopback(r.Remote) ? "index.html" : "welcome.html") : r.Path.TrimStart('/'); var file = Path.GetFullPath(Path.Combine(Www, requested));
         if (!file.StartsWith(Path.GetFullPath(Www) + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase) || !File.Exists(file)) { await J(stream, 404, new { ok = false }); return; }
@@ -156,7 +156,7 @@ namespace Tide {
         var join = archive.CreateEntry("join.json"); using (var writer = new StreamWriter(join.Open(), new UTF8Encoding(false))) writer.Write(Encode(new { invite = invitation }));
         var exe = Process.GetCurrentProcess().MainModule.FileName; var entry = archive.CreateEntry("鱼来.exe"); using (var stream = entry.Open()) { var bytes = File.ReadAllBytes(exe); stream.Write(bytes, 0, bytes.Length); }
         foreach (var file in Directory.GetFiles(Www, "*", SearchOption.AllDirectories)) { var item = archive.CreateEntry("www/" + file.Substring(Www.Length + 1).Replace('\\', '/'), CompressionLevel.Optimal); using (var stream = item.Open()) { var bytes = File.ReadAllBytes(file); stream.Write(bytes, 0, bytes.Length); } }
-        var readme = archive.CreateEntry("使用说明.txt"); using (var writer = new StreamWriter(readme.Open(), new UTF8Encoding(true))) writer.Write("鱼来 0.1.0\r\n解压整个文件夹，双击 鱼来.exe。\r\n浏览器进入固定本地地址 http://127.0.0.1:39241。\r\n支持 Chrome、Edge 和 Firefox。\r\n包内带有下载者的邀请码，自动尝试配对；也可在游戏中粘贴同事的邀请码。\r\n关闭游戏页即退出世界，托盘右键可退出启动器。\r\n世界数据仅保存在浏览器，请按需导出身份和记忆备份。\r\n");
+        var readme = archive.CreateEntry("使用说明.txt"); using (var writer = new StreamWriter(readme.Open(), new UTF8Encoding(true))) writer.Write("鱼来 " + BuildInfo.Version + "\r\n解压整个文件夹，双击 鱼来.exe。\r\n浏览器进入固定本地地址 http://127.0.0.1:39241。\r\n支持 Chrome、Edge 和 Firefox。\r\n包内带有下载者的邀请码，自动尝试配对；也可在游戏中粘贴同事的邀请码。\r\n关闭游戏页即退出世界，托盘右键可退出启动器。\r\n世界数据仅保存在浏览器，请按需导出身份和记忆备份。\r\n");
       } return memory.ToArray(); }
     }
   }

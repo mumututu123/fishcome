@@ -1,10 +1,16 @@
 ﻿param(
     [Parameter(Mandatory = $true)][string]$ArchivePath,
-    [int]$Port = 39781
+    [int]$Port = 39781,
+    [string]$SourceDirectory = (Join-Path $PSScriptRoot '..'),
+    [string]$BrowserTestPath = ''
 )
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.IO.Compression.FileSystem
-$projectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+$projectRoot = [IO.Path]::GetFullPath($SourceDirectory)
+if (-not $BrowserTestPath) { $BrowserTestPath = Join-Path $projectRoot 'tests\browser-release.cjs' }
+$assetName = [IO.Path]::GetFileName($ArchivePath)
+if ($assetName -notmatch '^fishcome-(.+)-windows\.zip$') { throw '发布包名称必须为 fishcome-版本-windows.zip' }
+$version = $Matches[1]
 $distRoot = Join-Path $projectRoot 'dist'
 $testRoot = Join-Path $distRoot ('.smoke-' + [Guid]::NewGuid().ToString('N'))
 $process = $null
@@ -27,6 +33,7 @@ try {
         Start-Sleep -Milliseconds 200
     }
     if (-not $ready) { throw '解压后的启动器未能启动网页服务' }
+    if ($health.version -ne $version) { throw '启动器版本与发布包名称不一致' }
     foreach ($file in Get-ChildItem -LiteralPath $wwwRoot -Recurse -File) {
         $relative = $file.FullName.Substring($wwwRoot.Length + 1).Replace('\', '/')
         $response = Invoke-WebRequest -Uri "$base/$relative" -UseBasicParsing -TimeoutSec 5
@@ -35,7 +42,9 @@ try {
         try { $servedHash = [BitConverter]::ToString($sha.ComputeHash($response.RawContentStream)).Replace('-', '') } finally { $sha.Dispose() }
         if ($servedHash -ne (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash) { throw "网页资源与源码不一致：$relative" }
     }
-    Write-Output '发布包验证通过：根目录程序可启动，所有网页资源完整且与源码一致。'
+    & node $BrowserTestPath $base $assetName
+    if ($LASTEXITCODE -ne 0) { throw '解压后的发布页面浏览器验证失败' }
+    Write-Output '发布包验证通过：名称与版本一致，程序可启动，资源完整，首次进入与刷新无前端异常。'
 } finally {
     if ($process -and -not $process.HasExited) {
         Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
