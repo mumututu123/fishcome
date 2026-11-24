@@ -1,6 +1,7 @@
 import { CHAT_FLOOR, validChatMessage, buildChatFloor, chatGlyphs } from './chat.js';
 import { shanghaiDay, mealIndex, fishStatus, mergeTravel } from './fish-status.js';
 import { HOUR, updateSeaweed } from './seaweed.js';
+import { MINUTE, updateBubbles, mergeBubbles } from './bubbles.js';
 import { fishNameError } from './fish-profile.js';
 import { REFERRAL_REWARD, referralError, chooseReferral } from './referral.js';
 import { WORLD_WIDTH, MAX_FLOOR, wrapX, worldKey, deltaX, nearX, makeTerrain, terrainOf, validTerrain, chooseTerrain, floorAt, waterAt } from './geography.js';
@@ -69,7 +70,7 @@ function transition(c, next, record) { Object.assign(c, next); c.path.push({ ...
 
 export class World {
   constructor(now = Date.now(), id = crypto.randomUUID()) {
-    this.data = { protocol: 1, roots: { [id]: now }, terrain: makeTerrain(id, now), tick: now, seaweedHour: Math.floor(now / HOUR), chars: {}, fishes: {}, breeding: {}, contacts: {}, contactAt: now, scenes: {}, ops: {}, participants: {}, notices: [], chats: {}, chatSources: {}, pendingChatGlyphs: 0, travel: {} };
+    this.data = { protocol: 1, roots: { [id]: now }, terrain: makeTerrain(id, now), tick: now, seaweedHour: Math.floor(now / HOUR), bubbleMinute: Math.floor(now / MINUTE), bubbles: {}, chars: {}, fishes: {}, breeding: {}, contacts: {}, contactAt: now, scenes: {}, ops: {}, participants: {}, notices: [], chats: {}, chatSources: {}, pendingChatGlyphs: 0, travel: {} };
     this.dirty = true; this.foodRevision = 0;
   }
   get id() { return Object.keys(this.data.roots).sort()[0]; }
@@ -236,6 +237,7 @@ export class World {
     this.initializeTracking(now);
     finishBreeding(this, now, transition);
     updateSeaweed(this, now, CONFIG, this.monument, hash, transition);
+    updateBubbles(this, now);
     const dt = Math.min(1, Math.max(0, (now - this.data.tick) / 1000)); this.data.tick = now;
     let scenery = this.sceneryMap(), groups = this.fishGroups(); const fishOccupancy = this.fishMap();
     const foods = Object.values(this.data.chars).filter(c => c.kind === 'food').sort((a, b) => a.born - b.born || a.id.localeCompare(b.id));
@@ -351,7 +353,9 @@ export class World {
     }
     if (!this.sceneCells(CHAT_FLOOR).length) delete this.data.scenes[CHAT_FLOOR];
     this.data.pendingChatGlyphs = Math.max(0, Object.values(this.data.chatSources).reduce((sum, message) => sum + chatGlyphs(message.body.text).length, 0) - Object.values(this.data.chars).filter(c => c.chat).length);
-    this.data.tick = Math.max(this.data.tick, other.tick); normalizeBreeding(this, this.data.tick); this.foodRevision++; this.dirty = true;
+    this.data.tick = Math.max(this.data.tick, other.tick);
+    this.data.bubbles = mergeBubbles(this.data.bubbles, other.bubbles, this.data.tick, this.data.chars); this.data.bubbleMinute = Math.max(this.data.bubbleMinute ?? Math.floor(this.data.tick / MINUTE), other.bubbleMinute ?? Math.floor(other.tick / MINUTE));
+    normalizeBreeding(this, this.data.tick); this.foodRevision++; this.dirty = true;
   }
   counts() { const chars = Object.values(this.data.chars); return { fish: Object.keys(this.data.fishes).length, scene: Object.keys(this.data.scenes).length, food: chars.filter(c => c.kind === 'food' && this.data.tick - c.born < CONFIG.foodLife).length, characters: chars.filter(c => c.kind !== 'burn').length }; }
 }

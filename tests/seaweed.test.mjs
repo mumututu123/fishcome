@@ -111,7 +111,7 @@ test('不能通过投放、搬动或缩放造景覆盖海草，也不扣鱼元',
   const move = world.apply({ id: crypto.randomUUID(), actor: 'builder', t: now, kind: 'sceneMove', scene: sceneId, x: 30, y: world.floorAt(30) - 2, cost: 0 }); assert.equal(move.ok, false);
   const spawn = world.apply({ id: crypto.randomUUID(), actor: 'alice', t: now, kind: 'scene', x: weed.x, y: weed.y, cells: [glyph(0, 0, '#'), glyph(1, 0, '#')], cost: 2 }); assert.equal(spawn.ok, false); assert.equal(world.wallet('alice'), 20);
   const scaleWorld = new World(now); stem(scaleWorld, 30);
-  const scaleId = crypto.randomUUID(); assert(scaleWorld.apply({ id: scaleId, actor: 'builder', t: now, kind: 'scene', x: 29, y: Math.min(scaleWorld.floorAt(29), scaleWorld.floorAt(30)) - 2, cells: [glyph(0, 0, '#'), glyph(1, 0, '#')], cost: 2 }).ok);
+  const scaleId = crypto.randomUUID(); assert(scaleWorld.apply({ id: scaleId, actor: 'builder', t: now, kind: 'scene', x: 29, y: scaleWorld.floorAt(30) - 2, cells: [glyph(0, 0, '#'), glyph(1, 0, '#')], cost: 2 }).ok);
   assert.equal(scaleWorld.apply({ id: crypto.randomUUID(), actor: 'builder', t: now, kind: 'sceneScale', scene: scaleId, factor: 2, cost: 6 }).ok, false);
   assert.equal(scaleWorld.wallet('builder'), 18);
 });

@@ -61,9 +61,9 @@ test('聊天沉积协议拒绝编辑、移动、旋转、缩放和删除', () =>
   assert.deepEqual(world.serialize(), before);
 });
 test('合流时海底记忆避开活鱼，鱼不会被移动或覆盖', () => {
-  const { world } = ended('海底记忆'), cell = world.sceneCells(CHAT_FLOOR)[0], other = new World(at);
-  const id = crypto.randomUUID(), x = Math.min(cell.x, CONFIG.width - 2), y = cell.y;
-  assert(other.apply({ id, actor: 'bob', t: at, kind: 'fish', x, y, cost: 2, cells: [0, 1].map(dx => ({ x: dx, y: 0, ch: '口', color: '#8be7df' })) }).ok);
+  const { world } = ended('海底记忆'), cell = world.sceneCells(CHAT_FLOOR)[0], other = new World(world.data.terrain.createdAt, world.data.terrain.seed);
+  const id = crypto.randomUUID(), x = cell.x, y = cell.y - 1;
+  assert(other.apply({ id, actor: 'bob', t: at, kind: 'fish', x, y, cost: 2, cells: [0, 1].map(dy => ({ x: 0, y: dy, ch: '口', color: '#8be7df' })) }).ok);
   world.merge(other.serialize()); world.reconcileGeometry();
   assert.equal(world.data.fishes[id].x, x); assert.equal(world.data.fishes[id].y, y);
   for (const point of world.fishMap().keys()) assert.equal(world.sceneryMap().has(point), false);

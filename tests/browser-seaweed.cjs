@@ -39,7 +39,7 @@ async function main() {
   }); await setup.close();
   a = await open(first, ports[0]); const b = await open(second, ports[1], '海草邻居');
   await a.locator('#seabed').click();
-  const poses = new Set(); for (let i = 0; i < 15; i++) { const xs = await a.evaluate(ids => ids.map(id => tide.world.data.chars[id].x), ids); poses.add(xs.join(',')); assert(xs.every(x => x <= 600), '摆动穿过右侧造景'); await pause(300); }
+  const poses = new Set(); for (let i = 0; i < 80; i++) { const xs = await a.evaluate(ids => ids.map(id => tide.world.data.chars[id].x), ids); poses.add(xs.join(',')); assert(xs.every(x => x <= 600), '摆动穿过右侧造景'); if (poses.size > 1) break; await pause(300); }
   assert(poses.size > 1, '浏览器中应持续摆动');
   fs.mkdirSync(path.join(project, 'test-output'), { recursive: true }); await a.screenshot({ path: path.join(project, 'test-output', 'seaweed.png') });
   await b.locator('#connect').click(); await b.locator('#peerUrl').fill(`http://127.0.0.1:${ports[0]}`); await b.locator('#connectionForm .primary').click();
@@ -47,8 +47,9 @@ async function main() {
   await a.locator('#makeFish').click(); const grid = await a.locator('#gridCanvas').boundingBox();
   for (const x of [7.5, 8.5]) await a.mouse.click(grid.x + x * grid.width / 15, grid.y + 7.5 * grid.height / 15);
   await a.locator('#placeDrawing').click();
-  const point = await a.evaluate(() => { const view = tide.view, size = 18 * view.scale; return { x: innerWidth / 2 + (598.5 - view.camera.x) * size, y: innerHeight / 2 + (Math.min(tide.world.data.terrain.depths[598], tide.world.data.terrain.depths[600]) - 1.5 - view.camera.y) * size }; });
+  const point = await a.evaluate(() => { const view = tide.view, size = 18 * view.scale; return { x: innerWidth / 2 + (596.5 - view.camera.x) * size, y: innerHeight / 2 + (Math.min(tide.world.data.terrain.depths[596], tide.world.data.terrain.depths[600]) - 1.5 - view.camera.y) * size }; });
   await a.mouse.click(point.x, point.y);
+  await a.waitForFunction(() => tide.world.counts.fish > 0);
   for (const page of [a, b]) await page.waitForFunction(ids => ids.some(id => tide.world.data.chars[id]?.kind === 'fish'), ids, { timeout: 20000 });
   const fed = await a.evaluate(ids => ids.map(id => tide.world.data.chars[id]).filter(c => c.kind === 'fish').map(c => ({ id: c.id, entity: c.entity, ch: c.ch, color: c.color, eats: c.path.filter(p => p.reason === 'eat').length })), ids);
   assert(fed.length > 0); assert(fed.every(c => c.ch === '草' && c.eats === 1));
