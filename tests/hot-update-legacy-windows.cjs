@@ -15,11 +15,12 @@ async function main({ root, buildVersion, startLauncher }) {
   const legacy = buildVersion('0.1.1', 'legacy', legacySource);
   const current = buildVersion('0.2.0', 'current');
   await verifyBrowserPeerUpdate(startLauncher, legacy, current);
-  console.log('Windows 的旧启动器已从同事更新到 Go 版，原位替换成功，鱼、配额和邀请码均保留。');
 }
 
 if (process.platform !== 'win32') throw new Error('旧启动器迁移验证需要 Windows');
-withReleaseFixtures(main).catch(error => {
-  console.error(error);
-  process.exitCode = 1;
-});
+withReleaseFixtures(main)
+  .then(() => console.log('Windows 的旧启动器已从同事更新到 Go 版，原位替换成功，鱼、配额和邀请码均保留。'))
+  .catch(error => {
+    console.error(error);
+    process.exitCode = 1;
+  });

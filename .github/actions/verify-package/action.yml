@@ -30,6 +30,11 @@ runs:
         cache: npm
         cache-dependency-path: source/package-lock.json
 
+    - name: Test hot-update process cleanup
+      shell: pwsh
+      working-directory: tools
+      run: node --test tests/release-cleanup.test.cjs
+
     - uses: actions/setup-go@v6
       if: inputs.legacy-windows != 'true'
       with:

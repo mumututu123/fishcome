@@ -224,11 +224,11 @@ async function main({ root, archivesDir, buildVersion, startLauncher }) {
     mockServer.closeAllConnections();
     await new Promise(resolve => mockServer.close(resolve));
   }
-
-  console.log('启动器热更新全流程实测通过：局域网升级、事务原地替换、join.json 字节不变、Host 校验、确认前零执行、崩溃回滚恢复、以及 GitHub 测试版升级全部验证成功。');
 }
 
-withReleaseFixtures(main).catch(err => {
-  console.error(err);
-  process.exitCode = 1;
-});
+withReleaseFixtures(main)
+  .then(() => console.log('启动器热更新全流程实测通过：局域网升级、事务原地替换、join.json 字节不变、Host 校验、确认前零执行、崩溃回滚恢复、以及 GitHub 测试版升级全部验证成功。'))
+  .catch(err => {
+    console.error(err);
+    process.exitCode = 1;
+  });

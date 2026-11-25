@@ -166,7 +166,7 @@ git push origin v0.1.1
 
 带后缀的版本（如 `v0.2.0-beta.1`）会发布为预发行版。发布使用 GitHub 自动提供的令牌，无需另配个人令牌。日常推送 master 不自动发布。修复工作流后请从 Run workflow 创建一次新运行；旧运行的 Re-run jobs 仍会使用旧版工作流。
 
-本地浏览器发布验证需先运行 `npm ci` 和 `npx playwright install chromium`；测试使用 Playwright 自带的 Chromium。CI 会固定当前工作流的构建、验证工具，再切换发行标签代码；旧标签的旧验证脚本不会绕过新版检查。
+本地浏览器发布验证需先运行 `npm ci` 和 `npx playwright install chromium`；测试使用 Playwright 自带的 Chromium。可单独运行 `node --test tests/release-cleanup.test.cjs` 验证热更新后的测试进程清理，Windows 需要 `pwsh`。两条工作流也把清理测试单独列为一步。CI 会固定当前工作流的构建、验证工具，再切换发行标签代码；旧标签的旧验证脚本不会绕过新版检查。
 
 本地可用 `./build.ps1 -Version 0.1.1 -OutputDirectory ./dist/release`（默认当前系统，可用 `-TargetOS windows` 或 `-TargetOS linux` 指定）构建，再用 `./scripts/test-release.ps1 -ArchivePath ./dist/fishcome-0.1.1-windows.zip` 或 `./scripts/test-release.ps1 -ArchivePath ./dist/fishcome-0.1.1-linux-amd64.zip` 在对应系统检查解压后的发行包（Windows 可用 PowerShell，Linux 使用 `pwsh`）。每次打包从独立的新目录收集文件，已有输出目录中的旧文件不会混进 ZIP。
 

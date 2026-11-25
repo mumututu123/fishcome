@@ -272,15 +272,15 @@ async function main({ buildVersion, startLauncher }) {
   }
 
   if (process.platform === 'win32') await verifyInstallRollback(portB, portA, v2.exe);
-
-  console.log('热更新全流程实测通过：同事局域网升级、浏览器自动刷新保留存档、join.json 保留、原地替换、GitHub 链接重定向升级测试版均验证成功。');
 }
 
 if (require.main === module) {
-  withReleaseFixtures(main).catch(err => {
-    console.error(err);
-    process.exitCode = 1;
-  });
+  withReleaseFixtures(main)
+    .then(() => console.log('热更新全流程实测通过：同事局域网升级、浏览器自动刷新保留存档、join.json 保留、原地替换、GitHub 链接重定向升级测试版均验证成功。'))
+    .catch(err => {
+      console.error(err);
+      process.exitCode = 1;
+    });
 }
 
 module.exports = { verifyBrowserPeerUpdate };
