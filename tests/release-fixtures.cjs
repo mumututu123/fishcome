@@ -117,26 +117,46 @@ async function withReleaseFixtures(test) {
     fs.mkdirSync(archivesDir);
     await test({ root, archivesDir, buildVersion, startLauncher });
   } finally {
-    for (const child of children) child.kill();
-    const deadline = Date.now() + 10000;
-    let pids = runningLaunchers(root);
-    while (pids.length && Date.now() < deadline) {
-      for (const pid of pids) {
-        try { process.kill(pid); } catch (error) { if (error.code !== 'ESRCH') throw error; }
-      }
-      await pause(200);
-      pids = runningLaunchers(root);
-    }
-    assert.deepEqual(pids, [], `测试启动器退出超时，目录 ${root}`);
+    await Promise.all(children.map(async child => {
+      if (!child.pid || child.exitCode !== null || child.signalCode !== null) return;
+      const exited = once(child, 'exit', { signal: AbortSignal.timeout(10000) });
+      child.kill();
+      await exited;
+    }));
     assert.equal(fs.realpathSync(root), root);
     assert.equal(path.dirname(root), parent);
     assert.match(path.basename(root), /^fishcome-e2e-[a-z0-9]+$/i);
-    if (windows) {
-      powershell(['-Command', "$ErrorActionPreference = 'Stop'; Remove-Item -LiteralPath $env:TIDE_FIXTURE_ROOT -Recurse"], {
-        env: { ...process.env, TIDE_FIXTURE_ROOT: root }
-      });
-    } else {
-      fs.rmSync(root, { recursive: true });
+    const deadline = Date.now() + 10000;
+    for (;;) {
+      const pids = runningLaunchers(root);
+      for (const pid of pids) {
+        try { process.kill(pid); } catch (error) { if (error.code !== 'ESRCH') throw error; }
+      }
+      if (!pids.length) {
+        if (!windows) {
+          fs.rmSync(root, { recursive: true });
+          break;
+        }
+        try {
+          powershell(['-Command', `
+            $ErrorActionPreference = 'Stop'
+            try {
+              Remove-Item -LiteralPath $env:TIDE_FIXTURE_ROOT -Recurse
+            } catch [System.IO.IOException], [System.UnauthorizedAccessException] {
+              if (Test-Path -LiteralPath $env:TIDE_FIXTURE_ROOT) {
+                Write-Error $_ -ErrorAction Continue
+                exit 23
+              }
+            }
+          `], { env: { ...process.env, TIDE_FIXTURE_ROOT: root }, stdio: 'pipe' });
+          break;
+        } catch (error) {
+          if (error.status !== 23 || Date.now() >= deadline) throw error;
+        }
+      } else if (Date.now() >= deadline) {
+        throw new Error(`测试启动器退出超时，目录 ${root}`);
+      }
+      await pause(200);
     }
   }
 
