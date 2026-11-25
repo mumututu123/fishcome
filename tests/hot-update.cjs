@@ -128,23 +128,91 @@ async function main() {
     await page.mouse.click(point.x, point.y);
     await page.waitForFunction(() => tide.balance() === 18);
 
-    // 打开连接同事窗口，使用同事邀请码检查并下载更新
+    // 打开连接同事窗口，使用同事邀请码检查并下载更新（自动识别来源，无需切换 Tab）
     await page.locator('#connect').click();
     await page.locator('#currentVersion').waitFor({ state: 'visible' });
     assert.match(await page.locator('#currentVersion').textContent(), /0\.1\.1/);
     await page.locator('#updateSourceInput').fill(metaB.url);
     await page.locator('#checkUpdateBtn').click();
     await page.locator('#updateConfirmCard').waitFor({ state: 'visible', timeout: 20000 });
+    const confirmSource = await page.locator('#updateConfirmSource').textContent();
+    assert(!confirmSource.includes('127.0.0.1'), `确认来源不应暴露明文 IP，实际为：${confirmSource}`);
+    assert.match(confirmSource, /局域网同事.*码尾 …/);
+    assert(confirmSource.includes(metaB.url.slice(-6)), `确认来源应包含邀请码短尾码便于核对，实际为：${confirmSource}`);
     assert.match(await page.locator('#updateConfirmVersions').textContent(), /0\.1\.1.*0\.2\.0/);
     assert.equal(await page.locator('#updatePrereleaseBadge').isVisible(), false);
 
-    // 点击更新并重启，等待页面自动刷新并进入 0.2.0
-    const navPromise = page.waitForNavigation({ timeout: 25000 });
+    // 关闭弹窗后，工具栏应显示「待重启」角标
+    await page.locator('#closeConnection').click();
+    await page.locator('#updateBadgeDot').waitFor({ state: 'visible' });
+    assert.equal(await page.locator('#updateBadgeDot').textContent(), '待重启');
+
+    // 打开第二个标签页并在画板画 1 个未投放字符，验证跨标签页草稿保护不会丢弃已准备的更新包
+    const page2 = await context.newPage();
+    page2.on('pageerror', err => errors.push(err.stack));
+    await page2.goto(`http://127.0.0.1:${portA}/`);
+    await page2.waitForFunction(() => window.tide && tide.balance() === 18);
+    await page2.locator('#makeFish').click();
+    await page2.locator('#glyphInput').fill('草');
+    await page2.locator('#prepareBeads').click();
+    await page2.locator('#beadTray button').first().click();
+    const box2 = await page2.locator('#gridCanvas').boundingBox();
+    await page2.mouse.click(box2.x + 5.5 * box2.width / 15, box2.y + 5.5 * box2.height / 15);
+    assert.equal(await page2.locator('#drawingCount').textContent(), '1');
+
+    // 回到第一个标签页点更新并重启，应被未投放草稿拦截且保留确认卡
+    await page.bringToFront();
+    await page.locator('#connect').click();
+    await page.locator('#updateConfirmCard').waitFor({ state: 'visible' });
     await page.locator('#applyUpdateBtn').click();
+    await page.locator('#updatePendingWarn').waitFor({ state: 'visible', timeout: 10000 });
+    assert.match(await page.locator('#updatePendingWarn').textContent(), /画的鱼或造景尚未投放/);
+    assert.equal(await page.locator('#updateConfirmCard').isVisible(), true, '拦截后必须保留更新确认卡');
+    assert.equal(await page.locator('#forceApplyUpdateBtn').isVisible(), true);
+    assert.equal(await page2.locator('#creatorDialog').isVisible(), true, '拦截后另一标签页的画板草稿必须保持打开');
+
+    // 点击仍要更新并重启，等待页面自动刷新并进入 0.2.0
+    const navPromise = page.waitForNavigation({ timeout: 25000 });
+    await page.locator('#forceApplyUpdateBtn').click();
     await navPromise;
     await page.waitForFunction(() => window.tide && document.getElementById('currentVersion')?.textContent?.includes('0.2.0'), { timeout: 15000 });
     assert.equal(await page.evaluate(() => tide.balance()), 18, '更新重启后余额必须保持 18');
     assert(await page.evaluate(() => Object.values(tide.world.data.fishes).some(f => f.name === '升鱼')), '更新重启后创建的鱼必须保留');
+
+    // 实测慢速下载：展示进度条并在下载中取消下载
+    let slowTimer = null;
+    const slowServer = http.createServer((req, res) => {
+      if (req.url === '/acme/fishcome/releases/download/v0.2.1-beta.1/fishcome-0.2.1-beta.1-windows.zip') {
+        res.writeHead(200, { 'Content-Type': 'application/zip', 'Content-Length': String(200000) });
+        res.write(Buffer.alloc(32768, 0x50));
+        slowTimer = setInterval(() => {
+          if (!res.writableEnded) res.write(Buffer.alloc(8192, 0x41));
+        }, 500);
+        req.on('close', () => { if (slowTimer) { clearInterval(slowTimer); slowTimer = null; } });
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+    await new Promise(resolve => slowServer.listen(0, '127.0.0.1', resolve));
+    const slowPort = slowServer.address().port;
+    try {
+      await page.locator('#connect').click();
+      await page.locator('#updateSourceInput').fill(`http://127.0.0.1:${slowPort}/acme/fishcome/releases/tag/v0.2.1-beta.1`);
+      await page.locator('#checkUpdateBtn').click();
+      await page.locator('#updateProgressWrap').waitFor({ state: 'visible', timeout: 10000 });
+      await page.waitForFunction(() => {
+        const metaText = document.getElementById('updateProgressMeta')?.textContent || '';
+        return metaText.includes('KB') || metaText.includes('%');
+      }, { timeout: 10000 });
+      await page.locator('#cancelDownloadingBtn').click();
+      await page.locator('#updateProgressWrap').waitFor({ state: 'hidden', timeout: 10000 });
+      assert.equal(await page.locator('#checkUpdateBtn').isDisabled(), false, '取消下载后检查按钮应恢复可用');
+    } finally {
+      if (slowTimer) clearInterval(slowTimer);
+      slowServer.close();
+    }
+    await page2.close();
     assert.deepEqual(errors, [], '浏览器更新过程不应出现脚本异常');
   } finally {
     await browser.close();

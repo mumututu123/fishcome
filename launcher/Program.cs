@@ -28,6 +28,7 @@ namespace Tide {
   }
   sealed class UpdateRecord {
     public string Phase = "idle", Id = "", SourceKind = "", SourceLabel = "", SourceInput = "", TargetVersion = "", TargetRulesVersion = "", StagingDir = "", Error = "";
+    public long DownloadedBytes, TotalBytes = -1;
     public bool Prerelease;
     public CancellationTokenSource Cts;
   }
@@ -443,7 +444,8 @@ namespace Tide {
       return new {
         phase = u.Phase, id = u.Id, sourceKind = u.SourceKind, sourceLabel = u.SourceLabel, sourceInput = u.SourceInput,
         currentVersion = BuildInfo.Version, targetVersion = u.TargetVersion, targetRulesVersion = u.TargetRulesVersion,
-        prerelease = u.Prerelease, error = u.Error
+        prerelease = u.Prerelease, error = u.Error,
+        downloadedBytes = u.DownloadedBytes, totalBytes = u.TotalBytes
       };
     }
     static void SafeDeleteDirectory(string path) {
@@ -492,7 +494,7 @@ namespace Tide {
       }
       throw new Exception("请粘贴具体的 GitHub Release 页面链接（/releases/tag/vX.Y.Z）或 Windows 便携包直链");
     }
-    static async Task<byte[]> DownloadBytes(Uri url, bool allowRedirects, bool enforceGithubHost, CancellationToken ct) {
+    static async Task<byte[]> DownloadBytes(Uri url, bool allowRedirects, bool enforceGithubHost, CancellationToken ct, Action<long, long> onProgress = null) {
       Uri current = url;
       using (var timeoutCts = new CancellationTokenSource(120000))
       using (var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token)) {
@@ -528,7 +530,9 @@ namespace Tide {
                 continue;
               }
               if (code != 200) throw new Exception("更新包下载失败（HTTP " + code + "）");
-              if (resp.ContentLength > MaxPackageBytes) throw new Exception("更新包体积超过限制");
+              long contentLength = resp.ContentLength;
+              if (contentLength > MaxPackageBytes) throw new Exception("更新包体积超过限制");
+              if (onProgress != null) onProgress(0, contentLength);
               using (var input = resp.GetResponseStream())
               using (var ms = new MemoryStream()) {
                 var buf = new byte[65536];
@@ -538,6 +542,7 @@ namespace Tide {
                   total += n;
                   if (total > MaxPackageBytes) throw new Exception("更新包体积超过限制");
                   ms.Write(buf, 0, n);
+                  if (onProgress != null) onProgress(total, contentLength);
                 }
                 return ms.ToArray();
               }
@@ -685,7 +690,21 @@ namespace Tide {
           if (statusObj == null || !Convert.ToBoolean(statusObj.ContainsKey("ok") ? statusObj["ok"] : false)) throw new Exception("无法读取同事的版本信息");
           targetVersion = Str(statusObj, "version");
           if (string.IsNullOrEmpty(targetVersion)) throw new Exception("同事版本过旧，不支持热更新");
-          sourceLabel = "局域网同事（" + peerUri.Host + ":" + peerUri.Port + "）";
+          var nicks = new List<string>();
+          var clientList = statusObj.ContainsKey("clients") && !(statusObj["clients"] is string) ? statusObj["clients"] as System.Collections.IEnumerable : null;
+          if (clientList != null) {
+            foreach (var item in clientList) {
+              var dict = item as IDictionary<string, object>;
+              string nick = Str(dict, "nick").Trim();
+              if (!string.IsNullOrEmpty(nick) && !nicks.Contains(nick)) nicks.Add(nick);
+            }
+          }
+          string inviteRef = (input ?? "").Trim();
+          if (!inviteRef.StartsWith("YL1.", StringComparison.OrdinalIgnoreCase)) inviteRef = Invite(peerUri.GetLeftPart(UriPartial.Authority));
+          string codeTail = inviteRef.Length > 6 ? inviteRef.Substring(inviteRef.Length - 6) : inviteRef;
+          if (nicks.Count == 1) sourceLabel = "局域网同事（" + nicks[0] + " · 码尾 …" + codeTail + "）";
+          else if (nicks.Count > 1) sourceLabel = "局域网同事（" + nicks[0] + " 等 " + nicks.Count + " 人 · 码尾 …" + codeTail + "）";
+          else sourceLabel = "局域网同事（码尾 …" + codeTail + "）";
           downloadUri = new Uri(peerUri, "/download.zip");
           allowRedirects = false;
           enforceGithubHost = false;
@@ -701,8 +720,17 @@ namespace Tide {
           UpdateState.SourceLabel = sourceLabel;
           UpdateState.TargetVersion = targetVersion;
           UpdateState.Prerelease = IsPrerelease(targetVersion);
+          UpdateState.DownloadedBytes = 0;
+          UpdateState.TotalBytes = -1;
         }
-        byte[] zipBytes = await DownloadBytes(downloadUri, allowRedirects, enforceGithubHost, cts.Token);
+        byte[] zipBytes = await DownloadBytes(downloadUri, allowRedirects, enforceGithubHost, cts.Token, (done, total) => {
+          lock (UpdateLock) {
+            if (UpdateState.Id == taskId) {
+              UpdateState.DownloadedBytes = done;
+              UpdateState.TotalBytes = total;
+            }
+          }
+        });
         cts.Token.ThrowIfCancellationRequested();
         stagingDir = Path.Combine(Root, ".update-" + taskId);
         ExtractPackageSafely(zipBytes, stagingDir);

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { WORLD_RULES, RULES_VERSION, rulesCompatible } from '../www/rules.js';
-import { parseSemver, compareSemver, isNewerVersion, isPrerelease, classifyPeerCompatibility, parseGithubReleaseInput } from '../www/update.js';
+import { parseSemver, compareSemver, isNewerVersion, isPrerelease, classifyPeerCompatibility, parseGithubReleaseInput, detectUpdateSource, formatUpdateBytes, pickHigherVersionPeers } from '../www/update.js';
 
 test('SemVer 2.0.0 正式版与测试版比较规则正确', () => {
   assert.equal(compareSemver('0.2.0', '0.1.9'), 1);
@@ -57,4 +57,34 @@ test('GitHub Release 链接解析限定官方 HTTPS 域名并校验完整路径�
   assert.throws(() => parseGithubReleaseInput('https://github.com:8443/acme/fishcome/releases/tag/v0.2.0'));
   assert.throws(() => parseGithubReleaseInput('https://github.com/acme/fishcome/releases/download/v0.2.0/fishcome-0.3.0-windows.zip'));
   assert.throws(() => parseGithubReleaseInput('https://github.com/acme/fishcome/releases/latest'));
+});
+
+test('更新来源自动识别、字节进度格式化与更高版本同事筛选准确', () => {
+  const gh = detectUpdateSource('  https://github.com/acme/fishcome/releases/tag/v0.2.0  ');
+  assert.equal(gh.kind, 'github');
+  assert.equal(gh.parsed.version, '0.2.0');
+
+  const peer = detectUpdateSource(' YL1.testcode ');
+  assert.equal(peer.kind, 'peer');
+  assert.equal(peer.input, 'YL1.testcode');
+
+  assert.throws(() => detectUpdateSource('   '));
+  assert.throws(() => detectUpdateSource('https://evil.example/a/b/releases/tag/v0.2.0'));
+
+  assert.equal(formatUpdateBytes(512, 1024), '512 B / 1 KB（50%）');
+  assert.equal(formatUpdateBytes(2 * 1024 * 1024, 4 * 1024 * 1024), '2.0 MB / 4.0 MB（50%）');
+  assert.equal(formatUpdateBytes(1536, -1), '已下载 2 KB');
+  assert.equal(formatUpdateBytes(0, -1), '');
+
+  const picked = pickHigherVersionPeers('0.1.1', [
+    { invite: 'YL1.old', nick: '旧版', version: '0.1.0' },
+    { invite: 'YL1.same', nick: '同版', version: '0.1.1' },
+    { invite: 'YL1.new1', nick: '同事甲', version: '0.2.0-beta.1' },
+    { invite: 'YL1.new2', nick: '同事乙', version: '0.2.0' },
+    { invite: 'YL1.new1', nick: '同事甲', version: '0.2.1' }
+  ]);
+  assert.deepEqual(picked.map(p => [p.invite, p.version, p.prerelease]), [
+    ['YL1.new1', '0.2.1', false],
+    ['YL1.new2', '0.2.0', false]
+  ]);
 });

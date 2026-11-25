@@ -129,3 +129,52 @@ export function parseGithubReleaseInput(input) {
   }
   throw new Error('请粘贴具体的 GitHub Release 页面链接（/releases/tag/vX.Y.Z）或 Windows 便携包直链');
 }
+
+export function detectUpdateSource(input) {
+  if (typeof input !== 'string' || !input.trim()) {
+    throw new Error('请粘贴同事的邀请码或 GitHub Release 链接');
+  }
+  const trimmed = input.trim();
+  if (/^https?:\/\//i.test(trimmed)) {
+    const parsed = parseGithubReleaseInput(trimmed);
+    return { kind: 'github', input: parsed.sourceLabel, parsed };
+  }
+  return { kind: 'peer', input: trimmed };
+}
+
+export function formatUpdateBytes(downloaded, total) {
+  const done = Number.isFinite(downloaded) && downloaded > 0 ? downloaded : 0;
+  const sum = Number.isFinite(total) && total > 0 ? total : -1;
+  const format = bytes => {
+    if (bytes >= 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+    if (bytes >= 1024) return Math.round(bytes / 1024) + ' KB';
+    return bytes + ' B';
+  };
+  if (sum > 0) {
+    const pct = Math.min(100, Math.round((done / sum) * 100));
+    return `${format(done)} / ${format(sum)}（${pct}%）`;
+  }
+  return done > 0 ? `已下载 ${format(done)}` : '';
+}
+
+export function pickHigherVersionPeers(localVersion, peers) {
+  if (!parseSemver(localVersion) || !Array.isArray(peers)) return [];
+  const byInvite = new Map();
+  for (const peer of peers) {
+    if (!peer || typeof peer.invite !== 'string' || !peer.invite.trim()) continue;
+    if (typeof peer.version !== 'string' || !parseSemver(peer.version)) continue;
+    if (!isNewerVersion(peer.version, localVersion)) continue;
+    const key = peer.invite.trim();
+    const prev = byInvite.get(key);
+    if (!prev || compareSemver(peer.version, prev.version) > 0) {
+      byInvite.set(key, {
+        invite: key,
+        nick: typeof peer.nick === 'string' && peer.nick.trim() ? peer.nick.trim() : '在线同事',
+        version: peer.version.trim(),
+        compatible: peer.compatible !== false,
+        prerelease: isPrerelease(peer.version)
+      });
+    }
+  }
+  return [...byInvite.values()].sort((a, b) => compareSemver(b.version, a.version) || a.nick.localeCompare(b.nick, 'zh-CN'));
+}
