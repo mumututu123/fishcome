@@ -8,7 +8,7 @@ function beadTint(color, target, amount) {
 }
 export class Creator {
   constructor(onPlace, getBalance, getDefaultName) {
-    Object.assign(this, { onPlace, getBalance, getDefaultName, autoName: true, cells: new Map(), undo: [], redo: [], kind: 'fish', size: 15, tab: 'grid', tool: 'bead', mode: 'repeat', beads: [], beadIndex: 0, selection: new Set(), selectedCell: { x: 0, y: 0 }, strokes: [], composing: false });
+    Object.assign(this, { onPlace, getBalance, getDefaultName, autoName: true, cells: new Map(), undo: [], redo: [], kind: 'fish', size: 15, tab: 'grid', tool: 'bead', beads: [], heldBead: null, cellBeads: new Map(), nextBeadId: 1, selection: new Set(), selectedCell: { x: 0, y: 0 }, strokes: [], composing: false });
     this.grid = $('gridCanvas'); this.input = $('gridCellInput'); this.sketch = $('sketchCanvas'); this.sketchCtx = this.sketch.getContext('2d');
     this.grid.addEventListener('focus', () => this.focusCell());
     this.input.addEventListener('keydown', e => this.keydown(e));
@@ -20,16 +20,16 @@ export class Creator {
       if ((e.ctrlKey || e.metaKey) && ['z', 'y'].includes(e.key.toLowerCase())) { e.preventDefault(); this.restoreHistory(e.shiftKey || e.key.toLowerCase() === 'y' ? this.redo : this.undo, e.shiftKey || e.key.toLowerCase() === 'y' ? this.undo : this.redo); }
     });
     let preparing = false;
-    $('glyphInput').addEventListener('compositionstart', () => { preparing = true; });
+    $('glyphInput').addEventListener('compositionstart', () => { preparing = true; $('prepareBeads').disabled = true; });
     $('glyphInput').addEventListener('compositionend', () => { preparing = false; this.loadBeads(); });
     $('glyphInput').addEventListener('input', e => { if (!preparing && !e.isComposing) this.loadBeads(); });
     for (const glyph of ['0', 'O', 'o', '口', '.', '。', '<', '>', '=', '#', '|', '/', '木', '石', '水', '鱼']) {
       const b = document.createElement('button'); b.type = 'button'; b.textContent = glyph;
-      b.onclick = () => { $('glyphInput').value = glyph; this.loadBeads(); this.setTool('bead'); }; $('glyphPresets').append(b);
+      b.onclick = () => this.takeNewBead(glyph); $('glyphPresets').append(b);
     }
     for (const glyph of ['0', 'O', 'o', '。', '.', '口']) {
       const b = document.createElement('button'); b.type = 'button'; b.textContent = glyph; b.dataset.eyeGlyph = glyph; b.setAttribute('aria-label', `用 ${glyph} 拼鱼眼`);
-      b.onclick = () => { $('glyphInput').value = glyph; this.mode = 'repeat'; this.loadBeads(); this.setTool('bead'); }; $('eyePresets').append(b);
+      b.onclick = () => this.takeNewBead(glyph); $('eyePresets').append(b);
     }
     for (const color of ['#8be7df', '#79b8ff', '#ff9fc8', '#ffcc66', '#a5dc86', '#e0f4f7', '#a996e8', '#e88372']) {
       const b = document.createElement('button'); b.type = 'button'; b.style.background = color; b.setAttribute('aria-label', `选择颜色 ${color}`);
@@ -37,8 +37,9 @@ export class Creator {
     }
     $('colorInput').addEventListener('input', () => this.colorBead());
     for (const [id, tool] of [['beadPen', 'bead'], ['colorPen', 'color'], ['selectBeads', 'select'], ['eraseBrush', 'erase']]) $(id).onclick = () => this.setTool(tool);
-    for (const [id, mode] of [['beadRepeat', 'repeat'], ['beadSequence', 'sequence']]) $(id).onclick = () => { this.mode = mode; this.beadIndex = Math.min(this.beadIndex, Math.max(0, this.beads.length - 1)); this.render(); };
-    $('restartBeads').onclick = () => { this.beadIndex = 0; this.setTool('bead'); };
+    $('prepareBeads').onclick = () => { if (!preparing) this.prepareBeads(); };
+    $('glyphInput').addEventListener('keydown', e => { if (e.key === 'Enter' && !preparing && !e.isComposing && e.keyCode !== 229) { e.preventDefault(); this.prepareBeads(); } });
+    $('returnBead').onclick = () => { if (!this.heldBead) return; this.saveUndo(); this.returnHeldBead(); this.render(); };
     $('selectAllBeads').onclick = () => { this.selection = new Set(this.cells.keys()); this.setTool('select'); };
     $('clearBeadSelection').onclick = () => { this.selection.clear(); this.render(); };
     $('recolorBeads').onclick = () => {
@@ -48,10 +49,10 @@ export class Creator {
     };
     $('replaceBead').onclick = () => {
       const key = [...this.selection][0], bead = this.currentBead(); if (this.selection.size !== 1 || !this.cells.has(key) || !bead) return;
-      this.saveUndo(); this.cells.set(key, { ...this.cells.get(key), ...bead }); this.advanceBead(); this.render();
+      this.saveUndo(); this.returnCellBead(key); this.cells.set(key, { ...this.cells.get(key), ch: bead.ch, color: bead.color }); this.cellBeads.set(key, { ...bead }); this.heldBead = null; this.render();
     };
     $('gridTab').onclick = () => this.setTab('grid'); $('drawTab').onclick = () => this.setTab('draw');
-    $('clearDrawing').onclick = () => { if (!this.cells.size && !this.strokes.length) return; this.saveUndo(); this.cells.clear(); this.selection.clear(); this.strokes = []; this.redrawSketch(); this.render(); };
+    $('clearDrawing').onclick = () => { if (!this.cells.size && !this.strokes.length) return; this.saveUndo(); for (const key of this.cells.keys()) this.returnCellBead(key); this.cells.clear(); this.selection.clear(); this.strokes = []; this.redrawSketch(); this.render(); };
     $('undoDrawing').onclick = () => this.restoreHistory(this.undo, this.redo);
     $('redoDrawing').onclick = () => this.restoreHistory(this.redo, this.undo);
     $('convertDrawing').onclick = () => this.convert(); $('closeCreator').onclick = () => $('creatorDialog').close();
@@ -70,22 +71,41 @@ export class Creator {
     this.grid.addEventListener('pointerleave', () => { this.hoverCell = null; this.render(); });
     this.loadBeads();
   }
-  loadBeads() {
+  preparedLetters() {
     const letters = Array.from($('glyphInput').value).filter(ch => !/\s/u.test(ch)), invalid = letters.filter(ch => !validGlyph(ch));
     const error = invalid.length ? `不支持「${[...new Set(invalid)].join('')}」，请用中文、中文标点或 ASCII 字符。` : letters.length > 128 ? '每次最多准备 128 个字符。' : '';
-    const previous = this.beads;
-    this.beads = error ? [] : letters.map((ch, i) => ({ ch, color: previous[i]?.ch === ch ? previous[i].color : $('colorInput').value })); this.beadIndex = 0;
-    if (this.beads.length) { this.tool = 'bead'; this.eraser = false; }
-    $('beadInputHint').textContent = error || (letters.length ? `${letters.length} 个备选字符 · 点选后拼放，空白会略过。` : '输入一个或多个字符，再选一个拼放。');
-    $('glyphInput').setAttribute('aria-invalid', String(!!error)); this.render();
+    return { letters, error };
   }
-  currentBead() { return this.beads[this.beadIndex]; }
-  advanceBead() { if (this.mode === 'sequence') this.beadIndex++; }
-  colorBead() { if (this.currentBead()) this.currentBead().color = $('colorInput').value; this.render(); }
-  setTool(tool) { this.tool = tool; this.eraser = tool === 'erase'; this.hoverCell = null; this.render(); }
+  loadBeads() { this.render(); }
+  makeBead(ch, color = $('colorInput').value) { return { id: this.nextBeadId++, ch, color }; }
+  prepareBeads() {
+    const { letters, error } = this.preparedLetters(); if (error || !letters.length) return;
+    this.saveUndo(); this.beads.push(...letters.map(ch => this.makeBead(ch))); $('glyphInput').value = ''; this.tool = 'bead'; this.eraser = false; this.render();
+  }
+  returnToTray(bead) {
+    if (!bead || this.beads.some(item => item.id === bead.id)) return;
+    this.beads.push({ ...bead }); this.beads.sort((a, b) => a.id - b.id);
+  }
+  returnHeldBead() { this.returnToTray(this.heldBead); this.heldBead = null; }
+  returnCellBead(key) {
+    const cell = this.cells.get(key), bead = this.cellBeads.get(key);
+    if (cell && bead) this.returnToTray({ ...bead, ch: cell.ch, color: cell.color });
+    this.cellBeads.delete(key);
+  }
+  takeBead(id) {
+    const index = this.beads.findIndex(bead => bead.id === id); if (index < 0) return;
+    this.saveUndo(); const [bead] = this.beads.splice(index, 1); this.returnHeldBead(); this.heldBead = bead;
+    $('colorInput').value = bead.color; this.tool = 'bead'; this.eraser = false; this.hoverCell = null; this.render();
+  }
+  takeNewBead(ch) {
+    this.saveUndo(); this.returnHeldBead(); this.heldBead = this.makeBead(ch); this.tool = 'bead'; this.eraser = false; this.hoverCell = null; this.render();
+  }
+  currentBead() { return this.heldBead; }
+  colorBead() { if (this.heldBead) this.heldBead.color = $('colorInput').value; this.render(); }
+  setTool(tool) { if (tool !== 'bead' && this.heldBead) { this.saveUndo(); this.returnHeldBead(); } this.tool = tool; this.eraser = tool === 'erase'; this.hoverCell = null; this.render(); }
   open(kind) {
     this.kind = kind; this.size = kind === 'fish' ? 15 : 20; this.selectedCell = { x: 0, y: 0 }; this.input.value = ''; this.composing = false;
-    this.cells.clear(); this.selection.clear(); this.undo = []; this.redo = []; this.strokes = []; this.redrawSketch(); this.tool = 'bead'; this.eraser = false; this.mode = 'repeat'; this.beadIndex = 0; this.dragging = false; this.hoverCell = null;
+    this.cells.clear(); this.cellBeads.clear(); this.beads = []; this.heldBead = null; this.nextBeadId = 1; this.selection.clear(); this.undo = []; this.redo = []; this.strokes = []; this.redrawSketch(); this.tool = 'bead'; this.eraser = false; this.dragging = false; this.hoverCell = null;
     $('fishGenderPicker').hidden = kind !== 'fish'; $('fishNameLabel').hidden = kind !== 'fish'; $('drawingEyesLabel').hidden = kind !== 'fish'; this.autoName = true; $('fishNameInput').value = ''; $('fishGenderMale').checked = true;
     $('creatorEyes').hidden = kind !== 'fish';
     $('creatorTitle').textContent = kind === 'fish' ? '拼一条鱼' : '拼一块造景';
@@ -93,6 +113,7 @@ export class Creator {
     this.setTab('grid'); this.render(); $('creatorDialog').showModal(); this.focusCell();
   }
   setTab(tab) {
+    if (tab === 'draw' && this.heldBead) { this.saveUndo(); this.returnHeldBead(); }
     if (tab === 'draw' && this.tool !== 'erase') this.tool = 'bead';
     this.tab = tab; $('gridEditor').hidden = tab !== 'grid'; this.grid.hidden = tab !== 'grid'; this.sketch.hidden = tab !== 'draw';
     for (const id of ['beadSelection', 'beadPalette', 'colorPen', 'selectBeads']) $(id).hidden = tab !== 'grid';
@@ -109,7 +130,7 @@ export class Creator {
     if (delta) { e.preventDefault(); this.selectedCell.x = Math.max(0, Math.min(this.size - 1, this.selectedCell.x + delta[0])); this.selectedCell.y = Math.max(0, Math.min(this.size - 1, this.selectedCell.y + delta[1])); this.input.value = ''; this.hoverCell = null; this.selection.clear(); this.render(); }
     else if (e.key === 'Backspace' || e.key === 'Delete') {
       e.preventDefault(); const keys = this.selection.size ? [...this.selection] : [`${this.selectedCell.x},${this.selectedCell.y}`];
-      if (keys.some(key => this.cells.has(key))) { this.saveUndo(); for (const key of keys) this.cells.delete(key); this.selection.clear(); this.render(); }
+      if (keys.some(key => this.cells.has(key))) { this.saveUndo(); for (const key of keys) { this.returnCellBead(key); this.cells.delete(key); } this.selection.clear(); this.render(); }
     } else if (e.key === 'Enter' || e.key === ' ') {
       e.preventDefault();
       if (this.tool === 'select') { const key = `${this.selectedCell.x},${this.selectedCell.y}`; this.selection = this.cells.has(key) ? new Set([key]) : new Set(); this.render(); return; }
@@ -118,14 +139,14 @@ export class Creator {
   }
   typeCell() {
     const ch = this.input.value; this.input.value = ''; if (!validGlyph(ch)) return;
-    this.saveUndo(); const { x, y } = this.selectedCell; this.cells.set(`${x},${y}`, { x, y, ch, color: $('colorInput').value }); this.selection.clear();
-    $('glyphInput').value = ch; this.beads = [{ ch, color: $('colorInput').value }]; this.beadIndex = 0; this.tool = 'bead'; this.eraser = false; this.render();
+    this.saveUndo(); const { x, y } = this.selectedCell, key = `${x},${y}`; this.returnHeldBead(); this.returnCellBead(key);
+    const bead = this.makeBead(ch); this.cells.set(key, { x, y, ch, color: bead.color }); this.cellBeads.set(key, bead); this.selection.clear(); this.tool = 'bead'; this.eraser = false; this.render();
   }
-  snapshot() { return { cells: [...this.cells.entries()].map(([k, v]) => [k, { ...v }]), strokes: structuredClone(this.strokes), beads: structuredClone(this.beads), beadIndex: this.beadIndex, text: $('glyphInput').value, mode: this.mode, selection: [...this.selection], selectedCell: { ...this.selectedCell } }; }
+  snapshot() { return { cells: [...this.cells.entries()].map(([k, v]) => [k, { ...v }]), cellBeads: structuredClone([...this.cellBeads]), strokes: structuredClone(this.strokes), beads: structuredClone(this.beads), heldBead: this.heldBead && { ...this.heldBead }, nextBeadId: this.nextBeadId, text: $('glyphInput').value, tool: this.tool, selection: [...this.selection], selectedCell: { ...this.selectedCell } }; }
   saveUndo() { this.undo.push(this.snapshot()); if (this.undo.length > 30) this.undo.shift(); this.redo = []; }
   restoreHistory(from, to) {
-    const old = from.pop(); if (!old) return; to.push(this.snapshot()); this.cells = new Map(old.cells); this.strokes = old.strokes; this.beads = old.beads; this.beadIndex = old.beadIndex; this.mode = old.mode; this.selection = new Set(old.selection); this.selectedCell = old.selectedCell; $('glyphInput').value = old.text;
-    $('glyphInput').setAttribute('aria-invalid', 'false'); $('beadInputHint').textContent = `${this.beads.length} 个备选字符 · 点选后拼放。`; if (this.currentBead()) $('colorInput').value = this.currentBead().color; this.hoverCell = null; this.redrawSketch(); this.render();
+    const old = from.pop(); if (!old) return; to.push(this.snapshot()); this.cells = new Map(old.cells); this.cellBeads = new Map(old.cellBeads); this.strokes = old.strokes; this.beads = old.beads; this.heldBead = old.heldBead; this.nextBeadId = old.nextBeadId; this.tool = old.tool; this.eraser = this.tool === 'erase'; this.selection = new Set(old.selection); this.selectedCell = old.selectedCell; $('glyphInput').value = old.text;
+    if (this.heldBead) $('colorInput').value = this.heldBead.color; this.hoverCell = null; this.redrawSketch(); this.render();
   }
   saveGesture() { if (!this.gestureSaved) { this.saveUndo(); this.gestureSaved = true; } }
   fishName() { return this.autoName || !$('fishNameInput').value.trim() ? this.getDefaultName(this.cells.size) : $('fishNameInput').value.trim(); }
@@ -144,7 +165,7 @@ export class Creator {
     if (this.pointerId !== e.pointerId) return;
     if (canvas === this.grid) {
       if (this.tool === 'select' && !this.eraseNow) this.selectRectangle(p);
-      else if (this.mode !== 'sequence' || this.tool !== 'bead' || this.eraseNow) {
+      else if (this.tool !== 'bead' || this.eraseNow) {
         const steps = Math.max(1, Math.ceil(Math.hypot(p.x - this.previous.x, p.y - this.previous.y) / (400 / this.size / 2)));
         for (let i = 1; i <= steps; i++) this.paint({ x: this.previous.x + (p.x - this.previous.x) * i / steps, y: this.previous.y + (p.y - this.previous.y) * i / steps });
       }
@@ -160,38 +181,39 @@ export class Creator {
     const { x, y } = this.gridPoint(p); if (x < 0 || x >= this.size || y < 0 || y >= this.size) return;
     const key = `${x},${y}`; this.selectedCell = { x, y }; this.hoverCell = null; if (this.visited.has(key)) return; this.visited.add(key);
     const old = this.cells.get(key), bead = this.currentBead();
-    if (this.eraseNow) { if (old) { this.saveGesture(); this.cells.delete(key); this.selection.delete(key); } }
+    if (this.eraseNow) { if (old) { this.saveGesture(); this.returnCellBead(key); this.cells.delete(key); this.selection.delete(key); } }
     else if (this.tool === 'color') { if (old && old.color !== $('colorInput').value) { this.saveGesture(); old.color = $('colorInput').value; } }
     else if (old) { this.selection = new Set([key]); }
-    else if (bead) { this.saveGesture(); this.cells.set(key, { x, y, ...bead }); this.selection.clear(); this.advanceBead(); }
+    else if (bead) { this.saveGesture(); this.cells.set(key, { x, y, ch: bead.ch, color: bead.color }); this.cellBeads.set(key, { ...bead }); this.selection.clear(); this.heldBead = null; }
     this.render();
   }
   renderBeads() {
-    const key = JSON.stringify([this.beads, this.beadIndex, this.kind]);
+    const { letters, error } = this.preparedLetters();
+    $('glyphInput').setAttribute('aria-invalid', String(!!error)); $('prepareBeads').disabled = !!error || !letters.length;
+    $('beadInputHint').textContent = error || (letters.length ? `${letters.length} 颗字符豆待准备，点击“添到盘里”后逐颗夹取。` : '输入字符并添到盘里，再夹取一颗拼放。');
+    const key = JSON.stringify([this.beads, this.kind]);
     if (key !== this.trayKey) {
-      const focused = document.activeElement?.dataset.beadIndex;
       this.trayKey = key; $('beadTray').replaceChildren(...this.beads.map((bead, i) => {
-        const b = document.createElement('button'); b.type = 'button'; b.textContent = bead.ch; b.style.color = bead.color; b.dataset.beadIndex = i; b.classList.toggle('active', i === this.beadIndex); b.classList.toggle('eyeBead', this.kind === 'fish' && EYES.has(bead.ch)); b.setAttribute('aria-pressed', String(i === this.beadIndex)); b.setAttribute('aria-label', `第 ${i + 1} 个字符 ${bead.ch}${this.kind === 'fish' && EYES.has(bead.ch) ? '，可作鱼眼' : ''}`);
-        b.onclick = () => { this.beadIndex = i; $('colorInput').value = bead.color; this.setTool('bead'); }; return b;
+        const b = document.createElement('button'); b.type = 'button'; b.textContent = bead.ch; b.style.color = bead.color; b.dataset.beadIndex = i; b.dataset.beadId = bead.id;
+        b.classList.toggle('eyeBead', this.kind === 'fish' && EYES.has(bead.ch)); b.setAttribute('aria-label', `夹取第 ${i + 1} 颗字符豆 ${bead.ch}${this.kind === 'fish' && EYES.has(bead.ch) ? '，可作鱼眼' : ''}`);
+        b.onclick = () => this.takeBead(bead.id); return b;
       }));
-      if (focused !== undefined) $('beadTray').querySelector(`[data-bead-index="${focused}"]`)?.focus({ preventScroll: true });
     }
     for (const [id, tool] of [['beadPen', 'bead'], ['colorPen', 'color'], ['selectBeads', 'select'], ['eraseBrush', 'erase']]) { $(id).classList.toggle('active', this.tool === tool); $(id).setAttribute('aria-pressed', String(this.tool === tool)); }
-    for (const [id, mode] of [['beadRepeat', 'repeat'], ['beadSequence', 'sequence']]) { $(id).classList.toggle('active', this.mode === mode); $(id).setAttribute('aria-pressed', String(this.mode === mode)); }
-    const bead = this.currentBead(), finished = this.mode === 'sequence' && this.beads.length && !bead;
+    const bead = this.currentBead();
     this.grid.dataset.tool = this.tool;
     $('beadPenPreview').hidden = this.tab !== 'grid';
     $('beadPenPreview').style.setProperty('--bead-color', this.tool === 'color' ? $('colorInput').value : bead?.color || '#83aab9');
-    $('beadPenStatus').textContent = this.tool === 'bead' ? bead ? `笔上字符「${bead.ch}」${this.kind === 'fish' && EYES.has(bead.ch) ? ' · 可作鱼眼' : ''}` : '笔上没有字符，请输入或重新开始' : this.tool === 'color' ? '上色笔 · 只改颜色' : this.tool === 'select' ? '框选 · 选中后批量上色' : '橡皮 · 擦除已拼字符';
-    $('beadProgress').textContent = finished ? '这一串拼完了，可以再拼一遍。' : bead ? this.mode === 'repeat' ? `当前「${bead.ch}」· 可反复拼放` : `下一个「${bead.ch}」· ${this.beadIndex + 1}/${this.beads.length}` : '先输入文字准备字符。';
-    $('restartBeads').hidden = !finished;
+    $('beadPenStatus').textContent = this.tool === 'bead' ? bead ? `笔上字符「${bead.ch}」${this.kind === 'fish' && EYES.has(bead.ch) ? ' · 可作鱼眼' : ''}` : '笔上没有豆子，请从字符盘夹取一颗' : this.tool === 'color' ? '上色笔 · 只改颜色' : this.tool === 'select' ? '框选 · 选中后批量上色' : '橡皮 · 擦除已拼字符';
+    $('beadProgress').textContent = `盘里剩 ${this.beads.length} 颗${bead ? ` · 已夹取「${bead.ch}」` : ''}`;
+    $('returnBead').disabled = !bead;
     for (const key of this.selection) if (!this.cells.has(key)) this.selection.delete(key);
     $('beadSelectionCount').textContent = this.selection.size ? `已选 ${this.selection.size} 个字` : '未选中文字';
     $('selectAllBeads').disabled = !this.cells.size; $('clearBeadSelection').disabled = $('recolorBeads').disabled = !this.selection.size; $('replaceBead').disabled = this.selection.size !== 1 || !bead;
     $('undoDrawing').disabled = !this.undo.length; $('redoDrawing').disabled = !this.redo.length;
     const eyes = [...this.cells.values()].filter(cell => EYES.has(cell.ch)).length;
     $('creatorEyeHint').textContent = eyes ? `已拼 ${eyes} 个鱼眼，会主动寻找鱼食和海草。` : this.cells.size ? '还没有鱼眼：这条鱼会是盲鱼，不主动寻找食物，但碰到食物仍能吃。可以照常投放。' : '鱼眼让鱼主动寻找鱼食和海草。没有鱼眼也可以造鱼。';
-    $('boardHint').textContent = this.tab === 'draw' ? '自由画下轮廓，转换后回到拼豆画板调整。' : this.tool === 'select' ? '拖动框选已有文字；按住 Shift 可追加选区，再点“选区上色”。' : this.tool === 'color' ? '拖动给已有字上色，字形不变，空格不填字。' : this.tool === 'erase' ? '点击或拖动擦除；一次拖动可一步撤销。' : this.mode === 'sequence' ? '每点一个空格拼一个字符，顺序拼不随拖动连放。已有字先选中，再点“替换此字”。' : '点空格拼字，拖动重复铺字。已有字先选中，再点“替换此字”。右键擦除。';
+    $('boardHint').textContent = this.tab === 'draw' ? '自由画下轮廓，转换后回到拼豆画板调整。' : this.tool === 'select' ? '拖动框选已有文字；按住 Shift 可追加选区，再点“选区上色”。' : this.tool === 'color' ? '拖动给已有字上色，字形不变，空格不填字。' : this.tool === 'erase' ? '点击或拖动擦除，字符豆会回到盘里。' : '从盘里夹取一颗，再点一个空格放下。已有字先选中，再点“替换此字”；拖动不会连放。';
   }
   redrawSketch() { const ctx = this.sketchCtx; ctx.clearRect(0, 0, 400, 400); for (const s of this.strokes) { ctx.globalCompositeOperation = s.erase ? 'destination-out' : 'source-over'; ctx.strokeStyle = s.color; ctx.fillStyle = s.color; ctx.lineWidth = s.width; ctx.lineCap = 'round'; ctx.lineJoin = 'round'; ctx.beginPath(); ctx.moveTo(s.points[0].x, s.points[0].y); for (const p of s.points.slice(1)) ctx.lineTo(p.x, p.y); if (s.points.length === 1) { ctx.arc(s.points[0].x, s.points[0].y, s.width / 2, 0, Math.PI * 2); ctx.fill(); } else ctx.stroke(); } ctx.globalCompositeOperation = 'source-over'; }
   convert() {
@@ -199,7 +221,8 @@ export class Creator {
     for (let y = 0; y < 400; y++) for (let x = 0; x < 400; x++) if (image.data[(y * 400 + x) * 4 + 3] > 32) { minX = Math.min(minX, x); maxX = Math.max(maxX, x); minY = Math.min(minY, y); maxY = Math.max(maxY, y); }
     if (maxX < 0) return; const max = Math.max(2, Math.min(this.kind === 'fish' ? 15 : 400, this.getBalance())), aspect = (maxX - minX + 1) / (maxY - minY + 1); let w = Math.min(this.size, Math.max(1, Math.round(Math.sqrt(max * aspect)))), h = Math.min(this.size, Math.max(1, Math.floor(max / w))); const cells = [], palette = '.-+*#O口';
     for (let gy = 0; gy < h; gy++) for (let gx = 0; gx < w; gx++) { let n = 0, r = 0, g = 0, b = 0, total = 0; for (let y = Math.floor(minY + gy * (maxY - minY + 1) / h); y < minY + (gy + 1) * (maxY - minY + 1) / h; y++) for (let x = Math.floor(minX + gx * (maxX - minX + 1) / w); x < minX + (gx + 1) * (maxX - minX + 1) / w; x++) { const i = (y * 400 + x) * 4; total++; if (image.data[i + 3] > 32) { n++; r += image.data[i]; g += image.data[i + 1]; b += image.data[i + 2]; } } if (n) cells.push({ x: gx + Math.floor((this.size - w) / 2), y: gy + Math.floor((this.size - h) / 2), ch: palette[Math.min(palette.length - 1, Math.floor(n / total * (palette.length - 1)))], color: '#' + [r, g, b].map(v => Math.round(v / n).toString(16).padStart(2, '0')).join('') }); }
-    this.selection.clear(); this.cells = new Map(cells.map(c => [`${c.x},${c.y}`, c])); this.setTab('grid'); this.render();
+    for (const key of this.cells.keys()) this.returnCellBead(key); this.returnHeldBead();
+    this.selection.clear(); this.cells = new Map(cells.map(c => [`${c.x},${c.y}`, c])); this.cellBeads = new Map(cells.map(c => [`${c.x},${c.y}`, this.makeBead(c.ch, c.color)])); this.setTab('grid'); this.render();
   }
   drawBead(ctx, cell, s) {
     const x = (cell.x + .5) * s, y = (cell.y + .5) * s, radius = s * .43;

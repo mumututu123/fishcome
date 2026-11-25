@@ -30,8 +30,8 @@ async function age(context, hours, legacy = false) {
 async function create(page, kind, x, y) {
   await page.locator(kind === 'fish' ? '#makeFish' : '#makeScene').click();
   const grid = await page.locator('#gridCanvas').boundingBox(), size = kind === 'fish' ? 15 : 20;
-  await page.locator('#glyphInput').fill('口');
-  for (const column of [7.5, 8.5]) await page.mouse.click(grid.x + column * grid.width / size, grid.y + 7.5 * grid.height / size);
+  await page.locator('#glyphInput').fill('口口'); await page.locator('#prepareBeads').click();
+  for (const column of [7.5, 8.5]) { await page.locator('[data-bead-id]').first().click(); await page.mouse.click(grid.x + column * grid.width / size, grid.y + 7.5 * grid.height / size); }
   await page.locator('#placeDrawing').click(); await page.mouse.click(x, y);
   await page.waitForFunction(kind => tide.world.counts[kind] > 0, kind);
 }

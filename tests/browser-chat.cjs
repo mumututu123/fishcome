@@ -38,7 +38,8 @@ async function main() {
   const aContext = await browser.newContext({ viewport: { width: 1440, height: 900 } }), bContext = await browser.newContext({ viewport: { width: 1440, height: 900 } });
   let a = await open(aContext, '聊天甲'), b;
   await a.locator('#makeFish').click(); const grid = await a.locator('#gridCanvas').boundingBox();
-  for (const column of [7.5, 8.5]) await a.mouse.click(grid.x + column * grid.width / 15, grid.y + 7.5 * grid.height / 15);
+  await a.locator('#glyphInput').fill('oo'); await a.locator('#prepareBeads').click();
+  for (const column of [7.5, 8.5]) { await a.locator('[data-bead-id]').first().click(); await a.mouse.click(grid.x + column * grid.width / 15, grid.y + 7.5 * grid.height / 15); }
   await a.locator('#placeDrawing').click(); await a.mouse.click(600, 370); await a.waitForFunction(() => Object.values(tide.world.data.fishes).some(f => f.actor === tide.identity.actor));
   const fishId = await a.evaluate(() => Object.values(tide.world.data.fishes).find(f => f.actor === tide.identity.actor).id);
   const first = '海底🐟 é 👨‍👩‍👧‍👦 <script>window.chatExecuted=1</script>';

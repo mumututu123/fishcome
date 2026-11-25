@@ -19,7 +19,8 @@ async function main() {
   await page.goto(origin); await page.locator('#nickInput').fill('鱼谱测试'); await page.locator('#welcomeForm .primary').click(); await page.waitForFunction(() => window.tide);
   await page.locator('#myFish').click(); await page.locator('#pedigreeTab').click(); assert((await page.locator('#pedigreeTree').textContent()).includes('还没有')); await page.locator('#closeMyFish').click();
   await page.locator('#makeFish').click(); const grid = await page.locator('#gridCanvas').boundingBox();
-  for (const x of [7.5, 8.5, 9.5]) await page.mouse.click(grid.x + x * grid.width / 15, grid.y + 7.5 * grid.height / 15);
+  await page.locator('#glyphInput').fill('ooo'); await page.locator('#prepareBeads').click();
+  for (const x of [7.5, 8.5, 9.5]) { await page.locator('[data-bead-id]').first().click(); await page.mouse.click(grid.x + x * grid.width / 15, grid.y + 7.5 * grid.height / 15); }
   assert.equal(await page.locator('#fishNameInput').inputValue(), '鱼谱测'); await page.locator('#fishNameInput').fill('阿鱼鱼'); assert(await page.locator('#placeDrawing').isEnabled());
   await page.mouse.click(grid.x + 9.5 * grid.width / 15, grid.y + 7.5 * grid.height / 15, { button: 'right' });
   assert(await page.locator('#placeDrawing').isDisabled()); assert((await page.locator('#fishNameHint').textContent()).includes('最多 2 字'));
@@ -38,7 +39,7 @@ async function main() {
   await page.locator('#fishPedigree').click(); assert.equal(await page.locator('#pedigreeRoot').inputValue(), ownFish); assert.equal(await page.locator('#myFishTitle').textContent(), '鱼谱'); assert.equal(await page.locator('[data-lineage-fish]').count(), 1); await page.locator('#closeMyFish').click();
   await page.locator('#followFish').click(); assert.equal(await page.evaluate(() => tide.view.followingFish), ownFish); await page.locator('#myFish').click(); await page.locator('#myFishList .fishCard').click(); assert.equal(await page.evaluate(() => tide.view.followingFish), null);
   assert.equal(await page.evaluate(() => Object.keys(tide.world.data.ops).length), opCount); await page.locator('#closeInspector').click();
-  await page.locator('#makeFish').click(); const second = await page.locator('#gridCanvas').boundingBox(); for (let x = 2.5; x < 12; x++) await page.mouse.click(second.x + x * second.width / 15, second.y + 7.5 * second.height / 15);
+  await page.locator('#makeFish').click(); const second = await page.locator('#gridCanvas').boundingBox(); await page.locator('#glyphInput').fill('o'.repeat(10)); await page.locator('#prepareBeads').click(); for (let x = 2.5; x < 12; x++) { await page.locator('[data-bead-id]').first().click(); await page.mouse.click(second.x + x * second.width / 15, second.y + 7.5 * second.height / 15); }
   assert.equal(await page.locator('#fishNameInput').inputValue(), '鱼谱测试的第2条鱼'); await page.locator('#closeCreator').click(); await page.locator('#makeScene').click(); assert(await page.locator('#fishNameLabel').isHidden()); await page.locator('#closeCreator').click(); await page.close();
   const setup = await context.newPage(); await setup.goto(origin + '/welcome.html');
   const fixture = await setup.evaluate(async () => {

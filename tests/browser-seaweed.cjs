@@ -45,7 +45,8 @@ async function main() {
   await b.locator('#connect').click(); await b.locator('#peerUrl').fill(`http://127.0.0.1:${ports[0]}`); await b.locator('#connectionForm .primary').click();
   await b.waitForFunction(ids => ids.every(id => tide.world.data.chars[id]?.kind === 'seaweed'), ids, { timeout: 20000 });
   await a.locator('#makeFish').click(); const grid = await a.locator('#gridCanvas').boundingBox();
-  for (const x of [7.5, 8.5]) await a.mouse.click(grid.x + x * grid.width / 15, grid.y + 7.5 * grid.height / 15);
+  await a.locator('#glyphInput').fill('oo'); await a.locator('#prepareBeads').click();
+  for (const x of [7.5, 8.5]) { await a.locator('[data-bead-id]').first().click(); await a.mouse.click(grid.x + x * grid.width / 15, grid.y + 7.5 * grid.height / 15); }
   await a.locator('#placeDrawing').click();
   const point = await a.evaluate(() => { const view = tide.view, size = 18 * view.scale; return { x: innerWidth / 2 + (596.5 - view.camera.x) * size, y: innerHeight / 2 + (Math.min(tide.world.data.terrain.depths[596], tide.world.data.terrain.depths[600]) - 1.5 - view.camera.y) * size }; });
   await a.mouse.click(point.x, point.y);

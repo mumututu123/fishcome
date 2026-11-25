@@ -28,7 +28,8 @@ async function main() {
     await page.locator('#drawTab').click(); await page.locator('#gridTab').click();
     assert(await page.locator(`input[name="fishGender"][value="${gender}"]`).isChecked());
     const grid = await page.locator('#gridCanvas').boundingBox();
-    for (const x of [7.5, 8.5]) await page.mouse.click(grid.x + x * grid.width / 15, grid.y + 7.5 * grid.height / 15);
+    await page.locator('#glyphInput').fill('oo'); await page.locator('#prepareBeads').click();
+    for (const x of [7.5, 8.5]) { await page.locator('[data-bead-id]').first().click(); await page.mouse.click(grid.x + x * grid.width / 15, grid.y + 7.5 * grid.height / 15); }
     await page.locator('#placeDrawing').click(); await page.mouse.click(600 + index * 150, 370);
     await page.waitForFunction(count => tide.world.counts.fish === count, index + 1);
   }
