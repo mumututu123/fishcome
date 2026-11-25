@@ -1,9 +1,11 @@
 import { MAX_FLOOR, WORLD_WIDTH, wrapX } from './geography.js';
+import { drawBeadGlyph } from './bead-visual.js';
 
 const FONT = "'Microsoft YaHei',Consolas,monospace";
 const TAU = 2 * Math.PI;
 const CELL = 64, PAD = 16, SPRITE = CELL + PAD * 2;
 const GLYPH_LIMIT = 512, GLYPHS_PER_FRAME = 24;
+const BEAD_KINDS = new Set(['fish', 'scene', 'beadPreview']);
 const FOCAL = 59, PITCH = .26;
 const BANDS = [0, 2, 5, 9, 15, 24, 36, 53, 75, 101, 132];
 const STEP = 2, COLUMNS = WORLD_WIDTH / STEP;
@@ -282,8 +284,9 @@ function drawTerrain(ctx, terrain, camera, size, halfW, halfH, shadow) {
   }
 }
 
-function glyphSprite(ch, color, glow, material) {
+function glyphSprite(ch, color, glow, material, kind) {
   const sprite = canvas(SPRITE, SPRITE), ctx = sprite.getContext('2d');
+  if (BEAD_KINDS.has(kind)) { drawBeadGlyph(ctx, ch, color, PAD, PAD, CELL, glow); return sprite; }
   const center = PAD + CELL / 2;
   const hex = Number.parseInt(color.slice(1), 16);
   const red = hex >> 16 & 255, green = hex >> 8 & 255, blue = hex & 255;
@@ -323,6 +326,12 @@ export class Scene3D {
     this.frameNumber = 0;
     this.trimmedFrame = -1;
     this.glyphBudget = GLYPHS_PER_FRAME;
+    // Budget misses still use beads; a shared body avoids per-frame gradients.
+    this.beadFallbacks = [false, true].map(glow => {
+      const sprite = canvas(SPRITE, SPRITE);
+      drawBeadGlyph(sprite.getContext('2d'), '', '#638393', PAD, PAD, CELL, glow);
+      return sprite;
+    });
     this.backdrop = canvas(1, 1);
     this.backdropContext = this.backdrop.getContext('2d', { alpha: false });
     this.caustics = waterCaustics();
@@ -481,7 +490,7 @@ export class Scene3D {
       }
       if (this.glyphs.size < GLYPH_LIMIT) {
         this.glyphBudget--;
-        entry = { sprite: glyphSprite(ch, color, glow, MATERIALS[kind] ?? MATERIALS.scene), lastSeen: this.frameNumber };
+        entry = { sprite: glyphSprite(ch, color, glow, MATERIALS[kind] ?? MATERIALS.scene, kind), lastSeen: this.frameNumber };
         this.glyphs.set(key, entry);
       }
     }
@@ -491,11 +500,15 @@ export class Scene3D {
       const scale = size / CELL;
       ctx.drawImage(entry.sprite, x - PAD * scale, y - PAD * scale, SPRITE * scale, SPRITE * scale);
     } else {
-      ctx.font = `${Math.max(3, size * .85)}px ${FONT}`;
+      if (BEAD_KINDS.has(kind)) {
+        const scale = size / CELL;
+        ctx.drawImage(this.beadFallbacks[glow ? 1 : 0], x - PAD * scale, y - PAD * scale, SPRITE * scale, SPRITE * scale);
+      }
+      ctx.font = `${Math.max(3, size * (BEAD_KINDS.has(kind) ? .52 : .85))}px ${FONT}`;
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
       ctx.fillStyle = color;
-      ctx.fillText(ch, x + size / 2, y + size / 2, size);
+      ctx.fillText(ch, x + size / 2, y + size / 2, BEAD_KINDS.has(kind) ? size * .56 : size);
     }
     ctx.globalAlpha = 1;
   }

@@ -59,7 +59,7 @@ export class Renderer {
     }
     if (occasion && occasion.kind !== 'whale') this.drawEvent(world, occasion, bubbleNow, size, visible);
     const monument = world.monument; monument.rows.forEach((row, dy) => Array.from(row).forEach((ch, dx) => { if (ch === ' ') return; const p = { x: monument.x + dx, y: monument.y + dy }; if (visible(p)) { const pixel = this.screen(p.x, p.y); paint.glyph(ctx, ch, '#b8b797', pixel.x, pixel.y, size, 1, false, 'monument'); } }));
-    if (this.preview) { const p = this.preview; for (const c of p.cells || [{ x: 0, y: 0, ch: p.ch, color: p.color }]) { const pixel = this.screen(p.x + c.x, p.y + c.y); ctx.fillStyle = '#9fecd918'; ctx.fillRect(pixel.x, pixel.y, size, size); paint.glyph(ctx, c.ch, p.valid === false ? '#efaa99' : c.color, pixel.x, pixel.y, size, .65, false, 'preview'); } }
+    if (this.preview) { const p = this.preview; for (const c of p.cells || [{ x: 0, y: 0, ch: p.ch, color: p.color }]) { const pixel = this.screen(p.x + c.x, p.y + c.y); ctx.fillStyle = '#9fecd918'; ctx.fillRect(pixel.x, pixel.y, size, size); paint.glyph(ctx, c.ch, p.valid === false ? '#efaa99' : c.color, pixel.x, pixel.y, size, .65, false, ['fish', 'scene'].includes(p.kind) ? 'beadPreview' : 'preview'); } }
   }
   drawLegend(world, legend, now, size, visible, beam) {
     const paint = this.scene3d || this;

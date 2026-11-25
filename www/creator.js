@@ -1,11 +1,7 @@
 import { validateDrawing, EYES, validGlyph } from './engine.js';
 import { fishNameError } from './fish-profile.js';
+import { drawBeadGlyph } from './bead-visual.js';
 const $ = id => document.getElementById(id);
-function beadTint(color, target, amount) {
-  const hex = /^#[0-9a-f]{6}$/i.test(color) ? color.slice(1) : '83aab9';
-  const rgb = [0, 2, 4].map((offset, i) => Math.round(parseInt(hex.slice(offset, offset + 2), 16) * (1 - amount) + target[i] * amount));
-  return `rgb(${rgb.join(',')})`;
-}
 export class Creator {
   constructor(onPlace, getBalance, getDefaultName) {
     Object.assign(this, { onPlace, getBalance, getDefaultName, autoName: true, cells: new Map(), undo: [], redo: [], kind: 'fish', size: 15, tab: 'grid', tool: 'bead', beads: [], heldBead: null, cellBeads: new Map(), nextBeadId: 1, selection: new Set(), selectedCell: { x: 0, y: 0 }, strokes: [], composing: false });
@@ -224,29 +220,7 @@ export class Creator {
     for (const key of this.cells.keys()) this.returnCellBead(key); this.returnHeldBead();
     this.selection.clear(); this.cells = new Map(cells.map(c => [`${c.x},${c.y}`, c])); this.cellBeads = new Map(cells.map(c => [`${c.x},${c.y}`, this.makeBead(c.ch, c.color)])); this.setTab('grid'); this.render();
   }
-  drawBead(ctx, cell, s) {
-    const x = (cell.x + .5) * s, y = (cell.y + .5) * s, radius = s * .43;
-    ctx.save();
-    // A shallow sidewall and a soft contact shadow keep the bead on the board.
-    ctx.shadowColor = 'rgba(0,8,16,.5)'; ctx.shadowBlur = s * .14; ctx.shadowOffsetX = s * .035; ctx.shadowOffsetY = s * .065;
-    const side = ctx.createLinearGradient(x, y - radius, x, y + radius);
-    side.addColorStop(0, beadTint(cell.color, [14, 34, 46], .72)); side.addColorStop(1, beadTint(cell.color, [3, 15, 24], .82));
-    ctx.fillStyle = side; ctx.beginPath(); ctx.arc(x, y + s * .045, radius, 0, Math.PI * 2); ctx.fill();
-    ctx.shadowColor = 'transparent';
-    const face = ctx.createLinearGradient(x - radius, y - radius, x + radius, y + radius);
-    face.addColorStop(0, beadTint(cell.color, [215, 240, 245], .27));
-    face.addColorStop(.4, beadTint(cell.color, [18, 47, 62], .50));
-    face.addColorStop(1, beadTint(cell.color, [6, 25, 38], .75));
-    ctx.fillStyle = face; ctx.beginPath(); ctx.arc(x, y, radius, 0, Math.PI * 2); ctx.fill();
-    ctx.strokeStyle = 'rgba(235,255,255,.28)'; ctx.lineWidth = Math.max(.65, s * .025);
-    ctx.beginPath(); ctx.arc(x, y, radius - s * .018, Math.PI * 1.08, Math.PI * 1.78); ctx.stroke();
-    // A quiet inset face gives the glyph its own space, away from the rim.
-    const inset = ctx.createRadialGradient(x, y, s * .12, x, y, s * .35);
-    inset.addColorStop(0, '#0d2c3d'); inset.addColorStop(.72, '#103244'); inset.addColorStop(1, 'rgba(16,50,68,0)');
-    ctx.fillStyle = inset; ctx.beginPath(); ctx.arc(x, y, s * .35, 0, Math.PI * 2); ctx.fill();
-    ctx.fillStyle = cell.color; ctx.fillText(cell.ch, x, y, s * .56);
-    ctx.restore();
-  }
+  drawBead(ctx, cell, s) { drawBeadGlyph(ctx, cell.ch, cell.color, cell.x * s, cell.y * s, s); }
   render() { this.renderBeads(); const ctx = this.grid.getContext('2d'), s = 400 / this.size; ctx.clearRect(0, 0, 400, 400); ctx.strokeStyle = '#32546c'; ctx.lineWidth = .6; for (let i = 0; i <= this.size; i++) { ctx.beginPath(); ctx.moveTo(i * s, 0); ctx.lineTo(i * s, 400); ctx.moveTo(0, i * s); ctx.lineTo(400, i * s); ctx.stroke(); }
     ctx.fillStyle = '#42657a'; for (let y = 0; y < this.size; y++) for (let x = 0; x < this.size; x++) { ctx.beginPath(); ctx.arc((x + .5) * s, (y + .5) * s, s * .055, 0, Math.PI * 2); ctx.fill(); }
     ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.font = `${s * .52}px 'Microsoft YaHei',Consolas,monospace`; for (const c of this.cells.values()) this.drawBead(ctx, c, s);
