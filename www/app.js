@@ -21,6 +21,8 @@ import { memoryForCell, ancestralGlyph, ancestralText } from './easter-eggs.js';
 import { activeEvent, eventSchedule, eventTitle, eventPosition, eventLetter, radioTranscript, eventNarration } from './random-events.js';
 import { activeLegend, legendSchedule, legendTitle, legendPosition, validLegends, validGhostCell, capturedFish } from './legends.js';
 import { ARCHIVE, ARCHIVE_FIELDS, ArchiveStore, archivePlan, archiveChunks, decodeArchive, assembleFragments, validArchiveState, emptyArchiveState, mergeArchiveState, compactKnown } from './archive.js';
+import { WORLD_RULES, rulesCompatible } from './rules.js';
+import { classifyPeerCompatibility, detectUpdateSource, formatUpdateBytes, pickHigherVersionPeers } from './update.js';
 const $ = id => document.getElementById(id);
 const renderer = new Renderer($('sea'));
 let world = new World(undefined, undefined, { populate: false }), identity, network, meta, creator, mode = null, selected = null, dragging, histories = {}, known = [], members = new Map(), pending = new Map(), inbox = new Map(), lastPicture = null, priorCheckpoint = null;
@@ -34,6 +36,12 @@ const fishDate = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', m
 let lastSnapshot = 0, snapshotBusy = false, lastHello = new Set(), lastMeter = Date.now(), lastSave = 0, lastPictureTime = 0, lastChat = 0, selfBeat = 0, lastLeader = '', status = '', started = false, lastRepair = 0;
 let lastFull = 0, sentOps = new Set(), sentChars = new Map(), sentChats = new Set(), sentChatSources = new Set(), sentTravel = new Map();
 let geometryRepair = false, fishRepairWaiting = 0;
+let updateFrozen = false, updateRestarting = false, activeRestartTaskId = '', activeSavePromise = null, preparedUpdate = null, peerUpdateCandidate = '', activeUpdateTaskId = '', updatePollTimer = null, peerProbeBusy = false, updateStateSeq = 0;
+let updateForcePendingAck = false, updateForceDraftAck = false, updateForceReason = '';
+const availablePeerUpdates = new Map();
+const tabInstanceId = crypto.randomUUID();
+const updateChannel = typeof BroadcastChannel !== 'undefined' ? new BroadcastChannel('fishcome-update') : null;
+const updatePeerWaiters = new Map();
 function newArchiveStore() { return new ArchiveStore({ load: id => get('archive:' + id) }); }
 let archiveStore = newArchiveStore(), archiveBusy = false, archiveCheckAt = 0, olderChats = {};
 const archiveWaiters = new Map(), archiveRequests = new Map(), historyArchiveStores = new Map();
@@ -106,7 +114,7 @@ async function ensureArchives(data, peer, bundle, target = archiveStore) {
   for (const chunk of chunks) await target.ingest(chunk, chooseClaim);
 }
 async function archiveWorld(now = Date.now()) {
-  if (archiveBusy || !amLeader() || now - archiveCheckAt < 60000) return; archiveCheckAt = now;
+  if (updateFrozen || archiveBusy || !amLeader() || now - archiveCheckAt < 60000) return; archiveCheckAt = now;
   const pressure = new TextEncoder().encode(JSON.stringify(world.data)).length >= ARCHIVE.threshold;
   if (now - (world.data.archives?.at || 0) < ARCHIVE.period && !pressure) return;
   archiveBusy = true; const target = world, store = archiveStore;
@@ -248,7 +256,10 @@ async function onMessage(message, peer) {
   if (members.has(message.from) && members.get(message.from).actor !== message.actor) return;
   const body = message.body;
   if (message.kind === 'hello') {
-    if (!body.world?.terrain || body.rules?.genesis !== 1 || body.rules?.life !== 4 || body.rules?.legends !== 1 || body.rules?.feeding !== 1 || body.rules?.ecology !== 1 || body.rules?.archives !== 1) { status = '对方使用旧版世界规则，请双方刷新游戏页面后再连接'; toast(status); network.close(peer); update(); return; }
+    if (!body.world?.terrain || !rulesCompatible(body.rules)) {
+      if (!peer.silent) { status = '对方使用不兼容的世界规则，请双方更新后再连接'; toast(status); }
+      network.close(peer); update(); return;
+    }
     if (message.from !== peer.node || body.member?.id !== message.from || body.member.actor !== message.actor) return;
     const own = body.member; members.set(own.id, { ...own, url: peer.url, at: Date.now() }); remember(peer.url);
     rememberAuthor(message.actor, own.nick);
@@ -307,7 +318,7 @@ async function completeReferral(peer, peerActor) {
 async function networkChange(error) {
   if (!started) return; if (error) { status = error; update(); return; }
   const live = network.live();
-  for (const p of live) if (!lastHello.has(p.id)) { lastHello.add(p.id); await network.direct(p, 'hello', { rules: { genesis: 1, life: 4, legends: 1, feeding: 1, ecology: 1, archives: 1 }, member: member(), members: active(), world: world.serialize(), cards: Object.values(histories).slice(0, 3), historyIndex: Object.keys(histories) }); }
+  for (const p of live) if (!lastHello.has(p.id)) { lastHello.add(p.id); await network.direct(p, 'hello', { rules: WORLD_RULES, member: member(), members: active(), world: world.serialize(), cards: Object.values(histories).slice(0, 3), historyIndex: Object.keys(histories) }); }
   const ids = new Set(live.map(p => p.node)); for (const m of active()) if (m.id !== network.node && m.direct && !ids.has(m.id)) { m.direct = false; probeGone(m.id, m.url); } for (const id of ids) if (members.has(id)) members.get(id).direct = true;
   network.presence(active().filter(m => m.id !== network.node).map(m => ({ id: m.id, url: m.url }))).catch(() => {}); update();
 }
@@ -326,7 +337,9 @@ async function broadcastWorld() {
   } catch (e) { status = e.message; } finally { snapshotBusy = false; }
 }
 async function submit(payload) {
+  if (updateFrozen) { toast('正在更新并重启，请稍候'); return; }
   if (started) await resumeAfterInactivity();
+  if (updateFrozen) { toast('正在更新并重启，请稍候'); return; }
   if (!identity) return; const op = { id: payload.kind === 'earn' ? `${identity.actor}:hour:${payload.serial}` : crypto.randomUUID(), actor: identity.actor, nick: displayNick(identity.nick), t: Date.now(), roots: [world.id], cost: 0, ...payload };
   if (op.cost > 0 && op.cost > balance()) { toast('鱼元余额不足'); return; } pending.set(op.id, op); update();
   try { const message = await network.broadcast('op', op); if (rejectedOps.has(op.id)) { pending.delete(op.id); update(); return; } inbox.set(op.id, clone(message)); if (amLeader()) { const result = world.apply({ ...clone(op), proof: message }, await archiveStore.get('ops', op.id)); pending.delete(op.id); if (!result.ok) { rejectOperation(op.id); toast(result.error); } else await save(); await broadcastWorld(); } else { setTimeout(() => { if (pending.has(op.id)) toast('这次投放仍在等待确认，连接恢复后同步'); }, 12000); } } catch (e) { pending.delete(op.id); toast(e.message); } update();
@@ -594,9 +607,21 @@ async function receiveHistory(card, peer, bundle) {
   renderChat();
 }
 function currentCheckpoint() { return { world: world.serialize(), picture: lastPicture || localPicture(), at: Date.now(), lastOnlineAt }; }
-async function save() { if (!identity) return; if (!lastPicture || JSON.stringify(lastPicture.counts) !== JSON.stringify(world.counts()) || lastPicture.roots.length !== world.roots.length || !world.roots.every(root => lastPicture.roots.includes(root)) || lastPicture.participants !== (Object.keys(world.data.participants).length || 1)) lastPicture = localPicture(); await putMany([['identity', identity], ['histories', histories], ['known', known], ['checkpoint', currentCheckpoint()]]); }
+async function saveInternal() {
+  if (!identity) return;
+  if (!lastPicture || JSON.stringify(lastPicture.counts) !== JSON.stringify(world.counts()) || lastPicture.roots.length !== world.roots.length || !world.roots.every(root => lastPicture.roots.includes(root)) || lastPicture.participants !== (Object.keys(world.data.participants).length || 1)) lastPicture = localPicture();
+  const task = putMany([['identity', identity], ['histories', histories], ['known', known], ['checkpoint', currentCheckpoint()]]);
+  activeSavePromise = task;
+  try { await task; } finally { if (activeSavePromise === task) activeSavePromise = null; }
+}
+async function save() { if (updateFrozen) return; return saveInternal(); }
 async function takePicture() { if (!amLeader()) return; lastPicture = localPicture(); await network.broadcast('picture', lastPicture); }
-async function reconnect() { const params = new URLSearchParams(location.search), input = params.get('join') || meta.joinUrl; if (params.has('join')) { params.delete('join'); history.replaceState(null, '', location.pathname + (params.size ? '?' + params.toString() : '') + location.hash); } const urls = [...new Set([input, ...known].filter(Boolean))]; for (const url of urls.slice(0, 12)) { if (network.live().length) break; try { await network.connectInvite(url); remember(url); } catch { } } }
+async function reconnect() {
+  const params = new URLSearchParams(location.search), input = params.get('join') || meta.joinUrl;
+  if (params.has('join')) { params.delete('join'); history.replaceState(null, '', location.pathname + (params.size ? '?' + params.toString() : '') + location.hash); }
+  const urls = [...new Set([input, ...known].filter(Boolean))];
+  for (const url of urls.slice(0, 12)) { if (network.live().length) break; try { await network.connectInvite(url, { silent: true }); remember(url); } catch { } }
+}
 async function start() {
   meta = await (await fetch('/local/meta')).json(); if (!meta.token) throw new Error('请运行自己的启动器，从固定本地地址进入');
   meta.url = await normalizeInvite(meta.url);
@@ -617,20 +642,22 @@ async function start() {
   else reconcileHistory();
   world.attachArchives(archiveStore);
   network = new Network(identity, meta, onMessage, networkChange); await network.start(displayNick(identity.nick)); started = true; members.set(network.node, member());
-  $('myUrl').value = meta.url; creator = new Creator(placement, balance, size => defaultFishName(identity.nick, world.myFishes(identity.actor).length + 1, size));
+  $('myUrl').value = meta.url; $('currentVersion').textContent = `当前版本 ${meta.version || '未知'}`;
+  creator = new Creator(placement, balance, size => defaultFishName(identity.nick, world.myFishes(identity.actor).length + 1, size));
   syncIncomeSerial(); renderChat(); await save();
+  syncUpdateStatus(); refreshPeerUpdates().catch(() => {});
   reconnect().catch(() => {}); update(); lastPictureTime = Date.now(); takePicture().catch(() => {});
   setInterval(tick, CONFIG.step); setInterval(() => { network.presence(active().filter(m => m.id !== network.node).map(m => ({ id: m.id, url: m.url }))).catch(() => {}); if (network.connections.size < 6) { const candidate = active().filter(m => m.id !== network.node && !network.has(m.id)).sort((a, b) => hash(`${network.node}:${a.id}`) - hash(`${network.node}:${b.id}`))[0]; if (candidate) network.connect(candidate.url, candidate.id).catch(() => {}); } }, 6000);
   document.addEventListener('visibilitychange', async () => { if (!document.hidden) { lifeSince = identity.lifeSeenAt || Date.now(); returnVisit = Date.now() - lifeSince > 60000; lifeMessage = null; } await resumeAfterInactivity(); network.broadcast('beat', { member: member() }).catch(() => {}); save().catch(() => {}); });
-  window.addEventListener('pagehide', () => { const blob = new Blob([JSON.stringify({ node: network.node, token: meta.token })], { type: 'application/json' }); navigator.sendBeacon('/local/unregister', blob); lastPicture = localPicture(); save().catch(() => {}); });
+  window.addEventListener('pagehide', () => { const blob = new Blob([JSON.stringify({ node: network.node, token: meta.token })], { type: 'application/json' }); navigator.sendBeacon('/local/unregister', blob); if (updateFrozen || updateRestarting) return; lastPicture = localPicture(); save().catch(() => {}); });
   // Exposes read-only diagnostics for the project's automated browser checks.
   window.tide = { get world() { return { data: world.serialize(), counts: world.counts() }; }, get network() { return { node: network.node, leader: leader(), peers: network.live().map(p => ({ node: p.node, url: p.url })), stats: clone(network.stats) }; }, get identity() { return { actor: identity.actor, nick: displayNick(identity.nick) }; }, get histories() { return clone(histories); }, get view() { return { camera: clone(renderer.camera), scale: renderer.scale, followingFish: trackedFish, selected: clone(selected) }; }, balance };
 }
 async function tick() {
   const now = Date.now(), elapsed = now - lastMeter; lastMeter = now;
-  if (elapsed < 90000) identity.remainder = (identity.remainder || 0) + elapsed / 1000;
+  if (!updateFrozen && elapsed < 90000) identity.remainder = (identity.remainder || 0) + elapsed / 1000;
   await resumeAfterInactivity(now);
-  if (identity.remainder >= 3600) { identity.remainder -= 3600; identity.serial = (identity.serial || 0) + 1; await submit({ kind: 'earn', cost: 0, serial: identity.serial }); }
+  if (!updateFrozen && identity.remainder >= 3600) { identity.remainder -= 3600; identity.serial = (identity.serial || 0) + 1; await submit({ kind: 'earn', cost: 0, serial: identity.serial }); }
   members.set(network.node, member());
   if (now - selfBeat >= 3000) { selfBeat = now; network.broadcast('beat', { member: member(), rootCount: world.roots.length, opCount: Object.keys(world.data.ops).length, chatCount: Object.keys(world.data.chats).length, chatSourceCount: Object.keys(world.data.chatSources).length }).catch(() => {}); }
   const currentLeader = leader(); if (currentLeader !== lastLeader) { lastLeader = currentLeader; lastFull = 0; sentChars.clear(); sentOps.clear(); sentChats.clear(); sentChatSources.clear(); sentTravel.clear(); if (amLeader()) { geometryRepair = true; world.data.tick = Math.max(world.data.tick, now - 2000); for (const envelope of [...inbox.values()].sort((a, b) => a.body.t - b.body.t || a.body.id.localeCompare(b.body.id))) { if (!world.data.ops[envelope.body.id]) { const result = world.apply({ ...clone(envelope.body), proof: clone(envelope) }); if (!result.ok) rejectOperation(envelope.body.id); network.broadcast('ack', { id: envelope.body.id, result }).catch(() => {}); } } for (const id of pending.keys()) if (world.data.ops[id]) pending.delete(id); } }
@@ -706,17 +733,494 @@ async function setScene3d(enabled) {
 }
 scene3dToggle.onclick = () => setScene3d(!renderer.scene3d);
 try { if (localStorage.getItem(scene3dPreference) === '1') setScene3d(true); } catch {}
-$('connect').onclick = () => $('connectionDialog').showModal(); $('closeConnection').onclick = () => $('connectionDialog').close();
-$('connectionForm').onsubmit = async e => { e.preventDefault(); status = '正在自动配对…'; update(); try { const code = await normalizeInvite($('peerUrl').value); $('peerUrl').value = code; await network.connectInvite(code); await remember(code); $('connectionDialog').close(); } catch (e) { status = e.message; toast(e.message); } update(); };
+$('connect').onclick = () => {
+  $('peerCompatBanner').hidden = true;
+  $('connectionDialog').showModal();
+  syncUpdateStatus();
+  refreshPeerUpdates().catch(() => {});
+};
+$('closeConnection').onclick = () => $('connectionDialog').close();
+function hasUnsavedCreatorDraft() {
+  const openDraft = Boolean($('creatorDialog')?.open && ((creator?.cells?.size || 0) > 0 || (creator?.strokes?.length || 0) > 0));
+  const placingDraft = mode?.kind === 'fish' || mode?.kind === 'scene';
+  return openDraft || placingDraft;
+}
+function resetUpdateForceAcks() {
+  updateForcePendingAck = false;
+  updateForceDraftAck = false;
+  updateForceReason = '';
+}
+function renderUpdateBadge() {
+  const badge = $('updateBadgeDot');
+  if (!badge) return;
+  if (preparedUpdate && preparedUpdate.phase === 'ready') {
+    badge.textContent = '待重启';
+    badge.classList.add('ready');
+    badge.hidden = false;
+    return;
+  }
+  const higherPeers = pickHigherVersionPeers(meta?.version, [...availablePeerUpdates.values()]);
+  if (higherPeers.length > 0) {
+    badge.textContent = '新版';
+    badge.classList.remove('ready');
+    badge.hidden = false;
+    return;
+  }
+  badge.hidden = true;
+}
+function renderPeerUpdates() {
+  const box = $('peerUpdatesBox'), list = $('peerUpdatesList');
+  if (!box || !list) return;
+  const peers = pickHigherVersionPeers(meta?.version, [...availablePeerUpdates.values()]);
+  const busy = !$('updateProgressWrap').hidden || updateFrozen || updateRestarting;
+  list.replaceChildren();
+  if (!peers.length) {
+    box.hidden = true;
+    renderUpdateBadge();
+    return;
+  }
+  for (const peer of peers) {
+    const row = document.createElement('div');
+    row.className = 'peerUpdateItem';
+    const info = document.createElement('div');
+    info.className = 'peerUpdateItemInfo';
+    const nameEl = document.createElement('strong');
+    nameEl.textContent = peer.nick;
+    const verEl = document.createElement('span');
+    verEl.className = 'quiet';
+    verEl.textContent = `v${peer.version}`;
+    info.append(nameEl, verEl);
+    if (peer.prerelease) {
+      const pre = document.createElement('span');
+      pre.className = 'updateBadge';
+      pre.textContent = '测试版';
+      info.append(pre);
+    }
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'primary';
+    btn.textContent = '立即更新';
+    btn.disabled = busy;
+    btn.onclick = () => startUpdatePrepareFromInput(peer.invite, true);
+    row.append(info, btn);
+    list.append(row);
+  }
+  box.hidden = false;
+  renderUpdateBadge();
+}
+function recordPeerVersion(invite, probe, fallbackNick = '') {
+  if (!invite || !meta?.version || !probe) return;
+  const compat = classifyPeerCompatibility(meta.version, probe);
+  if (compat.peerNewer && compat.peerVersion) {
+    const nick = (Array.isArray(probe.clients) && probe.clients.find(c => c?.nick)?.nick) || fallbackNick || '在线同事';
+    availablePeerUpdates.set(invite, { invite, nick, version: compat.peerVersion, compatible: compat.compatible, checkedAt: Date.now() });
+  } else {
+    availablePeerUpdates.delete(invite);
+  }
+  renderPeerUpdates();
+}
+async function refreshPeerUpdates() {
+  if (peerProbeBusy || !network || !meta?.version) return;
+  peerProbeBusy = true;
+  try {
+    const candidates = new Map();
+    for (const [invite, info] of availablePeerUpdates.entries()) {
+      if (invite && invite !== meta.url) candidates.set(invite, info.nick || '');
+    }
+    for (const m of active()) {
+      if (m.id !== network.node && m.url && m.url !== meta.url) candidates.set(m.url, m.nick || '');
+    }
+    for (const url of known) {
+      if (candidates.size >= 6) break;
+      if (url && url !== meta.url && !candidates.has(url)) candidates.set(url, '');
+    }
+    await Promise.allSettled([...candidates.entries()].map(async ([invite, nick]) => {
+      try {
+        const probe = await network.local('probe', { url: invite });
+        recordPeerVersion(invite, probe, nick);
+      } catch {
+        availablePeerUpdates.delete(invite);
+      }
+    }));
+  } finally {
+    peerProbeBusy = false;
+    renderPeerUpdates();
+  }
+}
+function stopUpdatePolling() {
+  if (updatePollTimer) { clearInterval(updatePollTimer); updatePollTimer = null; }
+}
+function startUpdatePolling() {
+  if (updatePollTimer) return;
+  updatePollTimer = setInterval(() => { syncUpdateStatus(); }, 300);
+}
+async function syncUpdateStatus() {
+  if (!network) return;
+  const seq = ++updateStateSeq;
+  try {
+    const res = await network.local('update/status');
+    if (seq !== updateStateSeq) return;
+    if (res?.update) renderUpdateState(res.update);
+  } catch { }
+}
+function renderUpdateState(state) {
+  const statusEl = $('updateStatus'), confirmEl = $('updateConfirmCard'), progressWrap = $('updateProgressWrap');
+  const progressBar = $('updateProgressBar'), progressLabel = $('updateProgressLabel'), progressMeta = $('updateProgressMeta');
+  if (!state || state.phase === 'idle') {
+    stopUpdatePolling();
+    resetUpdateForceAcks();
+    preparedUpdate = null; activeUpdateTaskId = '';
+    confirmEl.hidden = true; progressWrap.hidden = true;
+    $('updatePendingWarn').hidden = true; $('forceApplyUpdateBtn').hidden = true;
+    statusEl.hidden = true; $('checkUpdateBtn').disabled = false; $('cancelDownloadingBtn').disabled = false;
+    renderPeerUpdates(); return;
+  }
+  if (state.phase === 'checking' || state.phase === 'downloading') {
+    if (state.id) activeUpdateTaskId = state.id;
+    resetUpdateForceAcks();
+    confirmEl.hidden = true; statusEl.hidden = true; progressWrap.hidden = false;
+    $('checkUpdateBtn').disabled = true; $('cancelDownloadingBtn').disabled = false;
+    if (state.phase === 'checking') {
+      progressLabel.textContent = '正在连接来源并核对版本…';
+      progressBar.removeAttribute('value');
+      progressMeta.textContent = '你可以关闭窗口继续游玩，下载完成后会提醒你';
+    } else {
+      progressLabel.textContent = state.targetVersion ? `正在下载新版本 ${state.targetVersion}…` : '正在下载更新包…';
+      const done = Number(state.downloadedBytes || 0), total = Number(state.totalBytes ?? -1);
+      if (total > 0) progressBar.value = Math.min(100, Math.round((done / total) * 100));
+      else progressBar.removeAttribute('value');
+      const sizeText = formatUpdateBytes(done, total);
+      progressMeta.textContent = sizeText ? `${sizeText} · 你可以关闭窗口继续游玩` : '你可以关闭窗口继续游玩，完成后会提醒你';
+    }
+    startUpdatePolling();
+    renderPeerUpdates(); return;
+  }
+  if (state.phase === 'ready') {
+    stopUpdatePolling();
+    if (preparedUpdate?.id !== state.id) resetUpdateForceAcks();
+    preparedUpdate = state; activeUpdateTaskId = state.id || '';
+    progressWrap.hidden = true;
+    statusEl.hidden = false; statusEl.textContent = '更新包已下载并校验完成，确认后将保存进度并重启。';
+    $('updateConfirmSource').textContent = state.sourceLabel || state.sourceInput;
+    $('updateConfirmVersions').textContent = `${state.currentVersion} → ${state.targetVersion}`;
+    $('updatePrereleaseBadge').hidden = !state.prerelease;
+    $('updatePendingWarn').hidden = true; $('forceApplyUpdateBtn').hidden = true; $('applyUpdateBtn').hidden = false; $('applyUpdateBtn').disabled = false;
+    confirmEl.hidden = false; $('checkUpdateBtn').disabled = false;
+    renderPeerUpdates(); return;
+  }
+  if (state.phase === 'failed') {
+    stopUpdatePolling();
+    resetUpdateForceAcks();
+    preparedUpdate = null; activeUpdateTaskId = '';
+    progressWrap.hidden = true; confirmEl.hidden = true;
+    statusEl.hidden = false; statusEl.textContent = state.error || '更新检查或安装失败，当前版本继续运行。';
+    $('checkUpdateBtn').disabled = false;
+    renderPeerUpdates();
+  }
+}
+async function startUpdatePrepareFromInput(rawInput, scrollIntoView = false) {
+  if (updateFrozen || updateRestarting) { toast('正在保存进度并重启，请稍候'); return; }
+  let detected, kind, input;
+  try {
+    detected = detectUpdateSource(rawInput);
+    kind = detected.kind;
+    input = kind === 'peer' ? await normalizeInvite(detected.input) : detected.input;
+  } catch (error) {
+    renderUpdateState({ phase: 'failed', error: error.message }); toast(error.message); return;
+  }
+  $('peerCompatBanner').hidden = true;
+  $('updateSourceInput').value = input;
+  if (scrollIntoView) $('updateSection').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  const seq = ++updateStateSeq;
+  renderUpdateState({ phase: 'checking' });
+  updateChannel?.postMessage({ type: 'status-changed' });
+  try {
+    const result = await network.local('update/prepare', { kind, input });
+    if (seq !== updateStateSeq) { syncUpdateStatus(); return; }
+    renderUpdateState(result.update);
+    updateChannel?.postMessage({ type: 'status-changed' });
+    if ($('connectionDialog').open) toast(`新版本 ${result.update.targetVersion} 已准备好`);
+    else toast(`新版本 ${result.update.targetVersion} 已准备好，点「连接同事」即可重启更新`);
+  } catch (error) {
+    if (kind === 'peer' && availablePeerUpdates.has(input)) {
+      availablePeerUpdates.delete(input);
+      renderPeerUpdates();
+    }
+    if (seq !== updateStateSeq) { syncUpdateStatus(); return; }
+    if (error.message === '更新已取消') {
+      syncUpdateStatus();
+      updateChannel?.postMessage({ type: 'status-changed' });
+      return;
+    }
+    renderUpdateState({ phase: 'failed', error: error.message }); toast(error.message);
+    updateChannel?.postMessage({ type: 'status-changed' });
+  }
+}
+function showUpdateOverlay(text, showActions = false) {
+  $('updateOverlayText').textContent = text;
+  $('updateOverlayActions').hidden = !showActions;
+  for (const dialog of document.querySelectorAll('dialog[open]')) { if (dialog.id !== 'updateOverlay') dialog.close(); }
+  if (!$('updateOverlay').open) $('updateOverlay').showModal();
+}
+function hideUpdateOverlay() {
+  $('updateOverlayActions').hidden = true;
+  if ($('updateOverlay').open) $('updateOverlay').close();
+}
+$('updateOverlay').addEventListener('cancel', e => e.preventDefault());
+$('reloadAfterUpdateBtn').onclick = () => location.reload();
+$('dismissUpdateOverlayBtn').onclick = () => {
+  hideUpdateOverlay();
+  updateFrozen = false; updateRestarting = false; activeRestartTaskId = '';
+  renderPeerUpdates();
+  syncUpdateStatus();
+};
+async function waitForRestart(targetVersion, previousVersion, taskId) {
+  updateRestarting = true; activeRestartTaskId = taskId || '';
+  renderPeerUpdates();
+  showUpdateOverlay(`正在启动新版本 ${targetVersion}，完成后自动刷新页面…`, false);
+  const deadline = Date.now() + 25000;
+  while (Date.now() < deadline && updateRestarting && activeRestartTaskId === (taskId || '')) {
+    await new Promise(resolve => setTimeout(resolve, 400));
+    if (!updateRestarting || activeRestartTaskId !== (taskId || '')) return;
+    try {
+      const response = await fetch('/health', { cache: 'no-store', signal: AbortSignal.timeout(2500) });
+      if (response.ok) {
+        const health = await response.json();
+        if (health.ok && health.version === targetVersion && health.handoffReady === true) { location.reload(); return; }
+        if (health.ok && health.version === targetVersion && health.handoffFailed) {
+          hideUpdateOverlay(); updateFrozen = false; updateRestarting = false; activeRestartTaskId = '';
+          renderUpdateState({ phase: 'failed', error: '新版本文件替换失败，请关闭占用程序后重试' });
+          toast('新版本文件替换失败'); return;
+        }
+        if (health.ok && health.version === previousVersion) {
+          try {
+            const st = await network.local('update/status');
+            if (st?.update?.phase === 'failed' && (!taskId || st.update.id === taskId)) {
+              hideUpdateOverlay(); updateFrozen = false; updateRestarting = false; activeRestartTaskId = '';
+              const reason = st.update.error || '新版本启动失败，已恢复旧版本继续运行';
+              renderUpdateState({ phase: 'failed', error: reason }); toast(reason); return;
+            }
+          } catch { }
+        }
+      }
+    } catch { }
+  }
+  if (!updateRestarting || activeRestartTaskId !== (taskId || '')) return;
+  showUpdateOverlay('等待新版本重启超时。新版本可能已完成切换，你可以直接刷新页面，或返回当前页面查看。', true);
+  toast('等待新版本重启超时');
+}
+async function coordinateOtherTabsFreeze(taskId, { allowDraft = false } = {}) {
+  if (!updateChannel) return { ok: true };
+  const discovered = new Map();
+  const acked = new Map();
+  updatePeerWaiters.set(taskId, msg => {
+    if (msg.type === 'pong' && msg.tabId && msg.tabId !== tabInstanceId) discovered.set(msg.tabId, { hasDraft: !!msg.hasDraft });
+    if (msg.type === 'frozen' && msg.tabId && msg.tabId !== tabInstanceId) acked.set(msg.tabId, msg);
+  });
+  try {
+    updateChannel.postMessage({ type: 'ping', taskId, from: tabInstanceId });
+    await new Promise(resolve => setTimeout(resolve, 200));
+    if (!discovered.size) return { ok: true };
+    if (!allowDraft && [...discovered.values()].some(info => info.hasDraft)) {
+      return { ok: false, draftConflict: true };
+    }
+    updateChannel.postMessage({ type: 'freeze-tab', taskId, from: tabInstanceId });
+    const deadline = Date.now() + 3000;
+    while (Date.now() < deadline) {
+      if ([...discovered.keys()].every(id => acked.has(id))) break;
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    for (const id of discovered.keys()) {
+      const reply = acked.get(id);
+      if (!reply || !reply.ok) {
+        updateChannel.postMessage({ type: 'abort-restart', taskId });
+        return { ok: false, error: reply?.error || '其他游戏标签页正在保存进度，请稍后再试' };
+      }
+    }
+    return { ok: true };
+  } finally {
+    updatePeerWaiters.delete(taskId);
+  }
+}
+function keepReadyWithWarn(warnText, { allowForce = false, forceReason = '' } = {}) {
+  updateFrozen = false;
+  updateForceReason = allowForce ? forceReason : '';
+  $('checkUpdateBtn').disabled = false;
+  $('updateConfirmCard').hidden = false;
+  $('updatePendingWarn').textContent = warnText;
+  $('updatePendingWarn').hidden = false;
+  $('applyUpdateBtn').hidden = allowForce;
+  $('applyUpdateBtn').disabled = false;
+  $('forceApplyUpdateBtn').hidden = !allowForce;
+  $('forceApplyUpdateBtn').disabled = false;
+  $('updateStatus').hidden = false;
+  $('updateStatus').textContent = allowForce ? '请确认是否继续更新并重启。' : '当前版本继续运行，更新包已保留，可随时重试。';
+  renderPeerUpdates();
+}
+async function applyPreparedUpdate(confirmForce = false) {
+  const task = preparedUpdate ? { ...preparedUpdate } : null;
+  if (!task?.id) return;
+  if (confirmForce) {
+    if (updateForceReason === 'pending') updateForcePendingAck = true;
+    else if (updateForceReason === 'draft') updateForceDraftAck = true;
+    updateForceReason = '';
+  } else {
+    resetUpdateForceAcks();
+  }
+  updateStateSeq++;
+  updateFrozen = true;
+  renderPeerUpdates();
+  $('updatePendingWarn').hidden = true;
+  $('applyUpdateBtn').disabled = true; $('forceApplyUpdateBtn').disabled = true; $('checkUpdateBtn').disabled = true;
+  $('updateStatus').hidden = false; $('updateStatus').textContent = '正在等待待确认操作完成并保存游戏进度…';
+  if (!updateForcePendingAck && pending.size > 0) {
+    const waitUntil = Date.now() + 8000;
+    while (pending.size > 0 && Date.now() < waitUntil && preparedUpdate?.id === task.id) await new Promise(resolve => setTimeout(resolve, 200));
+    if (preparedUpdate?.id !== task.id) { updateFrozen = false; $('checkUpdateBtn').disabled = false; renderPeerUpdates(); return; }
+    if (pending.size > 0) {
+      keepReadyWithWarn(`还有 ${pending.size} 项刚发出的操作等待伙伴确认。你可以稍等同步完成，或选择仍要更新并重启。`, { allowForce: true, forceReason: 'pending' });
+      return;
+    }
+  }
+  const archiveWaitUntil = Date.now() + 5000;
+  while (archiveBusy && Date.now() < archiveWaitUntil) await new Promise(resolve => setTimeout(resolve, 100));
+  if (archiveBusy) {
+    keepReadyWithWarn('历史记忆正在整理中，请稍等片刻再点「更新并重启」。');
+    toast('历史记忆正在整理，已暂停更新');
+    return;
+  }
+  const tabsResult = await coordinateOtherTabsFreeze(task.id, { allowDraft: updateForceDraftAck });
+  if (!tabsResult.ok) {
+    if (tabsResult.draftConflict) {
+      keepReadyWithWarn('另一个游戏标签页还有正在画的鱼或造景尚未投放。你可以先去投放或关闭画板，也可以选择仍要更新并重启。', { allowForce: true, forceReason: 'draft' });
+      toast('检测到其他标签页有未投放的画板草稿');
+      return;
+    }
+    keepReadyWithWarn('其他游戏标签页暂未准备好：' + tabsResult.error);
+    toast('其他标签页暂未准备好，当前版本继续运行');
+    return;
+  }
+  try {
+    if (activeSavePromise) await activeSavePromise;
+    await saveInternal();
+  } catch (error) {
+    updateChannel?.postMessage({ type: 'abort-restart', taskId: task.id });
+    keepReadyWithWarn('本地进度保存失败：' + error.message + '。请重试，当前版本继续运行。');
+    toast('本地进度保存失败，当前版本继续运行');
+    return;
+  }
+  const targetVersion = task.targetVersion, previousVersion = meta.version;
+  updateChannel?.postMessage({ type: 'prepare-restart', taskId: task.id, targetVersion, previousVersion });
+  try {
+    await network.local('update/apply', { id: task.id });
+    await waitForRestart(targetVersion, previousVersion, task.id);
+  } catch (error) {
+    updateChannel?.postMessage({ type: 'abort-restart', taskId: task.id });
+    updateFrozen = false; updateRestarting = false; activeRestartTaskId = '';
+    if (/未就绪|已过期/.test(error.message || '')) {
+      renderUpdateState({ phase: 'failed', error: error.message });
+    } else {
+      keepReadyWithWarn('触发重启失败：' + error.message + '。请稍后重试。');
+    }
+    toast(error.message);
+  }
+}
+if (updateChannel) {
+  updateChannel.onmessage = async event => {
+    const data = event.data;
+    if (!data?.type) return;
+    if (data.type === 'status-changed') { syncUpdateStatus(); return; }
+    if (data.type === 'ping') { updateChannel.postMessage({ type: 'pong', taskId: data.taskId, tabId: tabInstanceId, hasDraft: hasUnsavedCreatorDraft() }); return; }
+    if (data.type === 'pong' || data.type === 'frozen') { updatePeerWaiters.get(data.taskId)?.(data); return; }
+    if (data.type === 'freeze-tab') {
+      updateFrozen = true;
+      try {
+        if (activeSavePromise) await activeSavePromise;
+        updateChannel.postMessage({ type: 'frozen', taskId: data.taskId, tabId: tabInstanceId, ok: true });
+      } catch (error) {
+        updateChannel.postMessage({ type: 'frozen', taskId: data.taskId, tabId: tabInstanceId, ok: false, error: error.message });
+      }
+      return;
+    }
+    if (data.type === 'abort-restart') {
+      if (!activeRestartTaskId || !data.taskId || activeRestartTaskId === data.taskId) {
+        updateFrozen = false; updateRestarting = false; activeRestartTaskId = ''; hideUpdateOverlay(); renderPeerUpdates();
+      }
+      return;
+    }
+    if (data.type === 'prepare-restart') {
+      updateFrozen = true;
+      waitForRestart(data.targetVersion, data.previousVersion, data.taskId);
+    }
+  };
+}
+async function cancelActiveUpdate(targetId, successToast = '') {
+  const seq = ++updateStateSeq;
+  try {
+    const res = await network.local('update/cancel', { id: targetId || '' });
+    if (seq !== updateStateSeq) return;
+    const nextState = res?.update || { phase: 'idle' };
+    updateFrozen = false;
+    renderUpdateState(nextState);
+    updateChannel?.postMessage({ type: 'status-changed' });
+    if (nextState.phase === 'idle') {
+      if (successToast) toast(successToast);
+    } else {
+      toast('当前更新任务已变化，已同步最新状态');
+    }
+  } catch (error) {
+    if (seq !== updateStateSeq) return;
+    toast(error.message || '取消更新失败');
+    syncUpdateStatus();
+  }
+}
+$('updateForm').onsubmit = async e => { e.preventDefault(); await startUpdatePrepareFromInput($('updateSourceInput').value, false); };
+$('updateFromPeerNow').onclick = async () => { if (peerUpdateCandidate) await startUpdatePrepareFromInput(peerUpdateCandidate, true); };
+$('applyUpdateBtn').onclick = () => applyPreparedUpdate(false);
+$('forceApplyUpdateBtn').onclick = () => applyPreparedUpdate(true);
+$('cancelDownloadingBtn').onclick = async () => {
+  $('cancelDownloadingBtn').disabled = true;
+  await cancelActiveUpdate(activeUpdateTaskId, '已取消下载');
+};
+$('cancelUpdateBtn').onclick = async () => {
+  await cancelActiveUpdate(preparedUpdate?.id || '', '');
+};
+$('connectionForm').onsubmit = async e => {
+  e.preventDefault(); $('peerCompatBanner').hidden = true; peerUpdateCandidate = ''; status = '正在自动配对…'; update();
+  try {
+    const code = await normalizeInvite($('peerUrl').value); $('peerUrl').value = code;
+    const probe = await network.local('probe', { url: code });
+    recordPeerVersion(code, probe);
+    const compat = classifyPeerCompatibility(meta.version, probe);
+    if (compat.action === 'block_update_self') {
+      peerUpdateCandidate = code;
+      $('peerCompatText').textContent = `同事正在运行新版本 ${compat.peerVersion}，联机规则已变更，需先更新后再连接。`;
+      $('updateFromPeerNow').hidden = false; $('peerCompatBanner').hidden = false;
+      status = '同事联机规则较新，请先更新'; toast(status); update(); return;
+    }
+    if (compat.action === 'block_update_peer') {
+      $('peerCompatText').textContent = `同事正在运行旧版本 ${compat.peerVersion || '未知'}，联机规则不兼容，请先请对方更新后再连接。`;
+      $('updateFromPeerNow').hidden = true; $('peerCompatBanner').hidden = false;
+      status = '同事版本较旧且规则不兼容'; toast(status); update(); return;
+    }
+    if (compat.action === 'block_incompatible') {
+      $('peerCompatText').textContent = `双方版本号相同（${compat.peerVersion || meta.version}），但联机规则不一致，暂停连接。`;
+      $('updateFromPeerNow').hidden = true; $('peerCompatBanner').hidden = false;
+      status = '双方版本相同但联机规则不一致'; toast(status); update(); return;
+    }
+    await network.connectInvite(code); await remember(code); $('connectionDialog').close();
+    if (compat.action === 'connect_with_hint') toast(`已连接同事；对方版本较新（${compat.peerVersion}），可随时点「连接同事」一键更新`);
+  } catch (e) { status = e.message; toast(e.message); } update();
+};
 $('copyUrl').onclick = async () => { await navigator.clipboard.writeText(meta.url); toast('邀请码已复制'); };
 $('backup').onclick = async () => { try { await resumeAfterInactivity(); const manifests = { ...world.data.archives?.chunks }; for (const card of Object.values(histories)) Object.assign(manifests, card.archives?.chunks); const archiveChunks = {}; for (const id of Object.keys(manifests)) { archiveChunks[id] = archiveStore.packs.get(id) || await get('archive:' + id); if (!archiveChunks[id]) throw new Error('备份缺少历史归档'); } download('鱼来-身份与记忆备份.json', { format: 'tide-backup-1', identity, histories, known, checkpoint: currentCheckpoint(), archiveChunks }); } catch (error) { toast(error.message); } };
-$('importBackup').onchange = async e => { try { const data = JSON.parse(await e.target.files[0].text()); if (data.format !== 'tide-backup-1' || !data.identity?.secret || await actorId(data.identity.pub) !== data.identity.actor) throw new Error('备份无效'); const entries = [['identity', data.identity], ['histories', data.histories || {}], ['known', data.known || []]]; if (data.checkpoint) { const restoredArchives = newArchiveStore(); await ensureArchives(data.checkpoint.world, null, data.archiveChunks, restoredArchives); data.checkpoint.world = await verifyLocalCheckpoint(data.checkpoint.world, await restoredArchives.dependencies(data.checkpoint.world, world.data), restoredArchives); entries.push(['checkpoint', data.checkpoint]); } for (const card of Object.values(data.histories || {})) await historyArchiveStore(card, null, data.archiveChunks); await putMany(entries); await network.stop(); location.reload(); } catch (e) { toast(e.message); } };
+$('importBackup').onchange = async e => { if (updateFrozen) { toast('正在更新并重启，请稍候'); return; } try { const data = JSON.parse(await e.target.files[0].text()); if (data.format !== 'tide-backup-1' || !data.identity?.secret || await actorId(data.identity.pub) !== data.identity.actor) throw new Error('备份无效'); const entries = [['identity', data.identity], ['histories', data.histories || {}], ['known', data.known || []]]; if (data.checkpoint) { const restoredArchives = newArchiveStore(); await ensureArchives(data.checkpoint.world, null, data.archiveChunks, restoredArchives); data.checkpoint.world = await verifyLocalCheckpoint(data.checkpoint.world, await restoredArchives.dependencies(data.checkpoint.world, world.data), restoredArchives); entries.push(['checkpoint', data.checkpoint]); } for (const card of Object.values(data.histories || {})) await historyArchiveStore(card, null, data.archiveChunks); await putMany(entries); await network.stop(); location.reload(); } catch (e) { toast(e.message); } };
 $('help').onclick = () => $('helpDialog').showModal(); $('closeHelp').onclick = () => $('helpDialog').close(); $('closeHistory').onclick = () => $('historyDialog').close();
 $('collapseChat').onclick = () => { document.querySelector('.chat').classList.toggle('collapsed'); $('collapseChat').textContent = document.querySelector('.chat').classList.contains('collapsed') ? '+' : '−'; };
 $('loadEarlierChat').onclick = async () => { chatLimit += 80; try { olderChats = await archiveStore.chats(chatLimit, world.data.chats, world.data.archives); renderChat(true); } catch (error) { toast('旧聊天读取失败：' + error.message); } };
 $('chatForm').onsubmit = async e => {
-  e.preventDefault(); const text = $('chatInput').value.trim(); if (!identity || !text || text.length > 160 || Date.now() - lastChat < 1500) return;
-  await resumeAfterInactivity(); lastChat = Date.now();
+  e.preventDefault(); if (updateFrozen) { toast('正在更新并重启，请稍候'); return; } const text = $('chatInput').value.trim(); if (!identity || !text || text.length > 160 || Date.now() - lastChat < 1500) return;
+  await resumeAfterInactivity(); if (updateFrozen) { toast('正在更新并重启，请稍候'); return; } lastChat = Date.now();
   try { const message = await network.makeEnvelope('chat', { nick: displayNick(identity.nick), text, t: Date.now(), roots: [world.id] }); const result = world.addChat(message); if (!result.ok) throw new Error(result.error); renderChat(); $('chatInput').value = ''; await save(); await network.broadcastEnvelope(message); }
   catch (error) { toast('聊天保存或发送失败：' + error.message); }
 };
