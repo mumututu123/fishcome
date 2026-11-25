@@ -64,9 +64,11 @@ test('初始海草草尖按原规则继续生长，新草尖仍有合法来源�
 });
 
 test('初始海草可冒泡、被初始鱼吃掉并保留可验证的生态来源', () => {
-  let world, cell;
-  do { world = new World(at); cell = Object.values(world.data.chars).find(cell => cell.kind === 'seaweed' && Array.from({ length: 4 }, (_, i) => Math.floor(at / MINUTE) + i + 2).some(minute => bubbleRoll(cell.id, minute, cell.y))); } while (!cell);
-  const minute = Array.from({ length: 4 }, (_, i) => Math.floor(at / MINUTE) + i + 2).find(minute => bubbleRoll(cell.id, minute, cell.y));
+  const start = Date.UTC(2026, 0, 1);
+  const world = new World(start, '00000000-0000-4000-8000-000000000000');
+  const minute = start / MINUTE + 2;
+  const cell = Object.values(world.data.chars).find(cell => cell.kind === 'seaweed' && bubbleRoll(cell.id, minute, cell.y));
+  assert(cell);
   world.step(minute * MINUTE); assert(Object.values(world.data.bubbles).some(bubble => bubble.source === cell.id));
   const fish = Object.values(world.data.fishes)[0]; fish.x = wrapX(cell.x - 3); fish.y = cell.y - 3; fish.facing = 1;
   world.step(world.data.tick); assert.equal(cell.kind, 'fish'); assert.equal(cell.entity, fish.id); assert(cell.path.some(event => event.reason === 'eat')); assert(validWildCell(cell, CONFIG, hash, initialSources(world.data.roots)));
