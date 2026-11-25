@@ -10,7 +10,7 @@ import { HOUR, validWildCell } from './seaweed.js';
 import { MINUTE, validBubble } from './bubbles.js';
 import { fishOrigin, validBreedingRecord, inheritedGlyph, repairLocalBirthTimes } from './breeding.js';
 import { defaultFishName, displayFishName, fishCatalog } from './fish-profile.js';
-import { drawPedigree } from './pedigree.js';
+import { drawPedigree, setupPedigreeViewport } from './pedigree.js';
 import { normalizeInvite, encodeInvite, decodeInvite, inviteDetails } from './invite.js';
 import { verifyReferral } from './referral.js';
 import { wrapX, nearX, validTerrain } from './geography.js';
@@ -400,6 +400,7 @@ function renderMyFishes() {
   if (myFishView === 'pedigree') renderPedigree(catalog);
 }
 function setMyFishView(view) {
+  $('myFishTitle').textContent = view === 'pedigree' ? '鱼谱' : '我的鱼';
   $('myFishDialog').classList.toggle('pedigreeView', view === 'pedigree');
   myFishView = view; $('myFishList').hidden = view !== 'list'; $('pedigreePane').hidden = view !== 'pedigree';
   $('myFishIntro').textContent = view === 'list' ? '点击鱼卡即可定位并观察，默认不跟随；可在观察面板手动开启跟随。这里只列出当前世界中属于你的存活鱼。' : '父母在上，后代在下。鱼谱包含血缘相关的其他作者鱼，已消失的亲鱼仍保留在家谱中。';
@@ -408,13 +409,14 @@ function setMyFishView(view) {
 }
 function renderPedigree(catalog) {
   const owned = [...catalog.values()].filter(entry => entry.actor === identity.actor).sort((a, b) => a.created - b.created || a.id.localeCompare(b.id));
-  if (!owned.some(entry => entry.id === pedigreeFish)) pedigreeFish = (owned.find(entry => entry.alive) || owned[0])?.id;
+  if (!catalog.has(pedigreeFish)) pedigreeFish = (owned.find(entry => entry.alive) || owned[0])?.id;
+  const choices = owned.some(entry => entry.id === pedigreeFish) || !catalog.has(pedigreeFish) ? owned : [catalog.get(pedigreeFish), ...owned];
   const heirloom = ancestralGlyph(world.data, pedigreeFish);
   $('pedigreeHeirloom').textContent = ancestralText(heirloom, id => displayFishName(catalog.get(id), identity)); $('pedigreeHeirloom').hidden = !heirloom;
   const key = JSON.stringify([pedigreeFish, [...catalog.values()].map(entry => [entry.id, displayFishName(entry, identity), entry.nick, entry.gender, entry.alive, entry.parents])]);
   if (pedigreeKey === key) return; pedigreeKey = key;
-  $('pedigreeRoot').replaceChildren(...owned.map(entry => { const option = document.createElement('option'); option.value = entry.id; option.textContent = `${displayFishName(entry, identity)} · ${shortFishId(entry.id)}${entry.alive ? '' : '（已消失）'}`; return option; }));
-  $('pedigreeRoot').disabled = !owned.length; if (pedigreeFish) $('pedigreeRoot').value = pedigreeFish;
+  $('pedigreeRoot').replaceChildren(...choices.map(entry => { const option = document.createElement('option'); option.value = entry.id; option.textContent = `${displayFishName(entry, identity)} · ${shortFishId(entry.id)}${entry.actor === identity.actor ? '' : ` · ${entry.nick || '自然鱼'}`}${entry.alive ? '' : '（已消失）'}`; return option; }));
+  $('pedigreeRoot').disabled = !choices.length; if (pedigreeFish) $('pedigreeRoot').value = pedigreeFish;
   const viewport = $('pedigreeTree'), scroll = { left: viewport.scrollLeft, top: viewport.scrollTop };
   const tree = drawPedigree(viewport, catalog, pedigreeFish, identity, id => { $('myFishDialog').close(); focusFish(id); });
   viewport.style.height = `${Math.min(480, tree.height)}px`;
@@ -660,6 +662,15 @@ $('makeFish').onclick = () => { stopObserving(); cancelMode(); creator?.open('fi
 $('myFish').onclick = () => { if (!identity) return; setMyFishView('list'); $('myFishDialog').showModal(); };
 $('myFishListTab').onclick = () => setMyFishView('list'); $('pedigreeTab').onclick = () => setMyFishView('pedigree');
 $('pedigreeRoot').onchange = () => { pedigreeFish = $('pedigreeRoot').value; pedigreeKey = ''; renderPedigree(fishCatalog(world.data)); };
+const pedigreeViewport = setupPedigreeViewport($('pedigreeTree'), scale => {
+  $('pedigreeZoomLevel').textContent = `${Math.round(scale * 100)}%`;
+  $('pedigreeZoomOut').disabled = scale <= .25; $('pedigreeZoomIn').disabled = scale >= 2;
+});
+$('pedigreeZoomIn').onclick = pedigreeViewport.zoomIn; $('pedigreeZoomOut').onclick = pedigreeViewport.zoomOut; $('pedigreeZoomReset').onclick = pedigreeViewport.reset;
+$('fishPedigree').onclick = () => {
+  if (selected?.kind !== 'fish') return;
+  pedigreeFish = selected.id; pedigreeKey = ''; setMyFishView('pedigree'); $('myFishDialog').showModal();
+};
 $('closeMyFish').onclick = () => $('myFishDialog').close(); $('createFromMyFish').onclick = () => { $('myFishDialog').close(); $('makeFish').click(); };
 $('followFish').onclick = () => { if (selected?.kind !== 'fish') return; if (trackedFish === selected.id) { trackedFish = null; update(); } else focusFish(selected.id, true); };
 $('closeFood').onclick = () => $('foodDialog').close();

@@ -1,7 +1,57 @@
 import { displayFishName, familyTree } from './fish-profile.js';
 const NS = 'http://www.w3.org/2000/svg';
+const viewports = new WeakMap();
+export function setupPedigreeViewport(container, onZoom) {
+  const state = { scale: 1, selected: null, canvas: null, stage: null, onZoom };
+  viewports.set(container, state);
+  function zoom(scale, point) {
+    if (!state.canvas) return;
+    const next = Math.min(2, Math.max(.25, scale)), previous = state.scale;
+    const x = point?.x ?? container.clientWidth / 2, y = point?.y ?? container.clientHeight / 2;
+    const oldOffset = state.stage.offsetLeft;
+    const worldX = (container.scrollLeft + x - oldOffset) / previous, worldY = (container.scrollTop + y) / previous;
+    state.scale = next; updatePedigreeScale(state);
+    container.scrollLeft = worldX * next + state.stage.offsetLeft - x;
+    container.scrollTop = worldY * next - y;
+  }
+  container.addEventListener('wheel', event => {
+    if (!state.canvas) return;
+    event.preventDefault();
+    const rect = container.getBoundingClientRect(), delta = event.deltaY * (event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? container.clientHeight : 1);
+    zoom(state.scale * Math.exp(-Math.max(-200, Math.min(200, delta)) * .002), { x: event.clientX - rect.left - container.clientLeft, y: event.clientY - rect.top - container.clientTop });
+  }, { passive: false });
+  let drag = null, suppressClick = false;
+  container.addEventListener('pointerdown', event => {
+    const rect = container.getBoundingClientRect();
+    if (event.button !== 0 || !state.canvas || event.clientX - rect.left >= container.clientWidth + container.clientLeft || event.clientY - rect.top >= container.clientHeight + container.clientTop) return;
+    suppressClick = false;
+    drag = { id: event.pointerId, x: event.clientX, y: event.clientY, left: container.scrollLeft, top: container.scrollTop, moved: false };
+  });
+  container.addEventListener('pointermove', event => {
+    if (!drag || drag.id !== event.pointerId) return;
+    if (!drag.moved && Math.hypot(event.clientX - drag.x, event.clientY - drag.y) < 5) return;
+    if (!drag.moved) { drag.moved = true; container.setPointerCapture(event.pointerId); container.classList.add('panning'); }
+    container.scrollLeft = drag.left - (event.clientX - drag.x); container.scrollTop = drag.top - (event.clientY - drag.y);
+  });
+  container.addEventListener('pointerleave', () => { if (drag && !drag.moved) drag = null; });
+  const endDrag = event => {
+    if (!drag || drag.id !== event.pointerId) return;
+    suppressClick = drag.moved; drag = null; container.classList.remove('panning');
+    if (container.hasPointerCapture(event.pointerId)) container.releasePointerCapture(event.pointerId);
+  };
+  container.addEventListener('pointerup', endDrag); container.addEventListener('pointercancel', endDrag);
+  container.addEventListener('click', event => { if (suppressClick) { event.preventDefault(); event.stopPropagation(); suppressClick = false; } }, true);
+  return { zoomIn: () => zoom(state.scale * 1.2), zoomOut: () => zoom(state.scale / 1.2), reset: () => zoom(1) };
+}
+function updatePedigreeScale(state) {
+  state.canvas.style.transform = `scale(${state.scale})`;
+  state.stage.style.width = `${state.width * state.scale}px`; state.stage.style.height = `${state.height * state.scale}px`;
+  state.onZoom?.(state.scale);
+}
 export function drawPedigree(container, catalog, selected, identity, onObserve) {
   const tree = familyTree(catalog, selected); container.replaceChildren();
+  const state = viewports.get(container);
+  if (state) { state.canvas = state.stage = null; if (state.selected !== selected) state.scale = 1; state.selected = selected; state.onZoom?.(state.scale); }
   if (!tree.nodes.length) { const empty = document.createElement('p'); empty.className = 'quiet'; empty.textContent = tree.error || '还没有属于你的鱼，造鱼后就能查看鱼谱。'; container.append(empty); return tree; }
   const canvas = document.createElement('div'); canvas.className = 'pedigreeCanvas'; canvas.style.width = `${tree.width}px`; canvas.style.height = `${tree.height}px`; canvas.setAttribute('role', 'group'); canvas.setAttribute('aria-label', '鱼的家谱，父母在上，后代在下');
   const svg = document.createElementNS(NS, 'svg'); svg.setAttribute('width', tree.width); svg.setAttribute('height', tree.height); svg.setAttribute('aria-hidden', 'true');
@@ -25,5 +75,8 @@ export function drawPedigree(container, catalog, selected, identity, onObserve) 
     button.setAttribute('aria-label', `${name}，${sex.textContent}，${owner.textContent}，${status.textContent}`); if (node.id === selected) button.setAttribute('aria-current', 'true');
     button.append(title, sex, owner, status); button.onclick = () => onObserve(node.id); canvas.append(button);
   }
-  container.append(canvas); return tree;
+  const stage = document.createElement('div'); stage.className = 'pedigreeStage'; stage.append(canvas); container.append(stage);
+  if (state) { Object.assign(state, { canvas, stage, width: tree.width, height: tree.height }); updatePedigreeScale(state); }
+  else { stage.style.width = `${tree.width}px`; stage.style.height = `${tree.height}px`; }
+  return tree;
 }
