@@ -1,4 +1,4 @@
-function beadTint(color, target, amount) {
+export function beadTint(color, target, amount) {
   const hex = /^#[0-9a-f]{6}$/i.test(color) ? color.slice(1) : '83aab9';
   const rgb = [0, 2, 4].map((offset, i) => Math.round(parseInt(hex.slice(offset, offset + 2), 16) * (1 - amount) + target[i] * amount));
   return `rgb(${rgb.join(',')})`;

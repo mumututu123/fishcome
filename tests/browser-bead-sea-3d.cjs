@@ -35,8 +35,8 @@ async function main() {
     scene.glyph = function (...args) { kinds.push(args[8]); return original.apply(this, args); };
     renderer.draw(world, 0); const pointAfter = renderer.point(500, 430), relief = canvas.toDataURL();
     const routed = { fish: kinds.includes('fish'), scene: kinds.includes('scene') };
-    renderer.preview = { kind: 'fish', x: 383, y: 25, cells: [{ x: 0, y: 0, ch: '鱼', color: '#79b8ff' }] }; renderer.draw(world, 0); const previewBead = kinds.includes('beadPreview');
-    renderer.preview = { kind: 'food', x: 383, y: 0, ch: '.', color: '#ffcc66' }; kinds.length = 0; renderer.draw(world, 0); const foodPreviewPlain = kinds.includes('preview') && !kinds.includes('beadPreview');
+    renderer.preview = { kind: 'fish', x: 383, y: 25, cells: [{ x: 0, y: 0, ch: '鱼', color: '#79b8ff' }] }; renderer.draw(world, 0); const previewBead = kinds.includes('fishPreview');
+    renderer.preview = { kind: 'food', x: 383, y: 0, ch: '.', color: '#ffcc66' }; kinds.length = 0; renderer.draw(world, 0); const foodPreviewPlain = kinds.includes('preview') && !kinds.includes('beadPreview') && !kinds.includes('fishPreview');
     const test = document.createElement('canvas'); test.width = test.height = 128; const ctx = test.getContext('2d');
     function rim(kind, fallback) {
       scene.glyphs.clear(); scene.glyphBudget = fallback ? 0 : 24; ctx.clearRect(0, 0, 128, 128);
@@ -45,15 +45,22 @@ async function main() {
     }
     const cached = ['fish', 'scene'].map(kind => rim(kind, false)), fallback = ['fish', 'scene'].map(kind => rim(kind, true)), food = rim('food', false);
     scene.glyphs.clear(); scene.glyphBudget = 24;
+    const originalMotion = scene.motion; scene.motion = { matches: false };
+    function jellyFrame(time) { scene.jellyTime = time; ctx.clearRect(0, 0, 128, 128); scene.glyph(ctx, '鱼', '#79b8ff', 16, 16, 64, 1, false, 'fish', { entity: 'jelly-test', x: 1, y: 0 }); return test.toDataURL(); }
+    const jellyA = jellyFrame(0), cachedJelly = scene.glyphs.size, jellyB = jellyFrame(.7), cacheStable = scene.glyphs.size === cachedJelly;
+    scene.motion = { matches: true }; const calmA = jellyFrame(0), calmB = jellyFrame(4); scene.motion = originalMotion;
+    const animation = { moves: jellyA !== jellyB, calm: calmA === calmB, cacheStable };
+    scene.glyphs.clear(); scene.glyphBudget = 24;
     for (let i = 0; i < 100; i++) scene.glyph(ctx, '.', '#' + (0x334455 + i).toString(16), 16, 16, 64, 1, false, 'fish');
     const budget = { cached: scene.glyphs.size, remaining: scene.glyphBudget };
     scene.glyphs.clear(); for (let i = 0; i < 512; i++) scene.glyphs.set(`busy:${i}`, { sprite: test, lastSeen: scene.frameNumber }); scene.glyphBudget = 24;
     ctx.clearRect(0, 0, 128, 128); scene.glyph(ctx, '鱼', '#79b8ff', 16, 16, 64, 1, true, 'fish'); const fullCacheFallback = ctx.getImageData(48, 22, 1, 1).data[3];
-    return { routed, cached, fallback, food, budget, fullCacheFallback, cacheLimit: scene.glyphs.size, pointBefore, pointAfter, changed: flat !== relief, unchangedWorld: before === JSON.stringify(world.serialize()), previewBead, foodPreviewPlain };
+    return { routed, cached, fallback, food, budget, fullCacheFallback, cacheLimit: scene.glyphs.size, pointBefore, pointAfter, changed: flat !== relief, unchangedWorld: before === JSON.stringify(world.serialize()), previewBead, foodPreviewPlain, animation };
   });
   assert.deepEqual(renderChecks.routed, { fish: true, scene: true }); assert(renderChecks.changed); assert(renderChecks.unchangedWorld); assert.deepEqual(renderChecks.pointBefore, renderChecks.pointAfter); assert(renderChecks.previewBead); assert(renderChecks.foodPreviewPlain);
-  for (const shape of [...renderChecks.cached, ...renderChecks.fallback]) { assert(shape.top > 180 && shape.center > 180, '鱼和造景应有完整的拼豆表面'); assert(shape.corner < 30, '拼豆应保持圆形轮廓'); }
-  assert.equal(renderChecks.food.top, 0); assert.equal(renderChecks.budget.cached, 24); assert.equal(renderChecks.budget.remaining, 0); assert.equal(renderChecks.cacheLimit, 512); assert(renderChecks.fullCacheFallback > 180);
+  for (const [i, shape] of [...renderChecks.cached, ...renderChecks.fallback].entries()) { assert(shape.top > (i % 2 ? 180 : 35) && shape.center > (i % 2 ? 180 : 35), '鱼和造景应有完整的颗粒表面'); assert(shape.corner < 30, '颗粒应保持柔和圆形轮廓'); if (i % 2 === 0) assert(shape.center < 245, '鱼身应保持果冻半透明质感'); }
+  assert.deepEqual(renderChecks.animation, { moves: true, calm: true, cacheStable: true });
+  assert.equal(renderChecks.food.top, 0); assert.equal(renderChecks.budget.cached, 24); assert.equal(renderChecks.budget.remaining, 0); assert.equal(renderChecks.cacheLimit, 512); assert(renderChecks.fullCacheFallback > 35);
   const wallet = await page.evaluate(() => tide.balance()); await page.locator('#scene3dToggle').click(); await page.waitForFunction(() => document.getElementById('scene3dToggle').getAttribute('aria-pressed') === 'true');
   for (let i = 0; i < 7; i++) await page.locator('#zoomIn').click();
   fs.mkdirSync(path.join(project, 'test-output'), { recursive: true }); await page.locator('#collapseChat').click(); await page.screenshot({ path: path.join(project, 'test-output', 'bead-sea-3d-desktop.png') });
@@ -65,6 +72,16 @@ async function main() {
   await page.locator('#scene3dToggle').click(); assert.equal(await page.locator('#scene3dToggle').getAttribute('aria-pressed'), 'false'); assert.equal(await page.evaluate(() => tide.balance()), wallet); await page.locator('#scene3dToggle').click(); await page.waitForFunction(() => document.getElementById('scene3dToggle').getAttribute('aria-pressed') === 'true');
   await page.reload(); await page.waitForFunction(() => document.getElementById('scene3dToggle').getAttribute('aria-pressed') === 'true'); await page.setViewportSize({ width: 390, height: 844 });
   await page.locator('#myFish').click(); await page.locator(`[data-fish="${fixture.pink}"]`).click(); await page.locator('#closeInspector').click(); await page.screenshot({ path: path.join(project, 'test-output', 'bead-sea-3d-mobile.png') });
-  assert.deepEqual(errors, []); console.log('3D拼豆海景：鱼/造景与编辑器共用颗粒、圆形留白、缓存预算及回退、投放预览、点击坐标、切换及刷新偏好、余额与世界状态不变、手机布局通过');
+  const frames = await page.evaluate(async () => {
+    const { World } = await import('./engine.js'), { Renderer } = await import('./renderer.js'), { Scene3D } = await import('./scene-3d.js');
+    const world = new World(Date.now(), undefined, { populate: false, ambient: false }); world.data = structuredClone(tide.world.data);
+    const fish = Object.values(world.data.fishes); fish[0].x = 370; fish[0].y = 24; fish[0].facing = 1; fish[1].x = 379; fish[1].y = 24; fish[1].facing = 1;
+    const canvas = document.createElement('canvas'), renderer = new Renderer(canvas); renderer.width = 1180; renderer.height = 360; renderer.dpr = 1; canvas.width = 1180; canvas.height = 360; renderer.ctx.setTransform(1,0,0,1,0,0);
+    renderer.cell = 30; renderer.zoom(2); renderer.camera = { x: 377.5, y: 24 }; renderer.scene3d = new Scene3D(); renderer.scene3d.motion = { matches: false };
+    const frames = []; for (let i = 0; i < 30; i++) { renderer.draw(world, 1000 + i * 80); frames.push(canvas.toDataURL('image/png').split(',')[1]); } return frames;
+  });
+  const frameDir = path.join(project, 'test-output', 'jelly-frames'); fs.mkdirSync(frameDir, { recursive: true });
+  frames.forEach((data, i) => fs.writeFileSync(path.join(frameDir, `frame-${String(i).padStart(2, '0')}.png`), Buffer.from(data, 'base64')));
+  assert.deepEqual(errors, []); console.log('果冻拼豆海景：半透明鱼身、弹性动画、减少动态效果偏好、缓存稳定、造景颗粒、投放预览、点击坐标、世界与余额不变、桌面手机及动画帧通过');
 }
 main().catch(error => { console.error(error); process.exitCode = 1; }).finally(async () => { if (browser) await browser.close(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); });

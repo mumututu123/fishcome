@@ -1,11 +1,12 @@
 import { MAX_FLOOR, WORLD_WIDTH, wrapX } from './geography.js';
-import { drawBeadGlyph } from './bead-visual.js';
+import { beadTint, drawBeadGlyph } from './bead-visual.js';
+import { drawJellyBody, drawJellyInk, drawJellySheen, jellyPhase, jellyPose } from './jelly-bead.js';
 
 const FONT = "'Microsoft YaHei',Consolas,monospace";
 const TAU = 2 * Math.PI;
 const CELL = 64, PAD = 16, SPRITE = CELL + PAD * 2;
 const GLYPH_LIMIT = 512, GLYPHS_PER_FRAME = 24;
-const BEAD_KINDS = new Set(['fish', 'scene', 'beadPreview']);
+const BEAD_KINDS = new Set(['fish', 'fishPreview', 'scene', 'beadPreview']);
 const FOCAL = 59, PITCH = .26;
 const BANDS = [0, 2, 5, 9, 15, 24, 36, 53, 75, 101, 132];
 const STEP = 2, COLUMNS = WORLD_WIDTH / STEP;
@@ -286,6 +287,11 @@ function drawTerrain(ctx, terrain, camera, size, halfW, halfH, shadow) {
 
 function glyphSprite(ch, color, glow, material, kind) {
   const sprite = canvas(SPRITE, SPRITE), ctx = sprite.getContext('2d');
+  if (kind === 'fish' || kind === 'fishPreview') {
+    drawJellyBody(ctx, color, PAD, PAD, CELL, glow);
+    if (kind === 'fishPreview') drawJellyInk(ctx, ch, color, PAD, PAD, CELL);
+    return sprite;
+  }
   if (BEAD_KINDS.has(kind)) { drawBeadGlyph(ctx, ch, color, PAD, PAD, CELL, glow); return sprite; }
   const center = PAD + CELL / 2;
   const hex = Number.parseInt(color.slice(1), 16);
@@ -332,6 +338,11 @@ export class Scene3D {
       drawBeadGlyph(sprite.getContext('2d'), '', '#638393', PAD, PAD, CELL, glow);
       return sprite;
     });
+    this.jellyFallbacks = [false, true].map(glow => {
+      const sprite = canvas(SPRITE, SPRITE); drawJellyBody(sprite.getContext('2d'), '#638393', PAD, PAD, CELL, glow); return sprite;
+    });
+    this.jellySheen = canvas(SPRITE, SPRITE); drawJellySheen(this.jellySheen.getContext('2d'), PAD, PAD, CELL);
+    this.jellyTime = 0; this.fishPhases = new Map();
     this.backdrop = canvas(1, 1);
     this.backdropContext = this.backdrop.getContext('2d', { alpha: false });
     this.caustics = waterCaustics();
@@ -344,9 +355,11 @@ export class Scene3D {
     const { ctx, width, height, camera } = renderer;
     this.frameNumber++;
     this.glyphBudget = GLYPHS_PER_FRAME;
+    this.jellyTime = Number.isFinite(now) ? now / 1000 : 0;
     if (width <= 0 || height <= 0) return;
     const terrain = world.data.terrain;
     if (terrain?.seed !== this.terrainSeed || terrain?.createdAt !== this.terrainDate || this.world !== world) {
+      this.fishPhases.clear();
       this.terrain = buildTerrain(world);
       this.terrainSeed = terrain?.seed;
       this.terrainDate = terrain?.createdAt;
@@ -478,7 +491,33 @@ export class Scene3D {
     ctx.globalAlpha = 1;
   }
 
-  glyph(ctx, ch, color, x, y, size, alpha = 1, glow = false, kind = 'scene') {
+  drawFishLinks(renderer, world, characters, size, visible) {
+    if (this.linkCharacters !== characters || this.linkWorld !== world) {
+      this.linkCharacters = characters; this.linkWorld = world; this.fishLinks = [];
+      const groups = new Map();
+      for (const cell of characters) if (cell.kind === 'fish') {
+        if (!groups.has(cell.entity)) groups.set(cell.entity, new Map());
+        groups.get(cell.entity).set(`${cell.x},${cell.y}`, cell);
+      }
+      for (const cells of groups.values()) for (const cell of cells.values()) for (const [dx, dy] of [[1, 0], [0, 1], [1, 1], [-1, 1]]) {
+        if (!cells.has(`${cell.x + dx},${cell.y + dy}`)) continue;
+        const color = beadTint(cell.color, [185, 235, 247], .2).replace('rgb(', 'rgba(').replace(')', `,${dx && dy ? .075 : .14})`);
+        this.fishLinks.push({ cell, dx, dy, color });
+      }
+    }
+    const ctx = renderer.ctx; ctx.save(); ctx.lineCap = 'round';
+    for (const { cell, dx, dy, color } of this.fishLinks) {
+      const fish = world.data.fishes[cell.entity]; if (!fish) continue;
+      const p = { x: fish.x + fish.facing * cell.x, y: fish.y + cell.y }; if (!visible(p)) continue;
+      const pixel = renderer.screen(p.x, p.y), length = Math.hypot(dx, dy), trim = .38 / length;
+      ctx.strokeStyle = color; ctx.lineWidth = size * (dx && dy ? .12 : .17); ctx.beginPath();
+      ctx.moveTo(pixel.x + size * (.5 + fish.facing * dx * trim), pixel.y + size * (.5 + dy * trim));
+      ctx.lineTo(pixel.x + size * (.5 + fish.facing * dx * (1 - trim)), pixel.y + size * (.5 + dy * (1 - trim))); ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  glyph(ctx, ch, color, x, y, size, alpha = 1, glow = false, kind = 'scene', cell = null, facing = 1) {
     const key = `${kind}:${ch}:${color}:${glow}`;
     let entry = this.glyphs.get(key);
     if (!entry && this.glyphBudget > 0) {
@@ -491,15 +530,35 @@ export class Scene3D {
       if (this.glyphs.size < GLYPH_LIMIT) {
         this.glyphBudget--;
         entry = { sprite: glyphSprite(ch, color, glow, MATERIALS[kind] ?? MATERIALS.scene, kind), lastSeen: this.frameNumber };
+        if (kind === 'fish') { entry.ink = canvas(SPRITE, SPRITE); drawJellyInk(entry.ink.getContext('2d'), ch, color, PAD, PAD, CELL); }
         this.glyphs.set(key, entry);
       }
     }
     ctx.globalAlpha = alpha;
+    if (kind === 'fish') {
+      const id = cell?.entity || 'fish';
+      if (!this.fishPhases.has(id)) { if (this.fishPhases.size >= 1024) this.fishPhases.delete(this.fishPhases.keys().next().value); this.fishPhases.set(id, jellyPhase(id)); }
+      const pose = jellyPose(this.jellyTime, this.fishPhases.get(id), cell?.x || 0, cell?.y || 0, facing, Boolean(this.motion?.matches));
+      const scale = size / CELL, width = SPRITE * scale;
+      if (entry) entry.lastSeen = this.frameNumber;
+      ctx.save(); ctx.translate(x + size * (.5 + pose.offsetX), y + size * (.5 + pose.offsetY)); ctx.rotate(pose.rotation); ctx.scale(pose.scaleX, pose.scaleY);
+      ctx.drawImage(entry?.sprite || this.jellyFallbacks[glow ? 1 : 0], -width / 2, -width / 2, width, width);
+      ctx.globalAlpha = alpha * pose.sheen; ctx.drawImage(this.jellySheen, -width / 2, -width / 2, width, width); ctx.restore();
+      // Glyphs stay centered and undeformed while the jelly surface moves.
+      if (entry?.ink) ctx.drawImage(entry.ink, x - PAD * scale, y - PAD * scale, width, width);
+      else drawJellyInk(ctx, ch, color, x, y, size);
+      ctx.globalAlpha = 1; return;
+    }
     if (entry) {
       entry.lastSeen = this.frameNumber;
       const scale = size / CELL;
       ctx.drawImage(entry.sprite, x - PAD * scale, y - PAD * scale, SPRITE * scale, SPRITE * scale);
     } else {
+      if (kind === 'fishPreview') {
+        const scale = size / CELL;
+        ctx.drawImage(this.jellyFallbacks[glow ? 1 : 0], x - PAD * scale, y - PAD * scale, SPRITE * scale, SPRITE * scale);
+        drawJellyInk(ctx, ch, color, x, y, size); ctx.globalAlpha = 1; return;
+      }
       if (BEAD_KINDS.has(kind)) {
         const scale = size / CELL;
         ctx.drawImage(this.beadFallbacks[glow ? 1 : 0], x - PAD * scale, y - PAD * scale, SPRITE * scale, SPRITE * scale);
