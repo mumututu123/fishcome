@@ -92,7 +92,7 @@ function runningLaunchers(root) {
   if (windows) {
     const output = powershell(['-Command', `
       $prefix = $env:TIDE_FIXTURE_ROOT + [IO.Path]::DirectorySeparatorChar
-      foreach ($proc in (Get-Process -Name $env:TIDE_FIXTURE_PROCESS -ErrorAction SilentlyContinue)) {
+      foreach ($proc in (Get-Process -ErrorAction Stop | Where-Object ProcessName -EQ $env:TIDE_FIXTURE_PROCESS)) {
         if ($proc.Path -and $proc.Path.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { $proc.Id }
       }
     `], { env: { ...process.env, TIDE_FIXTURE_ROOT: root, TIDE_FIXTURE_PROCESS: path.parse(launcherName).name } });
