@@ -1,6 +1,7 @@
 import { MAX_FLOOR, WORLD_WIDTH, wrapX } from './geography.js';
 import { beadTint, drawBeadGlyph } from './bead-visual.js';
 import { drawJellyBody, drawJellyInk, drawJellySheen, jellyPhase, jellyPose } from './jelly-bead.js';
+import { advanceSwimMotion, swimPose } from './swim-visual.js';
 
 const FONT = "'Microsoft YaHei',Consolas,monospace";
 const TAU = 2 * Math.PI;
@@ -343,6 +344,7 @@ export class Scene3D {
     });
     this.jellySheen = canvas(SPRITE, SPRITE); drawJellySheen(this.jellySheen.getContext('2d'), PAD, PAD, CELL);
     this.jellyTime = 0; this.fishPhases = new Map();
+    this.fishSwim = new Map(); this.fishPoses = new Map(); this.fishShapes = new Map();
     this.backdrop = canvas(1, 1);
     this.backdropContext = this.backdrop.getContext('2d', { alpha: false });
     this.caustics = waterCaustics();
@@ -360,6 +362,7 @@ export class Scene3D {
     const terrain = world.data.terrain;
     if (terrain?.seed !== this.terrainSeed || terrain?.createdAt !== this.terrainDate || this.world !== world) {
       this.fishPhases.clear();
+      this.fishSwim.clear(); this.fishPoses.clear();
       this.terrain = buildTerrain(world);
       this.terrainSeed = terrain?.seed;
       this.terrainDate = terrain?.createdAt;
@@ -499,22 +502,51 @@ export class Scene3D {
         if (!groups.has(cell.entity)) groups.set(cell.entity, new Map());
         groups.get(cell.entity).set(`${cell.x},${cell.y}`, cell);
       }
+      this.fishShapes.clear();
+      for (const [id, cells] of groups) {
+        const shape = { minX: Infinity, maxX: -Infinity, minY: Infinity, maxY: -Infinity };
+        for (const cell of cells.values()) { shape.minX = Math.min(shape.minX, cell.x); shape.maxX = Math.max(shape.maxX, cell.x); shape.minY = Math.min(shape.minY, cell.y); shape.maxY = Math.max(shape.maxY, cell.y); }
+        this.fishShapes.set(id, shape);
+      }
       for (const cells of groups.values()) for (const cell of cells.values()) for (const [dx, dy] of [[1, 0], [0, 1], [1, 1], [-1, 1]]) {
-        if (!cells.has(`${cell.x + dx},${cell.y + dy}`)) continue;
+        const other = cells.get(`${cell.x + dx},${cell.y + dy}`); if (!other) continue;
         const color = beadTint(cell.color, [185, 235, 247], .2).replace('rgb(', 'rgba(').replace(')', `,${dx && dy ? .075 : .14})`);
-        this.fishLinks.push({ cell, dx, dy, color });
+        this.fishLinks.push({ cell, other, dx, dy, color });
       }
     }
+    for (const [id, shape] of this.fishShapes) {
+      const fish = world.data.fishes[id]; if (!fish) { this.fishSwim.delete(id); continue; }
+      const sample = { x: fish.x + fish.facing * (shape.minX + shape.maxX) / 2, y: fish.y + (shape.minY + shape.maxY) / 2, facing: fish.facing, cx: fish.cx || 0, cy: fish.cy || 0 };
+      this.fishSwim.set(id, advanceSwimMotion(this.fishSwim.get(id), sample, this.jellyTime));
+    }
+    for (const id of this.fishSwim.keys()) if (!this.fishShapes.has(id)) this.fishSwim.delete(id);
+    this.fishPoses.clear();
     const ctx = renderer.ctx; ctx.save(); ctx.lineCap = 'round';
-    for (const { cell, dx, dy, color } of this.fishLinks) {
+    for (const { cell, other, dx, dy, color } of this.fishLinks) {
       const fish = world.data.fishes[cell.entity]; if (!fish) continue;
       const p = { x: fish.x + fish.facing * cell.x, y: fish.y + cell.y }; if (!visible(p)) continue;
-      const pixel = renderer.screen(p.x, p.y), length = Math.hypot(dx, dy), trim = .38 / length;
+      const pixel = renderer.screen(p.x, p.y), a = this.fishPose(cell, fish.facing), b = this.fishPose(other, fish.facing);
+      const ax = pixel.x + size * (.5 + a.offsetX), ay = pixel.y + size * (.5 + a.offsetY);
+      const bx = pixel.x + size * (.5 + fish.facing * dx + b.offsetX), by = pixel.y + size * (.5 + dy + b.offsetY);
+      const length = Math.hypot(bx - ax, by - ay), trim = .38 * size / length;
       ctx.strokeStyle = color; ctx.lineWidth = size * (dx && dy ? .12 : .17); ctx.beginPath();
-      ctx.moveTo(pixel.x + size * (.5 + fish.facing * dx * trim), pixel.y + size * (.5 + dy * trim));
-      ctx.lineTo(pixel.x + size * (.5 + fish.facing * dx * (1 - trim)), pixel.y + size * (.5 + dy * (1 - trim))); ctx.stroke();
+      ctx.moveTo(ax + (bx - ax) * trim, ay + (by - ay) * trim);
+      ctx.lineTo(bx - (bx - ax) * trim, by - (by - ay) * trim); ctx.stroke();
     }
     ctx.restore();
+  }
+
+  fishPose(cell, facing) {
+    const reduced = Boolean(this.motion?.matches), frame = `${this.frameNumber}:${this.jellyTime}:${reduced}`;
+    if (this.poseFrame !== frame) { this.poseFrame = frame; this.fishPoses.clear(); }
+    const id = cell?.entity || 'fish', key = `${id}:${cell?.x || 0}:${cell?.y || 0}:${facing}`;
+    if (this.fishPoses.has(key)) return this.fishPoses.get(key);
+    if (!this.fishPhases.has(id)) { if (this.fishPhases.size >= 1024) this.fishPhases.delete(this.fishPhases.keys().next().value); this.fishPhases.set(id, jellyPhase(id)); }
+    const phase = this.fishPhases.get(id), pose = jellyPose(this.jellyTime, phase, cell?.x || 0, cell?.y || 0, facing, reduced);
+    const swim = swimPose(this.fishSwim.get(id), phase, cell?.x || 0, cell?.y || 0, this.fishShapes.get(id), facing, reduced);
+    pose.offsetX += swim.offsetX; pose.offsetY += swim.offsetY; pose.rotation += swim.rotation;
+    pose.scaleX *= swim.scaleX; pose.scaleY *= swim.scaleY; pose.inkX = swim.offsetX; pose.inkY = swim.offsetY;
+    this.fishPoses.set(key, pose); return pose;
   }
 
   glyph(ctx, ch, color, x, y, size, alpha = 1, glow = false, kind = 'scene', cell = null, facing = 1) {
@@ -536,17 +568,16 @@ export class Scene3D {
     }
     ctx.globalAlpha = alpha;
     if (kind === 'fish') {
-      const id = cell?.entity || 'fish';
-      if (!this.fishPhases.has(id)) { if (this.fishPhases.size >= 1024) this.fishPhases.delete(this.fishPhases.keys().next().value); this.fishPhases.set(id, jellyPhase(id)); }
-      const pose = jellyPose(this.jellyTime, this.fishPhases.get(id), cell?.x || 0, cell?.y || 0, facing, Boolean(this.motion?.matches));
+      const pose = this.fishPose(cell, facing);
       const scale = size / CELL, width = SPRITE * scale;
       if (entry) entry.lastSeen = this.frameNumber;
       ctx.save(); ctx.translate(x + size * (.5 + pose.offsetX), y + size * (.5 + pose.offsetY)); ctx.rotate(pose.rotation); ctx.scale(pose.scaleX, pose.scaleY);
       ctx.drawImage(entry?.sprite || this.jellyFallbacks[glow ? 1 : 0], -width / 2, -width / 2, width, width);
       ctx.globalAlpha = alpha * pose.sheen; ctx.drawImage(this.jellySheen, -width / 2, -width / 2, width, width); ctx.restore();
-      // Glyphs stay centered and undeformed while the jelly surface moves.
-      if (entry?.ink) ctx.drawImage(entry.ink, x - PAD * scale, y - PAD * scale, width, width);
-      else drawJellyInk(ctx, ch, color, x, y, size);
+      // Glyphs follow the body bend without stretching or rotating their strokes.
+      const inkX = x + pose.inkX * size, inkY = y + pose.inkY * size;
+      if (entry?.ink) ctx.drawImage(entry.ink, inkX - PAD * scale, inkY - PAD * scale, width, width);
+      else drawJellyInk(ctx, ch, color, inkX, inkY, size);
       ctx.globalAlpha = 1; return;
     }
     if (entry) {
