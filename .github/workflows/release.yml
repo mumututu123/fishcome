@@ -1,7 +1,6 @@
 name: Release
 
 on:
-  pull_request:
   push:
     tags:
       - 'v*'
@@ -48,13 +47,9 @@ jobs:
           REQUESTED_TAG: ${{ inputs.tag || github.ref_name }}
           EVENT_NAME: ${{ github.event_name }}
         run: |
-          if ($env:EVENT_NAME -eq 'pull_request') {
-            $release = @{ Version = '0.0.0-ci'; Commit = $env:GITHUB_SHA }
-          } else {
-            $release = ./scripts/resolve-release.ps1 -Tag $env:REQUESTED_TAG -EventName $env:EVENT_NAME -EnvironmentFile ''
-            "tag=$($release.Tag)" >> $env:GITHUB_OUTPUT
-            "tag_exists=$($release.TagExists.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
-          }
+          $release = ./scripts/resolve-release.ps1 -Tag $env:REQUESTED_TAG -EventName $env:EVENT_NAME -EnvironmentFile ''
+          "tag=$($release.Tag)" >> $env:GITHUB_OUTPUT
+          "tag_exists=$($release.TagExists.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
           $legacy = !(Test-Path -LiteralPath './go.mod' -PathType Leaf) -and (Test-Path -LiteralPath './launcher/Program.cs' -PathType Leaf)
           $platforms = if ($legacy) { '["windows"]' } else { '["windows","linux"]' }
           "version=$($release.Version)" >> $env:GITHUB_OUTPUT
@@ -71,10 +66,6 @@ jobs:
         target: ${{ fromJSON(needs.resolve.outputs.platforms) }}
     runs-on: ${{ matrix.target == 'windows' && 'windows-latest' || 'ubuntu-latest' }}
     timeout-minutes: 20
-    env:
-      RELEASE_VERSION: ${{ needs.resolve.outputs.version }}
-      RELEASE_TARGET: ${{ matrix.target }}
-      TIDE_TEST_MODULES: ${{ github.workspace }}/source/node_modules
     steps:
       - uses: actions/checkout@v6
         with:
@@ -82,84 +73,14 @@ jobs:
           path: tools
           persist-credentials: false
 
-      - uses: actions/checkout@v6
+      - uses: ./tools/.github/actions/verify-package
         with:
-          ref: ${{ needs.resolve.outputs.commit }}
-          path: source
-          fetch-depth: 0
-          persist-credentials: false
-
-      - uses: actions/setup-node@v6
-        with:
-          node-version: '22'
-          cache: npm
-          cache-dependency-path: source/package-lock.json
-
-      - uses: actions/setup-go@v6
-        if: needs.resolve.outputs.legacy != 'true'
-        with:
-          go-version-file: source/go.mod
-          cache-dependency-path: |
-            source/go.mod
-            source/go.sum
-            tools/scripts/packaging/go.sum
-
-      - name: Install JavaScript dependencies
-        working-directory: source
-        run: npm ci
-
-      - name: Install Chromium
-        working-directory: source
-        run: |
-          $options = @()
-          if ($env:RELEASE_TARGET -eq 'linux') { $options += '--with-deps' }
-          npx playwright install chromium @options
-
-      - name: Test game rules
-        working-directory: source
-        run: npm test
-
-      - name: Check Go code
-        if: needs.resolve.outputs.legacy != 'true'
-        working-directory: source
-        run: go test ./...
-
-      - name: Build ZIP
-        if: needs.resolve.outputs.legacy != 'true'
-        run: ./tools/build.ps1 -Version $env:RELEASE_VERSION -OutputDirectory ./dist/release -SourceDirectory ./source -TargetOS $env:RELEASE_TARGET
-
-      - name: Rebuild historical Windows ZIP
-        if: needs.resolve.outputs.legacy == 'true'
-        working-directory: source
-        run: ./build.ps1 -Version $env:RELEASE_VERSION -OutputDirectory ./dist/release
-
-      - name: Verify extracted package in Chromium
-        env:
-          LEGACY_WINDOWS: ${{ needs.resolve.outputs.legacy }}
-        run: ./tools/scripts/test-release.ps1 -ArchivePath $env:RELEASE_ARCHIVE -SourceDirectory ./source -BrowserTestPath ./tools/tests/browser-release.cjs -LegacyWindows:($env:LEGACY_WINDOWS -eq 'true')
-
-      - name: Check packaging cleanup
-        run: |
-          $leftovers = @(Get-ChildItem -LiteralPath ./source/dist -Directory -Force | Where-Object { $_.Name -match '^\.(build|smoke)-[0-9a-f]{32}$' })
-          if ($leftovers.Count) { throw "构建或验证脚本需要清理临时目录：$($leftovers.Name -join '、')" }
-
-      - name: Verify launcher hot update
-        if: needs.resolve.outputs.legacy != 'true'
-        working-directory: source
-        run: node tests/hot-update-launcher.cjs
-
-      - name: Verify browser hot update
-        if: needs.resolve.outputs.legacy != 'true'
-        working-directory: source
-        run: node tests/hot-update.cjs
-
-      - name: Verify hot update from the C# launcher
-        if: matrix.target == 'windows' && needs.resolve.outputs.legacy != 'true'
-        working-directory: source
-        run: node tests/hot-update-legacy-windows.cjs
+          source-ref: ${{ needs.resolve.outputs.commit }}
+          version: ${{ needs.resolve.outputs.version }}
+          target: ${{ matrix.target }}
+          legacy-windows: ${{ needs.resolve.outputs.legacy }}
 
       - uses: actions/upload-artifact@v6
-        if: github.event_name != 'pull_request'
         with:
           name: package-${{ matrix.target }}
           path: ${{ env.RELEASE_ARCHIVE }}
@@ -167,7 +88,6 @@ jobs:
           compression-level: 0
 
   publish:
-    if: github.event_name != 'pull_request'
     needs: [resolve, verify]
     runs-on: ubuntu-latest
     timeout-minutes: 5

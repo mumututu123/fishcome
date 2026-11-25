@@ -153,16 +153,14 @@
 
 构建需要 Go 1.25 或更高版本。运行 `./build.ps1` 默认按当前系统构建（Windows 在 PowerShell 下生成 `dist/鱼来/鱼来.exe` 与 `fishcome-VERSION-windows.zip`，Linux 使用 `pwsh` 生成 `dist/鱼来/fishcome` 与 `fishcome-VERSION-linux-amd64.zip`），也可通过 `-TargetOS windows` 或 `-TargetOS linux` 指定目标系统。
 
-合并请求会在 Windows 和 Linux 上运行相同的发行包检查。GitHub Release 工作流位于 `.github/workflows/release.yml`。将工作流和构建脚本提交、推送到 master 后，在要发布的提交上创建并推送版本标签，例如：
-
-提交时也要包含新增的 `package-lock.json`、`tests/browser-release.cjs` 和 `tests/ui-contract.test.mjs`；只用 `git commit -am` 不会自动加入尚未追踪的新文件。工作流会在安装依赖前检查必需文件是否齐全。
+合并请求由 `Check` 工作流验证。正式发包由 `Release` 工作流处理。两者共用 Windows 和 Linux 的发行包验收步骤。将工作流和构建脚本提交、推送到 master 后，在要发布的提交上创建并推送版本标签，例如：
 
 ```powershell
 git tag v0.1.1
 git push origin v0.1.1
 ```
 
-工作流分别在 Windows 和 Linux runner 上运行规则测试与 `go test ./...`、编译启动器，再解压 ZIP 实际启动程序、校验所有网页资源，并用 Chromium 检查首次注册、弹窗、造鱼、下载名称、刷新恢复、双启动器联机与热更新流程，全部通过才创建 Release。用户按系统下载 Release 附件（Windows 为 `fishcome-VERSION-windows.zip`，完整解压后双击根目录「鱼来.exe」；Linux x64 为 `fishcome-VERSION-linux-amd64.zip`，完整解压后运行根目录「./fishcome」）；包内只包含程序和必需的 `www`，不含源码、测试或验证文档。用户手册可在 Release 说明中打开。ZIP 使用英文名称避免 GitHub 删除中文文件名前缀；发布说明与下载链接直接使用实际附件名称。更新时可通过游戏内热更新升级，或先退出旧启动器再运行新包，浏览器仍从原本的固定本地地址 `http://127.0.0.1:39241` 恢复身份和存档。
+两条工作流都在 Windows 和 Linux 上运行规则测试与 `go test ./...`、编译启动器，再解压 ZIP 实际启动程序、校验所有网页资源，并用 Chromium 检查首次注册、弹窗、造鱼、下载名称、刷新恢复、双启动器联机与热更新流程。正式发行在验收全部通过后才上传发行包。用户按系统下载 Release 附件（Windows 为 `fishcome-VERSION-windows.zip`，完整解压后双击根目录「鱼来.exe」；Linux x64 为 `fishcome-VERSION-linux-amd64.zip`，完整解压后运行根目录「./fishcome」）；包内只包含程序和必需的 `www`，不含源码、测试或验证文档。用户手册可在 Release 说明中打开。ZIP 使用英文名称避免 GitHub 删除中文文件名前缀；发布说明与下载链接直接使用实际附件名称。更新时可通过游戏内热更新升级，或先退出旧启动器再运行新包，浏览器仍从原本的固定本地地址 `http://127.0.0.1:39241` 恢复身份和存档。
 
 也可在 GitHub 的 Actions → Release → Run workflow 中选择分支（通常为 master），填写版本标签直接发布，例如 `v0.1.1`。标签不存在时，工作流构建本次所选分支的提交，测试与打包通过后才自动创建标签和 Release，不用事先手工打标签。标签已存在时，工作流构建其对应的原提交；重复执行更新同名 ZIP 附件，不移动原标签。大小写 `v`／`V` 都支持，推荐使用小写。
 

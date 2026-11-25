@@ -1,0 +1,39 @@
+name: Check
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  release-selection:
+    name: Test release selection
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - run: ./tests/release-workflow.ps1
+        shell: pwsh
+
+  verify:
+    name: Verify (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [windows, linux]
+    runs-on: ${{ matrix.target == 'windows' && 'windows-latest' || 'ubuntu-latest' }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: tools
+          persist-credentials: false
+
+      - uses: ./tools/.github/actions/verify-package
+        with:
+          source-ref: ${{ github.sha }}
+          version: 0.0.0-ci
+          target: ${{ matrix.target }}
