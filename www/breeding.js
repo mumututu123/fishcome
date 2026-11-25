@@ -1,6 +1,9 @@
-import { CONFIG, EYES, NEIGHBORS, bounds, cellPosition, components, hash, clone, key } from './engine.js';
+import { CONFIG, EYES, NEIGHBORS, bounds, cellPosition, components, hash, clone, key, touching } from './engine.js';
 import { defaultFishName, fishNameError } from './fish-profile.js';
 import { wrapX, nearX, deltaX } from './geography.js';
+import { recordStory } from './life.js';
+import { capturedFish } from './legends.js';
+import { densityField, contactTime } from './ecology.js';
 
 export const CONTACT_TIME = 5000;
 export const BREEDING_TIME = 3600000;
@@ -8,7 +11,7 @@ export function breedingId(male, female, started) { const pair = `${male}:${fema
 export function fishOrigin(data, id) {
   const op = data.ops[id]; if (op?.kind === 'fish') return { actor: op.actor, nick: op.nick, gender: op.gender, created: op.t, name: op.name, size: op.cells.length };
   const record = typeof id === 'string' && id.startsWith('born:') ? data.breeding?.[id.slice(5)] : null;
-  return record?.status === 'born' && record.baby?.id === id ? record.baby : undefined;
+  return record?.status === 'born' && record.baby?.id === id ? record.baby : data.archivedCatalog?.[id];
 }
 export function activeBreeding(data, id) { return Object.values(data.breeding || {}).find(record => record.status === 'active' && (record.male === id || record.female === id)); }
 export function contactCells(male, mc, female, fc, scenery) {
@@ -69,6 +72,7 @@ export function finishBreeding(world, now, transition) {
     world.data.fishes[id] = { id, actor: record.baby.actor, nick: record.baby.nick, gender, birth: record.id, parents: record.baby.parents, x: wrapX(body.minX), y: body.minY, facing: 1, created: now, lastFed: now, hungerAt: now + CONFIG.hunger, cx: 0, cy: 0, posAt: now };
     world.data.fishes[id].name = record.baby.name;
     world.data.travel[id] = { since: now, days: {} };
+    recordStory(world, 'birth', id, now, { parents: record.baby.parents });
     father.cx = father.cy = mother.cx = mother.cy = 0; father.posAt = mother.posAt = now;
     world.foodRevision++; world.dirty = true;
   }
@@ -79,7 +83,7 @@ export function updateContacts(world, now, groups, scenery) {
   const at = new Map(), eligible = new Map(), pairs = new Map();
   for (const [id, cells] of groups) {
     const fish = world.data.fishes[id], gender = fishOrigin(world.data, id)?.gender;
-    if (!fish || taken.has(id) || !['male', 'female'].includes(gender)) continue;
+    if (!fish || taken.has(id) || capturedFish(world.data, id, now) || !['male', 'female'].includes(gender)) continue;
     eligible.set(id, { fish, gender, cells });
     for (const cell of cells) { const p = cellPosition(fish, cell), k = key(p.x, p.y); if (!at.has(k)) at.set(k, new Set()); at.get(k).add(id); }
   }
@@ -93,12 +97,16 @@ export function updateContacts(world, now, groups, scenery) {
       }
     }
   }
-  const contacts = {};
+  const contacts = {}, density = world.ambient && pairs.size ? densityField(world, scenery) : null;
   for (const [key, pair] of [...pairs].sort(([a], [b]) => a.localeCompare(b))) {
     if (taken.has(pair.male) || taken.has(pair.female)) continue;
+    const f = world.data.fishes[pair.male], m = world.data.fishes[pair.female], contact = contactCells(f, groups.get(pair.male), m, groups.get(pair.female), scenery);
+    const maleCell = groups.get(pair.male).find(c => c.id === contact.male[0]), p = maleCell && cellPosition(f, maleCell), femaleCell = [...groups.get(pair.female)].sort((a, b) => a.id.localeCompare(b.id)).find(c => maleCell && touching(f, [maleCell], cellPosition(m, c), scenery)), q = femaleCell && cellPosition(m, femaleCell);
+    const wait = density && p && q ? contactTime(density((p.x + nearX(q.x, p.x)) / 2, (p.y + q.y) / 2)) : CONTACT_TIME;
+    if (!Number.isFinite(wait)) continue;
     const prior = world.data.contacts[key], since = prior && now >= prior.lastAt && now - prior.lastAt <= CONFIG.step * 2 ? prior.since : now;
     contacts[key] = { ...pair, since, lastAt: now };
-    if (now - since < CONTACT_TIME) continue;
+    if (now - since < wait) continue;
     const father = world.data.fishes[pair.male], mother = world.data.fishes[pair.female], fc = groups.get(pair.male), mc = groups.get(pair.female), all = [...fc.map(cell => cellPosition(father, cell)), ...mc.map(cell => cellPosition(mother, cell))];
     if (new Set(all.map(p => `${p.x},${p.y}`)).size !== all.length) continue;
     const started = now, id = breedingId(pair.male, pair.female, started), initialPose = { male: pose(father), female: pose(mother) };
@@ -129,15 +137,84 @@ export function commitUnit(unit, now) {
   }
   for (const fish of unit.members) { fish.x = wrapX(fish.x); fish.posAt = now; }
 }
-export function mergeBreeding(world, other) {
+export function mergeBreeding(world, other, archived = {}) {
   world.data.breeding ||= {};
   for (const [id, record] of Object.entries(other.breeding || {})) {
-    const old = world.data.breeding[id], terminal = record.status !== 'active', oldTerminal = old && old.status !== 'active';
+    const old = world.data.breeding[id] || archived[id], terminal = record.status !== 'active', oldTerminal = old && old.status !== 'active';
     const born = record.status === 'born', oldBorn = old?.status === 'born';
     if (!old || born && !oldBorn || !oldBorn && terminal && !oldTerminal || born === oldBorn && terminal === oldTerminal && ((born ? record.at < old.at : record.at > old.at) || record.at === old.at && JSON.stringify(record).localeCompare(JSON.stringify(old)) > 0)) world.data.breeding[id] = clone(record);
   }
   if ((other.contactAt || 0) > (world.data.contactAt || 0)) { world.data.contacts = clone(other.contacts || {}); world.data.contactAt = other.contactAt; }
 }
+// Birth certificates are selected independently of movement. Keep the immutable
+// origin coherent without resetting position, later feeding or user edits.
+export function canonicalBirthFish(fish, record) {
+  const baby = record?.baby;
+  if (record?.status !== 'born' || baby?.id !== fish.id || !Number.isFinite(baby.created)) return fish;
+  const { actor, created, gender, nick, parents } = baby;
+  if (fish.created === created && fish.actor === actor && fish.birth === record.id &&
+      fish.gender === gender && fish.nick === nick && JSON.stringify(fish.parents) === JSON.stringify(parents)) return fish;
+  const result = { ...fish, actor, created, gender, nick, parents: [...parents], birth: record.id };
+  if (fish.lastFed === fish.created && fish.lastMealAt == null) {
+    result.lastFed = created;
+    if (fish.hungerAt === fish.created + CONFIG.hunger) result.hungerAt = created + CONFIG.hunger;
+  }
+  return result;
+}
+
+// Only rebase equivalent inheritance events. A different cell, parent or glyph
+// is not evidence of the same transition; full validation still rejects it.
+export function canonicalBirthPath(cell, breeding) {
+  const path = cell.path;
+  if (!Array.isArray(path)) return cell;
+  let changed = false;
+  const next = path.map((event, index) => {
+    if (event?.reason !== 'birth' || !Object.hasOwn(breeding, event.birth)) return event;
+    const record = breeding[event.birth], baby = record?.baby;
+    if (record?.status !== 'born' || !Number.isFinite(baby?.created) || !Array.isArray(baby.cells)) return event;
+    const inherited = baby.cells.find(item => item.id === cell.id);
+    if (!inherited || event.id !== `birth:${record.id}:${cell.id}` || event.target !== baby.id ||
+        event.from !== inherited.parent || event.before !== inherited.before || event.after !== inherited.after ||
+        event.x !== inherited.x || event.y !== inherited.y || !Number.isFinite(event.t) || event.t < baby.created ||
+        baby.created < (path[index - 1]?.t ?? -Infinity) || event.t > (path[index + 1]?.t ?? Infinity) || event.t === baby.created) return event;
+    changed = true;
+    return { ...event, t: baby.created };
+  });
+  return changed ? { ...cell, path: next } : cell;
+}
+
+// Legacy local snapshots may contain the later branch's birth time. Repair
+// only this recognizable mismatch and let the caller verify the full result.
+export function repairLocalBirthTimes(data, archived = {}) {
+  if (!data?.ops || !data.fishes || !data.chars) return data;
+  const breeding = { ...archived.breeding, ...data.breeding };
+  const fishes = { ...data.fishes }, chars = { ...data.chars };
+  const sources = { ops: { ...archived.ops, ...data.ops }, breeding };
+  const validated = new Map();
+  const isValid = record => {
+    if (!validated.has(record.id)) validated.set(record.id, validBreedingRecord(record, sources));
+    return validated.get(record.id);
+  };
+  let changed = false;
+  for (const [id, fish] of Object.entries(fishes)) {
+    if (!fish || !id.startsWith('born:')) continue;
+    const record = breeding[id.slice(5)], baby = record?.baby;
+    if (fish.id !== id || fish.birth !== record?.id || baby?.id !== id || fish.actor !== baby.actor ||
+        !Number.isFinite(fish.created) || fish.created <= baby.created ||
+        !isValid(record)) continue;
+    const normalized = canonicalBirthFish(fish, record);
+    fishes[id] = { ...fish, created: normalized.created, lastFed: normalized.lastFed, hungerAt: normalized.hungerAt };
+    changed = true;
+  }
+  for (const [id, cell] of Object.entries(chars)) {
+    if (!Array.isArray(cell?.path) || !cell.path.some(event => event?.reason === 'birth')) continue;
+    const trusted = Object.fromEntries(cell.path.filter(event => event?.reason === 'birth' && Object.hasOwn(breeding, event.birth) && breeding[event.birth] && isValid(breeding[event.birth])).map(event => [event.birth, breeding[event.birth]]));
+    const normalized = canonicalBirthPath(cell, trusted);
+    if (normalized !== cell) { chars[id] = normalized; changed = true; }
+  }
+  return changed ? { ...data, fishes, chars } : data;
+}
+
 export function normalizeBirthCells(world) {
   for (const cell of Object.values(world.data.chars)) {
     const event = cell.path?.at(-1); if (cell.kind !== 'fish' || event?.reason !== 'birth') continue;

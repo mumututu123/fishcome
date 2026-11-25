@@ -15,11 +15,14 @@ async function main() {
   browser = await chromium.launch({ executablePath: 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe', headless: true });
   const first = await browser.newContext({ viewport: { width: 1440, height: 900 } }), second = await browser.newContext({ viewport: { width: 1440, height: 900 } });
   let a = await open(first, 39541, '碰撞甲'), b = await open(second, 39542, '碰撞乙'); await a.close(); await b.close();
-  const setupB = await second.newPage(); await setupB.goto('http://127.0.0.1:39542/welcome.html'); const otherIdentity = await setupB.evaluate(async () => (await import('./storage.js')).get('identity')); await setupB.close();
+  const setupB = await second.newPage(); await setupB.goto('http://127.0.0.1:39542/welcome.html'); const otherIdentity = await setupB.evaluate(async () => {
+    const { World } = await import('./engine.js'), { get, set } = await import('./storage.js'), previous = await get('checkpoint'), now = Date.now();
+    await set('checkpoint', { ...previous, world: new World(now, Object.keys(previous.world.roots)[0], { populate: false }).serialize(), lastOnlineAt: now }); return get('identity');
+  }); await setupB.close();
   const setup = await first.newPage(); await setup.goto('http://127.0.0.1:39541/welcome.html');
   const ids = await setup.evaluate(async otherIdentity => {
     const { World, hash, maskNick } = await import('./engine.js'), { get, set, signer } = await import('./storage.js'), { Network } = await import('./network.js');
-    const identity = await get('identity'), previous = await get('checkpoint'), now = Date.now(), world = new World(now, Object.keys(previous.world.roots)[0]), senders = [identity, otherIdentity].map(identity => new Network(identity, {}, () => {}, () => {}));
+    const identity = await get('identity'), previous = await get('checkpoint'), now = Date.now(), world = new World(now, Object.keys(previous.world.roots)[0], { populate: false }), senders = [identity, otherIdentity].map(identity => new Network(identity, {}, () => {}, () => {}));
     for (let i = 0; i < 2; i++) senders[i].sign = await signer(i ? otherIdentity : identity);
     const cell = (x, y) => ({ x, y, ch: 'Q', color: '#8be7df' });
     async function apply(index, body) { const author = index ? otherIdentity : identity, op = { id: crypto.randomUUID(), actor: author.actor, nick: maskNick(author.nick), t: now, roots: [world.id], ...body }; const result = world.apply({ ...op, proof: await senders[index].makeEnvelope('op', op) }); if (!result.ok) throw new Error(result.error); return op.id; }

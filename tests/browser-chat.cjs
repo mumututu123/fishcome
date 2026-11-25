@@ -38,17 +38,19 @@ async function main() {
   const aContext = await browser.newContext({ viewport: { width: 1440, height: 900 } }), bContext = await browser.newContext({ viewport: { width: 1440, height: 900 } });
   let a = await open(aContext, '聊天甲'), b;
   await a.locator('#makeFish').click(); const grid = await a.locator('#gridCanvas').boundingBox();
-  for (const column of [7.5, 8.5]) await a.mouse.click(grid.x + column * grid.width / 15, grid.y + 7.5 * grid.height / 15);
-  await a.locator('#placeDrawing').click(); await a.mouse.click(600, 370); await a.waitForFunction(() => tide.world.counts.fish === 1);
-  const fishId = await a.evaluate(() => Object.keys(tide.world.data.fishes)[0]);
+  await a.locator('#glyphInput').fill('oo'); await a.locator('#prepareBeads').click();
+  for (const column of [7.5, 8.5]) { await a.locator('[data-bead-id]').first().click(); await a.mouse.click(grid.x + column * grid.width / 15, grid.y + 7.5 * grid.height / 15); }
+  await a.locator('#placeDrawing').click(); await a.mouse.click(600, 370); await a.waitForFunction(() => Object.values(tide.world.data.fishes).some(f => f.actor === tide.identity.actor));
+  const fishId = await a.evaluate(() => Object.values(tide.world.data.fishes).find(f => f.actor === tide.identity.actor).id);
   const first = '海底🐟 é 👨‍👩‍👧‍👦 <script>window.chatExecuted=1</script>';
   await send(a, first); assert.equal(await a.evaluate(() => window.chatExecuted), undefined);
+  await a.waitForFunction(async () => { const { get } = await import('./storage.js'); const checkpoint = await get('checkpoint'); return Object.keys(checkpoint?.world.chats || {}).length === 1; });
   await a.close(); await pause(300);
   await control(aContext, async () => {
     const { get, set, signer } = await import('./storage.js'), { Network } = await import('./network.js');
     const identity = await get('identity'), checkpoint = await get('checkpoint'), network = new Network(identity, {}, () => {}, () => {}); network.sign = await signer(identity);
     for (let index = 0; index < 205; index++) { const message = await network.makeEnvelope('chat', { nick: '聊＊甲', text: `历史${String(index).padStart(3, '0')}`, t: Date.now() + index, roots: [Object.keys(checkpoint.world.roots).sort()[0]] }); checkpoint.world.chats[message.id] = message; }
-    const fish = Object.keys(checkpoint.world.fishes)[0], day = new Date(Date.now() + 8 * 3600000).toISOString().slice(0, 10); checkpoint.world.travel[fish].days[day] = 12.5;
+    const fish = Object.values(checkpoint.world.fishes).find(f => f.actor === identity.actor).id, day = new Date(Date.now() + 8 * 3600000).toISOString().slice(0, 10); checkpoint.world.travel[fish].days[day] = 12.5;
     checkpoint.lastOnlineAt = Date.now(); await set('checkpoint', checkpoint);
   });
   a = await open(aContext); assert.equal(await count(a), 206);
@@ -71,15 +73,17 @@ async function main() {
   a = await open(aContext); b = await open(bContext);
   const expected = await a.evaluate(async () => { const { chatGlyphs } = await import('./chat.js'); return Object.values(tide.world.data.chatSources).reduce((sum, message) => sum + chatGlyphs(message.body.text).length, 0); });
   assert.equal(await count(a), 0); assert.equal(await a.evaluate(() => Object.values(tide.world.data.chars).filter(cell => cell.chat).length), expected);
-  const cards = await a.evaluate(() => Object.values(tide.histories).filter(card => card.status !== 'corrected')); assert(cards.some(card => Object.keys(card.chats || {}).length === 207));
+  const cards = await a.evaluate(() => Object.values(tide.histories).filter(card => card.status !== 'corrected')); assert(cards.some(card => card.chatCount === 207 || Object.keys(card.chats || {}).length === 207));
   await connect(b); await a.waitForFunction(expected => Object.values(tide.world.data.chars).filter(cell => cell.chat).length === expected && tide.network.peers.length > 0, expected);
   assert.equal(await b.evaluate(() => Object.values(tide.world.data.chars).filter(cell => cell.chat).length), expected); assert.equal(await a.evaluate(() => tide.balance()), 20); assert.equal(await b.evaluate(() => tide.balance()), 20);
   await a.locator('#seabed').click(); await a.screenshot({ path: path.join(project, 'test-output', 'chat-seabed.png') });
   await a.mouse.click(711, 675); await a.locator('#historyCards details summary').first().click();
   await a.waitForFunction(() => document.querySelector('.archivedChat')?.textContent.includes('海底🐟'));
   assert.equal(await a.locator('.archivedChat script').count(), 0); await a.locator('#closeHistory').click();
-  const point = await a.evaluate(() => { const cell = Object.values(tide.world.data.chars).find(cell => cell.chat && Math.abs(cell.x - 614) < 30 && !(cell.x >= 610 && cell.x < 618 && cell.y >= Math.min(...tide.world.data.terrain.depths.slice(610, 618)) - 5)); return { x: innerWidth / 2 + (cell.x - tide.view.camera.x + .5) * 18 * tide.view.scale, y: innerHeight / 2 + (cell.y - tide.view.camera.y + .5) * 18 * tide.view.scale }; });
-  await a.mouse.click(point.x, point.y); assert.equal(await a.locator('#sceneActions').isVisible(), false); assert((await a.locator('#objectFootnote').textContent()).includes('不能编辑'));
+  const points = await a.evaluate(() => Object.values(tide.world.data.chars).filter(cell => cell.chat && !(cell.x >= 610 && cell.x < 618 && cell.y >= Math.min(...tide.world.data.terrain.depths.slice(610, 618)) - 5)).map(cell => ({ id: cell.id, x: innerWidth / 2 + (cell.x - tide.view.camera.x + .5) * 18 * tide.view.scale, y: innerHeight / 2 + (cell.y - tide.view.camera.y + .5) * 18 * tide.view.scale })).filter(p => p.x > 350 && p.x < innerWidth - 100 && p.y > 180 && p.y < innerHeight - 110));
+  assert(points.length, '视口内没有可点击的聊天沉积'); let selectedMemory = false;
+  for (const point of points.slice(0, 20)) { await a.mouse.click(point.x, point.y); selectedMemory = await a.evaluate(id => tide.view.selected?.kind === 'scene' && tide.view.selected.cell === id, point.id); if (selectedMemory) break; }
+  assert(selectedMemory, '没有选中聊天沉积'); assert.equal(await a.locator('#sceneActions').isVisible(), false); assert((await a.locator('#objectFootnote').textContent()).includes('不能编辑'));
   await a.close(); await b.close(); await pause(300); a = await open(aContext); assert.equal(await a.evaluate(() => Object.values(tide.world.data.chars).filter(cell => cell.chat).length), expected);
   await a.locator('#connect').click(); const downloadPromise = a.waitForEvent('download'); await a.locator('#backup').click(); const download = await downloadPromise, backupBytes = fs.readFileSync(await download.path());
   assert.equal(Object.keys(JSON.parse(backupBytes).checkpoint.world.chatSources).length, 207);

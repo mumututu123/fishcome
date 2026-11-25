@@ -2,6 +2,11 @@ import { MAX_FLOOR, WORLD_WIDTH, wrapX } from './geography.js';
 
 export const MINUTE = 60000, BUBBLE_SPEED = 1, BUBBLE_GROWTH = 25;
 export const BUBBLE_GLYPH = '泡', BUBBLE_COLOR = '#ffffff';
+// Appearance follows the existing birth ID, so reloads and peers see the same secret.
+export function bubbleGlyph(bubble) {
+  const roll = hash(`bubble-secret:${bubble.id}`) % 1000;
+  return roll < 5 ? '？' : roll < 35 ? '咕' : roll < 65 ? '噜' : BUBBLE_GLYPH;
+}
 function hash(text) { let value = 2166136261; for (const ch of text) value = Math.imul(value ^ ch.codePointAt(0), 16777619); return value >>> 0; }
 export const bubbleId = (source, minute) => `bubble:${source}:${minute}`;
 export const bubbleChance = depth => Math.max(0, Math.min(100, 100 - depth)) / 100;

@@ -5,7 +5,7 @@ export function fishNameError(name, size) {
   return Array.from(name).length > size ? `鱼名最多 ${size} 字，不能超过鱼身鱼元数` : '';
 }
 export function fishCatalog(data) {
-  const entries = new Map();
+  const entries = new Map(Object.entries(data.archivedCatalog || {}).map(([id, entry]) => [id, { ...entry, alive: !!data.fishes[id] }]));
   for (const op of Object.values(data.ops)) if (op.kind === 'fish') entries.set(op.id, { id: op.id, actor: op.actor, nick: op.nick, gender: op.gender, name: op.name, created: op.t, size: op.cells.length, parents: [], alive: !!data.fishes[op.id] });
   for (const record of Object.values(data.breeding || {})) if (record.status === 'born') { const baby = record.baby; entries.set(baby.id, { ...baby, size: baby.cells.length, alive: !!data.fishes[baby.id] }); }
   for (const entry of entries.values()) entry.nick = data.participants?.[entry.actor] || entry.nick;

@@ -4,6 +4,7 @@ const fs = require('node:fs');
 const assert = require('node:assert/strict');
 const { chromium } = require(process.env.TIDE_TEST_MODULES ? path.join(process.env.TIDE_TEST_MODULES, 'playwright') : 'playwright');
 const project = path.resolve(__dirname, '..'), ports = [39331, 39332], children = [], errors = []; let browser;
+const concurrent = process.argv.includes('--concurrent-births');
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 async function until(check, message) { const deadline = Date.now() + 20000; while (Date.now() < deadline) { if (await check()) return; await pause(150); } throw new Error(message); }
 async function open(context, port, nick) {
@@ -18,9 +19,9 @@ async function main() {
   let a = await open(first, ports[0], '父鱼作者'), b = await open(second, ports[1], '母鱼作者'); await a.close(); await b.close();
   const setupB = await second.newPage(); await setupB.goto(`http://127.0.0.1:${ports[1]}/welcome.html`); const motherIdentity = await setupB.evaluate(async () => (await import('./storage.js')).get('identity')); await setupB.close();
   const setup = await first.newPage(); await setup.goto(`http://127.0.0.1:${ports[0]}/welcome.html`);
-  const fixture = await setup.evaluate(async motherIdentity => {
-    const { World, maskNick } = await import('./engine.js'), { BREEDING_TIME, updateContacts } = await import('./breeding.js'), { HOUR } = await import('./seaweed.js'), { get, set, signer } = await import('./storage.js'), { Network } = await import('./network.js');
-    const identity = await get('identity'), checkpoint = await get('checkpoint'), now = Date.now(), start = now - BREEDING_TIME + 20000, created = start - 10000, world = new World(created, Object.keys(checkpoint.world.roots)[0]);
+  const fixture = await setup.evaluate(async ({ motherIdentity, concurrent }) => {
+    const { World, maskNick } = await import('./engine.js'), { BREEDING_TIME, updateContacts, finishBreeding } = await import('./breeding.js'), { HOUR } = await import('./seaweed.js'), { get, set, signer } = await import('./storage.js'), { Network } = await import('./network.js');
+    const identity = await get('identity'), checkpoint = await get('checkpoint'), now = Date.now(), start = now - BREEDING_TIME + (concurrent ? -10000 : 20000), created = start - 10000, world = new World(created, Object.keys(checkpoint.world.roots)[0]);
     const senders = [identity, motherIdentity].map(id => new Network(id, {}, () => {}, () => {})); for (let index = 0; index < 2; index++) senders[index].sign = await signer(index ? motherIdentity : identity);
     async function apply(index, body) { const author = index ? motherIdentity : identity, op = { id: crypto.randomUUID(), actor: author.actor, nick: maskNick(author.nick), roots: [world.id], t: created, ...body }, proof = await senders[index].makeEnvelope('op', op); const result = world.apply({ ...op, proof }); if (!result.ok) throw new Error(result.error); return op.id; }
     const male = await apply(0, { kind: 'fish', name: '蓝爸', gender: 'male', x: 390, y: 20, cells: [0, 1, 2].map(x => ({ x, y: 0, ch: 'Q', color: '#79b8ff' })), cost: 3 });
@@ -29,10 +30,71 @@ async function main() {
     await apply(1, { kind: 'scene', x: 389, y: 19, cells: [...Array.from({ length: 8 }, (_, x) => ({ x, y: 2, ch: '#', color: '#678999' })), { x: 7, y: 1, ch: '#', color: '#678999' }], cost: 9 });
     for (let elapsed = 0; elapsed <= 5000; elapsed += 500) updateContacts(world, start + elapsed, world.fishGroups(), world.sceneryMap());
     const record = Object.values(world.data.breeding)[0]; if (!record) throw new Error('未进入繁殖'); world.data.tick = now; world.data.seaweedHour = Math.floor(now / HOUR);
+    if (concurrent) {
+      const active = world.serialize();
+      const complete = birth => {
+        const replica = new World(now, undefined, { populate: false });
+        replica.data = structuredClone(active);
+        finishBreeding(replica, birth, (cell, next, event) => {
+          Object.assign(cell, next);
+          cell.path.push({ ...event, target: next.entity, x: next.x, y: next.y });
+        });
+        return replica.serialize();
+      };
+      const early = complete(record.ends), late = complete(record.ends + 500);
+      const id = early.breeding[record.id].baby.id;
+      checkpoint.world = early; checkpoint.lastOnlineAt = now;
+      await set('checkpoint', checkpoint);
+      return { id, early: record.ends, late: record.ends + 500, breeding: record.id, second: late };
+    }
     checkpoint.world = world.serialize(); checkpoint.lastOnlineAt = now; await set('checkpoint', checkpoint); return { male, female, breeding: record.id, fatherActor: identity.actor, motherActor: motherIdentity.actor };
-  }, motherIdentity); await setup.close();
+  }, { motherIdentity, concurrent }); await setup.close();
+  if (concurrent) {
+    const seed = await second.newPage();
+    await seed.goto(`http://127.0.0.1:${ports[1]}/welcome.html`);
+    await seed.evaluate(async data => {
+      const { get, set } = await import('./storage.js');
+      const checkpoint = await get('checkpoint');
+      await set('checkpoint', { ...checkpoint, world: data, lastOnlineAt: Date.now() });
+    }, fixture.second);
+    await seed.close();
+  }
   a = await open(first, ports[0]); b = await open(second, ports[1]);
+  if (concurrent) {
+    const birthTime = (page, id) => page.evaluate(id => tide.world.data.fishes[id]?.created, id);
+    assert.equal(await birthTime(a, fixture.id), fixture.early);
+    assert.equal(await birthTime(b, fixture.id), fixture.late);
+  }
   await b.locator('#connect').click(); await b.locator('#peerUrl').fill(`http://127.0.0.1:${ports[0]}`); await b.locator('#connectionForm .primary').click();
+  if (concurrent) {
+    const consistent = ({ id, early, breeding }) => {
+      const data = tide.world.data;
+      return data.fishes[id]?.created === early && data.breeding[breeding]?.baby.created === early &&
+        Object.values(data.chars).some(cell => cell.entity === id && cell.path.some(event => event.birth === breeding && event.t === early));
+    };
+    for (const page of [a, b]) await page.waitForFunction(consistent, fixture);
+    await a.reload(); await a.waitForFunction(consistent, fixture);
+    await a.close(); await b.close();
+    const damage = await first.newPage();
+    await damage.goto(`http://127.0.0.1:${ports[0]}/welcome.html`);
+    await damage.evaluate(async ({ id, late, breeding }) => {
+      const { get, set } = await import('./storage.js');
+      const checkpoint = await get('checkpoint');
+      checkpoint.world.fishes[id].created = late;
+      for (const cell of Object.values(checkpoint.world.chars)) {
+        for (const event of cell.path) if (event.birth === breeding) event.t = late;
+      }
+      await set('known', []);
+      await set('checkpoint', checkpoint);
+    }, fixture);
+    await damage.close();
+    a = await open(first, ports[0]);
+    await a.waitForFunction(consistent, fixture);
+    await a.reload(); await a.waitForFunction(consistent, fixture);
+    assert.deepEqual(errors, []);
+    console.log('Concurrent births: real peer merge, save/reload, and legacy checkpoint recovery passed');
+    return;
+  }
   await b.waitForFunction(id => tide.world.data.breeding[id]?.status === 'active', fixture.breeding);
   for (const page of [a, b]) { await page.locator('#myFish').click(); assert((await page.locator('#myFishList').textContent()).includes('繁殖中')); }
   fs.mkdirSync(path.join(project, 'test-output'), { recursive: true }); await a.screenshot({ path: path.join(project, 'test-output', 'breeding-active.png') });

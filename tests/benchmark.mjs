@@ -1,7 +1,8 @@
 import { performance } from 'node:perf_hooks';
 import { World, CONFIG } from '../www/engine.js';
 import assert from 'node:assert/strict';
-const start = Date.now(), world = new World(start), cells = Array.from({length:15}, (_,i)=>({x:i%5,y:Math.floor(i/5),ch:'o',color:'#8be7df'}));
+// Keep the benchmark's starting population exact; run the production ambient loop.
+const start = Date.now(), world = new World(start, undefined, { populate: false }), cells = Array.from({length:15}, (_,i)=>({x:i%5,y:Math.floor(i/5),ch:'o',color:'#8be7df'}));
 // Place all 500 fish without overlapping; the old diagonal fixture reused occupied rows.
 for(let i=0;i<500;i++) { const actor='actor-'+i; assert(world.apply({id:crypto.randomUUID(),actor,t:start,kind:'fish',cost:15,cells,x:(i%50)*20,y:10+Math.floor(i/50)*7}).ok); for(let j=0;j<5;j++) assert(world.apply({id:crypto.randomUUID(),actor,t:start,kind:'food',cost:1,x:(i*13+j)%CONFIG.width,y:0,ch:'口',color:'#f8d89b'}).ok); }
 assert.equal(world.counts().characters,10000); assert.equal(world.counts().fish,500);
