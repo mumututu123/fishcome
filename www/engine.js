@@ -329,6 +329,16 @@ export class World {
       else if (ambient) { const motion = idleMotion(this, f, now, ambient, { x: midX, y: midY }); dx = motion.dx; dy = motion.dy; }
       else { const phase = Math.floor((now - f.created) / 12000), r = hash(`${id}:${phase}`); dx = [-1, 0, 1][r % 3]; dy = [-1, 0, 1][Math.floor(r / 3) % 3]; }
       this.updateFishOccupants(movingOccupants, unit.members, groups, true);
+      // A blocked ambient direction needs a way out, especially when several
+      // friends select different companions in a packed group. Probe real cells
+      // against the live occupancy map; normal velocity and collision rules still apply.
+      if (ambient && unit.members.length === 1 && (dx || dy)) {
+        const free = (x, y) => { const next = { ...f }; if (x && x !== next.facing) this.turn(next, cells, turningObstacles, movingOccupants); next.x += x; next.y += y; return this.canOccupy(next, cells, scenery, movingOccupants) && cells.every(c => { const p = cellPosition(next, c); return !foodPositions.has(key(p.x, p.y)); }); };
+        if (!(dx && free(dx, 0)) && !(dy && free(0, dy))) {
+          const choices = [[0, -1], [0, 1], [-1, 0], [1, 0]], offset = hash(`avoid:${id}:${Math.floor(now / 12000)}`) % choices.length;
+          for (let i = 0; i < choices.length; i++) { const [x, y] = choices[(offset + i) % choices.length]; if (free(x, y)) { dx = x; dy = y; break; } }
+        }
+      }
       if (dx && dx !== f.facing) this.turn(f, cells, turningObstacles, movingOccupants);
       let movedX = 0, movedY = 0;
       const v = velocities(cells); f.cx = dx ? Math.min(2, (f.cx || 0) + v.x * dt) : 0; f.cy = dy ? Math.min(2, (f.cy || 0) + v.y * dt) : 0;

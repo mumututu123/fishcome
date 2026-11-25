@@ -47,6 +47,46 @@ test('三条附近鱼会短暂同游，一分钟内自动散开，双鱼不组�
   const motions = ids.map(id => idleMotion(w, w.data.fishes[id], at, group)); assert(motions.every(m => m.dx === motions[0].dx && m.dy === motions[0].dy));
   assert.equal(context(w, at + 20000).school.size, 0); delete w.data.fishes[ids[2]]; assert.equal(context(w, at).school.size, 0);
 });
+
+test('熟鱼同游先留出鱼体间距，大鱼和环形边界也会主动分开', () => {
+  for (const [x, otherX, width] of [[20, 22, 2], [998, 0, 2], [20, 30, 10]]) {
+    const w = world(), ids = ['00000000-0000-4000-8000-000000000001', '00000000-0000-4000-8000-000000000002'];
+    for (const [i, pos] of [x, otherX].entries()) assert(w.apply({ id: ids[i], actor: ids[i], t, kind: 'fish', x: pos, y: 20, gender: 'female', cells: Array.from({ length: width }, (_, j) => cell(j, 0, 'Q')), cost: width }).ok);
+    track(w, 45);
+    const at = Math.ceil((t + 45000) / 180000) * 180000 + 20000, group = context(w, at);
+    const a = idleMotion(w, w.data.fishes[ids[0]], at, group), b = idleMotion(w, w.data.fishes[ids[1]], at, group);
+    assert.equal(a.dx, -1); assert.equal(b.dx, 1); assert.equal(a.dy, 0); assert.equal(b.dy, 0);
+  }
+});
+
+test('48条扎堆熟鱼持续游动并散开，完整模拟无重叠且快照顺序不影响结果', () => {
+  const w = new World(t, 'crowded-regression', { populate: false }), ids = [];
+  for (let row = 0; row < 6; row++) for (let col = 0; col < 8; col++) {
+    const id = `00000000-0000-4000-8000-${String(row * 8 + col).padStart(12, '0')}`; ids.push(id);
+    assert(w.apply({ id, actor: id, t, kind: 'fish', x: 20 + col * 2, y: 20 + row, gender: 'female', cells: [cell(0, 0, 'Q'), cell(1, 0, 'Q')], cost: 2 }).ok);
+  }
+  track(w, 45); assert(Object.values(w.data.life.bonds).every(b => b.seconds >= LIFE.familiar));
+  w.data.tick = t + 45000;
+  const replica = new World(t, 'replica', { populate: false }); replica.data = w.serialize();
+  replica.data.fishes = Object.fromEntries(Object.entries(replica.data.fishes).reverse()); replica.data.chars = Object.fromEntries(Object.entries(replica.data.chars).reverse());
+  for (let i = 1; i <= 240; i++) {
+    const now = t + 45000 + i * CONFIG.step; w.step(now); replica.step(now);
+    for (const owners of w.fishOccupants().values()) assert.equal(owners.size, 1);
+    if (i === 60) for (const id of ids) assert(w.fishStatus(id, now).movement > 0, `${id} should escape the initial crowd`);
+  }
+  assert.equal(Object.keys(w.data.fishes).length, ids.length);
+  for (const id of ids) { assert(w.fishStatus(id, w.data.tick).movement > 5, `${id} should keep swimming`); assert.deepEqual(w.data.fishes[id], replica.data.fishes[id]); }
+});
+
+test('熟鱼被邻鱼与造景夹住时选择空闲方向绕行', () => {
+  const w = world(), a = '00000000-0000-4000-8000-000000000001';
+  assert(w.apply({ id: a, actor: 'alice', t, kind: 'fish', x: 20, y: 20, gender: 'female', cells: [cell(0, 0, 'Q'), cell(0, 1, 'Q')], cost: 2 }).ok);
+  fish(w, 21, 20, 'bob', '00000000-0000-4000-8000-000000000002', 'Q'); scene(w, 19, 20); track(w, 45); w.data.tick = t + 45000;
+  w.step(t + 45000 + CONFIG.step);
+  assert.notEqual(w.data.fishes[a].y, 20);
+  for (const owners of w.fishOccupants().values()) assert.equal(owners.size, 1);
+  for (const c of w.fishCells(a)) assert(!w.sceneryMap().has(`${(w.data.fishes[a].x + w.data.fishes[a].facing * c.x + 1000) % 1000},${w.data.fishes[a].y + c.y}`));
+});
 test('造景附近停留45秒形成常去之处，搬走或删除造景仍遵循现有操作', () => {
   const w = world(), id = fish(w), spot = scene(w, 24, 20); track(w, 45);
   assert(fishLifeText(w.data, id).haunt); assert.equal(w.data.life.places[id].scene, spot);

@@ -52,7 +52,7 @@ function indexPoints(points) {
 }
 export function lifeContext(world, now, scenery, groups) {
   const points = new Map();
-  for (const [id, cells] of groups) { const f = world.data.fishes[id]; if (!f || !cells.length) continue; const xs = cells.map(c => c.x), ys = cells.map(c => c.y); points.set(id, { id, x: wrapX(f.x + f.facing * (Math.min(...xs) + Math.max(...xs)) / 2), y: f.y + (Math.min(...ys) + Math.max(...ys)) / 2 }); }
+  for (const [id, cells] of groups) { const f = world.data.fishes[id]; if (!f || !cells.length) continue; const xs = cells.map(c => c.x), ys = cells.map(c => c.y); points.set(id, { id, x: wrapX(f.x + f.facing * (Math.min(...xs) + Math.max(...xs)) / 2), y: f.y + (Math.min(...ys) + Math.max(...ys)) / 2, halfWidth: (Math.max(...xs) - Math.min(...xs)) / 2, halfHeight: (Math.max(...ys) - Math.min(...ys)) / 2 }); }
   const nearby = indexPoints(points.values()), neighbors = new Map(), scenes = new Map();
   const scenePoints = [...scenery.values()].filter(({ scene }) => world.data.ops[scene.id]?.kind === 'scene').map(({ scene, cell }) => ({ id: scene.id, x: wrapX(scene.x + cell.x), y: scene.y + cell.y })), nearScene = indexPoints(scenePoints);
   for (const p of points.values()) {
@@ -119,15 +119,21 @@ export function idleMotion(world, fish, now, context, center) {
   let dx = [-1, 0, 1][r % 3], dy = [-1, 0, 1][Math.floor(r / 3) % 3];
   if (now - fish.lastFed >= 86400000) return { dx, dy };
   if (!world.breedingState(fish.id)) { const motion = eventMotion(world.data, fish.id, now, context); if (motion) return motion; }
+  const point = context.points.get(fish.id) || center;
+  // Leave water between bodies before following friends or a school. Center
+  // distance alone makes larger fish keep trying to swim into each other.
+  const gap = q => Math.max(Math.abs(deltaX(q.x, point.x)) - (point.halfWidth || 0) - (q.halfWidth || 0), Math.abs(q.y - point.y) - (point.halfHeight || 0) - (q.halfHeight || 0));
+  const crowded = !world.breedingState(fish.id) && neighbors.filter(q => gap(q) <= 2).sort((a, b) => gap(a) - gap(b) || a.id.localeCompare(b.id))[0];
+  if (crowded) return { dx: Math.sign(deltaX(point.x, crowded.x)), dy: Math.sign(point.y - crowded.y) };
   const school = context.school.get(fish.id); if (school) return school;
   const familiar = neighbors.find(q => life.bonds[pairKey(fish.id, q.id)]?.seconds >= LIFE.familiar);
   if (familiar && now % 180000 < 45000) {
     const pair = pairKey(fish.id, familiar.id), motion = hash(`companion:${pair}:${Math.floor(now / 12000)}`);
     return { dx: motion % 2 ? 1 : -1, dy: [0, 0, -1, 1][Math.floor(motion / 2) % 4] };
   }
-  const trait = personality(fish.id), spot = context.scenes.get(fish.id), point = context.points.get(fish.id) || center;
+  const trait = personality(fish.id), spot = context.scenes.get(fish.id);
   if (trait === 'quiet') { if (neighbors.length && phase % 3 !== 0) { dx = -Math.sign(deltaX(neighbors[0].x, point.x)); dy = -Math.sign(neighbors[0].y - point.y); } else if (phase % 3 === 0) dx = dy = 0; }
-  if (trait === 'social' && neighbors.length && phase % 3 !== 0) { dx = Math.sign(deltaX(neighbors[0].x, point.x)); dy = distance(point, neighbors[0]) > 5 ? Math.sign(neighbors[0].y - point.y) : 0; }
+  if (trait === 'social' && neighbors.length && phase % 3 !== 0 && gap(neighbors[0]) > 4) { dx = Math.sign(deltaX(neighbors[0].x, point.x)); dy = Math.sign(neighbors[0].y - point.y); }
   if (trait === 'deep' && phase % 3 !== 0) dy = Math.sign(world.floorAt(point.x) - 10 - point.y);
   if (trait === 'curious' && spot && phase % 3 !== 0) { const near = distance(point, spot) <= 5; dx = near ? [1, 0, -1, 0][phase % 4] : Math.sign(deltaX(spot.x, point.x)); dy = near ? [0, 1, 0, -1][phase % 4] : Math.sign(spot.y - point.y); }
   const place = life.places[fish.id];
