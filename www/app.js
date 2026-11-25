@@ -8,7 +8,7 @@ import { CHAT_FLOOR, validChatMessage, orderedChats, chatGlyphs, chatColor, chat
 import { DAY, shanghaiDay, validTravel } from './fish-status.js';
 import { HOUR, validWildCell } from './seaweed.js';
 import { MINUTE, validBubble } from './bubbles.js';
-import { fishOrigin, validBreedingRecord, inheritedGlyph } from './breeding.js';
+import { fishOrigin, validBreedingRecord, inheritedGlyph, repairLocalBirthTimes } from './breeding.js';
 import { defaultFishName, displayFishName, fishCatalog } from './fish-profile.js';
 import { drawPedigree } from './pedigree.js';
 import { normalizeInvite, encodeInvite, decodeInvite, inviteDetails } from './invite.js';
@@ -189,6 +189,17 @@ async function verifyReplica(data, extra = {}, store = archiveStore) {
     if (c.kind === 'fish' || c.kind === 'food') { if (!['food', 'fish'].includes(source.kind) || inheritedGlyph(c, initial.ch, sources) !== c.ch || initial.color !== c.color) throw new Error('鱼鱼元只能由合法创建与生态流转生成'); if (c.kind === 'fish' && !c.path.length && (c.entity !== source.id || c.x !== initial.x || c.y !== initial.y)) throw new Error('禁止人工重排已投放的鱼'); }
   }
 }
+// Never relax network validation; only local checkpoints and explicit backup
+// imports can take the legacy repair path, and the repaired copy must validate.
+async function verifyLocalCheckpoint(data, archived, store = archiveStore) {
+  try { await verifyReplica(data, archived, store); return data; }
+  catch (error) {
+    const repaired = repairLocalBirthTimes(data, archived);
+    if (repaired === data) throw error;
+    await verifyReplica(repaired, archived, store);
+    return repaired;
+  }
+}
 async function mergeReplica(data, peer) {
   await ensureArchives(data, peer); const archived = await archiveStore.dependencies(data, world.data);
   await verifyReplica(data, archived); const previousTerrain = world.data.terrain.seed; world.merge(data, archived); world.attachArchives(archiveStore); await compactKnown(world, archiveStore); if (world.data.terrain.seed !== previousTerrain) geometryRepair = true;
@@ -196,7 +207,7 @@ async function mergeReplica(data, peer) {
   // An expired local copy can be restored only after hearing its roots from a live peer.
   const checkpoint = priorCheckpoint; let recovered = false;
   if (checkpoint?.world?.roots && Object.keys(checkpoint.world.roots).some(r => world.roots.includes(r))) {
-    await ensureArchives(checkpoint.world, peer); const older = await archiveStore.dependencies(checkpoint.world, world.data); await verifyReplica(checkpoint.world, older); world.merge(checkpoint.world, older); world.attachArchives(archiveStore); if (priorCheckpoint === checkpoint) priorCheckpoint = null;
+    await ensureArchives(checkpoint.world, peer); const older = await archiveStore.dependencies(checkpoint.world, world.data); const local = await verifyLocalCheckpoint(checkpoint.world, older); world.merge(local, older); world.attachArchives(archiveStore); if (priorCheckpoint === checkpoint) priorCheckpoint = null;
     recovered = true;
   }
   reconcileHistory(); syncIncomeSerial(); await save(); renderChat();
@@ -597,8 +608,8 @@ async function start() {
   await verifyChats(previous?.world?.chats);
   const expires = previous?.world && now - (previous.lastOnlineAt ?? previous.at ?? previous.world.tick) >= CONFIG.offlineLife;
   if (expires) previous.world.chats = await archiveStore.chats(Infinity, previous.world.chats, previous.world.archives);
+  if (previous?.world && !expires) previous.world = await verifyLocalCheckpoint(previous.world, await archiveStore.dependencies(previous.world, world.data));
   const restored = restoreCheckpoint(previous, now);
-  if (previous?.world && !restored.expired) await verifyReplica(previous.world, await archiveStore.dependencies(previous.world, world.data));
   world = restored.world; world.data.participants[identity.actor] = identity.nick; lastOnlineAt = now; lastMeter = now;
   if (restored.expired) { const card = previous.picture ? await endedCard(previous, restored.expiresAt) : null; priorCheckpoint = previous; archiveStore = newArchiveStore(); if (card) acceptHistory(card); }
   else reconcileHistory();
@@ -688,7 +699,7 @@ $('connect').onclick = () => $('connectionDialog').showModal(); $('closeConnecti
 $('connectionForm').onsubmit = async e => { e.preventDefault(); status = '正在自动配对…'; update(); try { const code = await normalizeInvite($('peerUrl').value); $('peerUrl').value = code; await network.connectInvite(code); await remember(code); $('connectionDialog').close(); } catch (e) { status = e.message; toast(e.message); } update(); };
 $('copyUrl').onclick = async () => { await navigator.clipboard.writeText(meta.url); toast('邀请码已复制'); };
 $('backup').onclick = async () => { try { await resumeAfterInactivity(); const manifests = { ...world.data.archives?.chunks }; for (const card of Object.values(histories)) Object.assign(manifests, card.archives?.chunks); const archiveChunks = {}; for (const id of Object.keys(manifests)) { archiveChunks[id] = archiveStore.packs.get(id) || await get('archive:' + id); if (!archiveChunks[id]) throw new Error('备份缺少历史归档'); } download('鱼来-身份与记忆备份.json', { format: 'tide-backup-1', identity, histories, known, checkpoint: currentCheckpoint(), archiveChunks }); } catch (error) { toast(error.message); } };
-$('importBackup').onchange = async e => { try { const data = JSON.parse(await e.target.files[0].text()); if (data.format !== 'tide-backup-1' || !data.identity?.secret || await actorId(data.identity.pub) !== data.identity.actor) throw new Error('备份无效'); const entries = [['identity', data.identity], ['histories', data.histories || {}], ['known', data.known || []]]; if (data.checkpoint) { const restoredArchives = newArchiveStore(); await ensureArchives(data.checkpoint.world, null, data.archiveChunks, restoredArchives); await verifyReplica(data.checkpoint.world, await restoredArchives.dependencies(data.checkpoint.world, world.data), restoredArchives); entries.push(['checkpoint', data.checkpoint]); } for (const card of Object.values(data.histories || {})) await historyArchiveStore(card, null, data.archiveChunks); await putMany(entries); await network.stop(); location.reload(); } catch (e) { toast(e.message); } };
+$('importBackup').onchange = async e => { try { const data = JSON.parse(await e.target.files[0].text()); if (data.format !== 'tide-backup-1' || !data.identity?.secret || await actorId(data.identity.pub) !== data.identity.actor) throw new Error('备份无效'); const entries = [['identity', data.identity], ['histories', data.histories || {}], ['known', data.known || []]]; if (data.checkpoint) { const restoredArchives = newArchiveStore(); await ensureArchives(data.checkpoint.world, null, data.archiveChunks, restoredArchives); data.checkpoint.world = await verifyLocalCheckpoint(data.checkpoint.world, await restoredArchives.dependencies(data.checkpoint.world, world.data), restoredArchives); entries.push(['checkpoint', data.checkpoint]); } for (const card of Object.values(data.histories || {})) await historyArchiveStore(card, null, data.archiveChunks); await putMany(entries); await network.stop(); location.reload(); } catch (e) { toast(e.message); } };
 $('help').onclick = () => $('helpDialog').showModal(); $('closeHelp').onclick = () => $('helpDialog').close(); $('closeHistory').onclick = () => $('historyDialog').close();
 $('collapseChat').onclick = () => { document.querySelector('.chat').classList.toggle('collapsed'); $('collapseChat').textContent = document.querySelector('.chat').classList.contains('collapsed') ? '+' : '−'; };
 $('loadEarlierChat').onclick = async () => { chatLimit += 80; try { olderChats = await archiveStore.chats(chatLimit, world.data.chats, world.data.archives); renderChat(true); } catch (error) { toast('旧聊天读取失败：' + error.message); } };
