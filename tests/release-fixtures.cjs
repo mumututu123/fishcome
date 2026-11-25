@@ -89,15 +89,52 @@ function unpackZip(file, directory) {
   `], { env: { ...process.env, TIDE_FIXTURE_ZIP: file, TIDE_FIXTURE_DESTINATION: directory } });
 }
 
-function runningLaunchers(root) {
+function windowsUpdateOwners(launches) {
+  const owners = {};
+  for (const [port, directory] of launches) {
+    let entries;
+    try {
+      entries = fs.readdirSync(directory, { withFileTypes: true });
+    } catch (error) {
+      if (error.code === 'ENOENT') continue;
+      throw error;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory() || !/^\.update-[a-f0-9]{32}$/.test(entry.name)) continue;
+      let pid;
+      try {
+        pid = Number(fs.readFileSync(path.join(directory, entry.name, '.owner'), 'utf8'));
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+      }
+      if (Number.isSafeInteger(pid) && pid > 0) (owners[port] ||= []).push(pid);
+    }
+  }
+  return owners;
+}
+
+function runningLaunchers(root, launches) {
   if (windows) {
     const output = powershell(['-Command', `
       $prefix = $env:TIDE_FIXTURE_ROOT + [IO.Path]::DirectorySeparatorChar
       foreach ($proc in (Get-Process -ErrorAction Stop | Where-Object ProcessName -EQ $env:TIDE_FIXTURE_PROCESS)) {
         if ($proc.Path -and $proc.Path.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { $proc.Id }
       }
-    `], { env: { ...process.env, TIDE_FIXTURE_ROOT: root, TIDE_FIXTURE_PROCESS: path.parse(launcherName).name } });
-    return output ? output.split(/\s+/).map(Number) : [];
+      $owners = ConvertFrom-Json -AsHashtable -InputObject $env:TIDE_FIXTURE_OWNERS
+      if ($owners.Count -gt 0) {
+        foreach ($listener in (Get-NetTCPConnection -ErrorAction Stop)) {
+          if ($listener.State -ne 'Listen' -or $listener.LocalAddress -ne '127.0.0.1') { continue }
+          $recorded = $owners[[string]$listener.LocalPort]
+          if ($recorded -contains $listener.OwningProcess) { $listener.OwningProcess }
+        }
+      }
+    `], { env: {
+      ...process.env,
+      TIDE_FIXTURE_ROOT: root,
+      TIDE_FIXTURE_PROCESS: path.parse(launcherName).name,
+      TIDE_FIXTURE_OWNERS: JSON.stringify(windowsUpdateOwners(launches))
+    } });
+    return output ? [...new Set(output.split(/\s+/).map(Number))] : [];
   }
   return fs.readdirSync('/proc').filter(name => /^\d+$/.test(name)).flatMap(pid => {
     try {
@@ -114,6 +151,7 @@ async function withReleaseFixtures(test) {
   const root = fs.mkdtempSync(path.join(parent, 'fishcome-e2e-'));
   const archivesDir = path.join(root, 'archives');
   const children = [];
+  const launches = new Map();
   try {
     fs.mkdirSync(archivesDir);
     await test({ root, archivesDir, buildVersion, startLauncher });
@@ -129,7 +167,7 @@ async function withReleaseFixtures(test) {
     assert.match(path.basename(root), /^fishcome-e2e-[a-z0-9]+$/i);
     const deadline = Date.now() + 10000;
     for (;;) {
-      const pids = runningLaunchers(root);
+      const pids = runningLaunchers(root, launches);
       for (const pid of pids) {
         try { process.kill(pid); } catch (error) { if (error.code !== 'ESRCH') throw error; }
       }
@@ -180,6 +218,7 @@ async function withReleaseFixtures(test) {
       env: { ...process.env, ...env }
     });
     children.push(child);
+    launches.set(port, path.dirname(exePath));
     await new Promise((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
   }
 }
