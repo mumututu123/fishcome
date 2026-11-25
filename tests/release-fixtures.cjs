@@ -1,5 +1,6 @@
 const assert = require('node:assert/strict');
 const { execFileSync, spawn } = require('node:child_process');
+const { once } = require('node:events');
 const fs = require('node:fs');
 const net = require('node:net');
 const os = require('node:os');
