@@ -1,16 +1,16 @@
 const { spawn } = require('node:child_process');
+const { launcherPath } = require('./release-fixtures.cjs');
 const path = require('node:path');
 const fs = require('node:fs');
 const assert = require('node:assert/strict');
 const { chromium, firefox } = require(process.env.TIDE_TEST_MODULES ? path.join(process.env.TIDE_TEST_MODULES, 'playwright') : 'playwright');
-const project = path.resolve(__dirname, '..'), exe = path.join(project, 'dist', '鱼来', '鱼来.exe');
+const project = path.resolve(__dirname, '..');
+const output = process.env.TIDE_TEST_OUTPUT || path.join(project, 'test-output');
 const pause = ms => new Promise(r => setTimeout(r, ms));
 const children = [], browsers = [], errors = [];
-const edgeExecutable = 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe';
-const chromeExecutable = [process.env.TIDE_CHROME_EXECUTABLE, 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe', 'C:\\Users\\linmu\\AppData\\Local\\Google\\Chrome\\Application\\chrome.exe'].find(file => file && fs.existsSync(file));
 async function until(check, description, timeout = 20000) { const until = Date.now() + timeout; let last; while (Date.now() < until) { try { const value = await check(); if (value) return value; } catch(e) { last = e; } await pause(200); } throw new Error(description + (last ? ': ' + last.message : '')); }
-async function helper(port) { const child = spawn(exe, ['--headless', '--loopback', '--port', String(port)], { windowsHide: true, stdio: 'ignore' }); children.push(child); await until(async () => (await fetch(`http://127.0.0.1:${port}/health`)).ok, '启动器未就绪'); }
-async function browser(type, executable) { const b = await type.launch({ headless: true, timeout: 30000, ...(executable ? { executablePath: executable } : {}), downloadsPath: path.join(project, 'test-output') }); browsers.push(b); return b; }
+async function helper(port) { const child = spawn(launcherPath, ['--headless', '--loopback', '--port', String(port)], { windowsHide: true, stdio: 'ignore' }); children.push(child); await until(async () => (await fetch(`http://127.0.0.1:${port}/health`)).ok, '启动器未就绪'); }
+async function browser(type) { const b = await type.launch({ headless: true, timeout: 30000, downloadsPath: output }); browsers.push(b); return b; }
 async function page(b, port, nick) { const ctx = await b.newContext({ viewport: { width: 1440, height: 900 } }); const p = await ctx.newPage(); p.on('pageerror', e => errors.push(e.message)); p.on('console', m => { if(m.type() === 'error') errors.push(m.text()); }); await p.goto(`http://127.0.0.1:${port}`); await p.locator('#nickInput').fill(nick); await p.locator('#welcomeForm .primary').click(); await p.waitForFunction(() => window.tide); return p; }
 async function createFish(p, glyphs, x, y) { await p.locator('#makeFish').click(); const rect = await p.locator('#gridCanvas').boundingBox(); for (let i = 0; i < glyphs.length; i++) { await p.locator('#glyphInput').fill(glyphs[i]); await p.locator('#prepareBeads').click(); await p.locator('[data-bead-id]').first().click(); await p.mouse.click(rect.x + (7 + i + .5) * rect.width / 15, rect.y + 7.5 * rect.height / 15); } await p.locator('#placeDrawing').click(); await p.mouse.click(x, y); await until(async () => (await p.evaluate(() => window.tide.world.counts.fish)) >= 1, '鱼没有投放'); }
 async function connect(p, port) { await p.locator('#connect').click(); await p.locator('#peerUrl').fill(`http://127.0.0.1:${port}`); await p.locator('#connectionForm .primary').click(); }
@@ -29,11 +29,11 @@ async function ageCheckpoint(ctx, port, hours, legacy = false) {
   await p.close();
 }
 async function main() {
-  fs.mkdirSync(path.join(project, 'test-output'), { recursive: true });
+  fs.mkdirSync(output, { recursive: true });
   await helper(39081); await helper(39082); await helper(39083);
-  const chrome = await browser(chromium, chromeExecutable || edgeExecutable);
-  const edge = await browser(chromium, edgeExecutable);
-  const a = await page(chrome, 39081, '浏览器甲'), b = await page(edge, 39082, '浏览器乙');
+  const first = await browser(chromium);
+  const second = await browser(chromium);
+  const a = await page(first, 39081, '浏览器甲'), b = await page(second, 39082, '浏览器乙');
   await createFish(a, ['鱼', '口', '>'], 600, 370); await createFish(b, ['o', '='], 800, 450);
   assert.equal(await a.evaluate(() => tide.balance()), 17); assert.equal(await b.evaluate(() => tide.balance()), 18);
   await createScene(a); await createScene(b);
@@ -48,12 +48,12 @@ async function main() {
   await until(async () => (await b.evaluate(() => Object.values(tide.world.data.chars).some(c => c.kind === 'food'))), '水面食物未同步');
   assert.equal(await b.evaluate(() => Object.values(tide.world.data.chars).some(c => c.kind === 'food' && c.ch === '粮' && c.color === '#ff9933')), true, '自定义鱼食鱼元或颜色未同步');
   const foodY = await b.evaluate(() => Object.values(tide.world.data.chars).find(c => c.kind === 'food').y); assert(foodY <= 2, '食物未从水面开始');
-  const c = await page(chrome, 39083, '第三个同事'); await createFish(c, ['水', '。'], 1000, 400);
+  const c = await page(first, 39083, '第三个同事'); await createFish(c, ['水', '。'], 1000, 400);
   await until(async () => (await a.evaluate(() => tide.network.leader)) === (await b.evaluate(() => tide.network.leader)), '协调者未统一');
   const leaderAB = await a.evaluate(() => tide.network.leader), nonLeaderPort = (await a.evaluate(() => tide.network.node)) === leaderAB ? 39082 : 39081;
   await connect(c, nonLeaderPort); await until(async () => (await c.evaluate(() => tide.world.counts.fish)) === 3 && (await a.evaluate(() => tide.world.counts.fish)) === 3 && (await b.evaluate(() => tide.world.counts.fish)) === 3, '第三节点的独立世界未通过非协调者合流', 30000);
   await until(async () => new Set(await a.evaluate(() => Object.keys(tide.world.data.roots))).size >= 3, '起源没有传播');
-  await a.screenshot({ path: path.join(project, 'test-output', 'preview.png') });
+  await a.screenshot({ path: path.join(output, 'preview.png') });
   let entries = [{ p: a, port: 39081 }, { p: b, port: 39082 }, { p: c, port: 39083 }];
   await until(async () => new Set(await Promise.all(entries.map(e => e.p.evaluate(() => tide.network.leader)))).size === 1, '三节点协调者未统一');
   const leader = await b.evaluate(() => tide.network.leader); let departed;
@@ -64,7 +64,7 @@ async function main() {
   const [survivor, other] = entries.map(e => e.p); await survivor.locator('#chatInput').fill('协调者离开，海仍继续'); await survivor.locator('#chatForm button').click(); await until(async () => (await other.locator('#chatMessages').textContent()).includes('海仍继续'), '协调者退出后聊天失效');
   const oldBalance = await other.evaluate(() => tide.balance()); await feed(other, 900);
   await until(async () => (await other.evaluate(() => tide.balance())) === oldBalance - 1, '协调者离开后操作未被确认', 15000);
-  const zip = await fetch('http://127.0.0.1:39082/download.zip'); assert.equal(zip.status, 200); const bytes = Buffer.from(await zip.arrayBuffer()); assert.equal(bytes.readUInt32LE(0), 0x04034b50); fs.writeFileSync(path.join(project, 'test-output', 'download-test.zip'), bytes);
+  const zip = await fetch('http://127.0.0.1:39082/download.zip'); assert.equal(zip.status, 200); const bytes = Buffer.from(await zip.arrayBuffer()); assert.equal(bytes.readUInt32LE(0), 0x04034b50); fs.writeFileSync(path.join(output, 'download-test.zip'), bytes);
   await ageCheckpoint(context, departed.port, 240);
   const returned = await reopen(context, departed.port); entries.push({ p: returned, port: departed.port });
   await until(async () => (await returned.evaluate(() => tide.world.counts.fish)) === 3, '重开的协调者没有找回活跃世界', 30000);
@@ -98,7 +98,7 @@ async function main() {
   assert.equal(await fresh.evaluate(() => tide.balance()), 20);
   assert.equal(await fresh.evaluate(roots => Object.values(tide.histories).some(c => c.status !== 'corrected' && c.roots.every(r => roots.includes(r))), beforeSleep), true, '休眠过期合影未保存');
   assert.equal(errors.length, 0, '浏览器错误: ' + errors.join('\n'));
-  const result = { chrome: chromeExecutable ? 'passed' : 'not installed (used isolated Edge instance)', edge: 'passed', firefox: ff, checks: ['Chinese creation and billing', 'automatic WebRTC pairing', 'independent-world merge through non-coordinator', 'full-nickname XSS-safe chat', 'scenery collision repair', 'surface-only food sync', 'actual coordinator failover', 'expired checkpoint correction from live world', 'short offline preserves world and wallet', '239-hour legacy checkpoint migration', '240-hour extinction and retained monument', 'short sleep preserves world', '240-hour sleep extinction', 'portable ZIP'], errors };
-  fs.writeFileSync(path.join(project, 'test-output', 'browser-results.json'), JSON.stringify(result, null, 2)); console.log(JSON.stringify(result, null, 2));
+  const result = { chromium: 'passed', firefox: ff, checks: ['Chinese creation and billing', 'automatic WebRTC pairing', 'independent-world merge through non-coordinator', 'full-nickname XSS-safe chat', 'scenery collision repair', 'surface-only food sync', 'actual coordinator failover', 'expired checkpoint correction from live world', 'short offline preserves world and wallet', '239-hour legacy checkpoint migration', '240-hour extinction and retained monument', 'short sleep preserves world', '240-hour sleep extinction', 'portable ZIP'], errors };
+  fs.writeFileSync(path.join(output, 'browser-results.json'), JSON.stringify(result, null, 2)); console.log(JSON.stringify(result, null, 2));
 }
 main().catch(e => { console.error(e.stack); process.exitCode = 1; }).finally(async () => { for (const b of browsers) await b.close().catch(() => {}); for (const c of children) c.kill(); });

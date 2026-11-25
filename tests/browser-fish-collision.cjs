@@ -1,9 +1,10 @@
 const { spawn } = require('node:child_process');
+const { launcherPath } = require('./release-fixtures.cjs');
 const fs = require('node:fs');
 const path = require('node:path');
 const assert = require('node:assert/strict');
 const { chromium } = require(process.env.TIDE_TEST_MODULES ? path.join(process.env.TIDE_TEST_MODULES, 'playwright') : 'playwright');
-const project = path.resolve(__dirname, '..'), children = [], errors = [], exe = process.env.TIDE_TEST_LAUNCHER || path.join(project, 'dist', '鱼来', '鱼来.exe'); let browser;
+const project = path.resolve(__dirname, '..'), children = [], errors = [], exe = launcherPath; let browser;
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 async function helper(port) { const child = spawn(exe, ['--headless', '--loopback', '--port', String(port)], { windowsHide: true, stdio: 'ignore' }); children.push(child); const end = Date.now() + 20000; while (Date.now() < end) { try { if ((await fetch(`http://127.0.0.1:${port}/health`)).ok) return; } catch {} await pause(150); } throw new Error('启动器未就绪'); }
 async function open(context, port, nick) { const page = await context.newPage(); page.on('pageerror', error => errors.push(error.message)); await page.goto(`http://127.0.0.1:${port}/`); if (nick) { await page.locator('#nickInput').fill(nick); await page.locator('#welcomeForm .primary').click(); } await page.waitForFunction(() => window.tide); return page; }
@@ -12,7 +13,7 @@ async function draw(page) { await page.locator('#makeFish').click(); await page.
 async function point(page, x, y) { return page.evaluate(({ x, y }) => ({ x: innerWidth / 2 + (x - tide.view.camera.x + .5) * 18 * tide.view.scale, y: innerHeight / 2 + (y - tide.view.camera.y + .5) * 18 * tide.view.scale }), { x, y }); }
 async function main() {
   await helper(39541); await helper(39542); fs.mkdirSync(path.join(project, 'test-output'), { recursive: true });
-  browser = await chromium.launch({ executablePath: 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe', headless: true });
+  browser = await chromium.launch({ headless: true });
   const first = await browser.newContext({ viewport: { width: 1440, height: 900 } }), second = await browser.newContext({ viewport: { width: 1440, height: 900 } });
   let a = await open(first, 39541, '碰撞甲'), b = await open(second, 39542, '碰撞乙'); await a.close(); await b.close();
   const setupB = await second.newPage(); await setupB.goto('http://127.0.0.1:39542/welcome.html'); const otherIdentity = await setupB.evaluate(async () => {

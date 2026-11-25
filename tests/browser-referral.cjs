@@ -1,14 +1,16 @@
 const { spawn } = require('node:child_process');
+const { launcherPath, launcherName, unpackZip, withReleaseFixtures } = require('./release-fixtures.cjs');
 const fs = require('node:fs');
 const path = require('node:path');
-const { inflateRawSync } = require('node:zlib');
 const { pathToFileURL } = require('node:url');
 const assert = require('node:assert/strict');
+const { zipEntry } = require('./zip-entry.cjs');
 const { chromium } = require(process.env.TIDE_TEST_MODULES ? path.join(process.env.TIDE_TEST_MODULES, 'playwright') : 'playwright');
-const project = path.resolve(__dirname, '..'), children = [], errors = [], output = path.join(project, 'test-output'); let browser;
-const exe = process.env.TIDE_TEST_LAUNCHER || path.join(project, 'dist', '鱼来', '鱼来.exe');
+const project = path.resolve(__dirname, '..'), children = [], errors = [], output = process.env.TIDE_TEST_OUTPUT || path.join(project, 'test-output'); let browser;
+const exe = launcherPath;
 async function helper(port, file = exe) {
   const child = spawn(file, ['--headless', '--loopback', '--port', String(port)], { windowsHide: true, stdio: 'ignore' }); children.push(child);
+  await new Promise((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
   const deadline = Date.now() + 20000; while (Date.now() < deadline) { try { if ((await fetch(`http://127.0.0.1:${port}/health`)).ok) return; } catch {} await new Promise(resolve => setTimeout(resolve, 150)); } throw new Error('启动器未就绪');
 }
 async function open(context, port, nick, code) {
@@ -18,19 +20,11 @@ async function open(context, port, nick, code) {
 }
 async function code(page) { await page.locator('#connect').click(); const value = await page.locator('#myUrl').inputValue(); await page.locator('#closeConnection').click(); return value; }
 async function connect(page, invitation) { await page.locator('#connect').click(); await page.locator('#peerUrl').fill(invitation); await page.locator('#connectionForm .primary').click(); await page.waitForFunction(() => tide.network.peers.length > 0); }
-function zipEntry(bytes, name) {
-  const end = bytes.lastIndexOf(Buffer.from([0x50, 0x4b, 0x05, 0x06])); assert(end >= 0); let offset = bytes.readUInt32LE(end + 16);
-  for (let index = 0; index < bytes.readUInt16LE(end + 10); index++) {
-    const size = bytes.readUInt32LE(offset + 20), filenameLength = bytes.readUInt16LE(offset + 28), extra = bytes.readUInt16LE(offset + 30), comment = bytes.readUInt16LE(offset + 32), method = bytes.readUInt16LE(offset + 10), local = bytes.readUInt32LE(offset + 42), filename = bytes.subarray(offset + 46, offset + 46 + filenameLength).toString('utf8');
-    if (filename === name) { const start = local + 30 + bytes.readUInt16LE(local + 26) + bytes.readUInt16LE(local + 28), compressed = bytes.subarray(start, start + size); return method === 8 ? inflateRawSync(compressed) : compressed; }
-    offset += 46 + filenameLength + extra + comment;
-  } throw new Error('发行包缺少 ' + name);
-}
-async function main() {
+async function main({ root }) {
   fs.mkdirSync(output, { recursive: true });
   const { inviteDetails } = await import(pathToFileURL(path.join(project, 'www', 'invite.js')).href);
   for (const port of [39441, 39442, 39443]) await helper(port);
-  browser = await chromium.launch({ executablePath: 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe', headless: true });
+  browser = await chromium.launch({ headless: true });
   const ca = await browser.newContext(), cb = await browser.newContext(), cn = await browser.newContext();
   let a = await open(ca, 39441, '推广甲'), b = await open(cb, 39442, '推广乙'); const codeA = await code(a), codeB = await code(b), actorA = await a.evaluate(() => tide.identity.actor), actorB = await b.evaluate(() => tide.identity.actor);
   assert.equal((await inviteDetails(codeA)).actor, actorA); assert.equal((await inviteDetails(codeB)).actor, actorB);
@@ -38,8 +32,18 @@ async function main() {
   await connect(b, codeA); await a.waitForFunction(() => tide.balance() === 30); assert.equal(await b.evaluate(() => tide.balance()), 20);
   const n = await open(cn, 39443, '链接新人', codeB); await n.waitForFunction(() => tide.network.peers.length > 0); await b.waitForFunction(() => tide.balance() === 30); assert.equal(await a.evaluate(() => tide.balance()), 30); assert.equal(await n.evaluate(() => tide.balance()), 20);
   assert(!n.url().includes('join='));
-  const bytes = Buffer.from(await (await fetch('http://127.0.0.1:39441/download.zip?invite=' + encodeURIComponent(codeA))).arrayBuffer()); const join = JSON.parse(zipEntry(bytes, 'join.json').toString('utf8')); assert.equal(join.invite, codeA);
-  const packageRoot = path.join(output, 'referral-downloaded'); fs.mkdirSync(packageRoot, { recursive: true }); fs.copyFileSync(exe, path.join(packageRoot, '鱼来.exe')); fs.cpSync(path.join(project, 'www'), path.join(packageRoot, 'www'), { recursive: true }); fs.writeFileSync(path.join(packageRoot, 'join.json'), JSON.stringify(join)); await helper(39444, path.join(packageRoot, '鱼来.exe'));
+  const download = await fetch('http://127.0.0.1:39441/download.zip?invite=' + encodeURIComponent(codeA));
+  assert(download.ok, `分享包下载失败，状态 ${download.status}`);
+  const bytes = Buffer.from(await download.arrayBuffer());
+  const archive = path.join(root, 'referral-downloaded.zip');
+  const packageRoot = path.join(root, 'referral-downloaded');
+  fs.writeFileSync(archive, bytes);
+  unpackZip(archive, packageRoot);
+  const join = JSON.parse(fs.readFileSync(path.join(packageRoot, 'join.json'), 'utf8'));
+  assert.equal(join.invite, codeA);
+  const downloadedLauncher = path.join(packageRoot, launcherName);
+  fs.accessSync(downloadedLauncher, fs.constants.X_OK);
+  await helper(39444, downloadedLauncher);
   assert.equal((await (await fetch('http://127.0.0.1:39444/local/meta')).json()).joinUrl, codeA);
   const cm = await browser.newContext(); let m = await open(cm, 39444, '下载包新人'); await m.waitForFunction(() => tide.network.peers.length > 0); await a.waitForFunction(() => tide.balance() === 40);
   await b.waitForFunction(() => Object.values(tide.world.data.ops).filter(op => op.kind === 'referral').length === 3);
@@ -64,4 +68,10 @@ async function main() {
   assert.deepEqual(errors, []); fs.writeFileSync(path.join(output, 'browser-referral-results.json'), JSON.stringify({ passed: true, rewards: { inviterA: 20, inviterB: 10 }, errors }, null, 2));
   console.log('真实WebRTC推广奖励、手动/链接/下载包接入、发码账号归属、旧账号不奖励、刷新/备份/合流去重及协调者退出保留通过');
 }
-main().catch(error => { console.error(error); process.exitCode = 1; }).finally(async () => { if (browser) await browser.close(); for (const child of children) child.kill(); });
+withReleaseFixtures(async fixture => {
+  try {
+    await main(fixture);
+  } finally {
+    try { if (browser) await browser.close(); } finally { for (const child of children) child.kill(); }
+  }
+}).catch(error => { console.error(error); process.exitCode = 1; });

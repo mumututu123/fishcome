@@ -1,10 +1,11 @@
 const { spawn } = require('node:child_process');
+const { launcherPath } = require('./release-fixtures.cjs');
 const fs = require('node:fs');
 const path = require('node:path');
 const assert = require('node:assert/strict');
 const { chromium } = require(process.env.TIDE_TEST_MODULES ? path.join(process.env.TIDE_TEST_MODULES, 'playwright') : 'playwright');
 const project = path.resolve(__dirname, '..');
-const exe = process.env.TIDE_TEST_LAUNCHER || path.join(project, 'dist', '鱼来', '鱼来.exe');
+const exe = launcherPath;
 const ports = [39347, 39348], children = [], errors = [], results = [];
 const source = fs.readFileSync(path.join(project, 'www', 'network.js'), 'utf8');
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -77,7 +78,7 @@ async function connect(pages, initiator) {
 async function main() {
   const { decodeInvite } = await import('../www/invite.js');
   for (const port of ports) await helper(port);
-  browser = await chromium.launch({ executablePath: process.env.TIDE_TEST_BROWSER_PATH || 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe', headless: true });
+  browser = await chromium.launch({ headless: true });
   const baseline = await pair(false);
   try {
     await connect(baseline.pages, 0);

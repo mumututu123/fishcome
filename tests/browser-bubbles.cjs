@@ -1,10 +1,11 @@
 const { spawn } = require('node:child_process');
+const { launcherPath } = require('./release-fixtures.cjs');
 const fs = require('node:fs');
 const path = require('node:path');
 const assert = require('node:assert/strict');
 const { chromium } = require(process.env.TIDE_TEST_MODULES ? path.join(process.env.TIDE_TEST_MODULES, 'playwright') : 'playwright');
 const project = path.resolve(__dirname, '..'), output = path.join(project, 'test-output'), children = [], errors = [], born = Math.floor(Date.now() / 60000) * 60000;
-const exe = process.env.TIDE_TEST_LAUNCHER || path.join(project, 'dist', '鱼来', '鱼来.exe'); let browser;
+const exe = launcherPath; let browser;
 async function helper(port) { const child = spawn(exe, ['--headless', '--loopback', '--port', String(port)], { windowsHide: true, stdio: 'ignore' }); children.push(child); const end = Date.now() + 20000; while (Date.now() < end) { try { if ((await fetch(`http://127.0.0.1:${port}/health`)).ok) return; } catch {} await new Promise(resolve => setTimeout(resolve, 150)); } throw new Error('启动器未就绪'); }
 async function context(initial = born + 1000) { const c = await browser.newContext({ viewport: { width: 1440, height: 900 } }); await c.addInitScript(initial => { let clock = initial; try { clock = Number(localStorage.getItem('bubble-test-clock')) || initial; } catch {} window.bubbleTestNow = clock; window.bubbleClockStart = performance.now(); Date.now = () => Math.floor(window.bubbleTestNow + performance.now() - window.bubbleClockStart); }, initial); return c; }
 async function open(c, port, nick) { const p = await c.newPage(); p.on('pageerror', e => errors.push(e.message)); await p.goto(`http://127.0.0.1:${port}/`); if (nick) { await p.locator('#nickInput').fill(nick); await p.locator('#welcomeForm .primary').click(); } await p.waitForFunction(() => window.tide); return p; }
@@ -16,7 +17,7 @@ async function rendered(p, id, expected) {
 async function pan(p, id) { const target = await p.evaluate(async id => { const { bubbleState } = await import('./bubbles.js'); const state = bubbleState(tide.world.data.bubbles[id], Date.now()), view = tide.view; return { dx: (view.camera.x - state.x) * 18 * view.scale, dy: (view.camera.y - state.y - state.size / 2) * 18 * view.scale }; }, id); await p.mouse.move(700, 350); await p.mouse.down(); await p.mouse.move(700 + target.dx, 350 + target.dy, { steps: 3 }); await p.mouse.up(); }
 async function main() {
   fs.mkdirSync(output, { recursive: true }); for (const port of [39751, 39752, 39753]) await helper(port);
-  browser = await chromium.launch({ executablePath: 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe', headless: true }); const ca = await context(), cb = await context();
+  browser = await chromium.launch({ headless: true }); const ca = await context(), cb = await context();
   let a = await open(ca, 39751, '气泡测试'), b = await open(cb, 39752, '气泡邻居'); await a.close();
   const setup = await ca.newPage(); await setup.goto('http://127.0.0.1:39751/welcome.html');
   const fixture = await setup.evaluate(async born => {

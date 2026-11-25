@@ -3,6 +3,20 @@ import { rulesCompatible } from './rules.js';
 // SemVer 2.0.0: no leading zeros on numeric identifiers; optional prerelease and ignored build metadata.
 const SEMVER_RE = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/;
 
+export const DEFAULT_ASSET_SUFFIX = 'windows';
+
+export function normalizeAssetSuffix(assetSuffix) {
+  if (typeof assetSuffix !== 'string' || !assetSuffix.trim()) return DEFAULT_ASSET_SUFFIX;
+  return assetSuffix.trim().toLowerCase();
+}
+
+export function assetPlatformLabel(assetSuffix) {
+  const suffix = normalizeAssetSuffix(assetSuffix);
+  if (suffix === 'windows') return 'Windows';
+  if (suffix === 'linux-amd64') return 'Linux x64';
+  return suffix;
+}
+
 function compareNumericStrings(x, y) {
   if (x.length !== y.length) return x.length > y.length ? 1 : -1;
   if (x === y) return 0;
@@ -66,8 +80,11 @@ export function isNewerVersion(candidate, current) {
   return compareSemver(candidate, current) > 0;
 }
 
-export function classifyPeerCompatibility(localVersion, peerStatus) {
+export function classifyPeerCompatibility(localVersion, peerStatus, localAssetSuffix = DEFAULT_ASSET_SUFFIX) {
   const peerVersion = typeof peerStatus?.version === 'string' ? peerStatus.version.trim() : '';
+  const localSuffix = normalizeAssetSuffix(localAssetSuffix);
+  const peerSuffix = normalizeAssetSuffix(peerStatus?.assetSuffix);
+  const samePlatform = peerSuffix === localSuffix;
   const hasValidVersions = !!parseSemver(localVersion) && !!parseSemver(peerVersion);
   const cmp = hasValidVersions ? compareSemver(peerVersion, localVersion) : 0;
   const peerNewer = cmp > 0;
@@ -76,26 +93,24 @@ export function classifyPeerCompatibility(localVersion, peerStatus) {
   // Older launchers before hot-update do not expose status.rules; let WebRTC hello verify them.
   const compatible = hasRules ? rulesCompatible(peerStatus.rules) : true;
 
-  if (!compatible) {
-    return {
-      compatible: false,
-      peerNewer,
-      peerOlder,
-      peerVersion,
-      action: peerNewer ? 'block_update_self' : peerOlder ? 'block_update_peer' : 'block_incompatible'
-    };
-  }
   return {
-    compatible: true,
+    compatible,
     peerNewer,
     peerOlder,
     peerVersion,
-    action: peerNewer ? 'connect_with_hint' : 'connect'
+    localAssetSuffix: localSuffix,
+    peerAssetSuffix: peerSuffix,
+    samePlatform,
+    canPeerUpdate: peerNewer && samePlatform,
+    action: compatible
+      ? (peerNewer ? 'connect_with_hint' : 'connect')
+      : (peerNewer ? 'block_update_self' : peerOlder ? 'block_update_peer' : 'block_incompatible')
   };
 }
 
-export function parseGithubReleaseInput(input) {
+export function parseGithubReleaseInput(input, expectedAssetSuffix = DEFAULT_ASSET_SUFFIX) {
   if (typeof input !== 'string' || !input.trim()) throw new Error('请粘贴 GitHub Release 链接');
+  const targetSuffix = normalizeAssetSuffix(expectedAssetSuffix);
   let url;
   try {
     url = new URL(input.trim());
@@ -114,29 +129,38 @@ export function parseGithubReleaseInput(input) {
   const tagMatch = /^\/([^/]+)\/([^/]+)\/releases\/tag\/([vV]([^/]+))$/.exec(cleanPath);
   if (tagMatch) {
     const [, owner, repo, tag, version] = tagMatch;
+    if (owner === '.' || owner === '..' || repo === '.' || repo === '..') {
+      throw new Error('GitHub Release 链接格式无效');
+    }
     if (!parseSemver(version) || version.includes('+')) throw new Error('发行版链接中的版本号无效');
-    const downloadUrl = `${url.origin}/${owner}/${repo}/releases/download/${tag}/fishcome-${version}-windows.zip`;
-    return { kind: 'tag', owner, repo, tag, version, downloadUrl, sourceLabel: `${url.origin}${cleanPath}` };
+    const downloadUrl = `${url.origin}/${owner}/${repo}/releases/download/${tag}/fishcome-${version}-${targetSuffix}.zip`;
+    return { kind: 'tag', owner, repo, tag, version, assetSuffix: targetSuffix, downloadUrl, sourceLabel: `${url.origin}${cleanPath}` };
   }
-  const assetMatch = /^\/([^/]+)\/([^/]+)\/releases\/download\/([vV]([^/]+))\/fishcome-([^/]+)-windows\.zip$/.exec(cleanPath);
+  const assetMatch = /^\/([^/]+)\/([^/]+)\/releases\/download\/([vV]([^/]+))\/fishcome-([^/]+)-(windows|linux-amd64)\.zip$/.exec(cleanPath);
   if (assetMatch) {
-    const [, owner, repo, tag, tagVersion, fileVersion] = assetMatch;
+    const [, owner, repo, tag, tagVersion, fileVersion, fileSuffix] = assetMatch;
+    if (owner === '.' || owner === '..' || repo === '.' || repo === '..') {
+      throw new Error('GitHub Release 链接格式无效');
+    }
     if (!parseSemver(fileVersion) || fileVersion.includes('+') || tagVersion !== fileVersion) {
       throw new Error('发布包链接中的标签版本与文件名版本不一致或无效');
     }
+    if (fileSuffix !== targetSuffix) {
+      throw new Error(`该发布包适用于 ${assetPlatformLabel(fileSuffix)}，当前启动器为 ${assetPlatformLabel(targetSuffix)}，请改用对应系统的发布包或具体 Release 页面链接`);
+    }
     const downloadUrl = `${url.origin}${cleanPath}`;
-    return { kind: 'asset', owner, repo, tag, version: fileVersion, downloadUrl, sourceLabel: downloadUrl };
+    return { kind: 'asset', owner, repo, tag, version: fileVersion, assetSuffix: fileSuffix, downloadUrl, sourceLabel: downloadUrl };
   }
-  throw new Error('请粘贴具体的 GitHub Release 页面链接（/releases/tag/vX.Y.Z）或 Windows 便携包直链');
+  throw new Error('请粘贴具体的 GitHub Release 页面链接（/releases/tag/vX.Y.Z）或本平台便携包直链');
 }
 
-export function detectUpdateSource(input) {
+export function detectUpdateSource(input, expectedAssetSuffix = DEFAULT_ASSET_SUFFIX) {
   if (typeof input !== 'string' || !input.trim()) {
     throw new Error('请粘贴同事的邀请码或 GitHub Release 链接');
   }
   const trimmed = input.trim();
   if (/^https?:\/\//i.test(trimmed)) {
-    const parsed = parseGithubReleaseInput(trimmed);
+    const parsed = parseGithubReleaseInput(trimmed, expectedAssetSuffix);
     return { kind: 'github', input: parsed.sourceLabel, parsed };
   }
   return { kind: 'peer', input: trimmed };
@@ -157,12 +181,15 @@ export function formatUpdateBytes(downloaded, total) {
   return done > 0 ? `已下载 ${format(done)}` : '';
 }
 
-export function pickHigherVersionPeers(localVersion, peers) {
+export function pickHigherVersionPeers(localVersion, peers, localAssetSuffix = DEFAULT_ASSET_SUFFIX) {
   if (!parseSemver(localVersion) || !Array.isArray(peers)) return [];
+  const targetSuffix = normalizeAssetSuffix(localAssetSuffix);
   const byInvite = new Map();
   for (const peer of peers) {
     if (!peer || typeof peer.invite !== 'string' || !peer.invite.trim()) continue;
     if (typeof peer.version !== 'string' || !parseSemver(peer.version)) continue;
+    const peerSuffix = normalizeAssetSuffix(peer.assetSuffix);
+    if (peerSuffix !== targetSuffix) continue;
     if (!isNewerVersion(peer.version, localVersion)) continue;
     const key = peer.invite.trim();
     const prev = byInvite.get(key);
@@ -171,6 +198,7 @@ export function pickHigherVersionPeers(localVersion, peers) {
         invite: key,
         nick: typeof peer.nick === 'string' && peer.nick.trim() ? peer.nick.trim() : '在线同事',
         version: peer.version.trim(),
+        assetSuffix: peerSuffix,
         compatible: peer.compatible !== false,
         prerelease: isPrerelease(peer.version)
       });

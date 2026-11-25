@@ -1,12 +1,13 @@
 const { spawn } = require('node:child_process');
+const { launcherPath } = require('./release-fixtures.cjs');
 const fs = require('node:fs'), path = require('node:path'), assert = require('node:assert/strict');
 const { chromium } = require(process.env.TIDE_TEST_MODULES ? path.join(process.env.TIDE_TEST_MODULES, 'playwright') : 'playwright');
-const project = path.resolve(__dirname, '..'), output = path.join(project, 'test-output'), exe = process.env.TIDE_TEST_LAUNCHER || path.join(project, 'dist', '鱼来', '鱼来.exe'), errors = [];
+const project = path.resolve(__dirname, '..'), output = path.join(project, 'test-output'), exe = launcherPath, errors = [];
 let child, browser;
 async function open(c, nick) { const p = await c.newPage(); p.on('pageerror', e => errors.push(e.message)); await p.goto('http://127.0.0.1:39861/'); if (nick) { await p.locator('#nickInput').fill(nick); await p.locator('#welcomeForm .primary').click(); } await p.waitForFunction(() => window.tide); return p; }
 async function main() {
   fs.mkdirSync(output, { recursive: true }); child = spawn(exe, ['--headless', '--loopback', '--port', '39861'], { windowsHide: true, stdio: 'ignore' }); const end = Date.now() + 20000; while (Date.now() < end) { try { if ((await fetch('http://127.0.0.1:39861/health')).ok) break; } catch {} await new Promise(r => setTimeout(r, 100)); }
-  browser = await chromium.launch({ executablePath: 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe', headless: true }); const context = await browser.newContext({ viewport: { width: 1440, height: 900 } }); let p = await open(context, '更替测试'); await p.close(); const setup = await context.newPage(); await setup.goto('http://127.0.0.1:39861/welcome.html');
+  browser = await chromium.launch({ headless: true }); const context = await browser.newContext({ viewport: { width: 1440, height: 900 } }); let p = await open(context, '更替测试'); await p.close(); const setup = await context.newPage(); await setup.goto('http://127.0.0.1:39861/welcome.html');
   const f = await setup.evaluate(async () => {
     const { World, hash } = await import('./engine.js'), { get, set, signer } = await import('./storage.js'), { Network } = await import('./network.js'), { HOUR, GREENS, weedId, growthRoll } = await import('./seaweed.js'), { newEcology, weedExpires } = await import('./ecology.js'), { emptyArchiveState } = await import('./archive.js');
     const me = await get('identity'), now = Date.now(), old = now - 10 * 86400000, w = new World(old, undefined, { populate: false, ambient: false }), sender = new Network(me, {}, () => {}, () => {}); sender.sign = await signer(me);

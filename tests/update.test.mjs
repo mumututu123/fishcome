@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { WORLD_RULES, RULES_VERSION, rulesCompatible } from '../www/rules.js';
-import { parseSemver, compareSemver, isNewerVersion, isPrerelease, classifyPeerCompatibility, parseGithubReleaseInput, detectUpdateSource, formatUpdateBytes, pickHigherVersionPeers } from '../www/update.js';
+import { parseSemver, compareSemver, isNewerVersion, isPrerelease, DEFAULT_ASSET_SUFFIX, normalizeAssetSuffix, assetPlatformLabel, classifyPeerCompatibility, parseGithubReleaseInput, detectUpdateSource, formatUpdateBytes, pickHigherVersionPeers } from '../www/update.js';
 
 test('SemVer 2.0.0 正式版与测试版比较规则正确', () => {
   assert.equal(compareSemver('0.2.0', '0.1.9'), 1);
@@ -87,4 +87,93 @@ test('更新来源自动识别、字节进度格式化与更高版本同事筛�
     ['YL1.new1', '0.2.1', false],
     ['YL1.new2', '0.2.0', false]
   ]);
+});
+
+test('跨平台 assetSuffix 兼容旧启动器、按同平台挑选更新候选且不阻止异平台联机', () => {
+  assert.equal(DEFAULT_ASSET_SUFFIX, 'windows');
+  assert.equal(normalizeAssetSuffix(undefined), 'windows');
+  assert.equal(normalizeAssetSuffix(''), 'windows');
+  assert.equal(normalizeAssetSuffix('  '), 'windows');
+  assert.equal(normalizeAssetSuffix('windows'), 'windows');
+  assert.equal(normalizeAssetSuffix('linux-amd64'), 'linux-amd64');
+  assert.equal(assetPlatformLabel(undefined), 'Windows');
+  assert.equal(assetPlatformLabel('linux-amd64'), 'Linux x64');
+
+  const winToLinuxNewer = classifyPeerCompatibility('0.1.1', { version: '0.2.0', rules: WORLD_RULES, assetSuffix: 'linux-amd64' }, 'windows');
+  assert.equal(winToLinuxNewer.compatible, true);
+  assert.equal(winToLinuxNewer.action, 'connect_with_hint');
+  assert.equal(winToLinuxNewer.samePlatform, false);
+  assert.equal(winToLinuxNewer.canPeerUpdate, false);
+
+  const linuxToLegacyWin = classifyPeerCompatibility('0.2.0', { version: '0.2.0', rules: WORLD_RULES }, 'linux-amd64');
+  assert.equal(linuxToLegacyWin.compatible, true);
+  assert.equal(linuxToLegacyWin.action, 'connect');
+  assert.equal(linuxToLegacyWin.peerAssetSuffix, 'windows');
+  assert.equal(linuxToLegacyWin.samePlatform, false);
+  assert.equal(linuxToLegacyWin.canPeerUpdate, false);
+
+  const blockedCross = classifyPeerCompatibility('0.1.1', { version: '0.2.0', rules: { ...WORLD_RULES, life: 99 }, assetSuffix: 'linux-amd64' }, 'windows');
+  assert.equal(blockedCross.compatible, false);
+  assert.equal(blockedCross.action, 'block_update_self');
+  assert.equal(blockedCross.samePlatform, false);
+  assert.equal(blockedCross.canPeerUpdate, false);
+
+  const legacyWinToGoWin = classifyPeerCompatibility('0.1.1', { version: '0.2.0', rules: WORLD_RULES, assetSuffix: 'windows' }, undefined);
+  assert.equal(legacyWinToGoWin.samePlatform, true);
+  assert.equal(legacyWinToGoWin.canPeerUpdate, true);
+
+  const linuxToLinux = classifyPeerCompatibility('0.1.1', { version: '0.2.0', rules: WORLD_RULES, assetSuffix: 'linux-amd64' }, 'linux-amd64');
+  assert.equal(linuxToLinux.samePlatform, true);
+  assert.equal(linuxToLinux.canPeerUpdate, true);
+
+  const peers = [
+    { invite: 'YL1.win-legacy', nick: '旧版Win', version: '0.2.0' },
+    { invite: 'YL1.win-go', nick: '新版Win', version: '0.2.1', assetSuffix: 'windows' },
+    { invite: 'YL1.linux', nick: 'Linux同事', version: '0.3.0', assetSuffix: 'linux-amd64' }
+  ];
+  assert.deepEqual(
+    pickHigherVersionPeers('0.1.1', peers, 'windows').map(p => [p.invite, p.assetSuffix]),
+    [['YL1.win-go', 'windows'], ['YL1.win-legacy', 'windows']]
+  );
+  assert.deepEqual(
+    pickHigherVersionPeers('0.1.1', peers, 'linux-amd64').map(p => [p.invite, p.assetSuffix]),
+    [['YL1.linux', 'linux-amd64']]
+  );
+});
+
+test('GitHub Release 链接解析按平台生成资产名、支持本机测试地址并对异平台直链给出明确提示', () => {
+  const linuxTag = parseGithubReleaseInput('https://github.com/acme/fishcome/releases/tag/v0.2.0-beta.1/', 'linux-amd64');
+  assert.equal(linuxTag.version, '0.2.0-beta.1');
+  assert.equal(linuxTag.assetSuffix, 'linux-amd64');
+  assert.equal(linuxTag.downloadUrl, 'https://github.com/acme/fishcome/releases/download/v0.2.0-beta.1/fishcome-0.2.0-beta.1-linux-amd64.zip');
+  assert.equal(linuxTag.sourceLabel, 'https://github.com/acme/fishcome/releases/tag/v0.2.0-beta.1');
+
+  const linuxAsset = parseGithubReleaseInput('https://github.com/acme/fishcome/releases/download/v0.2.0-beta.1/fishcome-0.2.0-beta.1-linux-amd64.zip', 'linux-amd64');
+  assert.equal(linuxAsset.version, '0.2.0-beta.1');
+  assert.equal(linuxAsset.assetSuffix, 'linux-amd64');
+  assert.equal(linuxAsset.downloadUrl, 'https://github.com/acme/fishcome/releases/download/v0.2.0-beta.1/fishcome-0.2.0-beta.1-linux-amd64.zip');
+
+  const localLinuxTag = parseGithubReleaseInput('http://127.0.0.1:39999/acme/fishcome/releases/tag/v0.2.1-beta.1', 'linux-amd64');
+  assert.equal(localLinuxTag.downloadUrl, 'http://127.0.0.1:39999/acme/fishcome/releases/download/v0.2.1-beta.1/fishcome-0.2.1-beta.1-linux-amd64.zip');
+
+  const localLinuxAsset = detectUpdateSource('http://127.0.0.1:39999/acme/fishcome/releases/download/v0.2.1-beta.1/fishcome-0.2.1-beta.1-linux-amd64.zip', 'linux-amd64');
+  assert.equal(localLinuxAsset.kind, 'github');
+  assert.equal(localLinuxAsset.parsed.assetSuffix, 'linux-amd64');
+
+  assert.throws(
+    () => parseGithubReleaseInput('https://github.com/acme/fishcome/releases/download/v0.2.0/fishcome-0.2.0-linux-amd64.zip', 'windows'),
+    /Linux x64.*Windows/
+  );
+  assert.throws(
+    () => parseGithubReleaseInput('https://github.com/acme/fishcome/releases/download/v0.2.0/fishcome-0.2.0-windows.zip', 'linux-amd64'),
+    /Windows.*Linux x64/
+  );
+  assert.throws(
+    () => detectUpdateSource('http://127.0.0.1:39999/acme/fishcome/releases/download/v0.2.0/fishcome-0.2.0-windows.zip', 'linux-amd64'),
+    /Windows.*Linux x64/
+  );
+  assert.throws(
+    () => parseGithubReleaseInput('https://github.com/acme/fishcome/releases/download/v0.2.0/fishcome-0.3.0-linux-amd64.zip', 'linux-amd64'),
+    /版本不一致/
+  );
 });

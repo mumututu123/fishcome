@@ -1,15 +1,16 @@
 const { spawn } = require('node:child_process');
+const { launcherPath } = require('./release-fixtures.cjs');
 const fs = require('node:fs');
 const path = require('node:path');
 const assert = require('node:assert/strict');
 const { chromium } = require(process.env.TIDE_TEST_MODULES ? path.join(process.env.TIDE_TEST_MODULES, 'playwright') : 'playwright');
-const project = path.resolve(__dirname, '..'), children = [], errors = [], output = path.join(project, 'test-output'), exe = process.env.TIDE_TEST_LAUNCHER || path.join(project, 'dist', '鱼来', '鱼来.exe'); let browser;
+const project = path.resolve(__dirname, '..'), children = [], errors = [], output = path.join(project, 'test-output'), exe = launcherPath; let browser;
 async function helper(port) { const child = spawn(exe, ['--headless', '--loopback', '--port', String(port)], { windowsHide: true, stdio: 'ignore' }); children.push(child); const end = Date.now() + 20000; while (Date.now() < end) { try { if ((await fetch(`http://127.0.0.1:${port}/health`)).ok) return; } catch {} await new Promise(resolve => setTimeout(resolve, 150)); } throw new Error('启动器未就绪'); }
 async function open(context, port, nick) { const page = await context.newPage(); page.on('pageerror', e => errors.push(e.message)); await page.goto(`http://127.0.0.1:${port}/`); if (nick) { await page.locator('#nickInput').fill(nick); await page.locator('#welcomeForm .primary').click(); } await page.waitForFunction(() => window.tide); return page; }
 async function allInWater(page) { assert(await page.evaluate(() => { const data = tide.world.data, width = data.terrain.depths.length, wrap = x => (x % width + width) % width; return Object.values(data.chars).every(c => { if (c.kind === 'burn') return true; const entity = c.kind === 'fish' ? data.fishes[c.entity] : c.kind === 'scene' ? data.scenes[c.entity] : null, x = wrap(entity ? entity.x + (c.kind === 'fish' ? entity.facing : 1) * c.x : c.x), y = entity ? entity.y + c.y : c.y; return y >= 0 && y < data.terrain.depths[x]; }); })); }
 async function main() {
   fs.mkdirSync(output, { recursive: true }); await helper(39641); await helper(39642);
-  browser = await chromium.launch({ executablePath: 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe', headless: true });
+  browser = await chromium.launch({ headless: true });
   const ca = await browser.newContext({ viewport: { width: 1440, height: 900 } }), cb = await browser.newContext({ viewport: { width: 1440, height: 900 } });
   let a = await open(ca, 39641, '海底昵称测试'), b = await open(cb, 39642, '环海伙伴'); await a.close();
   const setup = await ca.newPage(); await setup.goto('http://127.0.0.1:39641/welcome.html');
