@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { World, CONFIG, EYES, cellPosition, components, velocities, clone, hash } from './empty-world.mjs';
-import { CONTACT_TIME, BREEDING_TIME, updateContacts, finishBreeding, chooseOwner, motionUnits, commitUnit, validBreedingRecord, inheritedGlyph } from '../www/breeding.js';
+import { CONTACT_TIME, BREEDING_TIME, updateContacts, finishBreeding, chooseOwner, motionUnits, commitUnit, validBreedingRecord, inheritedGlyph, repairLocalBirthTimes } from '../www/breeding.js';
 import { restoreCheckpoint } from '../www/lifecycle.js';
 import { HOUR, GREENS, growthRoll, weedId, validWildCell } from '../www/seaweed.js';
 import { storiesFor } from '../www/life.js';
@@ -135,4 +135,81 @@ test('曾吃入鱼体的海草也可遗传，补眼后仍保留合法自然来�
   const id = weedId(source, hour, hash), grass = { id, kind: 'food', entity: '', payer: '', ch: '草', color: GREENS[hash(id) % GREENS.length], x: 22, y: 20, born: t, created: hour * HOUR, path: [], wild: { source, hour, plant: id, index: 0, x: 22, y: 119 } }; world.data.chars[id] = grass;
   transition(grass, { kind: 'fish', entity: male, x: 2, y: 0 }, { id: `eat:${id}`, t, reason: 'eat' });
   const record = bind(world); finishBreeding(world, record.ends, transition); assert.equal(grass.entity, record.baby.id); assert(validWildCell(grass, CONFIG, hash)); assert.equal(inheritedGlyph(grass, '草', world.data), grass.ch); assert(validBreedingRecord(record, world.data));
+});
+
+test('concurrent births converge without losing the newest fish position or birth proof', () => {
+  const { world } = pair(), record = bind(world), active = world.serialize();
+  const make = now => {
+    const replica = new World(t); replica.merge(active);
+    finishBreeding(replica, now, transition);
+    return replica.serialize();
+  };
+  const early = make(record.ends), late = make(record.ends + 500);
+  const id = early.breeding[record.id].baby.id;
+  late.fishes[id].x += 4;
+  const later = new World(t); later.merge(late);
+  const meal = crypto.randomUUID(), mealAt = record.ends + 1000;
+  assert(later.apply({ id: meal, kind: 'food', actor: 'feeder', t, x: 21, y: 0, ch: 'Q', color: '#88aacc', cost: 1 }).ok);
+  transition(later.data.chars[meal], { kind: 'fish', entity: id, x: 2, y: 0 }, { id: 'meal', t: mealAt, reason: 'eat' });
+  const moved = later.fishCells(id)[0], shedAt = mealAt + 500, eatenAt = mealAt + 1000;
+  transition(moved, { kind: 'food', entity: '', x: 25, y: 20 }, { id: 'shed', t: shedAt, reason: 'shed' });
+  transition(moved, { kind: 'fish', entity: record.male, x: 2, y: 0 }, { id: 'eat-again', t: eatenAt, reason: 'eat' });
+  const fed = later.serialize();
+  const cold = new World(t);
+  cold.merge(late, { breeding: early.breeding });
+  assert.equal(cold.data.breeding[record.id].baby.created, record.ends);
+  assert.equal(cold.data.fishes[id].created, record.ends);
+  for (const c of cold.fishCells(id)) assert.equal(inheritedGlyph(c, 'Q', cold.data), c.ch);
+  for (const [left, right] of [[early, late], [late, early], [early, fed], [fed, early]]) {
+    const merged = new World(t); merged.merge(left); merged.merge(right); merged.merge(right);
+    const snapshot = merged.serialize(), saved = JSON.parse(JSON.stringify(snapshot));
+    const restored = restoreCheckpoint({ world: saved, lastOnlineAt: record.ends + 500 }, record.ends + 1000).world;
+    for (const data of [snapshot, restored.data]) {
+      const birth = data.breeding[record.id];
+      assert(validBreedingRecord(birth, data));
+      assert.equal(data.fishes[id].created, birth.baby.created);
+      assert.equal(data.fishes[id].actor, birth.baby.actor);
+      assert.equal(data.fishes[id].x, late.fishes[id].x);
+      const fedBranch = left === fed || right === fed;
+      assert.equal(data.fishes[id].lastMealAt, fedBranch ? mealAt : undefined);
+      if (fedBranch) {
+        const cell = data.chars[moved.id];
+        assert.equal(cell.entity, record.male);
+        assert.deepEqual([cell.x, cell.y], [2, 0]);
+        assert.deepEqual(cell.path.slice(-3).map(e => [e.reason, e.t]), [
+          ['birth', record.ends], ['shed', shedAt], ['eat', eatenAt]
+        ]);
+        assert.equal(inheritedGlyph(cell, 'Q', data), cell.ch);
+      }
+      for (const c of Object.values(data.chars).filter(c => c.entity === id)) {
+        if (c.id !== meal) assert.equal(c.path.find(e => e.birth === record.id).t, birth.baby.created);
+        assert.equal(inheritedGlyph(c, 'Q', data), c.ch);
+      }
+    }
+  }
+});
+
+
+test('legacy local repair is non-mutating, idempotent and does not bless mismatched ownership', () => {
+  const { world } = pair(), record = bind(world);
+  finishBreeding(world, record.ends, transition);
+  const data = world.serialize(), { id } = record.baby;
+  assert.strictEqual(repairLocalBirthTimes(data), data);
+  const legacy = clone(data);
+  legacy.fishes[id].created += 500;
+  const inherited = Object.values(legacy.chars).find(c => c.entity === id);
+  inherited.path.at(-1).t += 500;
+  const repaired = repairLocalBirthTimes(legacy);
+  assert.equal(repaired.fishes[id].created, record.ends);
+  assert.equal(repaired.chars[inherited.id].path.at(-1).t, record.ends);
+  assert.equal(legacy.fishes[id].created, record.ends + 500);
+  assert.equal(inherited.path.at(-1).t, record.ends + 500);
+  assert.strictEqual(repairLocalBirthTimes(repaired), repaired);
+  legacy.fishes[id].actor = 'someone-else';
+  inherited.path.at(-1).before = '#';
+  assert.strictEqual(repairLocalBirthTimes(legacy), legacy);
+  const invalidProof = clone(data);
+  invalidProof.fishes[id].created += 500;
+  invalidProof.breeding[record.id].baby.owner = 'someone-else';
+  assert.strictEqual(repairLocalBirthTimes(invalidProof), invalidProof);
 });

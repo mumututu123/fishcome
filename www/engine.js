@@ -9,7 +9,7 @@ import { emptyArchiveState, mergeArchiveState, operationValue, archiveDependenci
 import { LIFE, newLife, lifeContext, updateLife, idleMotion, spawnPlankton, recordStory, mergeLife, validateLife, freshPlankton } from './life.js';
 import { REFERRAL_REWARD, referralError, chooseReferral } from './referral.js';
 import { WORLD_WIDTH, MAX_FLOOR, wrapX, worldKey, deltaX, nearX, makeTerrain, terrainOf, validTerrain, chooseTerrain, floorAt, waterAt } from './geography.js';
-import { fishOrigin, activeBreeding, finishBreeding, updateContacts, motionUnits, commitUnit, mergeBreeding, normalizeBreeding, normalizeBirthCells } from './breeding.js';
+import { canonicalBirthFish, canonicalBirthPath, fishOrigin, activeBreeding, finishBreeding, updateContacts, motionUnits, commitUnit, mergeBreeding, normalizeBreeding, normalizeBirthCells } from './breeding.js';
 import { newLegends, processLegends, capturedFish, retargetCapture, mergeLegends, settleLegendary, validLegends, legendSchedule } from './legends.js';
 export const CONFIG = Object.freeze({ width: WORLD_WIDTH, depth: MAX_FLOOR + 1, shallow: 60, sightShallow: 20, sightDeep: 10, step: 500, speed: 2, foodLife: 300000, hunger: 86400000, initial: 20, offlineLife: 240 * 60 * 60 * 1000 });
 export const MONUMENT = { x: 610, y: CONFIG.depth - 5, rows: ['  ____  ', ' /记忆\\ ', ' | 口 | ', ' |____| ', '________'] };
@@ -404,7 +404,12 @@ export class World {
     }
     Object.assign(this.data.participants, other.participants);
     this.data.seaweedHour = Math.max(this.data.seaweedHour ?? Math.floor(this.data.tick / HOUR), other.seaweedHour ?? Math.floor(other.tick / HOUR));
-    mergeBreeding(this, other);
+    const competingBirths = [];
+    for (const [id, record] of Object.entries(other.breeding || {})) {
+      const previous = this.data.breeding[id] || archived.breeding?.[id];
+      if (previous?.status === 'born' && record.status === 'born' && previous.baby.created !== record.baby.created) competingBirths.push(id);
+    }
+    mergeBreeding(this, other, archived.breeding);
     for (const [id, record] of Object.entries(other.travel || {})) this.data.travel[id] = mergeTravel(this.data.travel[id], record);
     for (const message of Object.values(other.chats || {})) { const result = this.addChat(message); if (!result.ok) throw new Error(result.error); }
     for (const [id, message] of Object.entries(other.chatSources || {})) {
@@ -412,8 +417,24 @@ export class World {
       if (this.data.chatSources[id] && JSON.stringify(this.data.chatSources[id]) !== JSON.stringify(message)) throw new Error('已有聊天沉积来源不可覆盖');
       this.data.chatSources[id] = clone(message);
     }
-    for (const [id, c] of Object.entries(other.chars)) { const cold = archived.chars?.[id], old = this.data.chars[id] || cold, chosen = old ? chooseClaim(old, c) : c; if (!this.data.chars[id] && cold && JSON.stringify(chosen) === JSON.stringify(cold)) continue; this.data.chars[id] = clone(chosen); const grace = [old?.ecoGraceAt, c.ecoGraceAt].filter(Number.isFinite); if (grace.length) this.data.chars[id].ecoGraceAt = Math.min(...grace); }
-    for (const type of ['fishes', 'scenes']) for (const [id, obj] of Object.entries(other[type])) { const old = this.data[type][id]; if (!old || (obj.posAt || 0) > (old.posAt || 0) || ((obj.posAt || 0) === (old.posAt || 0) && JSON.stringify(obj).localeCompare(JSON.stringify(old)) > 0)) this.data[type][id] = clone(obj); }
+    const birthRecords = Object.fromEntries(competingBirths.map(id => [id, this.data.breeding[id] || archived.breeding?.[id]]));
+    const reconcilePath = competingBirths.length ? cell => canonicalBirthPath(cell, birthRecords) : cell => cell;
+    for (const [id, c] of Object.entries(other.chars)) {
+      const cold = archived.chars?.[id], previous = this.data.chars[id] || cold;
+      const old = previous && reconcilePath(previous), next = reconcilePath(c);
+      const chosen = old ? chooseClaim(old, next) : next;
+      if (!this.data.chars[id] && cold && JSON.stringify(chosen) === JSON.stringify(cold)) continue;
+      this.data.chars[id] = clone(chosen);
+      const grace = [old?.ecoGraceAt, c.ecoGraceAt].filter(Number.isFinite);
+      if (grace.length) this.data.chars[id].ecoGraceAt = Math.min(...grace);
+    }
+    if (competingBirths.length) for (const [id, c] of Object.entries(this.data.chars)) if (!Object.hasOwn(other.chars, id)) this.data.chars[id] = reconcilePath(c);
+    const birthOf = id => id.startsWith('born:') ? this.data.breeding[id.slice(5)] || archived.breeding?.[id.slice(5)] : undefined;
+    for (const [id, fish] of Object.entries(this.data.fishes)) this.data.fishes[id] = canonicalBirthFish(fish, birthOf(id));
+    for (const type of ['fishes', 'scenes']) for (const [id, incoming] of Object.entries(other[type])) {
+      const obj = type === 'fishes' ? canonicalBirthFish(incoming, birthOf(id)) : incoming, old = this.data[type][id];
+      if (!old || (obj.posAt || 0) > (old.posAt || 0) || ((obj.posAt || 0) === (old.posAt || 0) && JSON.stringify(obj).localeCompare(JSON.stringify(old)) > 0)) this.data[type][id] = clone(obj);
+    }
     const dependencies = archiveDependencies({ ...this.data, ops: { ...archived.ops, ...this.data.ops }, breeding: { ...archived.breeding, ...this.data.breeding } });
     for (const field of ['ops', 'breeding']) for (const [id, record] of Object.entries(archived[field] || {})) { if (!this.data[field][id] && dependencies[field].has(id)) this.data[field][id] = clone(record); else if (!dependencies[field].has(id) && JSON.stringify(this.data[field][id]) === JSON.stringify(record)) delete this.data[field][id]; }
     this.data.legends = mergeLegends(this.data.legends, other.legends, Math.max(this.data.tick, other.tick));

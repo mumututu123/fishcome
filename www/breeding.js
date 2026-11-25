@@ -137,15 +137,84 @@ export function commitUnit(unit, now) {
   }
   for (const fish of unit.members) { fish.x = wrapX(fish.x); fish.posAt = now; }
 }
-export function mergeBreeding(world, other) {
+export function mergeBreeding(world, other, archived = {}) {
   world.data.breeding ||= {};
   for (const [id, record] of Object.entries(other.breeding || {})) {
-    const old = world.data.breeding[id], terminal = record.status !== 'active', oldTerminal = old && old.status !== 'active';
+    const old = world.data.breeding[id] || archived[id], terminal = record.status !== 'active', oldTerminal = old && old.status !== 'active';
     const born = record.status === 'born', oldBorn = old?.status === 'born';
     if (!old || born && !oldBorn || !oldBorn && terminal && !oldTerminal || born === oldBorn && terminal === oldTerminal && ((born ? record.at < old.at : record.at > old.at) || record.at === old.at && JSON.stringify(record).localeCompare(JSON.stringify(old)) > 0)) world.data.breeding[id] = clone(record);
   }
   if ((other.contactAt || 0) > (world.data.contactAt || 0)) { world.data.contacts = clone(other.contacts || {}); world.data.contactAt = other.contactAt; }
 }
+// Birth certificates are selected independently of movement. Keep the immutable
+// origin coherent without resetting position, later feeding or user edits.
+export function canonicalBirthFish(fish, record) {
+  const baby = record?.baby;
+  if (record?.status !== 'born' || baby?.id !== fish.id || !Number.isFinite(baby.created)) return fish;
+  const { actor, created, gender, nick, parents } = baby;
+  if (fish.created === created && fish.actor === actor && fish.birth === record.id &&
+      fish.gender === gender && fish.nick === nick && JSON.stringify(fish.parents) === JSON.stringify(parents)) return fish;
+  const result = { ...fish, actor, created, gender, nick, parents: [...parents], birth: record.id };
+  if (fish.lastFed === fish.created && fish.lastMealAt == null) {
+    result.lastFed = created;
+    if (fish.hungerAt === fish.created + CONFIG.hunger) result.hungerAt = created + CONFIG.hunger;
+  }
+  return result;
+}
+
+// Only rebase equivalent inheritance events. A different cell, parent or glyph
+// is not evidence of the same transition; full validation still rejects it.
+export function canonicalBirthPath(cell, breeding) {
+  const path = cell.path;
+  if (!Array.isArray(path)) return cell;
+  let changed = false;
+  const next = path.map((event, index) => {
+    if (event?.reason !== 'birth' || !Object.hasOwn(breeding, event.birth)) return event;
+    const record = breeding[event.birth], baby = record?.baby;
+    if (record?.status !== 'born' || !Number.isFinite(baby?.created) || !Array.isArray(baby.cells)) return event;
+    const inherited = baby.cells.find(item => item.id === cell.id);
+    if (!inherited || event.id !== `birth:${record.id}:${cell.id}` || event.target !== baby.id ||
+        event.from !== inherited.parent || event.before !== inherited.before || event.after !== inherited.after ||
+        event.x !== inherited.x || event.y !== inherited.y || !Number.isFinite(event.t) || event.t < baby.created ||
+        baby.created < (path[index - 1]?.t ?? -Infinity) || event.t > (path[index + 1]?.t ?? Infinity) || event.t === baby.created) return event;
+    changed = true;
+    return { ...event, t: baby.created };
+  });
+  return changed ? { ...cell, path: next } : cell;
+}
+
+// Legacy local snapshots may contain the later branch's birth time. Repair
+// only this recognizable mismatch and let the caller verify the full result.
+export function repairLocalBirthTimes(data, archived = {}) {
+  if (!data?.ops || !data.fishes || !data.chars) return data;
+  const breeding = { ...archived.breeding, ...data.breeding };
+  const fishes = { ...data.fishes }, chars = { ...data.chars };
+  const sources = { ops: { ...archived.ops, ...data.ops }, breeding };
+  const validated = new Map();
+  const isValid = record => {
+    if (!validated.has(record.id)) validated.set(record.id, validBreedingRecord(record, sources));
+    return validated.get(record.id);
+  };
+  let changed = false;
+  for (const [id, fish] of Object.entries(fishes)) {
+    if (!fish || !id.startsWith('born:')) continue;
+    const record = breeding[id.slice(5)], baby = record?.baby;
+    if (fish.id !== id || fish.birth !== record?.id || baby?.id !== id || fish.actor !== baby.actor ||
+        !Number.isFinite(fish.created) || fish.created <= baby.created ||
+        !isValid(record)) continue;
+    const normalized = canonicalBirthFish(fish, record);
+    fishes[id] = { ...fish, created: normalized.created, lastFed: normalized.lastFed, hungerAt: normalized.hungerAt };
+    changed = true;
+  }
+  for (const [id, cell] of Object.entries(chars)) {
+    if (!Array.isArray(cell?.path) || !cell.path.some(event => event?.reason === 'birth')) continue;
+    const trusted = Object.fromEntries(cell.path.filter(event => event?.reason === 'birth' && Object.hasOwn(breeding, event.birth) && breeding[event.birth] && isValid(breeding[event.birth])).map(event => [event.birth, breeding[event.birth]]));
+    const normalized = canonicalBirthPath(cell, trusted);
+    if (normalized !== cell) { chars[id] = normalized; changed = true; }
+  }
+  return changed ? { ...data, fishes, chars } : data;
+}
+
 export function normalizeBirthCells(world) {
   for (const cell of Object.values(world.data.chars)) {
     const event = cell.path?.at(-1); if (cell.kind !== 'fish' || event?.reason !== 'birth') continue;
