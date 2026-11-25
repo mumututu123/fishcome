@@ -1,25 +1,38 @@
 ﻿param(
     [string]$Version = '',
     [string]$OutputDirectory = '',
-    [string]$SourceDirectory = $PSScriptRoot
+    [string]$SourceDirectory = $PSScriptRoot,
+    [string]$ArchiveDirectory = ''
 )
 
 $ErrorActionPreference = 'Stop'
 $projectRoot = [IO.Path]::GetFullPath($SourceDirectory)
 if (-not $Version) { $Version = (Get-Content -LiteralPath (Join-Path $projectRoot 'package.json') -Raw | ConvertFrom-Json).version }
-if ($Version -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?$') { throw '发行版本号无效' }
+if ($Version -notmatch '^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?$') { throw '发行版本号无效' }
 $compilerPath = 'C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe'
 if (-not (Test-Path -LiteralPath $compilerPath -PathType Leaf)) { $compilerPath = 'C:\Windows\Microsoft.NET\Framework\v4.0.30319\csc.exe' }
 if (-not (Test-Path -LiteralPath $compilerPath -PathType Leaf)) { throw '未找到 Windows .NET Framework C# 编译器' }
 $outputRoot = if (-not $OutputDirectory) { Join-Path $projectRoot 'dist\鱼来' } elseif ([IO.Path]::IsPathRooted($OutputDirectory)) { [IO.Path]::GetFullPath($OutputDirectory) } else { [IO.Path]::GetFullPath((Join-Path $projectRoot $OutputDirectory)) }
-$distRoot = [IO.Path]::GetFullPath((Join-Path $projectRoot 'dist'))
+$distRoot = if (-not $ArchiveDirectory) { [IO.Path]::GetFullPath((Join-Path $projectRoot 'dist')) } elseif ([IO.Path]::IsPathRooted($ArchiveDirectory)) { [IO.Path]::GetFullPath($ArchiveDirectory) } else { [IO.Path]::GetFullPath((Join-Path $projectRoot $ArchiveDirectory)) }
 $stagingRoot = Join-Path $distRoot ('.build-' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $outputRoot -Force | Out-Null
 New-Item -ItemType Directory -Path $stagingRoot -Force | Out-Null
 try {
 $archiveName = "fishcome-$Version-windows.zip"
+$rulesSource = Get-Content -LiteralPath (Join-Path $projectRoot 'www\rules.js') -Raw -Encoding UTF8
+$rulesMatch = [regex]::Match($rulesSource, 'Object\.freeze\((\{[\s\S]*?\})\)')
+if (-not $rulesMatch.Success) { throw '无法从 www/rules.js 解析联机规则版本' }
+$rulesObject = $rulesMatch.Groups[1].Value | ConvertFrom-Json
+$rulesParts = @()
+foreach ($prop in $rulesObject.PSObject.Properties) {
+    if ($prop.Value -isnot [int] -and $prop.Value -isnot [long]) { throw "联机规则版本字段必须为整数：$($prop.Name)" }
+    $rulesParts += [string]$prop.Value
+}
+$rulesVersion = $rulesParts -join '.'
+$rulesJsonCompact = ($rulesObject | ConvertTo-Json -Compress)
+$rulesJsonEscaped = $rulesJsonCompact.Replace('\', '\\').Replace('"', '\"')
 $buildInfo = Join-Path $stagingRoot 'BuildInfo.cs'
-[IO.File]::WriteAllText($buildInfo, "namespace Tide { static class BuildInfo { public const string Version = `"$Version`"; public const string PackageName = `"$archiveName`"; } }", (New-Object Text.UTF8Encoding($false)))
+[IO.File]::WriteAllText($buildInfo, "using System.Reflection;`n[assembly: AssemblyInformationalVersion(`"$Version`")]`n[assembly: AssemblyProduct(`"fishcome`")]`nnamespace Tide { static class BuildInfo { public const string Version = `"$Version`"; public const string PackageName = `"$archiveName`"; public const string RulesVersion = `"$rulesVersion`"; public const string RulesJson = `"$rulesJsonEscaped`"; } }", (New-Object Text.UTF8Encoding($false)))
 & $compilerPath /nologo /codepage:65001 /optimize+ /target:winexe /reference:System.Windows.Forms.dll /reference:System.Drawing.dll /reference:System.Web.Extensions.dll /reference:System.IO.Compression.dll /reference:System.IO.Compression.FileSystem.dll "/out:$stagingRoot\鱼来.exe" "$projectRoot\launcher\Program.cs" $buildInfo
 if ($LASTEXITCODE -ne 0) { throw '启动器编译失败' }
 Copy-Item -LiteralPath (Join-Path $projectRoot 'www') -Destination $stagingRoot -Recurse -Force

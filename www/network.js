@@ -17,8 +17,8 @@ export class Network {
   async start(nick) { this.sign = await signer(this.identity); await this.local('register', { nick, actor: this.identity.actor }); this.events = new EventSource(`/local/events?node=${this.node}&token=${encodeURIComponent(this.meta.token)}`); this.events.onmessage = e => { try { this.signal(JSON.parse(e.data)).catch(error => this.onChange(error.message)); } catch { } }; }
   live() { return [...this.connections.values()].filter(p => p.dc?.readyState === 'open'); }
   has(node) { return [...this.connections.values()].some(p => p.node === node && !['closed', 'failed'].includes(p.pc.connectionState)); }
-  async connectInvite(value) { const code = await normalizeInvite(value); return this.connect(code, '', new Set(), code); }
-  async connect(url, requestedNode = '', visited = new Set(), entryInvite = '') {
+  async connectInvite(value, options = {}) { const code = await normalizeInvite(value); return this.connect(code, '', new Set(), code, !!options.silent); }
+  async connect(url, requestedNode = '', visited = new Set(), entryInvite = '', silent = false) {
     url = await normalizeInvite(url);
     if (visited.has(url + requestedNode)) return; visited.add(url + requestedNode);
     const status = await this.local('probe', { url });
@@ -27,8 +27,8 @@ export class Network {
     if (this.connections.size >= MAX_PEERS) throw new Error('你的直接连接已达上限，请稍后重试');
     const possible = (status.clients || []).filter(c => c.id !== this.node && !this.has(c.id) && c.peers < MAX_PEERS && (!requestedNode || c.id === requestedNode));
     const target = possible.sort((a, b) => a.peers - b.peers)[0];
-    if (!target) { for (const hint of (status.hints || []).slice(0, 8)) { if (hint.id !== this.node && !this.has(hint.id)) { try { await this.connect(hint.url, hint.id, visited, entryInvite); if (this.live().length) return; } catch { } } } throw new Error('入口可访问，但暂时没有正在玩的伙伴或空位'); }
-    const id = crypto.randomUUID(), p = this.make(id, url, target.id); p.entryInvite = entryInvite; this.attach(p, p.pc.createDataChannel('tide'));
+    if (!target) { for (const hint of (status.hints || []).slice(0, 8)) { if (hint.id !== this.node && !this.has(hint.id)) { try { await this.connect(hint.url, hint.id, visited, entryInvite, silent); if (this.live().length) return; } catch { } } } throw new Error('入口可访问，但暂时没有正在玩的伙伴或空位'); }
+    const id = crypto.randomUUID(), p = this.make(id, url, target.id); p.entryInvite = entryInvite; p.silent = silent; this.attach(p, p.pc.createDataChannel('tide'));
     try { await p.pc.setLocalDescription(await p.pc.createOffer()); await this.ice(p.pc); const result = await this.local('relay', { url, signal: { type: 'offer', from: this.node, to: target.id, connection: id, sdp: p.pc.localDescription.toJSON() } }); if (!result.ok) throw new Error(result.error || '配对入口繁忙'); await this.waitForConnection(p); } catch (e) { this.close(p, e); throw e; }
   }
   waitForConnection(p) { if (p.dc?.readyState === 'open') return Promise.resolve(); if (!this.connections.has(p.id)) return Promise.reject(p.error || new Error(DIRECT_ERROR)); return new Promise((resolve, reject) => p.waiters.add({ resolve, reject })); }
