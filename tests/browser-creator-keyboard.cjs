@@ -39,13 +39,16 @@ async function main() {
   async function glyph(x, y, ch, color) {
     assert(await page.locator('#gridCanvas').evaluate((canvas, { x, y, ch, color }) => {
       const ctx = canvas.getContext('2d'), size = document.querySelector('#creatorTitle').textContent.includes('鱼') ? 15 : 20, s = 400 / size;
-      const border = ctx.getImageData(Math.round(x * s + 1), Math.round(y * s + s / 2), 1, 1).data;
+      const border = ctx.getImageData(Math.floor(x * s + 1), Math.round(y * s + s / 2), 1, 1).data;
       if ([154, 238, 224].some((value, i) => Math.abs(border[i] - value) > 2) || border[3] < 100) return false;
       // Check the rendered glyph against an independent canvas with the same font and position.
       const reference = document.createElement('canvas'); reference.width = reference.height = 400;
-      const other = reference.getContext('2d'); other.font = `${s * .8}px 'Microsoft YaHei',Consolas,monospace`; other.textAlign = 'center'; other.textBaseline = 'middle'; other.fillStyle = color; other.fillText(ch, (x + .5) * s, (y + .5) * s, s);
+      const other = reference.getContext('2d'); other.font = `${s * .52}px 'Microsoft YaHei',Consolas,monospace`; other.textAlign = 'center'; other.textBaseline = 'middle'; other.fillStyle = color; other.fillText(ch, (x + .5) * s, (y + .5) * s, s * .56);
       const left = Math.ceil(x * s + 4), top = Math.ceil(y * s + 4), width = Math.floor(s - 8), pixels = ctx.getImageData(left, top, width, width).data, expected = other.getImageData(left, top, width, width).data;
-      return expected.some((v, i) => i % 4 === 3 && v > 0 && pixels[i] === v && pixels[i - 1] === expected[i - 1] && pixels[i - 2] === expected[i - 2] && pixels[i - 3] === expected[i - 3]);
+      // Bead backplates are opaque. Check the glyph's substantial strokes against
+      // the independent text raster rather than requiring a transparent canvas.
+      const strokes = []; for (let i = 3; i < expected.length; i += 4) if (expected[i] > 180) strokes.push(i);
+      return strokes.length > 0 && strokes.filter(i => pixels[i] >= expected[i] && [1, 2, 3].every(offset => Math.abs(pixels[i - offset] - expected[i - offset]) < 65)).length / strokes.length > .7;
     }, { x, y, ch, color }));
   }
   await page.locator('#makeFish').click(); assert(await input.evaluate(node => node === document.activeElement)); await cell(0, 0);
