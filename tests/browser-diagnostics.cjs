@@ -521,3 +521,46 @@ test('两个欢迎页同时注册时只有一个身份能够写入', async t => 
   const stored = await page.evaluate(async () => (await (await import('./storage.js')).get('identity')).actor);
   assert.equal(stored, attempts.find(a => a.actor).actor);
 });
+
+test('慢刷新显示恢复提示，旧版进度只提醒一次且仍可继续导出', async t => {
+  let release, pending = false;
+  const blocked = new Promise(resolve => { release = resolve; });
+  t.after(release);
+  const register = () => pending && blocked;
+  const page = await profile(t, { register });
+  await page.goto(origin);
+  await page.waitForFunction(() => window.tide);
+  const roots = await page.evaluate(() => Object.keys(tide.world.data.roots));
+  await page.goto(origin + '/fixture');
+  await page.evaluate(async () => {
+    const { database } = await import('./storage.js');
+    const tx = (await database()).transaction('items', 'readwrite'), store = tx.objectStore('items');
+    const saved = store.get('checkpoint');
+    saved.onsuccess = () => store.put({ ...saved.result, at: saved.result.at + 1 }, 'checkpoint');
+    await new Promise((resolve, reject) => { tx.oncomplete = resolve; tx.onabort = () => reject(tx.error); });
+  });
+  await page.addInitScript(() => {
+    window.legacyToasts = 0;
+    new MutationObserver(records => {
+      if (records.some(({ target }) => target.id === 'toast' && target.textContent.includes('留着一份旧版进度'))) window.legacyToasts++;
+    }).observe(document, { subtree: true, childList: true });
+  });
+  pending = true;
+  const registering = page.waitForRequest(origin + '/local/register');
+  await page.goto(origin, { waitUntil: 'domcontentloaded' });
+  await registering;
+  await page.locator('#startupNotice').waitFor({ state: 'visible' });
+  assert.match(await page.locator('#startupNotice').textContent(), /正在恢复这片海/);
+  assert.equal(await page.evaluate(() => !!window.tide), false);
+  pending = false;
+  release();
+  await page.waitForFunction(() => window.tide && legacyToasts === 1);
+  await page.locator('#startupNotice').waitFor({ state: 'hidden' });
+  assert.deepEqual(await page.evaluate(() => Object.keys(tide.world.data.roots)), roots);
+  await page.reload();
+  await page.waitForFunction(() => window.tide && document.querySelector('[data-legacy-backup="live"]'));
+  await page.locator('#connect').click();
+  const old = await exported(page, '[data-legacy-backup="live"]');
+  assert.deepEqual(Object.keys(old.checkpoint.world.roots), roots);
+  assert.equal(await page.evaluate(() => legacyToasts), 0);
+});

@@ -1,7 +1,7 @@
 import { World, CONFIG, clone, EYES, bounds, validGlyph, displayNick, hash, sceneryCount, chooseClaim } from './engine.js';
 import { SimulationClient, subscribeSimulationChanges } from './simulation-client.js';
 import { setParticipantName, subscribeBeforeSimulationPatch, worldEdited } from './simulation-changes.js';
-import { get, getMany, readCheckpointVersion, sameStoredCheckpoint, putMany, readHandoffCheckpoint, replaceFromBackup, getOldBranch, newIdentity, signer, verifyEnvelope, actorId, download } from './storage.js';
+import { get, getMany, readCheckpointVersion, sameStoredCheckpoint, putMany, readHandoffCheckpoint, replaceFromBackup, getOldBranch, claimLegacyNotice, newIdentity, signer, verifyEnvelope, actorId, download } from './storage.js';
 import { beforeCheckpointPatch, noteCheckpointChanges } from './checkpoint-pages.js';
 import { CheckpointPictures } from './checkpoint-picture.js';
 import { Network } from './network.js';
@@ -207,12 +207,14 @@ async function mergeVerifiedWorld(data, peer, context, { local = false } = {}) {
   // Overlapping archive rows have a canonical winner after ingestion.
   if (revision !== store.revision) archived = await store.dependencies(incoming, target.data);
   if (target !== world || store !== archiveStore) throw new Error('运行世界已更换，请重新同步');
+  const rootCount = target.roots.length;
   target.merge(incoming, archived);
   target.attachArchives(store);
+  return target.roots.length > rootCount;
 }
 async function mergeReplica(data, peer, context = 'merge') {
   const previousTerrain = world.data.terrain.seed;
-  await mergeVerifiedWorld(data, peer, context);
+  const joinedWorld = await mergeVerifiedWorld(data, peer, context);
   await compactKnown(world, archiveStore);
   if (world.data.terrain.seed !== previousTerrain) geometryRepair = true;
   worldEdited(world);
@@ -230,6 +232,7 @@ async function mergeReplica(data, peer, context = 'merge') {
   }
   reconcileHistory(); syncIncomeSerial(); await save(); renderChat();
   if (recovered) await network.broadcast('merge', { world: await captureReplica() }, { capturedWorld: true });
+  return joinedWorld;
 }
 function resumeAfterInactivity(now = Date.now()) { if (!resumeTask) resumeTask = resumeWorld(now).finally(() => { resumeTask = null; }); return resumeTask; }
 async function resumeWorld(now) {
@@ -288,7 +291,7 @@ async function onMessage(message, peer) {
     }
     if (message.from !== peer.node || body.member?.id !== message.from || body.member.actor !== message.actor) return;
     const newKnowledge = Object.keys(body.world.roots || {}).some(r => !world.data.roots[r]) || Object.keys(body.world.ops || {}).some(id => !world.data.ops[id]) || Object.keys(body.world.chats || {}).some(id => !world.data.chats[id]) || Object.keys(body.world.chatSources || {}).some(id => !world.data.chatSources[id]);
-    await mergeReplica(body.world, peer, 'hello'); geometryRepair = true;
+    const joinedWorld = await mergeReplica(body.world, peer, 'hello'); geometryRepair = true;
     const own = body.member; members.set(own.id, { ...own, url: peer.url, at: Date.now() }); remember(peer.url);
     rememberAuthor(message.actor, own.nick);
     for (const m of body.members || []) remember(m.url);
@@ -298,7 +301,7 @@ async function onMessage(message, peer) {
     await save();
     const missing = (body.historyIndex || []).filter(id => !histories[id]); if (missing.length) { historyQueues.set(peer.id, missing); await requestHistory(peer); }
     await completeReferral(peer, message.actor);
-    status = ''; toast('已接入伙伴，两个世界正在合流'); update();
+    status = ''; if (joinedWorld) toast('两片海合流了'); update();
   } else if (message.kind === 'beat') {
     if (body.member?.id === message.from && body.member.actor === message.actor) { const direct = network.live().find(p => p.node === message.from); members.set(message.from, { ...body.member, direct: !!direct, url: await normalizeInvite(direct?.url || body.member.url), at: Date.now() }); remember(body.member.url); rememberAuthor(message.actor, body.member.nick); if (Date.now() - lastRepair > 5000 && (body.rootCount > world.roots.length || body.opCount > Object.keys(world.data.ops).length || body.chatCount > Object.keys(world.data.chats).length || body.chatSourceCount > Object.keys(world.data.chatSources).length)) { lastRepair = Date.now(); network.broadcast('replicaRequest', { to: message.from }).catch(() => {}); } }
   } else if (message.kind === 'merge') {
@@ -748,6 +751,7 @@ async function start() {
   identity = owner;
   histories = cards || {};
   if (!identity) {
+    $('startupNotice').hidden = true;
     const showDiagnostics = $('diagnosticsDialog').open;
     if (showDiagnostics) $('diagnosticsDialog').close();
     $('welcomeDialog').showModal();
@@ -760,6 +764,7 @@ async function start() {
         try { identity = await newIdentity(nick, generation); }
         catch (error) { toast(error.message); return; }
         $('welcomeDialog').close();
+        $('startupNotice').hidden = false;
         resolve();
       };
     });
@@ -771,12 +776,16 @@ async function start() {
   const migrated = await Promise.allSettled((Array.isArray(invites) ? invites : []).map(normalizeInvite)); known = [...new Set(migrated.filter(result => result.status === 'fulfilled').map(result => result.value))];
   if (previous?.world) await ensureArchives(previous.world);
   const expires = previous?.world && now - (previous.lastOnlineAt ?? previous.at ?? previous.world.tick) >= CONFIG.offlineLife;
-  if (previous?.world) previous.world = await verifyLocalCheckpoint(previous.world, await archiveStore.dependencies(previous.world), archiveStore, { context: 'start' });
+  const savedWorld = previous?.world;
+  if (savedWorld) previous.world = await verifyLocalCheckpoint(savedWorld, await archiveStore.dependencies(savedWorld), archiveStore, { context: 'start' });
   if (expires) previous.world.chats = await archiveStore.chats(Infinity, previous.world.chats, previous.world.archives);
   const restored = restoreCheckpoint(previous, now);
   world = restored.world; world.data.participants[identity.actor] = identity.nick; lastOnlineAt = now; lastMeter = now;
   if (restored.expired) { const card = previous.picture ? await endedCard(previous, restored.expiresAt) : null; priorCheckpoint = previous; archiveStore = newArchiveStore(); if (card) acceptHistory(card); }
-  else reconcileHistory();
+  else {
+    reconcileHistory();
+    if (previous?.world === savedWorld && previous?.picture) pictures.reuse(previous.picture);
+  }
   world.attachArchives(archiveStore);
   network = new Network(identity, meta, onMessage, networkChange, (error, peer) => {
     diagnostics.record('warn', 'network', `已拒绝来自 ${peer?.node || 'unknown'} 的消息：${error?.message || error}`);
@@ -785,10 +794,12 @@ async function start() {
   $('myUrl').value = meta.url;
   creator = new Creator(placement, balance, size => defaultFishName(identity.nick, world.myFishes(identity.actor).length + 1, size));
   syncIncomeSerial(); renderChat(); await saveHandoff({ startup: true });
+  lastSave = lastPictureTime = Date.now();
   started = true;
+  $('startupNotice').hidden = true;
   if (network.live().length) networkChange().catch(error => { status = error.message; });
   syncUpdateStatus(); refreshPeerUpdates().catch(() => {});
-  reconnect().catch(() => {}); update(); lastPictureTime = Date.now(); takePicture().catch(() => {});
+  reconnect().catch(() => {}); update();
   setInterval(tick, CONFIG.step); setInterval(() => { network.presence(active().filter(m => m.id !== network.node).map(m => ({ id: m.id, url: m.url }))).catch(() => {}); if (network.connections.size < 6) { const candidate = active().filter(m => m.id !== network.node && !network.has(m.id)).sort((a, b) => hash(`${network.node}:${a.id}`) - hash(`${network.node}:${b.id}`))[0]; if (candidate) network.connect(candidate.url, candidate.id).catch(() => {}); } }, 6000);
   document.addEventListener('visibilitychange', async () => { if (!document.hidden) { lifeSince = identity.lifeSeenAt || Date.now(); returnVisit = Date.now() - lifeSince > 60000; lifeMessage = null; } await resumeAfterInactivity(); if (network.live().length) network.broadcast('beat', { member: member() }).catch(() => {}); save().catch(() => {}); });
   window.addEventListener('pagehide', () => { simulation.close(); const blob = new Blob([JSON.stringify({ node: network.node, token: meta.token })], { type: 'application/json' }); navigator.sendBeacon('/local/unregister', blob); if (updateFrozen || updateRestarting || replacingCheckpoint) return; save().catch(() => {}); });
@@ -1412,7 +1423,9 @@ function refreshOldBackups(notify = false) {
     if (data.error) { toast(data.error); return; }
     const row = $('backup').parentElement;
     for (const button of row.querySelectorAll('[data-legacy-backup]')) button.remove();
-    if (notify && data.branches.length) toast('旧版也保存过游戏进度，可在连接窗口导出。');
+    if (notify && data.branches.length) claimLegacyNotice().then(first => {
+      if (first) toast('留着一份旧版进度，可在「连接同事」里导出。');
+    }).catch(() => {});
     for (const { id, at } of data.branches) {
       const button = document.createElement('button');
       button.dataset.legacyBackup = id;
@@ -1704,6 +1717,7 @@ function render(now) {
 render();
 if (new URLSearchParams(location.search).get('debug') === '1') openDiagnostics();
 start().catch(e => {
+  $('startupNotice').hidden = true;
   if (network && !started) network.stop().catch(() => {});
   diagnostics.record('error', 'start', e.message);
   toast(e.message);

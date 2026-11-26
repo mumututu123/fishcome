@@ -56,6 +56,18 @@ export async function readHandoffCheckpoint() {
   if (!revision) throw new Error('本地存档已更换，请重新打开游戏。');
   return { checkpoint, identity, histories, known, revision, generation };
 }
+export async function claimLegacyNotice() {
+  const db = await database();
+  return new Promise((resolve, reject) => {
+    const key = 'legacy-progress-notice-seen';
+    const tx = db.transaction('items', 'readwrite'), store = tx.objectStore('items');
+    const request = store.get(key);
+    request.onsuccess = () => { if (request.result === undefined) store.put(true, key); };
+    tx.oncomplete = () => resolve(request.result === undefined);
+    tx.onabort = () => reject(tx.error);
+  });
+}
+
 export async function getOldBranch(id) {
   const db = await database();
   return new Promise((resolve, reject) => {
