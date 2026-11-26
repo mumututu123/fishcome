@@ -78,11 +78,28 @@ export class SimulationClient {
       this.worker.postMessage(message);
     });
   }
+  archiveAtStepBoundary(world, commit) {
+    return new Promise((resolve, reject) => {
+      const apply = () => {
+        try {
+          const change = commit();
+          if (change && this.owner === world) this.archiveChanges.push(change);
+          resolve(!!change);
+        } catch (error) { reject(error); }
+      };
+      if (this.task) (this.boundaries ||= []).push(apply);
+      else apply();
+    });
+  }
+  finishBoundary() {
+    for (const apply of this.boundaries?.splice(0) || []) apply();
+  }
   async open(world, valid) {
     this.close();
     const worker = this.worker = this.makeWorker();
     this.names = new Map();
     this.foods = new Map();
+    this.archiveChanges = [];
     this.stopInputs = subscribeSimulationChanges((source, patch, origin) => {
       if (world !== source || origin !== 'input') return;
       for (const [id, nick] of patch.tables.participants?.set || []) this.names.set(id, nick);
@@ -128,6 +145,8 @@ export class SimulationClient {
     return true;
   }
   async compute(world, message, valid) {
+    this.finishBoundary();
+    if (this.archiveChanges.length) message.archives = this.archiveChanges.splice(0);
     message.names = Array.from(this.names);
     message.foods = Array.from(this.foods);
     this.names.clear();
@@ -171,7 +190,7 @@ export class SimulationClient {
       this.close();
       this.failure = { world, error, reported: true };
       throw error;
-    }).finally(() => { this.task = null; });
+    }).finally(() => { this.task = null; this.finishBoundary(); });
     return this.task;
   }
   async run(world, now, ownsWorld, repair) {

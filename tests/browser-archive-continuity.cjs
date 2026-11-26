@@ -27,6 +27,15 @@ test('空归档保持后台模拟，有记录时继续归档和整理', async t 
     const fixture = `
       window.archiveFixture = () => ({
         world, archiveStore,
+        async observeReplica() {
+          const peer = { node: 'archive-reader' }, packets = [];
+          network.live = network.replicaPeers = () => [peer];
+          network.broadcast = async (kind, body) => {
+            if (kind === 'world') packets.push({ delta: body.delta, chunks: Object.keys(body.world.archives.chunks) });
+          };
+          await broadcastWorld();
+          return packets;
+        },
         holdArchiveSave() {
           const original = save;
           let entered, release;
@@ -91,10 +100,11 @@ test('空归档保持后台模拟，有记录时继续归档和整理', async t 
   assert.equal(workers, workersBefore, '清理已有归档的热副本应保留模拟线程');
 
   await page.evaluate(async () => {
-    const { world, earn, scan, holdArchiveSave } = archiveFixture();
+    const { world, earn, scan, holdArchiveSave, observeReplica } = archiveFixture();
     const { ARCHIVE } = await import('./archive.js');
     const op = await earn(2, Date.now() - 2 * ARCHIVE.period);
     world.data.ops[op.id] = op;
+    window.archivePackets = await observeReplica();
     const { saving, release } = holdArchiveSave();
     window.finishArchive = { scan: scan(), release, id: op.id };
     await saving;
@@ -113,9 +123,10 @@ test('空归档保持后台模拟，有记录时继续归档和整理', async t 
     const saved = await get('checkpoint', { observeCheckpoint: false });
     const chunk = archiveStore.ids.ops.get(id);
     return { live: Object.hasOwn(world.data.ops, id), saved: Object.hasOwn(saved.world.ops, id),
-      chunks: Object.keys(saved.world.archives.chunks).length, stored: !!(await get('archive:' + chunk)) };
+      chunks: Object.keys(saved.world.archives.chunks).length, stored: !!(await get('archive:' + chunk)),
+      initial: archivePackets[0].delta, delivered: archivePackets.find(packet => packet.chunks.includes(chunk))?.delta };
   });
-  assert.deepEqual(archived, { live: false, saved: false, chunks: 2, stored: true });
+  assert.deepEqual(archived, { live: false, saved: false, chunks: 2, stored: true, initial: false, delivered: true });
   assert.equal(workers, workersBefore, '写入非空归档期间继续使用同一模拟线程');
   assert.deepEqual(errors, []);
 });

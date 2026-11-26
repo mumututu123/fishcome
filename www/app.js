@@ -158,6 +158,8 @@ async function archiveWorld(now = Date.now()) {
   if (updateFrozen || archiveScanning || replacingCheckpoint || !amLeader() || now - archiveCheckAt < 60000) return;
   archiveCheckAt = now; archiveScanning = true;
   const target = world, store = archiveStore;
+  const initialRevision = store.revision;
+  let committed = false;
   const isCurrent = () => target === world && store === archiveStore;
   const canArchive = () => isCurrent() && !updateFrozen && !replacingCheckpoint && amLeader();
   try {
@@ -166,25 +168,36 @@ async function archiveWorld(now = Date.now()) {
     const plan = await archivePlanAsync(target.data, now, { pressure });
     if (!canArchive()) return;
     const hasNewRecords = Object.values(plan).some(table => Object.keys(table).length);
+    const mealTargets = new Set();
     if (hasNewRecords) {
       archiveBusy = true;
       const chunks = await archiveChunks(plan, target.data.roots);
       if (!canArchive()) return;
-      await putMany(chunks.map(chunk => ['archive:' + chunk.manifest.id, chunk.encoded]));
+      await putMany(chunks.map(chunk => ['archive:' + chunk.manifest.id, chunk.encoded]), { generation: await saveGeneration });
       if (!isCurrent()) return;
-      for (const chunk of chunks) { await store.ingest(chunk, chooseClaim); target.data.archives ||= emptyArchiveState(); target.data.archives.chunks[chunk.manifest.id] = chunk.manifest; }
+      for (const [id, cell] of Object.entries(plan.chars)) {
+        for (const event of store.summary.mealSources.get(id)?.events || []) mealTargets.add(event.target);
+        for (const event of cell.path) if (event.reason === 'eat') mealTargets.add(event.target);
+      }
+      for (const chunk of chunks) await store.ingest(chunk, chooseClaim);
+      target.data.archives ||= emptyArchiveState();
+      for (const { manifest } of chunks) target.data.archives.chunks[manifest.id] = manifest;
     }
     const compact = await prepareCompaction(target, store);
-    if (!isCurrent() || (!hasNewRecords && !canArchive())) return;
-    const compacted = compact();
-    target.data.archives.at = now;
-    if (!hasNewRecords && !compacted) return;
+    const changed = await simulation.archiveAtStepBoundary(target, () => {
+      if (!isCurrent() || (!hasNewRecords && !canArchive())) return;
+      const removed = compact();
+      (target.data.archives ||= emptyArchiveState()).at = now;
+      if (!hasNewRecords && !removed) return;
+      const meals = Array.from(mealTargets, id => [id, store.summary.lastMeals.get(id), store.summary.grassMeals.has(id)]);
+      committed = true;
+      return { removed: removed || {}, meals };
+    });
+    if (!changed) return;
     archiveBusy = true;
-    if (!compacted) { target.dirty = true; target.foodRevision++; }
-    target.attachArchives(store); worldBroadcast.reset();
     await save(); await broadcastWorld(); renderChat();
   } catch (error) {
-    if (archiveBusy && isCurrent()) worldEdited(target);
+    if (!committed && isCurrent() && store.revision !== initialRevision) worldEdited(target);
     status = '记忆整理稍后重试：' + error.message;
   } finally { archiveBusy = false; archiveScanning = false; }
 }
@@ -842,7 +855,7 @@ async function tick() {
   if (amLeader() && fishRepairWaiting && now - lastSave > 5000) geometryRepair = true;
   if (amLeader() && !updateFrozen && !replacingCheckpoint) {
     const target = world;
-    simulation.advance(target, now, () => target === world && amLeader() && !updateFrozen && !replacingCheckpoint && !archiveBusy && !archiveImports, {
+    simulation.advance(target, now, () => target === world && amLeader() && !updateFrozen && !replacingCheckpoint && !archiveImports, {
       geometry: geometryRepair, chat: world.data.pendingChatGlyphs && now - lastSave > 5000,
       done(result) {
         geometryRepair = false; fishRepairWaiting = result.fishWaiting;

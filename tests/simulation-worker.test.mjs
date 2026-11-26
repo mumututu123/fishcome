@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { CONFIG, World } from '../www/engine.js';
+import { CONFIG, World, chooseClaim } from '../www/engine.js';
+import { ARCHIVE_FIELDS, ArchiveStore, encodeArchive, prepareCompaction } from '../www/archive.js';
 import { SimulationClient, subscribeSimulationChanges } from '../www/simulation-client.js';
 import { WorkerSimulation } from '../www/simulation-worker.js';
 import { applyInputRows, setParticipantName } from '../www/simulation-changes.js';
@@ -8,8 +9,7 @@ import { CONTACT_TIME, updateContacts } from '../www/breeding.js';
 
 const start = Date.UTC(2025, 5, 15, 12, 17);
 const root = '00000000-0000-4000-8000-000000000012';
-function localWorker(beforeReceive = () => {}) {
-  const simulation = new WorkerSimulation();
+function localWorker(beforeReceive = () => {}, simulation = new WorkerSimulation()) {
   let closed = false;
   return {
     terminate() { closed = true; },
@@ -25,6 +25,48 @@ function localWorker(beforeReceive = () => {}) {
     }
   };
 }
+
+test('追赶中在第一步交接真实归档，保留鱼的最后一餐并清除线程里的旧热行', async () => {
+  const world = new World(start, root), store = new ArchiveStore(), worker = new WorkerSimulation();
+  world.attachArchives(store);
+  const fish = Object.keys(world.data.fishes)[0], at = start - 3600000;
+  const records = Object.fromEntries(ARCHIVE_FIELDS.map(field => [field, {}]));
+  records.chars.history = world.data.chars.history = { id: 'history', kind: 'burn', wild: { source: 'floor:1' },
+    path: [{ reason: 'eat', target: fish, t: at }] };
+  records.ops.edit = world.data.ops.edit = { id: 'edit', kind: 'sceneEdit', cell: 'history' };
+  records.chats.old = { id: 'old', body: { t: at, roots: [root] } };
+  delete world.data.chats;
+  const chunk = await encodeArchive(records, world.data.roots);
+  const issued = Promise.withResolvers(), resume = Promise.withResolvers();
+  const client = new SimulationClient(() => localWorker(async message => {
+    if (message.kind === 'step' && message.base === start) { issued.resolve(); await resume.promise; }
+  }, worker));
+  try {
+    const run = client.advance(world, start + 20 * CONFIG.step);
+    await issued.promise;
+    await store.ingest(chunk, chooseClaim);
+    world.data.archives.chunks[chunk.manifest.id] = chunk.manifest;
+    const compact = await prepareCompaction(world, store);
+    let cut;
+    const committed = client.archiveAtStepBoundary(world, () => {
+      cut = world.data.tick;
+      return { removed: compact(), meals: [[fish, store.summary.lastMeals.get(fish), store.summary.grassMeals.has(fish)]] };
+    });
+    assert(world.data.chars.history);
+    resume.resolve();
+    await committed;
+    await run;
+    assert.equal(cut, start + CONFIG.step);
+    assert.equal(world.data.tick, start + 20 * CONFIG.step);
+    for (const copy of [world, worker.world]) {
+      assert.equal(copy.data.chars.history, undefined);
+      assert.equal(copy.data.ops.edit, undefined);
+      assert.equal(copy.archives.summary.lastMeals.get(fish), at);
+      assert(copy.archives.summary.grassMeals.has(fish));
+    }
+    assert.equal(await store.get('chars', 'history').then(c => c.path[0].target), fish);
+  } finally { resume.resolve(); client.close(); }
+});
 
 test('后台模拟与同种子的前台基线逐步一致，已结束历史和创建凭据不进入线程', async () => {
   const a = new World(start, root), b = new World(start, root);

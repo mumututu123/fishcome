@@ -1,5 +1,6 @@
 import { chooseReferral } from './referral.js';
 import { mergeTravel } from './fish-status.js';
+import { simulationWillApply, simulationApplied } from './simulation-changes.js';
 
 export const ARCHIVE = Object.freeze({ age: 7 * 86400000, period: 86400000, threshold: 8 * 1024 * 1024, chunkSize: 256 * 1024, maxChunk: 1024 * 1024, fragmentSize: 384 * 1024, maxRecord: 32 * 1024 * 1024 });
 const compactableFields = ['ops', 'chars', 'breeding', 'travel', 'chats'];
@@ -10,7 +11,7 @@ const same = (a, b) => json(a) === json(b);
 export function archiveDependencies(data) {
   const keep = Object.fromEntries(ARCHIVE_FIELDS.map(field => [field, new Set()]));
   const fish = id => { if (!id) return; if (id.startsWith('born:')) birth(id.slice(5)); else keep.ops.add(id); };
-  const birth = id => { if (keep.breeding.has(id)) return; keep.breeding.add(id); const r = data.breeding[id]; if (r) { fish(r.male); fish(r.female); } };
+  const birth = id => { if (keep.breeding.has(id)) return; keep.breeding.add(id); const r = data.breeding?.[id]; if (r) { fish(r.male); fish(r.female); } };
   for (const id of Object.keys(data.fishes)) { fish(id); keep.travel.add(id); }
   for (const contact of Object.values(data.contacts || {})) { fish(contact.male); fish(contact.female); }
   for (const bubble of Object.values(data.bubbles || {})) keep.chars.add(bubble.source);
@@ -311,7 +312,7 @@ export async function prepareCompaction(world, store) {
   for (const field of compactableFields) {
     const index = store.ids[field];
     if (!index.size) continue;
-    for (const id of Object.keys(data[field])) {
+    for (const id of Object.keys(data[field] || {})) {
       if (!index.has(id) || field === 'chars' && data.chars[id]?.kind !== 'burn') continue;
       keep ??= archiveDependencies(data);
       if (keep[field].has(id)) continue;
@@ -320,19 +321,27 @@ export async function prepareCompaction(world, store) {
     }
   }
   return () => {
-    if (!candidates.length || revision !== store.revision) return false;
+    if (!candidates.length || revision !== store.revision) return;
     const current = archiveDependencies(world.data);
-    let changed = false;
+    const removed = {};
     for (const [field, id, record] of candidates) {
-      if (current[field].has(id) || !same(world.data[field][id], record)) continue;
-      delete world.data[field][id];
-      changed = true;
+      if (current[field].has(id) || !same(world.data[field]?.[id], record)) continue;
+      (removed[field] ||= []).push(id);
     }
-    if (changed) { world.dirty = true; world.foodRevision++; }
-    return changed;
+    const fields = Object.entries(removed);
+    if (!fields.length) return;
+    const patch = { values: {}, tables: Object.fromEntries(fields.map(([field, ids]) =>
+      [field, { set: [], remove: ids, addedCount: 0, removedCount: ids.length }])) };
+    simulationWillApply(world, patch);
+    for (const [field, ids] of fields) {
+      for (const id of ids) delete world.data[field][id];
+    }
+    world.dirty = true; world.foodRevision++;
+    simulationApplied(world, patch);
+    return removed;
   };
 }
 export async function compactKnown(world, store) {
   const compact = await prepareCompaction(world, store);
-  return compact();
+  return !!compact();
 }
