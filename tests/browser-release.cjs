@@ -2,10 +2,52 @@ const assert = require('node:assert/strict');
 const path = require('node:path');
 const fs = require('node:fs');
 const { chromium } = require(process.env.TIDE_TEST_MODULES ? path.join(process.env.TIDE_TEST_MODULES, 'playwright') : 'playwright');
-const base = process.argv[2], expectedAsset = process.argv[3];
-if (!base || !expectedAsset) throw new Error('Usage: node browser-release.cjs URL ASSET_NAME');
+const { zipEntry } = require('./zip-entry.cjs');
+const [base, expectedAsset, peerBase] = process.argv.slice(2);
+if (!base || !expectedAsset) throw new Error('Usage: node browser-release.cjs URL ASSET_NAME [PEER_URL]');
+if (peerBase) assert.notEqual(new URL(base).origin, new URL(peerBase).origin, '联机验证需要两个独立启动器地址');
+
+async function checkPeer(browser, page, errors, fishId) {
+  await page.locator('#connect').click();
+  await page.waitForFunction(() => document.querySelector('#myUrl').value.startsWith('YL1.'));
+  const invite = await page.locator('#myUrl').inputValue();
+  await page.locator('#closeConnection').click();
+
+  const peerContext = await browser.newContext();
+  try {
+    const peer = await peerContext.newPage();
+    peer.on('pageerror', error => errors.push(error.stack));
+    await peer.goto(peerBase);
+    await peer.locator('#nickInput').fill('发布联机同事');
+    await peer.locator('#welcomeForm .primary').click();
+    await peer.waitForFunction(() => window.tide);
+    await peer.locator('#connect').click();
+    await peer.locator('#peerUrl').fill(invite);
+    await peer.locator('#connectionForm .primary').click();
+    await peer.locator('#connectionDialog').waitFor({ state: 'hidden', timeout: 35000 });
+    await Promise.all([
+      page.waitForFunction(() => tide.network.peers.length === 1),
+      peer.waitForFunction(id => tide.network.peers.length === 1 && !!tide.world.data.fishes[id], fishId)
+    ]);
+
+    for (const [sender, receiver, nick, message] of [
+      [peer, page, '发布联机同事', '同事收到了发布包里的鱼'],
+      [page, peer, '发布包验证', '两边的聊天都能收到']
+    ]) {
+      await sender.locator('#chatInput').fill(message);
+      await sender.locator('#chatForm button').click();
+      const line = receiver.locator('#chatMessages .message').filter({ hasText: message });
+      await line.waitFor();
+      assert.equal(await line.locator('.name').textContent(), nick, '聊天应展示发送者的完整昵称');
+    }
+    console.log('发行包联机通过，两份启动器完成合流并双向收到聊天。');
+  } finally {
+    await peerContext.close();
+  }
+}
+
 async function main() {
-  const browser = await chromium.launch({ headless: true, ...(process.env.TIDE_TEST_BROWSER_PATH ? { executablePath: process.env.TIDE_TEST_BROWSER_PATH } : {}) });
+  const browser = await chromium.launch({ headless: true });
   const errors = [];
   try {
     const context = await browser.newContext({ acceptDownloads: true }), page = await context.newPage();
@@ -68,17 +110,27 @@ async function main() {
     }
     await page.keyboard.press('Escape');
     await page.keyboard.press('l');
+    const invite = await page.locator('#myUrl').inputValue();
+    assert.match(invite, /^YL1\./, 'The launcher must display an invitation code');
+    assert(await page.evaluate(async code => {
+      const { inviteDetails } = await import('/invite.js');
+      return (await inviteDetails(code)).actor === tide.identity.actor;
+    }, invite), 'The invitation must identify the registered player');
     const downloadEvent = page.waitForEvent('download'); await page.locator('#downloadPackage').click(); const download = await downloadEvent;
     assert.equal(download.suggestedFilename(), expectedAsset, 'Launcher download filename differs from release asset');
     assert.equal(await download.failure(), null);
+    const join = JSON.parse(zipEntry(fs.readFileSync(await download.path()), 'join.json').toString('utf8'));
+    assert.equal(join.invite, invite, 'Downloaded package must carry the registered player\'s invitation');
+    assert.equal(join.url, undefined, 'Downloaded package must hide the plain invitation address');
     await page.keyboard.press('Escape');
     await page.reload(); await page.waitForFunction(() => window.tide);
     assert.deepEqual(await page.evaluate(() => tide.world.data.roots), roots, 'Reload must restore the same world');
     assert(await page.evaluate(id => !!tide.world.data.fishes[id], created.id), 'Created fish must survive reload');
     assert.equal(await page.evaluate(() => tide.balance()), 18);
+    if (peerBase) await checkPeer(browser, page, errors, created.id);
     await page.waitForTimeout(1100);
     assert.deepEqual(errors, [], 'Published page raised JavaScript exceptions');
-    console.log('浏览器发布验证通过：实际创建两字母鱼、配额20→18、我的鱼显示及刷新保留，下载名称和页面均无异常。');
+    console.log('浏览器发布验证通过。造鱼扣除两枚鱼元，刷新后保留，下载包名称正确并携带注册玩家的邀请码，页面无异常。');
   } finally { await browser.close(); }
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });

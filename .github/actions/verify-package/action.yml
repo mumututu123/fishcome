@@ -1,0 +1,118 @@
+name: Verify package
+description: Build, unpack, and verify a Fishcome release package.
+inputs:
+  source-ref:
+    description: Commit to build and verify.
+    required: true
+  version:
+    description: Version to put in the package.
+    required: true
+  target:
+    description: Target platform, windows or linux.
+    required: true
+  legacy-windows:
+    description: Whether to use the historical Windows build.
+    default: 'false'
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ inputs.source-ref }}
+        path: source
+        fetch-depth: 0
+        persist-credentials: false
+
+    - uses: actions/setup-node@v6
+      with:
+        node-version: '22'
+        cache: npm
+        cache-dependency-path: source/package-lock.json
+
+    - name: Test hot-update process cleanup
+      shell: pwsh
+      working-directory: tools
+      run: node --test tests/release-cleanup.test.cjs
+
+    - uses: actions/setup-go@v6
+      if: inputs.legacy-windows != 'true'
+      with:
+        go-version-file: source/go.mod
+        cache-dependency-path: |
+          source/go.mod
+          source/go.sum
+          tools/scripts/packaging/go.sum
+
+    - name: Install JavaScript dependencies
+      shell: pwsh
+      working-directory: source
+      run: npm ci
+
+    - name: Install Chromium
+      shell: pwsh
+      working-directory: source
+      env:
+        RELEASE_TARGET: ${{ inputs.target }}
+      run: |
+        $options = @()
+        if ($env:RELEASE_TARGET -eq 'linux') { $options += '--with-deps' }
+        npx playwright install chromium @options
+
+    - name: Test game rules
+      shell: pwsh
+      working-directory: source
+      run: npm test
+
+    - name: Check Go code
+      if: inputs.legacy-windows != 'true'
+      shell: pwsh
+      working-directory: source
+      run: go test ./...
+
+    - name: Build ZIP
+      if: inputs.legacy-windows != 'true'
+      shell: pwsh
+      env:
+        RELEASE_VERSION: ${{ inputs.version }}
+        RELEASE_TARGET: ${{ inputs.target }}
+      run: ./tools/build.ps1 -Version $env:RELEASE_VERSION -OutputDirectory ./dist/release -SourceDirectory ./source -TargetOS $env:RELEASE_TARGET
+
+    - name: Rebuild historical Windows ZIP
+      if: inputs.legacy-windows == 'true'
+      shell: pwsh
+      working-directory: source
+      env:
+        RELEASE_VERSION: ${{ inputs.version }}
+      run: ./build.ps1 -Version $env:RELEASE_VERSION -OutputDirectory ./dist/release
+
+    - name: Verify extracted package in Chromium
+      shell: pwsh
+      env:
+        LEGACY_WINDOWS: ${{ inputs.legacy-windows }}
+        TIDE_TEST_MODULES: ${{ github.workspace }}/source/node_modules
+      run: ./tools/scripts/test-release.ps1 -ArchivePath $env:RELEASE_ARCHIVE -SourceDirectory ./source -BrowserTestPath ./tools/tests/browser-release.cjs -LegacyWindows:($env:LEGACY_WINDOWS -eq 'true')
+
+    - name: Check packaging cleanup
+      shell: pwsh
+      run: |
+        $leftovers = @(Get-ChildItem -LiteralPath ./source/dist -Directory -Force | Where-Object { $_.Name -match '^\.(build|smoke)-[0-9a-f]{32}$' })
+        if ($leftovers.Count) { throw "构建或验证脚本需要清理临时目录：$($leftovers.Name -join '、')" }
+
+    - name: Verify launcher hot update
+      if: inputs.legacy-windows != 'true'
+      shell: pwsh
+      working-directory: source
+      run: node tests/hot-update-launcher.cjs
+
+    - name: Verify browser hot update
+      if: inputs.legacy-windows != 'true'
+      shell: pwsh
+      working-directory: source
+      run: node tests/hot-update.cjs
+
+    - name: Verify hot update from the C# launcher
+      if: inputs.target == 'windows' && inputs.legacy-windows != 'true'
+      shell: pwsh
+      working-directory: source
+      run: node tests/hot-update-legacy-windows.cjs

@@ -1,13 +1,14 @@
 const { spawn } = require('node:child_process');
+const { launcherPath } = require('./release-fixtures.cjs');
 const fs = require('node:fs'), path = require('node:path'), assert = require('node:assert/strict');
 const { chromium } = require(process.env.TIDE_TEST_MODULES ? path.join(process.env.TIDE_TEST_MODULES, 'playwright') : 'playwright');
 const project = path.resolve(__dirname, '..'), output = path.join(project, 'test-output'), children = [], errors = [];
-const exe = process.env.TIDE_TEST_LAUNCHER || path.join(project, 'dist', '鱼来', '鱼来.exe'); let browser;
+const exe = launcherPath; let browser;
 async function helper(port) { const child = spawn(exe, ['--headless', '--loopback', '--port', String(port)], { windowsHide: true, stdio: 'ignore' }); children.push(child); const end = Date.now() + 20000; while (Date.now() < end) { try { if ((await fetch(`http://127.0.0.1:${port}/health`)).ok) return; } catch {} await new Promise(r => setTimeout(r, 150)); } throw new Error('启动器未就绪'); }
 async function open(c, port, nick) { const p = await c.newPage(); p.on('pageerror', e => errors.push(e.message)); await p.goto(`http://127.0.0.1:${port}/`); if (nick) { await p.locator('#nickInput').fill(nick); await p.locator('#welcomeForm .primary').click(); } await p.waitForFunction(() => window.tide); return p; }
 async function main() {
   fs.mkdirSync(output, { recursive: true }); for (const port of [39851, 39852, 39853]) await helper(port);
-  browser = await chromium.launch({ executablePath: 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe', headless: true });
+  browser = await chromium.launch({ headless: true });
   const ca = await browser.newContext({ viewport: { width: 1440, height: 900 }, acceptDownloads: true }), cb = await browser.newContext({ acceptDownloads: true }), cc = await browser.newContext();
   let a = await open(ca, 39851, '档案甲'); await a.close(); const setup = await ca.newPage(); await setup.goto('http://127.0.0.1:39851/welcome.html');
   const fixture = await setup.evaluate(async () => {

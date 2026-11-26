@@ -1,13 +1,13 @@
-# 鱼来 0.1.8
+# 鱼来
 
-中文与 ASCII 字符组成的浏览器多人鱼来世界。联机模式仅限同局域网内游玩，玩家Windows电脑上运行便携启动器，玩家浏览器间通过 WebRTC 组成网络。游戏状态、身份和记忆使用浏览器 IndexedDB 保存；启动器只提供网页文件与临时配对通道。
+中文与 ASCII 字符组成的浏览器多人鱼来世界。联机模式仅限同局域网内游玩，玩家在 Windows 或 Linux 的 x64 电脑上运行便携启动器，玩家浏览器间通过 WebRTC 组成网络。浏览器保存游戏状态、身份和记忆。启动器提供网页文件、临时配对和热更新。
 
 ## 开始玩
 
-1. 下载、解压Release页面最新发布的压缩包，或其他玩家发给你的便携启动压缩包（自动与提供者的鱼来世界联机）。
-2. Windows 10/11 双击「鱼来.exe」。游戏自动打开固定的本地网页地址 `http://127.0.0.1:39241`。
+1. 下载并完整解压 Release 页面对应系统的最新压缩包（Windows 为 `fishcome-VERSION-windows.zip`，Linux x64 为 `fishcome-VERSION-linux-amd64.zip`），或同系统玩家发给你的便携启动压缩包（包内带邀请码，启动后自动尝试配对）。
+2. Windows 10/11 双击「鱼来.exe」，Linux x64 运行「./fishcome」（依赖系统默认浏览器）。游戏自动打开固定的本地网页地址 `http://127.0.0.1:39241`；升级或换包后用同一浏览器访问该地址即可保留原有身份与存档。
 3. 浏览器第一次接入设置昵称。聊天、作品和鱼谱会公开展示你的完整昵称；每个浏览器配置文件拥有独立身份。
-4. 也可分享给其他同事联机玩：点击「连接同事」，复制自己的「邀请码」给同事。首次使用的同事需要便携启动包：可以从本机游戏中下载 ZIP 后分享给同事，包中带有邀请码，启动后自动尝试配对。
+4. 也可分享给其他同事联机玩：点击「连接同事」，复制自己的「邀请码」给同事。同系统首次使用的同事可以直接使用你从本机下载的便携启动包（包内带有邀请码，解压运行后自动尝试配对）；不同系统的同事请先下载适合自己系统的发布包，再粘贴邀请码连接。
 5. 已有启动器的同事可直接粘贴邀请码连接。后续会尝试已缓存的邀请码；旧版地址缓存和下载包会自动迁移为邀请码。
 
 每邀请一位新用户完成昵称注册并首次通过邀请码接入世界，发码账号获得 **10 鱼元** 推广奖励，新用户保留原有初始 20 鱼元。同一新账号只奖励一次；无邀请码注册、已有账号重连、自邀、失败连接及后台自动补邻居均不发奖。奖励写入带新用户签名的世界账本，刷新、备份恢复和世界合流不会重复累加，并可用于创建、投食或抵扣负余额；世界湮灭后仍按原规则重置为 20。
@@ -18,7 +18,7 @@
 
 访问地址需要当前网段能够访问 TCP 39241，并能建立浏览器 WebRTC 直连。当前没有 TURN 中继。启动器不自动修改防火墙或浏览器设置。
 
-关闭游戏网页即退出玩家网络，启动器仍可发布代码；托盘右键「退出启动器」停止发布服务。其他已接入浏览器可以继续维持世界。账号、余额和历史不要依赖浏览器默认缓存，请使用「导出身份与记忆」备份；备份含身份密钥，保管在自己的设备上。
+关闭游戏网页即退出玩家网络，启动器仍可发布代码；可通过系统托盘菜单「退出启动器」停止发布服务（Linux 托盘依赖系统桌面支持通知区域，托盘复制邀请码需要系统已安装 `wl-copy`、`xclip` 或 `xsel`，否则可在游戏「连接同事」中复制）。其他已接入浏览器可以继续维持世界。账号、余额和历史不要依赖浏览器默认缓存，请使用「导出身份与记忆」备份；备份含身份密钥，保管在自己的设备上。
 
 ## 操作
 
@@ -131,7 +131,7 @@
 
 ## 实现与验证范围
 
-第一版面向 Windows；浏览器使用原生 Canvas、Web Crypto、IndexedDB、EventSource、WebRTC 和压缩流。启动器使用 Windows 内置 .NET Framework，无需安装 Node.js 或 Python。
+当前支持 Windows 10/11 与 Linux x64 便携运行；浏览器使用原生 Canvas、Web Crypto、IndexedDB、EventSource、WebRTC 和压缩流。启动器使用 Go 编译为独立原生程序，解压即可运行，无需安装 Node.js 或 Python；Linux 托盘依赖系统桌面支持通知区域，托盘复制邀请码需要 `wl-copy`、`xclip` 或 `xsel`。
 
 在线网络采用最多 8 个直接邻居、消息去重和转发；普通鱼游动由当前选出的临时浏览器协调，每秒发布位置和变化鱼元，30 秒补发完整快照，离开后其他浏览器接替。协调者是普通玩家浏览器，没有常驻游戏后端。合流时保留鱼身鱼元，先整体分开重叠鱼，再把与鱼或其他景物重叠的造景整体移至最近空位；极端满世界时会提示仍待安置。
 
@@ -143,38 +143,36 @@
 
 本轮世界湮灭时，聊天正文按可见鱼元拆开，随机分布在下一轮海底，成为固定、不可编辑／搬动／删除的地形，不消耗玩家配额。空白不占格，中文、ASCII、组合文字和完整表情都会保留；昵称和时间不参与沉积。相同消息使用相同鱼元身份和稳定随机规则，多个浏览器分别开启下一轮再合流不会复制沉积；发现旧世界仍存活时会撤销错误沉积。空间不足的文字保留来源并等待空位，不直接丢弃。新一轮聊天室从空记录开始，更早的聊天可在对应纪念卡展开查看；每轮只把本轮聊天传到下一轮海底。
 
-本轮 46 项规则测试通过。Edge 专项测试通过，覆盖鱼况统计、本人鱼筛选、定位跟随、小屏观察、自定义鱼食、240 小时期限、持久聊天与聊天沉积。真实 WebRTC 测试验证了运动记录同步、实际协调者退出后的统计保留，并使用 207 条聊天形成 1,078 个沉积鱼元，验证重开、合流去重和误判纠正；浏览器没有报错。期限和鱼况时间边界采用模拟时间验证。当前 Windows 应用程序控制策略阻止运行新编译启动器，浏览器测试使用 Node 静态网页／信令服务。Chrome 当前未安装，Firefox 测试发行版在图形初始化时未能启动。本轮与初版的验证范围见「验证记录.md」。
+历次玩法专项验证见《验证记录》。[打开验证记录](验证记录.md)
 
 500 人是目标：初版基线的 500 参与者、10,000 鱼元、40 步 Node 模拟中，每步耗时中位数约 61 毫秒、p95 约 132 毫秒；六邻居模型能到达全部 500 节点。这些基线没有包含本轮鱼况界面、完整签名和真实浏览器传输，不等于 500 台办公电脑真实内网验收；正式推广前需在实际网段测试握手、流量、浏览器资源占用和长时间运行。详细记录见项目根目录「验证记录.md」，原始结果保存在 `test-output`。
 
 ## 开发
 
-源文件 `www/engine.js` 是生态、账本与世界合流，`fish-status.js` 管理鱼况统计口径和记录合并，`chat.js` 管理聊天记录和海底沉积鱼元，`lifecycle.js` 管理 240 小时离线期限与存档恢复，`network.js` 是配对及 WebRTC 传输，`app.js` 管理浏览器副本和界面，`launcher/Program.cs` 是静态发布与临时信令。
+源文件 `www/engine.js` 是生态、账本与世界合流，`fish-status.js` 管理鱼况统计口径和记录合并，`chat.js` 管理聊天记录和海底沉积鱼元，`lifecycle.js` 管理 240 小时离线期限与存档恢复，`network.js` 是配对及 WebRTC 传输，`app.js` 管理浏览器副本和界面，`launcher/`（Go）负责静态发布、临时信令、便携包导出、热更新与桌面托盘。
 
-在 Windows PowerShell 运行 `./build.ps1` 构建 `dist/鱼来/鱼来.exe` 和干净发行 ZIP。编译器为 Windows 自带的 .NET Framework C# 编译器。
+构建需要 Go 1.25 或更高版本。运行 `./build.ps1` 默认按当前系统构建（Windows 在 PowerShell 下生成 `dist/鱼来/鱼来.exe` 与 `fishcome-VERSION-windows.zip`，Linux 使用 `pwsh` 生成 `dist/鱼来/fishcome` 与 `fishcome-VERSION-linux-amd64.zip`），也可通过 `-TargetOS windows` 或 `-TargetOS linux` 指定目标系统。
 
-GitHub Release 工作流位于 `.github/workflows/release.yml`。将工作流和构建脚本提交、推送到 master 后，在要发布的提交上创建并推送版本标签，例如：
-
-提交时也要包含新增的 `package-lock.json`、`tests/browser-release.cjs` 和 `tests/ui-contract.test.mjs`；只用 `git commit -am` 不会自动加入尚未追踪的新文件。工作流会在安装依赖前检查必需文件是否齐全。
+合并请求由 `Check` 工作流验证。正式发包由 `Release` 工作流处理。两者共用 Windows 和 Linux 的发行包验收步骤。将工作流和构建脚本提交、推送到 master 后，在要发布的提交上创建并推送版本标签，例如：
 
 ```powershell
 git tag v0.1.1
 git push origin v0.1.1
 ```
 
-工作流在 Windows runner 上运行规则测试、编译启动器，再解压 ZIP 实际启动程序、校验所有网页资源，并用 Chromium 检查首次注册、弹窗、下载名称和刷新恢复，全部通过才创建 Release。用户下载 Release 附件「fishcome-0.1.1-windows.zip」，完整解压后双击根目录「鱼来.exe」即可；包内只包含程序和必需的 `www`，不含源码、测试或验证文档。用户手册可在 Release 说明中打开。ZIP 使用英文名称避免 GitHub 删除中文文件名前缀；发布说明与下载链接直接使用实际附件名称。更新时先从托盘退出旧启动器，再运行新包，浏览器仍从原本的固定本地地址恢复身份和存档。
+两条工作流都在 Windows 和 Linux 上运行规则测试与 `go test ./...`、编译启动器，再解压 ZIP 实际启动程序、校验所有网页资源，并用 Chromium 检查首次注册、弹窗、造鱼、下载名称、刷新恢复、双启动器联机与热更新流程。正式发行在验收全部通过后才上传发行包。用户按系统下载 Release 附件（Windows 为 `fishcome-VERSION-windows.zip`，完整解压后双击根目录「鱼来.exe」；Linux x64 为 `fishcome-VERSION-linux-amd64.zip`，完整解压后运行根目录「./fishcome」）；包内只包含程序和必需的 `www`，不含源码、测试或验证文档。用户手册可在 Release 说明中打开。ZIP 使用英文名称避免 GitHub 删除中文文件名前缀；发布说明与下载链接直接使用实际附件名称。更新时可通过游戏内热更新升级，或先退出旧启动器再运行新包，浏览器仍从原本的固定本地地址 `http://127.0.0.1:39241` 恢复身份和存档。
 
 也可在 GitHub 的 Actions → Release → Run workflow 中选择分支（通常为 master），填写版本标签直接发布，例如 `v0.1.1`。标签不存在时，工作流构建本次所选分支的提交，测试与打包通过后才自动创建标签和 Release，不用事先手工打标签。标签已存在时，工作流构建其对应的原提交；重复执行更新同名 ZIP 附件，不移动原标签。大小写 `v`／`V` 都支持，推荐使用小写。
 
 带后缀的版本（如 `v0.2.0-beta.1`）会发布为预发行版。发布使用 GitHub 自动提供的令牌，无需另配个人令牌。日常推送 master 不自动发布。修复工作流后请从 Run workflow 创建一次新运行；旧运行的 Re-run jobs 仍会使用旧版工作流。
 
-本地浏览器发布验证需先运行 `npm ci` 和 `npx playwright install chromium`；也可用 `TIDE_TEST_BROWSER_PATH` 指定本机 Chrome／Edge。CI 会固定当前工作流的构建、验证工具，再切换发行标签代码；旧标签的旧验证脚本不会绕过新版检查。
+本地浏览器发布验证需先运行 `npm ci` 和 `npx playwright install chromium`；测试使用 Playwright 自带的 Chromium。可单独运行 `node --test tests/release-cleanup.test.cjs` 验证热更新后的测试进程清理，Windows 需要 `pwsh`。两条工作流也把清理测试单独列为一步。CI 会固定当前工作流的构建、验证工具，再切换发行标签代码；旧标签的旧验证脚本不会绕过新版检查。
 
-本地可用 `./build.ps1 -Version 0.1.1 -OutputDirectory ./dist/release` 构建，再用 `./scripts/test-release.ps1 -ArchivePath ./dist/fishcome-0.1.1-windows.zip` 检查解压后的发行包。每次打包从独立的新目录收集文件，已有输出目录中的旧文件不会混进 ZIP。
+本地可用 `./build.ps1 -Version 0.1.1 -OutputDirectory ./dist/release`（默认当前系统，可用 `-TargetOS windows` 或 `-TargetOS linux` 指定）构建，再用 `./scripts/test-release.ps1 -ArchivePath ./dist/fishcome-0.1.1-windows.zip` 或 `./scripts/test-release.ps1 -ArchivePath ./dist/fishcome-0.1.1-linux-amd64.zip` 在对应系统检查解压后的发行包（Windows 可用 PowerShell，Linux 使用 `pwsh`）。每次打包从独立的新目录收集文件，已有输出目录中的旧文件不会混进 ZIP。
 
-如果已有 `dist/潮生` 兼容目录，构建会同时更新其中的 `www`、使用说明与验证记录，同步更新对应启动器以支持邀请码。已打开的旧页面需要刷新才能载入更新；固定本地地址和 IndexedDB 数据库保持不变。`node tests/served-ui.cjs` 可检查当前 `http://127.0.0.1:39241` 实际发布的“我的鱼”入口、快捷键绑定及鱼况模块，其他测试地址可通过 `TIDE_UI_URL` 指定。
+Windows 默认构建时，如果已有 `dist/潮生` 兼容目录，构建会同时更新其中的 `www`、使用说明与验证记录，同步更新对应启动器以支持邀请码。已打开的旧页面需要刷新才能载入更新；固定本地地址和 IndexedDB 数据库保持不变。`node tests/served-ui.cjs` 可检查当前 `http://127.0.0.1:39241` 实际发布的“我的鱼”入口、快捷键绑定及鱼况模块，其他测试地址可通过 `TIDE_UI_URL` 指定。
 
-安装 Node.js 后，`npm test` 运行规则测试，`node tests/benchmark.mjs` 检查模拟负载。浏览器测试需 Playwright：`node tests/browser-smoke.cjs`，也可用 `TIDE_TEST_MODULES` 指向已有 Playwright 包。测试启动器只监听本机 39081–39084，浏览器使用临时配置。缺少 Chrome 时联机测试使用另一独立 Edge 实例；`TIDE_SKIP_FIREFOX=1` 可跳过 Firefox。`node tests/browser-lifecycle.cjs` 使用本机随机端口的 Node 测试服务和 Edge 临时配置，专项验证离线期限，不运行 Windows 启动器。
+安装 Node.js 后，`npm test` 运行规则测试，`node tests/benchmark.mjs` 检查模拟负载。浏览器测试需 Playwright：`node tests/browser-smoke.cjs`，也可用 `TIDE_TEST_MODULES` 指向已有 Playwright 包。测试启动器只监听本机 39081–39084，浏览器使用临时配置。联机测试使用两个独立的 Playwright Chromium 实例。`TIDE_SKIP_FIREFOX=1` 可跳过 Firefox。`node tests/browser-lifecycle.cjs` 使用本机随机端口的 Node 测试服务和 Edge 临时配置，专项验证离线期限，不运行启动器。
 
 完整产品规格见「鱼来世界开发规格.md」。海宽、固定海底生成与环形坐标在 `www/geography.js`；浅深分界、速度系数与结算步长集中于 `www/engine.js` 的 `CONFIG`。
 

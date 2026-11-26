@@ -1,101 +1,29 @@
 const assert = require('node:assert/strict');
-const { spawn, execFileSync } = require('node:child_process');
+const { execFileSync } = require('node:child_process');
 const http = require('node:http');
 const net = require('node:net');
 const fs = require('node:fs');
 const path = require('node:path');
+const { assetName, launcherName, availablePort, waitForHealth, postLocal, printVersion, makeZip, withReleaseFixtures } = require('./release-fixtures.cjs');
 
-const project = path.resolve(__dirname, '..');
-const scratchRoot = path.join(project, 'dist', '.hot-update-launcher-' + Date.now());
-const archivesDir = path.join(scratchRoot, 'archives');
-const children = [];
-
-function buildVersion(version, outDir) {
-  execFileSync('powershell', [
-    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command',
-    `$ProgressPreference = 'SilentlyContinue'; & '${path.join(project, 'build.ps1')}' -Version '${version}' -OutputDirectory '${outDir}' -ArchiveDirectory '${archivesDir}'`
-  ], { stdio: 'pipe' });
-  return {
-    dir: outDir,
-    exe: path.join(outDir, '鱼来.exe'),
-    zip: path.join(archivesDir, `fishcome-${version}-windows.zip`)
-  };
-}
-
-function buildCrashingUpdateZip(version, zipPath) {
-  const dir = path.join(scratchRoot, 'crash-pkg-' + version);
-  fs.mkdirSync(path.join(dir, 'www'), { recursive: true });
-  for (const name of ['index.html', 'app.js', 'rules.js', 'update.js', 'network.js', 'storage.js', 'style.css']) {
-    fs.writeFileSync(path.join(dir, 'www', name), `/* ${name} */`, 'utf8');
-  }
-  const csPath = path.join(dir, 'Crash.cs');
-  // Writes a marker if ever executed during prepare, and exits immediately with code 1 during handoff.
-  const markerPath = path.join(dir, 'executed.marker').replace(/\\/g, '\\\\');
-  fs.writeFileSync(csPath, `
-using System;
-using System.IO;
-using System.Reflection;
-[assembly: AssemblyInformationalVersion("${version}")]
-static class Crash {
-  static int Main() {
-    try { File.WriteAllText("${markerPath}", "ran"); } catch {}
-    return 1;
-  }
-}
-`, 'utf8');
-  const script = `
-$csc = 'C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe'
-if (-not (Test-Path $csc)) { $csc = 'C:\\Windows\\Microsoft.NET\\Framework\\v4.0.30319\\csc.exe' }
-& $csc /nologo /target:winexe "/out:${path.join(dir, '鱼来.exe')}" "${csPath}"
-if ($LASTEXITCODE -ne 0) { throw 'compile crash exe failed' }
-Add-Type -AssemblyName System.IO.Compression.FileSystem
-if (Test-Path '${zipPath}') { Remove-Item '${zipPath}' -Force }
-$ProgressPreference = 'SilentlyContinue'
-Compress-Archive -LiteralPath '${path.join(dir, '鱼来.exe')}', '${path.join(dir, 'www')}' -DestinationPath '${zipPath}' -Force
-`;
-  execFileSync('powershell', ['-NoProfile', '-Command', script], { stdio: 'pipe' });
-  return { markerPath: path.join(dir, 'executed.marker'), zipPath };
-}
-
-function startLauncher(exePath, port) {
-  const child = spawn(exePath, ['--headless', '--loopback', '--port', String(port)], {
-    cwd: path.dirname(exePath),
-    windowsHide: true,
-    stdio: 'ignore'
+function buildCrashingUpdateZip(version, root, archivesDir) {
+  const source = path.join(root, launcherName);
+  const zipPath = path.join(archivesDir, assetName(version));
+  const markerPath = path.join(root, 'executed.marker');
+  const stamp = `fishcome-release:${version}:`;
+  execFileSync('go', ['build', '-ldflags', `-X main.version=${version} -X main.releaseStamp=${stamp}`, '-o', source, path.join(__dirname, 'fixtures', 'crash-launcher.go')], {
+    stdio: 'inherit', windowsHide: true
   });
-  children.push(child);
-  return child;
-}
-
-async function waitForHealth(port, expectedVersion = null, requireReady = true, timeoutMs = 20000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    try {
-      const res = await fetch(`http://127.0.0.1:${port}/health`, { cache: 'no-store' });
-      if (res.ok) {
-        const body = await res.json();
-        if (body.ok && (!expectedVersion || body.version === expectedVersion) && (!requireReady || body.handoffReady !== false)) {
-          return body;
-        }
-      }
-    } catch { }
-    await new Promise(r => setTimeout(r, 200));
-  }
-  throw new Error(`端口 ${port} 未能在超时内就绪${expectedVersion ? `（期望版本 ${expectedVersion}）` : ''}`);
-}
-
-async function postLocal(port, token, node, route, payload = {}) {
-  const res = await fetch(`http://127.0.0.1:${port}/local/${route}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ token, node, ...payload })
-  });
-  return { status: res.status, body: await res.json() };
+  const entries = ['index.html', 'app.js', 'rules.js', 'update.js', 'network.js', 'storage.js', 'style.css']
+    .map(name => ({ name: `www/${name}`, text: `/* ${name} */` }));
+  makeZip(zipPath, [{ name: launcherName, source }, ...entries]);
+  return { markerPath, zipPath, marker: `${version}\n${stamp}` };
 }
 
 function rawHttpStatus(port, requestText) {
   return new Promise((resolve, reject) => {
     const sock = net.createConnection({ host: '127.0.0.1', port }, () => sock.write(requestText));
+    sock.setTimeout(5000, () => sock.destroy(new Error(`读取端口 ${port} 的响应超时`)));
     let data = '';
     sock.on('data', chunk => { data += chunk.toString('utf8'); });
     sock.on('end', () => {
@@ -106,46 +34,21 @@ function rawHttpStatus(port, requestText) {
   });
 }
 
-function printVersion(exePath) {
-  const out = execFileSync(exePath, ['--print-version'], { encoding: 'utf8' });
-  return JSON.parse(out.trim());
-}
-
-function makeBrokenZip(targetZip, entries) {
-  const script = `
-Add-Type -AssemblyName System.IO.Compression
-Add-Type -AssemblyName System.IO.Compression.FileSystem
-if (Test-Path '${targetZip}') { Remove-Item '${targetZip}' -Force }
-$fs = [IO.File]::Open('${targetZip}', [IO.FileMode]::Create)
-$zip = New-Object IO.Compression.ZipArchive($fs, [IO.Compression.ZipArchiveMode]::Create, $false)
-${entries.map(([name, text]) => `
-$e = $zip.CreateEntry('${name}')
-$w = New-Object IO.StreamWriter($e.Open())
-$w.Write('${text}')
-$w.Dispose()
-`).join('\n')}
-$zip.Dispose()
-$fs.Dispose()
-`;
-  execFileSync('powershell', ['-NoProfile', '-Command', script], { stdio: 'pipe' });
-}
-
-async function main() {
-  fs.mkdirSync(archivesDir, { recursive: true });
-  const v1 = buildVersion('0.1.1', path.join(scratchRoot, 'node-a'));
-  const v2 = buildVersion('0.2.0', path.join(scratchRoot, 'node-b'));
-  const v3 = buildVersion('0.2.1-beta.1', path.join(scratchRoot, 'node-c'));
-  const crashPkg = buildCrashingUpdateZip('0.3.0', path.join(archivesDir, 'fishcome-0.3.0-windows.zip'));
+async function main({ root, archivesDir, buildVersion, startLauncher }) {
+  const v1 = buildVersion('0.1.1', 'node-a');
+  const v2 = buildVersion('0.2.0', 'node-b');
+  const v3 = buildVersion('0.2.1-beta.1', 'node-c');
+  const crashPkg = buildCrashingUpdateZip('0.3.0', root, archivesDir);
 
   // 写入带自定义字段的 join.json，验证热更新前后字节 100% 一致
   const nodeAJoinPath = path.join(v1.dir, 'join.json');
   const originalJoinBytes = Buffer.from(JSON.stringify({ url: 'http://127.0.0.1:39999', custom: 'keep-me' }), 'utf8');
   fs.writeFileSync(nodeAJoinPath, originalJoinBytes);
 
-  const portA = 39851;
-  const portB = 39852;
-  startLauncher(v1.exe, portA);
-  startLauncher(v2.exe, portB);
+  const portA = await availablePort();
+  await startLauncher(v1.exe, portA, { TIDE_TEST_CRASH_MARKER: crashPkg.markerPath });
+  const portB = await availablePort();
+  await startLauncher(v2.exe, portB);
 
   const healthA = await waitForHealth(portA, '0.1.1');
   const healthB = await waitForHealth(portB, '0.2.0');
@@ -180,20 +83,18 @@ async function main() {
   assert.equal(applyPeer.status, 200, JSON.stringify(applyPeer.body));
 
   // 等待磁盘交接完全就绪（handoffReady === true）
-  const healthAfterPeer = await waitForHealth(portA, '0.2.0', true, 20000);
-  assert.equal(healthAfterPeer.version, '0.2.0');
-  assert.equal(healthAfterPeer.handoffReady, true);
-  assert.equal(printVersion(v1.exe).version, '0.2.0', '原安装目录的 鱼来.exe 必须在 handoffReady 时已是 0.2.0');
+  await waitForHealth(portA, '0.2.0');
+  assert.equal(printVersion(v1.exe).version, '0.2.0', '端口交接完成时，原安装目录的启动器必须已是 0.2.0');
   assert.deepEqual(fs.readFileSync(nodeAJoinPath), originalJoinBytes, '交接过程不得改写原安装目录的 join.json 字节');
 
   // 2. 边界校验 + 确认前不执行 + 失败回滚 + GitHub 302 升级测试版
   const slipZip = path.join(archivesDir, 'slip.zip');
-  makeBrokenZip(slipZip, [['../evil.txt', 'bad'], ['鱼来.exe', 'MZfake'], ['www/index.html', 'hi']]);
+  makeZip(slipZip, [{ name: '../evil.txt', text: 'bad' }, { name: launcherName, text: 'MZfake' }, { name: 'www/index.html', text: 'hi' }]);
   const dupZip = path.join(archivesDir, 'dup.zip');
-  makeBrokenZip(dupZip, [['鱼来.exe', 'MZfake'], ['www/index.html', 'a'], ['www/Index.html', 'b']]);
+  makeZip(dupZip, [{ name: launcherName, text: 'MZfake' }, { name: 'www/index.html', text: 'a' }, { name: 'www/Index.html', text: 'b' }]);
 
   const mockServer = http.createServer((req, res) => {
-    if (req.url === '/acme/fishcome/releases/download/v0.2.1-beta.1/fishcome-0.2.1-beta.1-windows.zip') {
+    if (req.url === `/acme/fishcome/releases/download/v0.2.1-beta.1/${assetName('0.2.1-beta.1')}`) {
       res.writeHead(302, { Location: '/cdn/v3.zip' });
       res.end();
       return;
@@ -204,25 +105,25 @@ async function main() {
       res.end(data);
       return;
     }
-    if (req.url === '/acme/fishcome/releases/download/v0.9.0/fishcome-0.9.0-windows.zip') {
+    if (req.url === `/acme/fishcome/releases/download/v0.9.0/${assetName('0.9.0')}`) {
       const data = fs.readFileSync(slipZip);
       res.writeHead(200, { 'Content-Type': 'application/zip', 'Content-Length': data.length });
       res.end(data);
       return;
     }
-    if (req.url === '/acme/fishcome/releases/download/v0.8.5/fishcome-0.8.5-windows.zip') {
+    if (req.url === `/acme/fishcome/releases/download/v0.8.5/${assetName('0.8.5')}`) {
       const data = fs.readFileSync(dupZip);
       res.writeHead(200, { 'Content-Type': 'application/zip', 'Content-Length': data.length });
       res.end(data);
       return;
     }
-    if (req.url === '/acme/fishcome/releases/download/v0.8.0/fishcome-0.8.0-windows.zip') {
+    if (req.url === `/acme/fishcome/releases/download/v0.8.0/${assetName('0.8.0')}`) {
       const data = fs.readFileSync(v2.zip);
       res.writeHead(200, { 'Content-Type': 'application/zip', 'Content-Length': data.length });
       res.end(data);
       return;
     }
-    if (req.url === '/acme/fishcome/releases/download/v0.3.0/fishcome-0.3.0-windows.zip') {
+    if (req.url === `/acme/fishcome/releases/download/v0.3.0/${assetName('0.3.0')}`) {
       const data = fs.readFileSync(crashPkg.zipPath);
       res.writeHead(200, { 'Content-Type': 'application/zip', 'Content-Length': data.length });
       res.end(data);
@@ -275,7 +176,7 @@ async function main() {
       kind: 'github', input: `http://127.0.0.1:${mockPort}/acme/fishcome/releases/tag/v0.3.0`
     });
     assert.equal(prepCrash.status, 200, JSON.stringify(prepCrash.body));
-    assert.equal(fs.existsSync(crashPkg.markerPath), false, '准备阶段绝不能执行更新包内的 鱼来.exe');
+    assert.equal(fs.existsSync(crashPkg.markerPath), false, '准备阶段不得运行更新包内的启动器');
 
     const applyCrash = await postLocal(portA, metaA2.token, nodeId, 'update/apply', { id: prepCrash.body.update.id });
     assert.equal(applyCrash.status, 200);
@@ -295,6 +196,7 @@ async function main() {
       await new Promise(r => setTimeout(r, 250));
     }
     assert.equal(recovered, true, '新版启动崩溃时旧版必须重新接管端口并报告 failed');
+    assert.equal(fs.readFileSync(crashPkg.markerPath, 'utf8'), crashPkg.marker, '确认更新后应实际运行崩溃版本');
     assert.equal(printVersion(v1.exe).version, '0.2.0', '回滚后原安装目录的程序必须保持 0.2.0');
 
     // 4. 回滚后仍可继续从合法 GitHub 链接升级到测试版 0.2.1-beta.1
@@ -316,24 +218,17 @@ async function main() {
 
     const applyGh = await postLocal(portA, metaA2.token, nodeId, 'update/apply', { id: prepGh2.body.update.id });
     assert.equal(applyGh.status, 200);
-    const healthV3 = await waitForHealth(portA, '0.2.1-beta.1', true, 20000);
+    const healthV3 = await waitForHealth(portA, '0.2.1-beta.1');
     assert.equal(healthV3.version, '0.2.1-beta.1');
   } finally {
-    mockServer.close();
+    mockServer.closeAllConnections();
+    await new Promise(resolve => mockServer.close(resolve));
   }
-
-  console.log('启动器热更新全流程实测通过：局域网升级、事务原地替换、join.json 字节不变、Host 校验、确认前零执行、崩溃回滚恢复、以及 GitHub 测试版升级全部验证成功。');
 }
 
-main().catch(err => {
-  console.error(err);
-  process.exitCode = 1;
-}).finally(() => {
-  for (const child of children) {
-    try { child.kill(); } catch { }
-  }
-  try {
-    execFileSync('powershell', ['-NoProfile', '-Command', `Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith('${scratchRoot.replace(/'/g, "''")}', [StringComparison]::OrdinalIgnoreCase) } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`], { stdio: 'ignore' });
-  } catch { }
-  try { fs.rmSync(scratchRoot, { recursive: true, force: true }); } catch { }
-});
+withReleaseFixtures(main)
+  .then(() => console.log('启动器热更新全流程实测通过：局域网升级、事务原地替换、join.json 字节不变、Host 校验、确认前零执行、崩溃回滚恢复、以及 GitHub 测试版升级全部验证成功。'))
+  .catch(err => {
+    console.error(err);
+    process.exitCode = 1;
+  });

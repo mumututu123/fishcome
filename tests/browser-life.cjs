@@ -1,10 +1,11 @@
 const { spawn } = require('node:child_process');
+const { launcherPath } = require('./release-fixtures.cjs');
 const fs = require('node:fs');
 const path = require('node:path');
 const assert = require('node:assert/strict');
 const { chromium } = require(process.env.TIDE_TEST_MODULES ? path.join(process.env.TIDE_TEST_MODULES, 'playwright') : 'playwright');
 const project = path.resolve(__dirname, '..'), output = path.join(project, 'test-output'), children = [], errors = [];
-const exe = process.env.TIDE_TEST_LAUNCHER || path.join(project, 'dist', '鱼来', '鱼来.exe');
+const exe = launcherPath;
 let browser;
 async function helper(port) {
   const child = spawn(exe, ['--headless', '--loopback', '--port', String(port)], { windowsHide: true, stdio: 'ignore' }); children.push(child);
@@ -17,7 +18,7 @@ async function open(context, port, nick) {
 }
 async function main() {
   fs.mkdirSync(output, { recursive: true }); for (const port of [39821, 39822]) await helper(port);
-  browser = await chromium.launch({ executablePath: 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe', headless: true });
+  browser = await chromium.launch({ headless: true });
   const ca = await browser.newContext({ viewport: { width: 1440, height: 900 } }), cb = await browser.newContext({ viewport: { width: 1440, height: 900 } });
   let a = await open(ca, 39821, '摸鱼甲'), b = await open(cb, 39822, '摸鱼乙');
   const other = await b.evaluate(async () => (await import('./storage.js')).get('identity')); await a.close(); await b.close();

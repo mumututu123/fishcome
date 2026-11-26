@@ -22,7 +22,7 @@ import { activeEvent, eventSchedule, eventTitle, eventPosition, eventLetter, rad
 import { activeLegend, legendSchedule, legendTitle, legendPosition, validLegends, validGhostCell, capturedFish } from './legends.js';
 import { ARCHIVE, ARCHIVE_FIELDS, ArchiveStore, archivePlan, archiveChunks, decodeArchive, assembleFragments, validArchiveState, emptyArchiveState, mergeArchiveState, compactKnown } from './archive.js';
 import { WORLD_RULES, rulesCompatible } from './rules.js';
-import { classifyPeerCompatibility, detectUpdateSource, formatUpdateBytes, pickHigherVersionPeers } from './update.js';
+import { assetPlatformLabel, classifyPeerCompatibility, detectUpdateSource, formatUpdateBytes, normalizeAssetSuffix, pickHigherVersionPeers } from './update.js';
 const $ = id => document.getElementById(id);
 const renderer = new Renderer($('sea'));
 let world = new World(undefined, undefined, { populate: false }), identity, network, meta, creator, mode = null, selected = null, dragging, histories = {}, known = [], members = new Map(), pending = new Map(), inbox = new Map(), lastPicture = null, priorCheckpoint = null;
@@ -624,6 +624,7 @@ async function reconnect() {
 }
 async function start() {
   meta = await (await fetch('/local/meta')).json(); if (!meta.token) throw new Error('请运行自己的启动器，从固定本地地址进入');
+  meta.assetSuffix = normalizeAssetSuffix(meta.assetSuffix);
   meta.url = await normalizeInvite(meta.url);
   identity = await get('identity'); if (!identity) { $('welcomeDialog').showModal(); await new Promise(resolve => $('welcomeForm').onsubmit = async e => { e.preventDefault(); const nick = $('nickInput').value.trim(); if (!nick) return; identity = await newIdentity(nick); $('welcomeDialog').close(); resolve(); }); }
   lifeSince = Number.isFinite(identity.lifeSeenAt) ? identity.lifeSeenAt : Date.now(); returnVisit = Date.now() - lifeSince > 60000;
@@ -759,7 +760,7 @@ function renderUpdateBadge() {
     badge.hidden = false;
     return;
   }
-  const higherPeers = pickHigherVersionPeers(meta?.version, [...availablePeerUpdates.values()]);
+  const higherPeers = pickHigherVersionPeers(meta?.version, [...availablePeerUpdates.values()], meta?.assetSuffix);
   if (higherPeers.length > 0) {
     badge.textContent = '新版';
     badge.classList.remove('ready');
@@ -771,7 +772,7 @@ function renderUpdateBadge() {
 function renderPeerUpdates() {
   const box = $('peerUpdatesBox'), list = $('peerUpdatesList');
   if (!box || !list) return;
-  const peers = pickHigherVersionPeers(meta?.version, [...availablePeerUpdates.values()]);
+  const peers = pickHigherVersionPeers(meta?.version, [...availablePeerUpdates.values()], meta?.assetSuffix);
   const busy = !$('updateProgressWrap').hidden || updateFrozen || updateRestarting;
   list.replaceChildren();
   if (!peers.length) {
@@ -810,10 +811,10 @@ function renderPeerUpdates() {
 }
 function recordPeerVersion(invite, probe, fallbackNick = '') {
   if (!invite || !meta?.version || !probe) return;
-  const compat = classifyPeerCompatibility(meta.version, probe);
-  if (compat.peerNewer && compat.peerVersion) {
+  const compat = classifyPeerCompatibility(meta.version, probe, meta.assetSuffix);
+  if (compat.canPeerUpdate && compat.peerVersion) {
     const nick = (Array.isArray(probe.clients) && probe.clients.find(c => c?.nick)?.nick) || fallbackNick || '在线同事';
-    availablePeerUpdates.set(invite, { invite, nick, version: compat.peerVersion, compatible: compat.compatible, checkedAt: Date.now() });
+    availablePeerUpdates.set(invite, { invite, nick, version: compat.peerVersion, assetSuffix: compat.peerAssetSuffix, compatible: compat.compatible, checkedAt: Date.now() });
   } else {
     availablePeerUpdates.delete(invite);
   }
@@ -922,7 +923,7 @@ async function startUpdatePrepareFromInput(rawInput, scrollIntoView = false) {
   if (updateFrozen || updateRestarting) { toast('正在保存进度并重启，请稍候'); return; }
   let detected, kind, input;
   try {
-    detected = detectUpdateSource(rawInput);
+    detected = detectUpdateSource(rawInput, meta?.assetSuffix);
     kind = detected.kind;
     input = kind === 'peer' ? await normalizeInvite(detected.input) : detected.input;
   } catch (error) {
@@ -993,6 +994,7 @@ async function waitForRestart(targetVersion, previousVersion, taskId) {
           toast('新版本文件替换失败'); return;
         }
         if (health.ok && health.version === previousVersion) {
+          if (health.handoffFailed && health.handoffReady === true) { location.reload(); return; }
           try {
             const st = await network.local('update/status');
             if (st?.update?.phase === 'failed' && (!taskId || st.update.id === taskId)) {
@@ -1191,11 +1193,17 @@ $('connectionForm').onsubmit = async e => {
     const code = await normalizeInvite($('peerUrl').value); $('peerUrl').value = code;
     const probe = await network.local('probe', { url: code });
     recordPeerVersion(code, probe);
-    const compat = classifyPeerCompatibility(meta.version, probe);
+    const compat = classifyPeerCompatibility(meta.version, probe, meta.assetSuffix);
     if (compat.action === 'block_update_self') {
-      peerUpdateCandidate = code;
-      $('peerCompatText').textContent = `同事正在运行新版本 ${compat.peerVersion}，联机规则已变更，需先更新后再连接。`;
-      $('updateFromPeerNow').hidden = false; $('peerCompatBanner').hidden = false;
+      if (compat.canPeerUpdate) {
+        peerUpdateCandidate = code;
+        $('peerCompatText').textContent = `同事正在运行新版本 ${compat.peerVersion}，联机规则已变更，需先更新后再连接。`;
+        $('updateFromPeerNow').hidden = false; $('peerCompatBanner').hidden = false;
+      } else {
+        peerUpdateCandidate = '';
+        $('peerCompatText').textContent = `同事正在运行新版本 ${compat.peerVersion}（${assetPlatformLabel(compat.peerAssetSuffix)}），联机规则已变更。对方启动包不适用于当前系统（${assetPlatformLabel(compat.localAssetSuffix)}），请通过 GitHub Release 或同系统同事更新后再连接。`;
+        $('updateFromPeerNow').hidden = true; $('peerCompatBanner').hidden = false;
+      }
       status = '同事联机规则较新，请先更新'; toast(status); update(); return;
     }
     if (compat.action === 'block_update_peer') {
@@ -1209,7 +1217,10 @@ $('connectionForm').onsubmit = async e => {
       status = '双方版本相同但联机规则不一致'; toast(status); update(); return;
     }
     await network.connectInvite(code); await remember(code); $('connectionDialog').close();
-    if (compat.action === 'connect_with_hint') toast(`已连接同事；对方版本较新（${compat.peerVersion}），可随时点「连接同事」一键更新`);
+    if (compat.action === 'connect_with_hint') {
+      if (compat.canPeerUpdate) toast(`已连接同事。对方版本较新（${compat.peerVersion}），可随时点「连接同事」一键更新`);
+      else toast(`已连接同事。对方版本较新（${compat.peerVersion}，${assetPlatformLabel(compat.peerAssetSuffix)}），可通过 GitHub Release 或同系统同事更新`);
+    }
   } catch (e) { status = e.message; toast(e.message); } update();
 };
 $('copyUrl').onclick = async () => { await navigator.clipboard.writeText(meta.url); toast('邀请码已复制'); };

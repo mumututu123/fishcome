@@ -1,10 +1,11 @@
 const { spawn } = require('node:child_process');
+const { launcherPath } = require('./release-fixtures.cjs');
 const fs = require('node:fs');
 const path = require('node:path');
 const assert = require('node:assert/strict');
 const { chromium } = require(process.env.TIDE_TEST_MODULES ? path.join(process.env.TIDE_TEST_MODULES, 'playwright') : 'playwright');
 const project = path.resolve(__dirname, '..'), output = path.join(project, 'test-output'), children = [], errors = [];
-const exe = process.env.TIDE_TEST_LAUNCHER || path.join(project, 'dist', '鱼来', '鱼来.exe'); let browser;
+const exe = launcherPath; let browser;
 async function helper(port) { const child = spawn(exe, ['--headless', '--loopback', '--port', String(port)], { windowsHide: true, stdio: 'ignore' }); children.push(child); const end = Date.now() + 20000; while (Date.now() < end) { try { if ((await fetch(`http://127.0.0.1:${port}/health`)).ok) return; } catch {} await new Promise(resolve => setTimeout(resolve, 150)); } throw new Error('启动器未就绪'); }
 async function open(context, port, nick) { const page = await context.newPage(); page.on('pageerror', error => errors.push(error.message)); await page.goto(`http://127.0.0.1:${port}/`); if (nick) { await page.locator('#nickInput').fill(nick); await page.locator('#welcomeForm .primary').click(); } await page.waitForFunction(() => window.tide); await page.evaluate(async () => { const { Network } = await import('./network.js'), receive = Network.prototype.receive; window.replicaErrors = []; Network.prototype.receive = async function(...args) { try { return await receive.apply(this, args); } catch (error) { window.replicaErrors.push(error.message); throw error; } }; }); return page; }
 async function healthy(page) {
@@ -23,7 +24,7 @@ async function healthy(page) {
 }
 async function main() {
   fs.mkdirSync(output, { recursive: true }); for (const port of [39761, 39762, 39763]) await helper(port);
-  browser = await chromium.launch({ executablePath: 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe', headless: true });
+  browser = await chromium.launch({ headless: true });
   const ca = await browser.newContext({ viewport: { width: 1440, height: 900 } }), cb = await browser.newContext({ viewport: { width: 1440, height: 900 } });
   let a = await open(ca, 39761, '新生海测试'), b = await open(cb, 39762, '新生海伙伴');
   const initialA = await a.evaluate(() => tide.world.data), initialB = await b.evaluate(() => tide.world.data);

@@ -1,10 +1,11 @@
 const { spawn } = require('node:child_process');
+const { launcherPath } = require('./release-fixtures.cjs');
 const fs = require('node:fs');
 const path = require('node:path');
 const assert = require('node:assert/strict');
 const { chromium } = require(process.env.TIDE_TEST_MODULES ? path.join(process.env.TIDE_TEST_MODULES, 'playwright') : 'playwright');
 const project = path.resolve(__dirname, '..'), output = path.join(project, 'test-output'), children = [], errors = [];
-const exe = process.env.TIDE_TEST_LAUNCHER || path.join(project, 'dist', '鱼来', '鱼来.exe'); let browser;
+const exe = launcherPath; let browser;
 async function helper(port) {
   const child = spawn(exe, ['--headless', '--loopback', '--port', String(port)], { windowsHide: true, stdio: 'ignore' }); children.push(child);
   const until = Date.now() + 20000; while (Date.now() < until) { try { if ((await fetch(`http://127.0.0.1:${port}/health`)).ok) return; } catch {} await new Promise(r => setTimeout(r, 150)); } throw new Error('启动器未就绪');
@@ -12,7 +13,7 @@ async function helper(port) {
 async function open(context, port, nick) { const p = await context.newPage(); p.on('pageerror', e => errors.push(e.message)); await p.goto(`http://127.0.0.1:${port}/`); if (nick) { await p.locator('#nickInput').fill(nick); await p.locator('#welcomeForm .primary').click(); } await p.waitForFunction(() => window.tide); return p; }
 async function main() {
   fs.mkdirSync(output, { recursive: true }); for (const port of [39831, 39832]) await helper(port);
-  browser = await chromium.launch({ executablePath: 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe', headless: true });
+  browser = await chromium.launch({ headless: true });
   const ca = await browser.newContext({ viewport: { width: 1440, height: 900 } }), cb = await browser.newContext(); let a = await open(ca, 39831, '限食测试'); await a.close();
   const setup = await ca.newPage(); await setup.goto('http://127.0.0.1:39831/welcome.html');
   const fixture = await setup.evaluate(async () => {

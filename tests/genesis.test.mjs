@@ -63,13 +63,53 @@ test('初始海草草尖按原规则继续生长，新草尖仍有合法来源�
   assert(child); assert.equal(child.entity, root.entity); assert.equal(child.wild.index, 1); assert(validWildCell(child, CONFIG, hash, initialSources(world.data.roots)));
 });
 
-test('初始海草可冒泡、被初始鱼吃掉并保留可验证的生态来源', () => {
-  let world, cell;
-  do { world = new World(at); cell = Object.values(world.data.chars).find(cell => cell.kind === 'seaweed' && Array.from({ length: 4 }, (_, i) => Math.floor(at / MINUTE) + i + 2).some(minute => bubbleRoll(cell.id, minute, cell.y))); } while (!cell);
-  const minute = Array.from({ length: 4 }, (_, i) => Math.floor(at / MINUTE) + i + 2).find(minute => bubbleRoll(cell.id, minute, cell.y));
-  world.step(minute * MINUTE); assert(Object.values(world.data.bubbles).some(bubble => bubble.source === cell.id));
-  const fish = Object.values(world.data.fishes)[0]; fish.x = wrapX(cell.x - 3); fish.y = cell.y - 3; fish.facing = 1;
-  world.step(world.data.tick); assert.equal(cell.kind, 'fish'); assert.equal(cell.entity, fish.id); assert(cell.path.some(event => event.reason === 'eat')); assert(validWildCell(cell, CONFIG, hash, initialSources(world.data.roots)));
+function initialSeaweedAtBubbleMinute(world, minute) {
+  const cell = Object.values(world.data.chars).find(cell => cell.kind === 'seaweed' && bubbleRoll(cell.id, minute, cell.y));
+  assert(cell);
+  return cell;
+}
+
+const seaweedStart = Date.UTC(2026, 0, 1);
+const seaweedWorldId = '00000000-0000-4000-8000-000000000000';
+
+test('初始海草会产生能追溯到该株海草的气泡', () => {
+  const world = new World(seaweedStart, seaweedWorldId);
+  const minute = seaweedStart / MINUTE + 2;
+  const cell = initialSeaweedAtBubbleMinute(world, minute);
+  world.step(minute * MINUTE);
+  assert(Object.values(world.data.bubbles).some(bubble => bubble.source === cell.id));
+});
+
+test('初始鱼吃到海草后保留可验证的生态来源', () => {
+  const world = new World(seaweedStart, seaweedWorldId);
+  const minute = seaweedStart / MINUTE + 2;
+  const cell = initialSeaweedAtBubbleMinute(world, minute);
+  world.step(minute * MINUTE);
+  const fish = Object.values(world.data.fishes)[0];
+  Object.assign(fish, { x: wrapX(cell.x - 3), y: cell.y - 3, facing: 1 });
+
+  world.step(world.data.tick);
+
+  assert.equal(cell.kind, 'fish');
+  assert.equal(cell.entity, fish.id);
+  assert(cell.path.some(event => event.reason === 'eat'));
+  assert(validWildCell(cell, CONFIG, hash, initialSources(world.data.roots)));
+});
+
+test('初始鱼在相同偏移处够不到海草时不会吃掉它', () => {
+  const start = Date.UTC(2026, 10, 25, 7, 52, 8);
+  const world = new World(start, 'd2f48367-2c02-49f6-87dd-3c9ecee6deac');
+  const minute = Math.floor(start / MINUTE) + 5;
+  const cell = initialSeaweedAtBubbleMinute(world, minute);
+  world.step(minute * MINUTE);
+  const fish = Object.values(world.data.fishes)[0];
+  Object.assign(fish, { x: wrapX(cell.x - 3), y: cell.y - 3, facing: 1 });
+
+  world.step(world.data.tick);
+
+  assert.equal(cell.kind, 'seaweed');
+  assert(!cell.path.some(event => event.reason === 'eat'));
+  assert(validWildCell(cell, CONFIG, hash, initialSources(world.data.roots)));
 });
 
 test('初始公母鱼按正常接触计时繁殖，后代具有真实归属和鱼谱记录', () => {

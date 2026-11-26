@@ -1,8 +1,8 @@
 const { spawn } = require('node:child_process');
-const path = require('node:path');
+const { launcherPath } = require('./release-fixtures.cjs');
 const assert = require('node:assert/strict');
-const project = path.resolve(__dirname, '..'), origin = 'http://127.0.0.1:39345';
-const child = spawn(process.env.TIDE_TEST_LAUNCHER || path.join(project, 'dist', '鱼来', '鱼来.exe'), ['--headless', '--loopback', '--port', '39345'], { windowsHide: true, stdio: 'ignore' });
+const origin = 'http://127.0.0.1:39345';
+const child = spawn(launcherPath, ['--headless', '--loopback', '--port', '39345'], { windowsHide: true, stdio: 'ignore' });
 const events = new AbortController();
 async function main() {
   const deadline = Date.now() + 10000;
