@@ -13,7 +13,7 @@ export async function lanDescription(description, fromUrl) {
 }
 async function inflateBounded(bytes) { const reader = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip')).getReader(), chunks = []; let size = 0; while (true) { const { done, value } = await reader.read(); if (done) break; size += value.length; if (size > MAX_RAW) { await reader.cancel(); throw new Error('解压数据过大'); } chunks.push(value); } const result = new Uint8Array(size); let offset = 0; for (const chunk of chunks) { result.set(chunk, offset); offset += chunk.length; } return result; }
 export class Network {
-  constructor(identity, meta, onMessage, onChange) { this.identity = identity; this.meta = meta; this.node = identity.actor.slice(0, 16) + '-' + crypto.randomUUID().replace(/-/g, '').slice(0, 19); this.onMessage = onMessage; this.onChange = onChange; this.replicas = new ReplicaTransfers(this); this.lastLegacyBeat = 0; this.connections = new Map(); this.seen = new Map(); this.pending = new Map(); this.stats = { sent: 0, received: 0, rejected: 0 }; }
+  constructor(identity, meta, onMessage, onChange, onReject) { this.identity = identity; this.meta = meta; this.node = identity.actor.slice(0, 16) + '-' + crypto.randomUUID().replace(/-/g, '').slice(0, 19); this.onMessage = onMessage; this.onChange = onChange; this.onReject = onReject; this.replicas = new ReplicaTransfers(this); this.lastLegacyBeat = 0; this.connections = new Map(); this.seen = new Map(); this.pending = new Map(); this.stats = { sent: 0, received: 0, rejected: 0 }; }
   async local(route, payload = {}) { const response = await fetch('/local/' + route, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: this.meta.token, node: this.node, ...payload }) }); const result = await response.json(); if (!response.ok) throw new Error(result.error || '本地配对通道不可用'); return result; }
   async start(nick) { this.sign = await signer(this.identity); await this.local('register', { nick, actor: this.identity.actor }); this.events = new EventSource(`/local/events?node=${this.node}&token=${encodeURIComponent(this.meta.token)}`); this.events.onmessage = e => { try { this.signal(JSON.parse(e.data)).catch(error => this.onChange(error.message)); } catch { } }; }
   live() { return [...this.connections.values()].filter(p => p.dc?.readyState === 'open'); }
@@ -52,10 +52,21 @@ export class Network {
     p.dc = dc; dc.binaryType = 'arraybuffer'; dc.bufferedAmountLowThreshold = 65536;
     dc.onopen = () => { clearTimeout(p.timeout); for (const waiter of p.waiters) waiter.resolve(); p.waiters.clear(); const duplicates = this.live().filter(x => x.node === p.node).sort((a, b) => a.id.localeCompare(b.id)); for (const extra of duplicates.slice(1)) this.close(extra); this.onChange(); };
     dc.onclose = () => this.close(p);
-    dc.onmessage = e => { this.receive(p, e.data).catch(() => { this.stats.rejected++; }); };
+    dc.onmessage = e => { this.receive(p, e.data).catch(error => { this.stats.rejected++; this.onReject?.(error, p); }); };
   }
   close(p, error = new Error(DIRECT_ERROR)) { if (!this.connections.has(p.id)) return; this.connections.delete(p.id); this.replicas.close(p, error); clearTimeout(p.timeout); p.error = error; for (const waiter of p.waiters) waiter.reject(error); p.waiters.clear(); p.pc.onconnectionstatechange = null; if (p.dc) p.dc.onclose = null; p.pc.close(); this.onChange(); }
-  async makeEnvelope(kind, body) { const message = { id: crypto.randomUUID(), kind, from: this.node, actor: this.identity.actor, key: this.identity.pub, body }; return { ...message, signature: await this.sign(message) }; }
+  async makeEnvelope(kind, body, { capturedWorld = false } = {}) {
+    const page = kind === 'replicaPage' && typeof body?.text === 'string';
+    if (capturedWorld || page) {
+      // Detached world snapshots and serialized page strings stay immutable
+      // through signing and encoding; only the surrounding message can change.
+      const key = page ? 'text' : 'world';
+      const { [key]: snapshot, ...metadata } = body;
+      body = { ...structuredClone(metadata), [key]: snapshot };
+    } else body = structuredClone(body);
+    const message = { id: crypto.randomUUID(), kind, from: this.node, actor: this.identity.actor, key: this.identity.pub, body };
+    return { ...message, signature: await this.sign(message) };
+  }
   async encode(message) { const raw = encoder.encode(JSON.stringify(message)); if (raw.byteLength > 32 * 1024 * 1024) throw new Error('世界快照过大'); if (raw.byteLength > 2048 && typeof CompressionStream !== 'undefined') { const bytes = new Uint8Array(await new Response(new Blob([raw]).stream().pipeThrough(new CompressionStream('gzip'))).arrayBuffer()); const result = new Uint8Array(bytes.length + 1); result[0] = 1; result.set(bytes, 1); return result; } const result = new Uint8Array(raw.length + 1); result.set(raw, 1); return result; }
   replicaPeers() { return this.live().filter(p => !p.replicaPages || p.sentHello && p.confirmedReplica); }
   fitsLegacy(kind, body) {
@@ -64,7 +75,7 @@ export class Network {
     return fitsLegacyEnvelope(body, MAX_RAW - encoder.encode(JSON.stringify(header)).length + 4);
   }
   async broadcastEnvelope(message, peers = this.live()) { this.seen.set(message.id, Date.now()); const bytes = await this.encode(message); await Promise.allSettled(peers.map(p => this.send(p, message.id, bytes))); return message; }
-  async broadcast(kind, body) {
+  async broadcast(kind, body, options) {
     if ((kind === 'merge' || kind === 'world') && body.world) {
       const peers = this.replicaPeers();
       if (!peers.length) return;
@@ -73,11 +84,11 @@ export class Network {
         if (peers.every(p => !p.replicaPages)) throw new Error('世界太大，联机伙伴需更新才能分块同步');
         return this.replicas.broadcast(kind, body, peers);
       }
-      return this.broadcastEnvelope(await this.makeEnvelope(kind, body), peers);
+      return this.broadcastEnvelope(await this.makeEnvelope(kind, body, options), peers);
     }
     return this.broadcastEnvelope(await this.makeEnvelope(kind, body));
   }
-  async direct(p, kind, body, captureCurrent) {
+  async direct(p, kind, body, captureCurrent, options) {
     if (kind === 'hello' && body.world) {
       if (p.replicaPages) {
         const base = await this.replicas.hello(p, body);
@@ -93,9 +104,9 @@ export class Network {
       }
       if (!await this.fitsLegacy(kind, body)) throw new Error('世界太大，联机伙伴需更新才能分块同步');
     }
-    return this.directControl(p, kind, body);
+    return this.directControl(p, kind, body, options);
   }
-  async directControl(p, kind, body) { const message = await this.makeEnvelope(kind, body); this.seen.set(message.id, Date.now()); await this.send(p, message.id, await this.encode(message), true); return message; }
+  async directControl(p, kind, body, options) { const message = await this.makeEnvelope(kind, body, options); this.seen.set(message.id, Date.now()); await this.send(p, message.id, await this.encode(message), true); return message; }
   async send(p, id, bytes, reliable = false) {
     while (reliable && p.queued > 8) await p.sendQueue.catch(() => {});
     if (p.dc?.readyState !== 'open') { if (reliable) throw new Error('伙伴连接已关闭'); return; }
@@ -113,7 +124,8 @@ export class Network {
     if (record.size > 32 * 1024 * 1024) { p.packets.delete(id); return; } if (record.count !== total) return;
     p.packets.delete(id); const bytes = new Uint8Array(record.size); let offset = 0; for (const part of record.parts) { bytes.set(part, offset); offset += part.length; }
     let raw = bytes.slice(1); if (bytes[0] === 1) raw = await inflateBounded(raw); if (raw.length > MAX_RAW) return;
-    const message = JSON.parse(decoder.decode(raw)); if (message.id !== id || !await verifyEnvelope(message)) { this.stats.rejected++; return; }
+    const message = JSON.parse(decoder.decode(raw));
+    if (message?.id !== id || !await verifyEnvelope(message)) throw new Error('消息标识或签名无效');
     this.seen.set(id, Date.now()); if (this.seen.size > 20000) { for (const [k, at] of this.seen) if (Date.now() - at > 120000) this.seen.delete(k); }
     const replicaPage = message.kind === 'replicaPage';
     if (replicaPage || message.kind === 'replicaReceipt') {

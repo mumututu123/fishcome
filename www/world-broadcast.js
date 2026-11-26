@@ -114,7 +114,7 @@ export class WorldBroadcast {
         world = captureFull ? full : structuredClone(full);
         this.previous = baseline(world, data.breeding, now);
       }
-      return await network.broadcast('world', { delta: !!previous, world });
+      return await network.broadcast('world', { delta: !!previous, world }, { capturedWorld: true });
     } catch (error) {
       this.reset();
       throw error;

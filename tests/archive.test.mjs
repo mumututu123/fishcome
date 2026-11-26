@@ -6,6 +6,7 @@ import { newLife } from '../www/life.js';
 import { fishCatalog } from '../www/fish-profile.js';
 import { signer, actorId, verifyEnvelope } from '../www/storage.js';
 import { Network } from '../www/network.js';
+import { loadReplicaArchives, verifyReplica } from '../www/replica.js';
 const now = Date.now(), old = now - 10 * 86400000, glyph = (x, y, ch = 'Q') => ({ x, y, ch, color: '#88aacc' });
 test('分批检查归档大小保留 UTF-8 字节阈值和原有归档选择', async () => {
   const { w } = await fixture();
@@ -17,6 +18,78 @@ test('分批检查归档大小保留 UTF-8 字节阈值和原有归档选择', a
   assert.deepEqual(await archivePlanAsync(w.data, now, { pressure: true }), archivePlan(w.data, now, { pressure: true }));
 });
 const blank = () => Object.fromEntries(ARCHIVE_FIELDS.map(f => [f, {}]));
+
+test('并发吸收同一归档只更新一次余额、归档版本和起源索引', async () => {
+  const store = new ArchiveStore();
+  const roots = { [crypto.randomUUID()]: old };
+  const id = 'account:referral';
+  async function claim(t, inviter) {
+    const records = blank();
+    records.ops[id] = { id, kind: 'referral', actor: 'account', cost: 0, t, inviter };
+    return encodeArchive(records, roots);
+  }
+  const later = await claim(old + 1, 'later'), first = await claim(old, 'first');
+  await store.ingest(later, chooseClaim);
+  await Promise.all([store.ingest(first, chooseClaim), store.ingest(first, chooseClaim)]);
+  assert.equal(store.summary.ledger.first, 10);
+  assert.equal(store.summary.ledger.later, 0);
+  assert.equal(store.revision, 2);
+  assert.deepEqual([...store.rootsByChunk.values()], [roots, roots]);
+});
+
+test('热记录未通过校验时，新归档不会写入磁盘或运行世界', async () => {
+  const data = new World(now).serialize(), store = new ArchiveStore();
+  const records = blank(), [id, op] = Object.entries(data.ops)[0];
+  records.ops[id] = op;
+  delete data.ops[id];
+  data.fishes[id].actor += '-old';
+  const chunk = await encodeArchive(records, data.roots);
+  data.archives.chunks[chunk.manifest.id] = chunk.manifest;
+  let writes = 0;
+  await assert.rejects(loadReplicaArchives(data, store, () => chunk.encoded, {
+    beforeIngest(extra, checked) {
+      assert.deepEqual(extra.ops[id], op);
+      assert.deepEqual(checked.ops[id], op);
+      return verifyReplica(data, extra, store, { current: checked });
+    },
+    persist() { writes++; }
+  }), /创建者/);
+  assert.equal(writes, 0);
+  assert.deepEqual(store.manifests, {});
+});
+
+test('提交前校验的重复归档记录与实际合流结果一致', async () => {
+  const data = new World(now).serialize(), store = new ArchiveStore();
+  const id = Object.keys(data.fishes)[0];
+  async function travel(days) {
+    const records = blank();
+    records.travel[id] = { since: data.fishes[id].created, days };
+    return encodeArchive(records, data.roots);
+  }
+  const oldChunk = await travel({ '2020-01-01': 7 });
+  await store.ingest(oldChunk, chooseClaim);
+  const left = await travel({ '2020-01-02': 2 }), right = await travel({ '2020-01-02': 1 });
+  for (const chunk of [oldChunk, left, right]) data.archives.chunks[chunk.manifest.id] = chunk.manifest;
+  let checked;
+  await loadReplicaArchives(data, store, id => [left, right].find(chunk => chunk.manifest.id === id).encoded, {
+    beforeIngest(extra) { checked = extra.travel[id]; }
+  });
+  assert.deepEqual(checked, await store.get('travel', id));
+});
+
+test('副本聊天须与合流后的世界有共同起源，沉积来源可来自其他世界', async () => {
+  const owner = await identity(), sender = new Network(owner);
+  sender.sign = await signer(owner);
+  const world = new World(now).serialize();
+  const root = crypto.randomUUID();
+  const message = await sender.makeEnvelope('chat', { nick: '测试', text: '旧记忆', roots: [root], t: now });
+  world.chats[message.id] = message;
+  await assert.rejects(verifyReplica(world), /聊天不属于/);
+  await verifyReplica(world, {}, undefined, { current: { roots: { [root]: now } } });
+  delete world.chats[message.id];
+  world.chatSources[message.id] = message;
+  await verifyReplica(world);
+});
 async function identity() { const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']), pub = await crypto.subtle.exportKey('jwk', pair.publicKey), secret = await crypto.subtle.exportKey('jwk', pair.privateKey); return { actor: await actorId(pub), pub, secret, nick: '档案测试' }; }
 async function fixture() {
   const owner = await identity(), w = new World(old, undefined, { populate: false, ambient: false }), sender = new Network(owner, {}, () => {}, () => {}); sender.sign = await signer(owner);

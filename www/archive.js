@@ -10,7 +10,9 @@ export function archiveDependencies(data) {
   const keep = Object.fromEntries(ARCHIVE_FIELDS.map(field => [field, new Set()]));
   const fish = id => { if (!id) return; if (id.startsWith('born:')) birth(id.slice(5)); else keep.ops.add(id); };
   const birth = id => { if (keep.breeding.has(id)) return; keep.breeding.add(id); const r = data.breeding[id]; if (r) { fish(r.male); fish(r.female); } };
-  for (const f of Object.values(data.fishes)) { fish(f.id); keep.travel.add(f.id); }
+  for (const id of Object.keys(data.fishes)) { fish(id); keep.travel.add(id); }
+  for (const contact of Object.values(data.contacts || {})) { fish(contact.male); fish(contact.female); }
+  for (const bubble of Object.values(data.bubbles || {})) keep.chars.add(bubble.source);
   for (const r of Object.values(data.breeding || {})) if (r.status === 'active') birth(r.id);
   for (const [id, scene] of Object.entries(data.scenes)) { keep.ops.add(id); if (scene.poseId) keep.ops.add(scene.poseId); }
   for (const c of Object.values(data.chars)) if (c.kind !== 'burn') {
@@ -166,23 +168,42 @@ export function mergeArchiveState(a, b) {
 }
 export function operationValue(op, actor) { return (op.kind === 'referral' && op.inviter === actor ? 10 : 0) + (op.actor === actor ? op.kind === 'earn' ? 1 : -(op.cost || 0) : 0); }
 function opSummary(op) { return { id: op.id, kind: op.kind, actor: op.actor, cost: op.cost, inviter: op.inviter, t: op.t }; }
+export function mergeArchiveRecord(field, old, record, chooseChar) {
+  if (!old) return record;
+  if (field === 'chars') return chooseChar(old, record);
+  if (field === 'ops') {
+    if (old.kind === 'referral' && record.kind === 'referral') return chooseReferral(old, record);
+    const { proof: oldProof, ...left } = old, { proof: newProof, ...right } = record;
+    if (!same(left, right)) throw new Error('归档操作记录不可覆盖');
+    return old;
+  }
+  if (field === 'chats' || field === 'chatSources') {
+    if (!same(old, record)) throw new Error('归档聊天记录不可覆盖');
+    return old;
+  }
+  if (field === 'travel') return mergeTravel(old, record);
+  if (field === 'breeding') {
+    const born = record.status === 'born', oldBorn = old.status === 'born', terminal = record.status !== 'active', oldTerminal = old.status !== 'active';
+    if (born !== oldBorn) return born ? record : old;
+    if (terminal !== oldTerminal) return terminal ? record : old;
+    if (record.at !== old.at) return (born ? record.at < old.at : record.at > old.at) ? record : old;
+    return json(record).localeCompare(json(old)) > 0 ? record : old;
+  }
+  return (record.posAt || 0) > (old.posAt || 0) || record.posAt === old.posAt && json(record).localeCompare(json(old)) > 0 ? record : old;
+}
 export class ArchiveStore {
-  constructor({ load } = {}) { this.load = load; this.packs = new Map(); this.manifests = {}; this.ids = Object.fromEntries(ARCHIVE_FIELDS.map(f => [f, new Map()])); this.cache = new Map(); this.bigCache = new Map(); this.overrides = Object.fromEntries(ARCHIVE_FIELDS.map(f => [f, {}])); this.summary = { ops: {}, ledger: {}, serials: {}, catalog: {}, lastMeals: new Map(), grassMeals: new Set(), mealSources: new Map() }; }
+  constructor({ load } = {}) { this.load = load; this.packs = new Map(); this.manifests = {}; this.rootsByChunk = new Map(); this.ids = Object.fromEntries(ARCHIVE_FIELDS.map(f => [f, new Map()])); this.cache = new Map(); this.bigCache = new Map(); this.overrides = Object.fromEntries(ARCHIVE_FIELDS.map(f => [f, {}])); this.summary = { ops: {}, ledger: {}, serials: {}, catalog: {}, lastMeals: new Map(), grassMeals: new Set(), mealSources: new Map() }; }
   async ingest(chunk, chooseChar) {
     if (this.manifests[chunk.manifest.id]) return;
+    const revision = this.revision;
     const changes = [];
     for (const field of ARCHIVE_FIELDS) for (const [id, record] of Object.entries((chunk.logical || chunk.raw.records)[field])) if (this.ids[field].has(id)) {
-      const old = await this.get(field, id); let chosen = old;
-      if (field === 'chars') chosen = chooseChar(old, record);
-      else if (field === 'ops') { if (old.kind === 'referral' && record.kind === 'referral') chosen = chooseReferral(old, record); else { const { proof: p, ...a } = old, { proof: q, ...b } = record; if (!same(a, b)) throw new Error('归档操作记录不可覆盖'); } }
-      else if (field === 'chats' || field === 'chatSources') { if (!same(old, record)) throw new Error('归档聊天记录不可覆盖'); }
-      else if (field === 'travel') chosen = mergeTravel(old, record);
-      else if (field === 'breeding') {
-        const born = record.status === 'born', oldBorn = old.status === 'born', terminal = record.status !== 'active', oldTerminal = old.status !== 'active';
-        if (born && !oldBorn || !oldBorn && terminal && !oldTerminal || born === oldBorn && terminal === oldTerminal && ((born ? record.at < old.at : record.at > old.at) || record.at === old.at && json(record).localeCompare(json(old)) > 0)) chosen = record;
-      } else if ((record.posAt || 0) > (old.posAt || 0) || record.posAt === old.posAt && json(record).localeCompare(json(old)) > 0) chosen = record;
+      const old = await this.get(field, id), chosen = mergeArchiveRecord(field, old, record, chooseChar);
       if (!same(old, chosen)) changes.push({ field, id, old, chosen });
     }
+    // Reading a cold record yields. Resolve overlapping imports against the
+    // latest winner before updating the per-account summaries.
+    if (this.revision !== revision) return this.ingest(chunk, chooseChar);
     this.addVerified(chunk);
     for (const { field, id, old, chosen } of changes) {
       this.overrides[field][id] = chosen;
@@ -196,7 +217,7 @@ export class ArchiveStore {
   addVerified(chunk) {
     const { manifest, encoded, raw } = chunk; if (this.manifests[manifest.id]) return;
     this.revision = (this.revision || 0) + 1;
-    this.packs.set(manifest.id, encoded); this.manifests[manifest.id] = manifest;
+    this.packs.set(manifest.id, encoded); this.manifests[manifest.id] = manifest; this.rootsByChunk.set(manifest.id, raw.roots);
     const logical = chunk.logical || raw.records;
     if (raw.fragment && chunk.logical) { this.bigCache.set(raw.fragment.hash, logical[raw.fragment.field][raw.fragment.id]); while (this.bigCache.size > 2) this.bigCache.delete(this.bigCache.keys().next().value); }
     for (const field of ARCHIVE_FIELDS) for (const [id, record] of Object.entries(logical[field])) {
@@ -222,14 +243,30 @@ export class ArchiveStore {
     const first = { manifest: this.manifests[chunk], raw: await this.raw(chunk) }; await assembleFragments([first], { chunks: this.manifests }, async key => ({ manifest: this.manifests[key], raw: await this.raw(key) }));
     const record = first.logical[field][id]; this.bigCache.set(fragment.hash, record); while (this.bigCache.size > 2) this.bigCache.delete(this.bigCache.keys().next().value); return record;
   }
-  async dependencies(incoming, current) {
+  async dependencies(incoming, current = {}) {
     const extra = Object.fromEntries(ARCHIVE_FIELDS.map(f => [f, {}])), pending = [];
-    const need = (field, id) => { if (id && this.ids[field].has(id) && !extra[field][id]) pending.push([field, id]); };
+    if (ARCHIVE_FIELDS.every(field => !this.ids[field].size)) return extra;
+    const queued = Object.fromEntries(ARCHIVE_FIELDS.map(field => [field, new Set()]));
+    const need = (field, id) => {
+      if (typeof id !== 'string' || queued[field].has(id)) return;
+      const hotDependency = (field === 'breeding' || field === 'chars') && current[field]?.[id] && !incoming[field]?.[id];
+      if (!this.ids[field].has(id) && !hotDependency) return;
+      queued[field].add(id);
+      pending.push([field, id]);
+    };
     const fish = id => id?.startsWith('born:') ? need('breeding', id.slice(5)) : need('ops', id);
     for (const field of ARCHIVE_FIELDS) for (const id of Object.keys(incoming[field] || {})) need(field, id);
     const refs = data => {
-      for (const c of Object.values(data.chars || {})) { need('ops', c.id.slice(0, 36)); for (const e of c.path) if (e.birth) need('breeding', e.birth); if (c.wild?.source.startsWith('cell:')) { need('chars', c.wild.source.slice(5)); need('ops', c.wild.source.slice(5, 41)); } }
-      for (const f of Object.values(data.fishes || {})) fish(f.id);
+      for (const c of Object.values(data.chars || {})) {
+        need('ops', c.id.slice(0, 36));
+        if (c.chat) { need('chats', c.chat); need('chatSources', c.chat); need('scenes', c.entity); }
+        if (c.kind === 'fish') need('fishes', c.entity);
+        for (const e of c.path) if (e.birth) need('breeding', e.birth);
+        if (c.wild?.source?.startsWith('cell:')) { need('chars', c.wild.source.slice(5)); need('ops', c.wild.source.slice(5, 41)); }
+      }
+      for (const id of Object.keys(data.fishes || {})) fish(id);
+      for (const r of Object.values(data.contacts || {})) { fish(r.male); fish(r.female); }
+      for (const bubble of Object.values(data.bubbles || {})) need('chars', bubble.source);
       for (const r of Object.values(data.breeding || {})) { fish(r.male); fish(r.female); }
       for (const id of Object.keys(data.travel || {})) fish(id);
       for (const r of Object.values(data.life?.bonds || {})) { fish(r.a); fish(r.b); }
@@ -243,8 +280,10 @@ export class ArchiveStore {
     };
     refs(incoming);
     while (pending.length) {
-      const [field, id] = pending.pop(); if (extra[field][id] || current[field]?.[id]) continue;
-      const record = await this.get(field, id); if (!record) continue; extra[field][id] = record;
+      const [field, id] = pending.pop();
+      const hot = current[field]?.[id], record = hot || await this.get(field, id);
+      if (!record) continue;
+      if (!hot) extra[field][id] = record;
       if (field === 'breeding') { fish(record.male); fish(record.female); }
       if (field === 'chars') refs({ chars: { [id]: record } });
     }

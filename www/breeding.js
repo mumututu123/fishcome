@@ -11,7 +11,7 @@ const activeIndexes = new WeakMap();
 
 export function breedingId(male, female, started) { const pair = `${male}:${female}`; return `breed:${started}:${hash(pair).toString(16)}-${hash('pair:' + pair).toString(16)}`; }
 export function fishOrigin(data, id) {
-  const op = data.ops[id]; if (op?.kind === 'fish') return { actor: op.actor, nick: op.nick, gender: op.gender, created: op.t, name: op.name, size: op.cells.length };
+  const op = data.ops[id]; if (op?.kind === 'fish') return { actor: op.actor, nick: op.nick, gender: op.gender, created: op.t, name: op.name, size: op.cells?.length };
   const record = typeof id === 'string' && id.startsWith('born:') ? data.breeding?.[id.slice(5)] : null;
   return record?.status === 'born' && record.baby?.id === id ? record.baby : data.archivedCatalog?.[id];
 }
@@ -231,23 +231,33 @@ export function canonicalBirthFish(fish, record) {
 
 // Only rebase equivalent inheritance events. A different cell, parent or glyph
 // is not evidence of the same transition; full validation still rejects it.
-export function canonicalBirthPath(cell, breeding) {
+export function canonicalBirthPath(cell, breeding, alternatives = {}) {
   const path = cell.path;
   if (!Array.isArray(path)) return cell;
-  let changed = false;
+  let changed = false, glyph = cell.ch;
   const next = path.map((event, index) => {
     if (event?.reason !== 'birth' || !Object.hasOwn(breeding, event.birth)) return event;
     const record = breeding[event.birth], baby = record?.baby;
     if (record?.status !== 'born' || !Number.isFinite(baby?.created) || !Array.isArray(baby.cells)) return event;
     const inherited = baby.cells.find(item => item.id === cell.id);
     if (!inherited || event.id !== `birth:${record.id}:${cell.id}` || event.target !== baby.id ||
-        event.from !== inherited.parent || event.before !== inherited.before || event.after !== inherited.after ||
-        event.x !== inherited.x || event.y !== inherited.y || !Number.isFinite(event.t) || event.t < baby.created ||
-        baby.created < (path[index - 1]?.t ?? -Infinity) || event.t > (path[index + 1]?.t ?? Infinity) || event.t === baby.created) return event;
+        event.from !== inherited.parent || event.before !== inherited.before || !Number.isFinite(event.t) ||
+        event.t < baby.created || baby.created < (path[index - 1]?.t ?? -Infinity) ||
+        event.t > (path[index + 1]?.t ?? Infinity)) return event;
+    const sameShape = event.x === inherited.x && event.y === inherited.y && event.after === inherited.after;
+    if (!sameShape) {
+      // Only a second birth certificate can justify changing shape during a merge.
+      const alternate = alternatives[event.birth]?.baby;
+      const previous = alternate?.cells.find(c => c.id === cell.id);
+      if (event.t !== alternate?.created || !previous || previous.parent !== event.from ||
+          previous.before !== event.before || previous.after !== event.after ||
+          previous.x !== event.x || previous.y !== event.y) return event;
+    } else if (event.t === baby.created) return event;
     changed = true;
-    return { ...event, t: baby.created };
+    if (!sameShape && glyph === event.after && ['fish', 'food'].includes(cell.kind) && !path.slice(index + 1).some(e => e.reason === 'birth')) glyph = inherited.after;
+    return { ...event, t: baby.created, x: inherited.x, y: inherited.y, after: inherited.after };
   });
-  return changed ? { ...cell, path: next } : cell;
+  return changed ? { ...cell, ch: glyph, path: next } : cell;
 }
 
 // Legacy local snapshots may contain the later branch's birth time. Repair
