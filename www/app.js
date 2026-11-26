@@ -1,7 +1,7 @@
 import { World, CONFIG, clone, EYES, bounds, validGlyph, displayNick, hash, sceneryCount, chooseClaim } from './engine.js';
 import { SimulationClient, subscribeSimulationChanges } from './simulation-client.js';
 import { setParticipantName, subscribeBeforeSimulationPatch, worldEdited } from './simulation-changes.js';
-import { get, getMany, readCheckpointVersion, sameStoredCheckpoint, putMany, readHandoffCheckpoint, replaceFromBackup, getOldBranch, claimLegacyNotice, newIdentity, signer, verifyEnvelope, actorId, download } from './storage.js';
+import { get, getMany, readCheckpointVersion, sameStoredCheckpoint, putMany, readHandoffCheckpoint, replaceFromBackup, getOldBranch, LEGACY_NOTICE_SEEN, claimLegacyNotice, newIdentity, signer, verifyEnvelope, actorId, download } from './storage.js';
 import { beforeCheckpointPatch, noteCheckpointChanges } from './checkpoint-pages.js';
 import { CheckpointPictures } from './checkpoint-picture.js';
 import { Network } from './network.js';
@@ -231,8 +231,8 @@ async function mergeReplica(data, peer, context = 'merge') {
     recovered = true;
   }
   reconcileHistory(); syncIncomeSerial(); await save(); renderChat();
+  if (joinedWorld) toast('两片海合流了');
   if (recovered) await network.broadcast('merge', { world: await captureReplica() }, { capturedWorld: true });
-  return joinedWorld;
 }
 function resumeAfterInactivity(now = Date.now()) { if (!resumeTask) resumeTask = resumeWorld(now).finally(() => { resumeTask = null; }); return resumeTask; }
 async function resumeWorld(now) {
@@ -291,7 +291,7 @@ async function onMessage(message, peer) {
     }
     if (message.from !== peer.node || body.member?.id !== message.from || body.member.actor !== message.actor) return;
     const newKnowledge = Object.keys(body.world.roots || {}).some(r => !world.data.roots[r]) || Object.keys(body.world.ops || {}).some(id => !world.data.ops[id]) || Object.keys(body.world.chats || {}).some(id => !world.data.chats[id]) || Object.keys(body.world.chatSources || {}).some(id => !world.data.chatSources[id]);
-    const joinedWorld = await mergeReplica(body.world, peer, 'hello'); geometryRepair = true;
+    await mergeReplica(body.world, peer, 'hello'); geometryRepair = true;
     const own = body.member; members.set(own.id, { ...own, url: peer.url, at: Date.now() }); remember(peer.url);
     rememberAuthor(message.actor, own.nick);
     for (const m of body.members || []) remember(m.url);
@@ -301,7 +301,7 @@ async function onMessage(message, peer) {
     await save();
     const missing = (body.historyIndex || []).filter(id => !histories[id]); if (missing.length) { historyQueues.set(peer.id, missing); await requestHistory(peer); }
     await completeReferral(peer, message.actor);
-    status = ''; if (joinedWorld) toast('两片海合流了'); update();
+    status = ''; update();
   } else if (message.kind === 'beat') {
     if (body.member?.id === message.from && body.member.actor === message.actor) { const direct = network.live().find(p => p.node === message.from); members.set(message.from, { ...body.member, direct: !!direct, url: await normalizeInvite(direct?.url || body.member.url), at: Date.now() }); remember(body.member.url); rememberAuthor(message.actor, body.member.nick); if (Date.now() - lastRepair > 5000 && (body.rootCount > world.roots.length || body.opCount > Object.keys(world.data.ops).length || body.chatCount > Object.keys(world.data.chats).length || body.chatSourceCount > Object.keys(world.data.chatSources).length)) { lastRepair = Date.now(); network.broadcast('replicaRequest', { to: message.from }).catch(() => {}); } }
   } else if (message.kind === 'merge') {
@@ -746,7 +746,7 @@ async function start() {
   meta.assetSuffix = normalizeAssetSuffix(meta.assetSuffix);
   meta.url = await normalizeInvite(meta.url);
   $('currentVersion').textContent = `当前版本 ${meta.version || '未知'}`;
-  const [owner, cards, invites, previous, storedGeneration] = await getMany(['identity', 'histories', 'known', 'checkpoint', 'saveGeneration']);
+  const [owner, cards, invites, previous, storedGeneration, sawLegacyNotice] = await getMany(['identity', 'histories', 'known', 'checkpoint', 'saveGeneration', LEGACY_NOTICE_SEEN]);
   if ((storedGeneration ?? 0) !== generation) throw new Error('存档已在其他页面更换，请刷新后再试');
   identity = owner;
   histories = cards || {};
@@ -803,7 +803,7 @@ async function start() {
   setInterval(tick, CONFIG.step); setInterval(() => { network.presence(active().filter(m => m.id !== network.node).map(m => ({ id: m.id, url: m.url }))).catch(() => {}); if (network.connections.size < 6) { const candidate = active().filter(m => m.id !== network.node && !network.has(m.id)).sort((a, b) => hash(`${network.node}:${a.id}`) - hash(`${network.node}:${b.id}`))[0]; if (candidate) network.connect(candidate.url, candidate.id).catch(() => {}); } }, 6000);
   document.addEventListener('visibilitychange', async () => { if (!document.hidden) { lifeSince = identity.lifeSeenAt || Date.now(); returnVisit = Date.now() - lifeSince > 60000; lifeMessage = null; } await resumeAfterInactivity(); if (network.live().length) network.broadcast('beat', { member: member() }).catch(() => {}); save().catch(() => {}); });
   window.addEventListener('pagehide', () => { simulation.close(); const blob = new Blob([JSON.stringify({ node: network.node, token: meta.token })], { type: 'application/json' }); navigator.sendBeacon('/local/unregister', blob); if (updateFrozen || updateRestarting || replacingCheckpoint) return; save().catch(() => {}); });
-  refreshOldBackups(true);
+  if (!sawLegacyNotice) refreshOldBackups(true);
   // Exposes read-only diagnostics for the project's automated browser checks.
   window.tide = { get world() { return { data: world.serialize(), counts: world.counts() }; }, get network() { return { node: network.node, leader: leader(), peers: network.live().map(p => ({ node: p.node, url: p.url })), stats: clone(network.stats) }; }, get identity() { return { actor: identity.actor, nick: displayNick(identity.nick) }; }, get histories() { return clone(histories); }, get view() { return { camera: clone(renderer.camera), scale: renderer.scale, followingFish: trackedFish, selected: clone(selected) }; }, balance };
 }

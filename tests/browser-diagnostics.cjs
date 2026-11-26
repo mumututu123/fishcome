@@ -558,7 +558,8 @@ test('慢刷新显示恢复提示，旧版进度只提醒一次且仍可继续�
   await page.locator('#startupNotice').waitFor({ state: 'hidden' });
   assert.deepEqual(await page.evaluate(() => Object.keys(tide.world.data.roots)), roots);
   await page.reload();
-  await page.waitForFunction(() => window.tide && document.querySelector('[data-legacy-backup="live"]'));
+  await page.waitForFunction(() => window.tide);
+  assert.equal(await page.locator('[data-legacy-backup="live"]').count(), 0);
   await page.locator('#connect').click();
   const old = await exported(page, '[data-legacy-backup="live"]');
   assert.deepEqual(Object.keys(old.checkpoint.world.roots), roots);

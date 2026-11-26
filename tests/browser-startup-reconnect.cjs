@@ -32,7 +32,7 @@ test('真实合流只提醒一次，同一身份刷新两次后仍能双向同�
   await a.evaluate(() => {
     window.mergeNotices = 0;
     new MutationObserver(records => {
-      if (records.some(({ target }) => target.textContent.includes('合流'))) window.mergeNotices++;
+      if (records.some(({ target }) => /^(已接入伙伴，两个世界正在合流|两片海合流了)$/.test(target.textContent))) window.mergeNotices++;
     }).observe(document.querySelector('#toast'), { childList: true });
   });
   await b.locator('#connect').click();
@@ -60,5 +60,12 @@ test('真实合流只提醒一次，同一身份刷新两次后仍能双向同�
     assert.deepEqual(await state(b), expected);
     assert.equal(await a.evaluate(() => mergeNotices), 1, '重连不应重复提示合流');
   }
+  const c = await open(await launch(), '隔离丙');
+  await c.locator('#connect').click();
+  await c.locator('#peerUrl').fill(second);
+  await c.locator('#connectionForm .primary').click();
+  await a.waitForFunction(() => Object.keys(tide.world.data.roots).length === 3 && mergeNotices === 2);
+  await chat(c, a, '新来的一片海');
+  assert.equal(await a.evaluate(() => mergeNotices), 2, '经伙伴转发的合流也只应提醒一次');
   assert.deepEqual(errors, []);
 });
