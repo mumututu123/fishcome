@@ -195,7 +195,7 @@ export function mergeArchiveRecord(field, old, record, chooseChar) {
 }
 export class ArchiveStore {
   constructor({ load } = {}) { this.load = load; this.packs = new Map(); this.manifests = {}; this.rootsByChunk = new Map(); this.ids = Object.fromEntries(ARCHIVE_FIELDS.map(f => [f, new Map()])); this.cache = new Map(); this.bigCache = new Map(); this.overrides = Object.fromEntries(ARCHIVE_FIELDS.map(f => [f, {}])); this.summary = { ops: {}, ledger: {}, serials: {}, catalog: {}, lastMeals: new Map(), grassMeals: new Set(), mealSources: new Map() }; }
-  async ingest(chunk, chooseChar) {
+  async ingest(chunk, chooseChar, mealTargets) {
     if (this.manifests[chunk.manifest.id]) return;
     const revision = this.revision;
     const changes = [];
@@ -205,18 +205,28 @@ export class ArchiveStore {
     }
     // Reading a cold record yields. Resolve overlapping imports against the
     // latest winner before updating the per-account summaries.
-    if (this.revision !== revision) return this.ingest(chunk, chooseChar);
-    this.addVerified(chunk);
+    if (this.revision !== revision) return this.ingest(chunk, chooseChar, mealTargets);
+    this.addVerified(chunk, mealTargets);
     for (const { field, id, old, chosen } of changes) {
       this.overrides[field][id] = chosen;
       if (field === 'ops') { for (const actor of new Set([old.actor, old.inviter, chosen.actor, chosen.inviter].filter(Boolean))) this.summary.ledger[actor] = (this.summary.ledger[actor] || 0) - operationValue(old, actor) + operationValue(chosen, actor); this.summary.ops[id] = opSummary(chosen); }
       if (field === 'breeding' && chosen.status === 'born') { const b = chosen.baby; this.summary.catalog[b.id] = { id: b.id, actor: b.actor, nick: b.nick, name: b.name, nameAuto: b.nameAuto, nameOrdinal: b.nameOrdinal, gender: b.gender, created: b.created, parents: b.parents, size: b.cells.length }; }
-      if (field === 'chars') this.summary.mealSources.set(id, { wild: !!chosen.wild, events: chosen.path.filter(e => e.reason === 'eat').map(e => ({ target: e.target, t: e.t })) });
+      if (field === 'chars') this.setMealSource(id, chosen, mealTargets);
     }
     if (changes.some(c => c.field === 'chars')) { this.summary.lastMeals.clear(); this.summary.grassMeals.clear(); for (const source of this.summary.mealSources.values()) for (const e of source.events) { this.summary.lastMeals.set(e.target, Math.max(this.summary.lastMeals.get(e.target) ?? -Infinity, e.t)); if (source.wild) this.summary.grassMeals.add(e.target); } }
   }
+  setMealSource(id, cell, mealTargets) {
+    const sources = this.summary.mealSources;
+    const events = cell.path.filter(e => e.reason === 'eat').map(({ target, t }) => ({ target, t }));
+    if (mealTargets) {
+      for (const event of sources.get(id)?.events || []) mealTargets.add(event.target);
+      for (const event of events) mealTargets.add(event.target);
+    }
+    sources.set(id, { wild: !!cell.wild, events });
+    return events;
+  }
   // addVerified is called only after original signatures/source records have been checked.
-  addVerified(chunk) {
+  addVerified(chunk, mealTargets) {
     const { manifest, encoded, raw } = chunk; if (this.manifests[manifest.id]) return;
     this.revision = (this.revision || 0) + 1;
     this.packs.set(manifest.id, encoded); this.manifests[manifest.id] = manifest; this.rootsByChunk.set(manifest.id, raw.roots);
@@ -231,7 +241,12 @@ export class ArchiveStore {
         if (record.kind === 'fish') this.summary.catalog[id] = { id, actor: record.actor, nick: record.nick, gender: record.gender, name: record.name, created: record.t, size: record.cells.length, parents: [] };
       }
       if (field === 'breeding' && record.status === 'born') { const baby = record.baby; this.summary.catalog[baby.id] = { id: baby.id, actor: baby.actor, nick: baby.nick, name: baby.name, nameAuto: baby.nameAuto, nameOrdinal: baby.nameOrdinal, gender: baby.gender, created: baby.created, parents: baby.parents, size: baby.cells.length }; }
-      if (field === 'chars') { this.summary.mealSources.set(id, { wild: !!record.wild, events: record.path.filter(e => e.reason === 'eat').map(e => ({ target: e.target, t: e.t })) }); for (const e of record.path) if (e.reason === 'eat') { this.summary.lastMeals.set(e.target, Math.max(this.summary.lastMeals.get(e.target) ?? -Infinity, e.t)); if (record.wild) this.summary.grassMeals.add(e.target); } }
+      if (field === 'chars') {
+        for (const { target, t } of this.setMealSource(id, record, mealTargets)) {
+          this.summary.lastMeals.set(target, Math.max(this.summary.lastMeals.get(target) ?? -Infinity, t));
+          if (record.wild) this.summary.grassMeals.add(target);
+        }
+      }
     }
     this.remember(manifest.id, raw);
     if (this.load) while (this.packs.size > 4) this.packs.delete(this.packs.keys().next().value);

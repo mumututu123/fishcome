@@ -44,13 +44,14 @@ test('追赶中在第一步交接真实归档，保留鱼的最后一餐并清�
   try {
     const run = client.advance(world, start + 20 * CONFIG.step);
     await issued.promise;
-    await store.ingest(chunk, chooseClaim);
+    const targets = new Set();
+    await store.ingest(chunk, chooseClaim, targets);
     world.data.archives.chunks[chunk.manifest.id] = chunk.manifest;
     const compact = await prepareCompaction(world, store);
     let cut;
     const committed = client.archiveAtStepBoundary(world, () => {
       cut = world.data.tick;
-      return { removed: compact(), meals: [[fish, store.summary.lastMeals.get(fish), store.summary.grassMeals.has(fish)]] };
+      return { removed: compact(), meals: Array.from(targets, id => [id, store.summary.lastMeals.get(id), store.summary.grassMeals.has(id)]) };
     });
     assert(world.data.chars.history);
     resume.resolve();

@@ -175,11 +175,7 @@ async function archiveWorld(now = Date.now()) {
       if (!canArchive()) return;
       await putMany(chunks.map(chunk => ['archive:' + chunk.manifest.id, chunk.encoded]), { generation: await saveGeneration });
       if (!isCurrent()) return;
-      for (const [id, cell] of Object.entries(plan.chars)) {
-        for (const event of store.summary.mealSources.get(id)?.events || []) mealTargets.add(event.target);
-        for (const event of cell.path) if (event.reason === 'eat') mealTargets.add(event.target);
-      }
-      for (const chunk of chunks) await store.ingest(chunk, chooseClaim);
+      for (const chunk of chunks) await store.ingest(chunk, chooseClaim, mealTargets);
       target.data.archives ||= emptyArchiveState();
       for (const { manifest } of chunks) target.data.archives.chunks[manifest.id] = manifest;
     }
