@@ -93,7 +93,7 @@ async function main() {
   const report = { count, width, duration, mode: '2D', inputs: [], errors: [], completedSteps: 0, worker: [] };
   const frames = [], draws = [], screens = [], attempts = [];
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
-  browser = await chromium.launch({ headless: true });
+  browser = await chromium.launch({ headless: true, ...(process.env.TIDE_TEST_BROWSER ? { executablePath: process.env.TIDE_TEST_BROWSER } : {}) });
   report.browser = browser.version();
   const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
   page.on('pageerror', error => report.errors.push(error.message));
@@ -164,7 +164,22 @@ async function main() {
         await page.locator('#placeFood').click({ timeout: 10000 });
         report.feed.stage = 'place';
         report.feed.clicked = Date.now();
-        await page.mouse.click(735, Math.round(720 * .27));
+        const position = await page.evaluate(() => {
+          const data = tide.world.data, view = tide.view, blocked = new Set();
+          for (const c of Object.values(data.chars)) {
+            const f = c.kind === 'fish' ? data.fishes[c.entity] : c.kind === 'scene' ? data.scenes[c.entity] : null;
+            if (!f || f.y + c.y !== 0) continue;
+            const x = ((f.x + (c.kind === 'fish' ? f.facing : 1) * c.x) % 1000 + 1000) % 1000;
+            for (let offset = -3; offset <= 3; offset++) blocked.add((x + offset + 1000) % 1000);
+          }
+          const size = 18 * view.scale;
+          for (let offset = 0; offset <= 20; offset++) {
+            const x = (Math.floor(view.camera.x) + offset + 1000) % 1000;
+            if (!blocked.has(x)) return { x: 640 + (offset + .5) * size, y: Math.max(20, Math.min(680, 360 + (.5 - view.camera.y) * size)) };
+          }
+          throw new Error('压测镜头附近暂时没有空闲水面投食位置');
+        });
+        await page.mouse.click(position.x, position.y);
         await page.keyboard.press('Escape');
         if (!report.feed.ok) report.feed.stage = 'awaiting operation';
       } catch (error) { report.feed.failure = error.message; }

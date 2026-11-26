@@ -6,7 +6,7 @@ import { validLegendStory } from './legends.js';
 export const LIFE = Object.freeze({ weatherPeriod: 180000, weatherDuration: 55000, familiar: 45, haunt: 45, reunion: 180000, storyLimit: 512, bondLimit: 4096, planktonLife: 75000 });
 const TYPES = ['quiet', 'social', 'deep', 'curious'];
 const HABITS = { quiet: '喜欢独自慢慢游', social: '喜欢往热闹的地方凑', deep: '喜欢在海底附近闲逛', curious: '喜欢绕着造景探索' };
-const KINDS = new Set(['arrive', 'meal', 'grass', 'friend', 'reunion', 'haunt', 'birth', 'depart', 'revisit', 'rediscover', 'ambient', 'captured', 'cthulhuDepart', 'atomicSurvivor', 'shipMeal']);
+const KINDS = new Set(['arrive', 'meal', 'grass', 'friend', 'reunion', 'haunt', 'birth', 'depart', 'revisit', 'rediscover', 'ambient', 'captured', 'cthulhuDepart', 'atomicSurvivor', 'shipMeal', 'depressed', 'recovered']);
 const hash = text => { let n = 2166136261; for (const c of text) n = Math.imul(n ^ c.codePointAt(0), 16777619); return n >>> 0; };
 const choose = (a, b) => !a ? b : !b ? a : JSON.stringify(a) < JSON.stringify(b) ? a : b;
 const trim = (map, limit, score = r => r.at) => Object.fromEntries(Object.entries(map).sort(([a, x], [b, y]) => score(y) - score(x) || a.localeCompare(b)).slice(0, limit));
@@ -284,6 +284,9 @@ export function storiesFor(data, catalog, actor) {
 }
 export function storyText(story, name) {
   const fish = `「${name(story.fish)}」`, other = story.other ? `「${name(story.other)}」` : '';
+  if (story.kind === 'depressed') return `${fish}因拥挤而抑郁了，每小时会消散一块鱼元，吃到「乐」字鱼食就能康复`;
+  if (story.kind === 'recovered') return `${fish}吃到了「乐」，从抑郁中康复了`;
+  if (story.kind === 'depart' && story.cause) return `${fish}${{ depression: '未能及时吃到「乐」，因抑郁离世', predator: '被食肉鱼捕食了', magma: '碰到了炽热的岩浆' }[story.cause] || '的鱼生结束了'}，记忆还在鱼谱里`;
   if (story.kind === 'captured') return `${fish}被克苏鲁的触须缠住`;
   if (story.kind === 'cthulhuDepart') return `${fish}随克苏鲁沉回了深海`;
   if (story.kind === 'atomicSurvivor') return `${fish} · 哥斯拉原子吐息幸存者`;
@@ -292,6 +295,6 @@ export function storyText(story, name) {
   return { arrive: `${fish}开始了自己的鱼生`, meal: `${fish}第一次吃到了鱼食`, grass: `${fish}第一次吃到了草`, friend: `${fish}和${other}成了熟鱼`, reunion: `${fish}又遇见了熟鱼${other}${hash(`greeting:${story.id}`) % 3 === 0 ? '，它们用自己的暗号打了招呼' : ''}`, haunt: `${fish}有了常去的造景`, birth: `${fish}出生了，海里多了一位小邻居`, depart: `${fish}的鱼生结束了，记忆还在鱼谱里`, revisit: `${fish}来看看常去的地方，发现风景换了`, rediscover: `${fish}又认出了那处造景：原来你搬到这里了` }[story.kind];
 }
 export function returnStory(stories, since) {
-  const rank = { birth: 8, captured: 7, atomicSurvivor: 7, shipMeal: 6, cthulhuDepart: 6, friend: 6, reunion: 5, rediscover: 5, revisit: 4, grass: 4, haunt: 3, ambient: 3, meal: 2, depart: 1, arrive: 0 };
+  const rank = { birth: 8, depressed: 8, recovered: 7, captured: 7, atomicSurvivor: 7, shipMeal: 6, cthulhuDepart: 6, friend: 6, reunion: 5, rediscover: 5, revisit: 4, grass: 4, haunt: 3, ambient: 3, meal: 2, depart: 1, arrive: 0 };
   return stories.filter(r => r.at > since).sort((a, b) => rank[b.kind] - rank[a.kind] || b.at - a.at || a.id.localeCompare(b.id))[0];
 }

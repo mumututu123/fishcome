@@ -56,4 +56,4 @@ export function setParticipantName(world, actor, nick) {
 // These dictionaries are keyed by stable world IDs. Smaller world-level fields
 // (e.g. the current ecology hour) are replaced as a value.
 export const worldTables = new Set(['roots', 'participants', 'fishes', 'chars', 'scenes',
-  'ops', 'breeding', 'contacts', 'travel', 'chats', 'chatSources', 'bubbles']);
+  'ops', 'breeding', 'contacts', 'travel', 'chats', 'chatSources', 'bubbles', 'rocks']);

@@ -10,6 +10,7 @@ import { validTerrain } from './geography.js';
 import { validInitialOp, initialSources } from './genesis.js';
 import { validateLife, validPlankton } from './life.js';
 import { validEcology } from './ecology.js';
+import { validPopulation, validRocks } from './population.js';
 import { validLegends, validGhostCell } from './legends.js';
 import { ARCHIVE_FIELDS, assembleFragments, decodeArchive, mergeArchiveRecord, validArchiveState } from './archive.js';
 import { buildOriginSources, inspectFishOrigin } from './diagnostics.js';
@@ -47,6 +48,7 @@ export async function verifyReplica(data, extra = {}, store, { current = {}, con
   if (data.bubbleMinute !== undefined && (!Number.isInteger(data.bubbleMinute) || data.bubbleMinute < 0 || data.bubbleMinute > Math.floor((Date.now() + 60000) / MINUTE))) throw new Error('气泡生成时钟无效');
   if (data.bubbles !== undefined && (!data.bubbles || typeof data.bubbles !== 'object' || Array.isArray(data.bubbles) || Object.keys(data.bubbles).length > 200000)) throw new Error('气泡记录无效');
   const sources = buildOriginSources(data, extra, current);
+  if (!validPopulation(data.population, { ...sources, fishes: { ...current.fishes, ...extra.fishes, ...data.fishes } }) || !validRocks(data.rocks, sources)) throw new Error('生态控制记录无效');
   // Check branch-local structure here; reconcile the source's final history during merge.
   for (const [id, bubble] of Object.entries(data.bubbles || {})) if (id !== bubble.id || !validBubble(bubble, sources.chars, false) || bubble.born > Date.now() + 60000) throw new Error('气泡缺少合法海草来源');
   await verifyChats(data.chats, store, current, sources.roots);
@@ -75,6 +77,7 @@ export async function verifyReplica(data, extra = {}, store, { current = {}, con
   const sourceGlyphs = new Map();
   for (const [id, c] of Object.entries(data.chars)) {
     if (id !== c.id) throw new Error('鱼元身份重复或被篡改');
+    for (const e of c.path || []) if (['ecoDeath', 'ecoDissolve'].includes(e.reason) && (c.kind !== 'burn' || !['depression', 'predator', 'magma'].includes(e.cause) || e.reason === 'ecoDissolve' && e.cause !== 'depression' || !fishOrigin(sources, e.fish) || !Number.isFinite(e.t) || e.t < fishOrigin(sources, e.fish).created || e.t > Date.now() + 60000 || e.target !== '')) throw new Error('生态消散或死亡记录无效');
     if (c.ecoGraceAt !== undefined && (!Number.isFinite(c.ecoGraceAt) || c.ecoGraceAt < c.created || c.ecoGraceAt > Date.now() + 60000)) throw new Error('海草更替过渡时间无效');
     if ((!c.chat && !validGlyph(c.ch)) || !/^#[0-9a-f]{6}$/i.test(c.color) || !Number.isInteger(c.x) || !Number.isInteger(c.y) || !Array.isArray(c.path) || c.path.length > 1024 || !['fish', 'scene', 'food', 'burn', 'seaweed'].includes(c.kind)) throw new Error('世界鱼元无效');
     const missingOwner = c.kind === 'fish' && !(data.fishes[c.entity] || current.fishes?.[c.entity] || extra.fishes?.[c.entity]);

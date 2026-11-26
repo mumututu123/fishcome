@@ -261,10 +261,11 @@ export class ArchiveStore {
         need('ops', c.id.slice(0, 36));
         if (c.chat) { need('chats', c.chat); need('chatSources', c.chat); need('scenes', c.entity); }
         if (c.kind === 'fish') need('fishes', c.entity);
-        for (const e of c.path) if (e.birth) need('breeding', e.birth);
+        for (const e of c.path) { if (e.birth) need('breeding', e.birth); if (['ecoDeath', 'ecoDissolve'].includes(e.reason)) fish(e.fish); }
         if (c.wild?.source?.startsWith('cell:')) { need('chars', c.wild.source.slice(5)); need('ops', c.wild.source.slice(5, 41)); }
       }
       for (const id of Object.keys(data.fishes || {})) fish(id);
+      for (const id of Object.keys(data.population?.illnesses || {})) fish(id);
       for (const r of Object.values(data.contacts || {})) { fish(r.male); fish(r.female); }
       for (const bubble of Object.values(data.bubbles || {})) need('chars', bubble.source);
       for (const r of Object.values(data.breeding || {})) { fish(r.male); fish(r.female); }

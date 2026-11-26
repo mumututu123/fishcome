@@ -23,6 +23,7 @@ import { weatherAt, fishLifeText, storiesFor, storyText, returnStory } from './l
 import { memoryForCell, ancestralGlyph, ancestralText } from './easter-eggs.js';
 import { activeEvent, eventSchedule, eventTitle, eventPosition, eventLetter, radioTranscript, eventNarration } from './random-events.js';
 import { activeLegend, legendSchedule, legendTitle, legendPosition, capturedFish } from './legends.js';
+import { POPULATION, illnessOf } from './population.js';
 import { ARCHIVE, ARCHIVE_FIELDS, ArchiveStore, archivePlanAsync, reachesArchiveThreshold, archiveChunks, emptyArchiveState, mergeArchiveState, compactKnown } from './archive.js';
 import { WORLD_RULES, rulesCompatible } from './rules.js';
 import { assetPlatformLabel, classifyPeerCompatibility, detectUpdateSource, formatUpdateBytes, normalizeAssetSuffix, pickHigherVersionPeers } from './update.js';
@@ -247,7 +248,7 @@ async function resumeWorld(now) {
       archiveStore = newArchiveStore(); world.attachArchives(archiveStore); olderChats = {}; acceptHistory(card);
       chatLimit = 80; renderChat();
       pictures.latest = null; pending.clear(); inbox.clear(); selected = null; trackedFish = null; renderer.selected = null; renderer.observedFish = null; $('inspector').hidden = true; cancelMode();
-    } else { world.resolveLegends(now); world.data.tick = now; }
+    } else { world.resolveLegends(now); world.resolvePopulation(now); world.data.tick = now; }
     members.clear(); members.set(network.node, member()); lastHello.clear(); lastLeader = ''; worldBroadcast.reset(); lastPictureTime = 0;
   }
   lastOnlineAt = Math.max(lastOnlineAt, now);
@@ -443,7 +444,8 @@ function renderMyFishes() {
       breeding.className = 'fishBreeding'; body.append(title, gender, health, breeding, info, metrics); card.append(canvas, body); card.onclick = () => { $('myFishDialog').close(); focusFish(fish.id); }; myFishCards.set(fish.id, { card, canvas, title, gender, health, breeding, info, metrics });
     }
     const entry = myFishCards.get(fish.id), cells = groups.get(fish.id) || [], status = world.fishStatus(fish.id, now);
-    entry.title.textContent = displayFishName(catalog.get(fish.id), identity); renderFishGender(entry.gender, fish); entry.health.textContent = status.hungry ? '饥饿' : '未饥饿'; entry.health.classList.toggle('hungry', status.hungry);
+    const illness = illnessOf(world.data, fish.id);
+    entry.title.textContent = displayFishName(catalog.get(fish.id), identity); renderFishGender(entry.gender, fish); entry.health.textContent = illness ? `抑郁 · 约${Math.max(0, ((illness.nextLossAt ?? illness.at + POPULATION.dissolveEvery) - now) / 60000).toFixed(0)}分钟后消散1字 · 需「乐」` : status.hungry ? '饥饿' : '未饥饿'; entry.health.classList.toggle('hungry', !!illness || status.hungry);
     renderBreeding(entry.breeding, fish, now);
     entry.info.textContent = `${identity.nick} · ${shortFishId(fish.id)} · ${cells.length} 鱼元 · ${fish.birth ? '自然出生于' : '创建于'} ${fishDate.format(fish.created)}`;
     entry.metrics.textContent = `${fishLifeText(world.data, fish.id, now).habit} · 今日运动 ${status.trackedSince === undefined ? '待同步' : status.movement.toFixed(1) + ' 格'} · 近24小时进食 ${status.meals24} 颗`;
@@ -478,6 +480,13 @@ function renderPedigree(catalog) {
 function inspect(hit, show = true) {
   if (show || trackedFish && (hit.kind !== 'fish' || hit.id !== trackedFish)) trackedFish = null;
   selected = hit; if (hit.kind === 'monument') { renderer.observedFish = null; renderer.selected = null; $('inspector').hidden = true; historyDialog(); selected = null; return; }
+  if (hit.kind === 'ecosystem') {
+    renderer.observedFish = renderer.selected = null; $('fishDetails').hidden = $('chatMemory').hidden = $('sceneActions').hidden = true; $('eventDetails').hidden = false;
+    $('objectTitle').textContent = { predator: '海洋食肉鱼', volcano: '海底火山', rock: '冷却的火山岩' }[hit.id];
+    $('objectInfo').textContent = '自然生态 · 无需鱼元';
+    $('eventText').textContent = hit.id === 'predator' ? '鱼群超过200条时出现，最多4条。优先追逐视野内的患病鱼，只捕食不超过8字且出生已满两小时的鱼；造景可阻挡，每条至少30分钟吃一次，全海至少间隔10分钟。' : hit.id === 'volcano' ? '喷发前预警30秒，最多喷出32个红色「浆」。岩浆先上升再慢慢落下，真实碰到的鱼会死亡；每个字出生10分钟后冷却为灰色「岩」。远离喷口与落点。' : '「浆」冷却成「岩」，堆积在海底形成新的障碍与地貌。天然岩石不能搬动或删除，全海最多保留2000块。';
+    $('objectFootnote').textContent = '自然生态随存档与联机保存。'; if (show) $('inspector').hidden = false; return;
+  }
   if (hit.kind === 'legend') {
     const record = world.data.legends?.events[hit.id], schedule = record && legendSchedule(world.data.roots, record.seed, record.slot); if (!schedule) { stopObserving(); return; }
     const seconds = Math.max(0, Math.ceil((schedule.ends - Date.now()) / 1000));
@@ -531,6 +540,8 @@ function inspect(hit, show = true) {
     $('fishTrackingNote').textContent = !travel ? '运动记录尚未同步。' : status.partialMovement ? `旧版运动量未记录，从 ${fishDate.format(status.trackedSince)} 起累计。` : '';
     const rows = []; for (let index = 0; index < 7; index++) { const day = shanghaiDay(now - index * DAY), row = document.createElement('p'); row.textContent = `${day} · ${travel && day >= shanghaiDay(travel.since) ? (travel.days[day] || 0).toFixed(1) + ' 格' : '未记录'}`; rows.push(row); } $('fishDailyRows').replaceChildren(...rows);
     $('objectFootnote').textContent = `连续 24 小时未进食即饥饿。距下一次饥饿退化约 ${Math.max(0, (object.hungerAt - now) / 3600000).toFixed(1)} 小时。`; $('sceneActions').hidden = true; renderer.selected = null;
+    const illness = illnessOf(world.data, hit.id);
+    if (illness) { $('fishHunger').textContent = '抑郁'; $('fishHunger').classList.add('hungry'); $('objectFootnote').textContent = `拥挤导致抑郁，每小时随机消散一块鱼元，约 ${Math.max(0, Math.ceil(((illness.nextLossAt ?? illness.at + POPULATION.dissolveEvery) - now) / 60000))} 分钟后发生下一次。消散的字不会变成鱼食；鱼身不足两个相连鱼元时自然结束。存活期间吃到「${POPULATION.remedy}」字鱼食即可康复，普通食物不能治愈。治愈后24小时内不再患病；进食仍遵守60分钟间隔。`; }
   }
   else { const fixed = hit.id === CHAT_FLOOR; $('objectInfo').textContent = `${cells.length} 鱼元 · 八方向地形 · ${fixed ? '海底聊天记忆' : '共享摆放'}`; $('objectFootnote').textContent = fixed ? '旧世界聊天已固化在海底，不能编辑、搬动或删除。' : '移除、缩小不返鱼元；放大产生的新鱼元需要支付配额。'; $('sceneActions').hidden = fixed; renderer.selected = hit.id; }
   if (show) $('inspector').hidden = false;
@@ -543,8 +554,10 @@ function renderLife() {
   if (!identity) return;
   $('weatherLabel').textContent = weatherAt(world.data, Date.now()).label;
   const myth = activeLegend(world.data, Date.now()), occasion = activeEvent(world.data, Date.now());
-  $('ambientPeek').hidden = !myth && !occasion || !!selected || !!mode || !!document.querySelector('dialog[open]');
-  if (myth) $('ambientPeek').textContent = `${Date.now() - myth.started < 20000 && myth.kind !== 'ship' ? '海床传来异动' : legendTitle(myth.kind)} · 看看 ›`;
+  const eruption = world.data.population?.eruption, volcanic = eruption && (Date.now() < eruption.at + POPULATION.warning || Object.keys(eruption.particles).length);
+  $('ambientPeek').hidden = !myth && !occasion && !volcanic || !!selected || !!mode || !!document.querySelector('dialog[open]');
+  if (volcanic) $('ambientPeek').textContent = `${Date.now() < eruption.at + POPULATION.warning ? '海底火山即将喷发' : '火山岩浆正在冷却'} · 看看 ›`;
+  else if (myth) $('ambientPeek').textContent = `${Date.now() - myth.started < 20000 && myth.kind !== 'ship' ? '海床传来异动' : legendTitle(myth.kind)} · 看看 ›`;
   else if (occasion) $('ambientPeek').textContent = `${eventTitle(occasion.kind)} · 看看 ›`;
   const stories = storiesFor(world.data, { get: id => world.fishOrigin(id) }, identity.actor);
   const latest = returnStory(stories, lifeSince);
@@ -841,6 +854,8 @@ async function tick() {
 }
 $('lifePeek').onclick = lifeDialog;
 $('ambientPeek').onclick = () => {
+  const eruption = world.data.population?.eruption;
+  if (eruption && (Date.now() < eruption.at + POPULATION.warning || Object.keys(eruption.particles).length)) { cancelMode(); stopObserving(); renderer.camera.x = eruption.x; renderer.camera.y = world.floorAt(eruption.x) - 10; inspect({ kind: 'ecosystem', id: 'volcano' }); update(); return; }
   const myth = activeLegend(world.data, Date.now()); if (myth) { cancelMode(); stopObserving(); const p = legendPosition(world.data.roots, myth, Date.now()); renderer.camera.x = p.x; renderer.camera.y = myth.kind === 'ship' ? 5 : Math.max(0, world.floorAt(p.x) - 13); inspect({ kind: 'legend', id: myth.id }); update(); return; }
   const event = activeEvent(world.data, Date.now()); if (!event) return;
   cancelMode(); stopObserving(); const p = eventPosition(event, Date.now());
