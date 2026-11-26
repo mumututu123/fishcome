@@ -7,7 +7,16 @@ const path = require('node:path');
 const { chromium } = require(process.env.TIDE_TEST_MODULES ? path.join(process.env.TIDE_TEST_MODULES, 'playwright') : 'playwright');
 const { assetName, availablePort, waitForHealth, postLocal, printVersion, withReleaseFixtures } = require('./release-fixtures.cjs');
 
-async function verifyBrowserPeerUpdate(startLauncher, v1, v2, { legacyCheckpoint = false } = {}) {
+function assertUpdateRules(installed, source, { allowRuleUpgrade = false } = {}) {
+  assert(installed.rulesVersion && installed.rules, '当前启动器 /health 必须返回联机规则版本');
+  assert(source.rulesVersion && source.rules, '来源启动器 /health 必须返回联机规则版本');
+  if (!allowRuleUpgrade) {
+    assert.equal(installed.rulesVersion, source.rulesVersion, '启动器联机规则版本必须与更新来源一致');
+    assert.deepEqual(installed.rules, source.rules, '启动器完整联机规则必须与更新来源一致');
+  }
+}
+
+async function verifyBrowserPeerUpdate(startLauncher, v1, v2, { legacyCheckpoint = false, allowRuleUpgrade = false } = {}) {
   // 写入 node-a 自己的 join.json，验证热更新后不被覆盖
   const preservedInvite = 'http://127.0.0.1:39999';
   const nodeAJoinPath = path.join(v1.dir, 'join.json');
@@ -20,10 +29,9 @@ async function verifyBrowserPeerUpdate(startLauncher, v1, v2, { legacyCheckpoint
 
   const healthA = await waitForHealth(portA, '0.1.1');
   const healthB = await waitForHealth(portB, '0.2.0');
-  assert(healthA.rulesVersion && healthA.rules, '/health 必须返回联机规则版本');
-  if (legacyCheckpoint) {
-    assert.notEqual(healthA.rulesVersion, healthB.rulesVersion, '旧版迁移应覆盖不同的联机规则');
-  } else assert.equal(healthA.rulesVersion, healthB.rulesVersion);
+  // Historical launchers retain their original rules. Compatibility must
+  // converge after the upgrade, rather than blocking the migration before it.
+  assertUpdateRules(healthA, healthB, { allowRuleUpgrade });
 
   const metaB = await (await fetch(`http://127.0.0.1:${portB}/local/meta`)).json();
   const statusB = await (await fetch(`http://127.0.0.1:${portB}/status`)).json();
@@ -142,9 +150,6 @@ async function verifyBrowserPeerUpdate(startLauncher, v1, v2, { legacyCheckpoint
     await page.locator('#forceApplyUpdateBtn').click();
     await navPromise;
     await page.waitForFunction(() => window.tide && document.getElementById('currentVersion')?.textContent?.includes('0.2.0'), undefined, { timeout: 15000 });
-    const upgraded = await waitForHealth(portA, '0.2.0');
-    assert.equal(upgraded.rulesVersion, healthB.rulesVersion, '更新后应采用目标版本的联机规则');
-    assert.deepEqual(upgraded.rules, healthB.rules);
     assert.equal(await page.evaluate(() => tide.balance()), 18, '更新重启后余额必须保持 18');
     const texts = await page.evaluate(() => Object.values(tide.world.data.chats).map(record => record.body.text));
     for (const text of expectedChats) assert(texts.includes(text), `热更新后遗失聊天：${text}`);
@@ -195,7 +200,8 @@ async function verifyBrowserPeerUpdate(startLauncher, v1, v2, { legacyCheckpoint
     await browser.close();
   }
 
-  await waitForHealth(portA, '0.2.0');
+  const updatedHealth = await waitForHealth(portA, '0.2.0');
+  assertUpdateRules(updatedHealth, healthB);
   assert.equal(printVersion(v1.exe).version, '0.2.0', '原目录的启动器必须被原地替换为 0.2.0');
   assert.deepEqual(fs.readFileSync(nodeAJoinPath), joinBefore, '更新不得覆盖本机的 join.json');
   return { portA, portB, metaB };
@@ -314,4 +320,4 @@ if (require.main === module) {
     });
 }
 
-module.exports = { verifyBrowserPeerUpdate };
+module.exports = { verifyBrowserPeerUpdate, assertUpdateRules };
