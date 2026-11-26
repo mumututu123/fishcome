@@ -27,6 +27,14 @@ test('空归档保持后台模拟，有记录时继续归档和整理', async t 
     const fixture = `
       window.archiveFixture = () => ({
         world, archiveStore,
+        holdArchiveSave() {
+          const original = save;
+          let entered, release;
+          const saving = new Promise(resolve => { entered = resolve; });
+          const hold = new Promise(resolve => { release = resolve; });
+          save = async () => { save = original; entered(); await hold; return original(); };
+          return { saving, release };
+        },
         async earn(serial, t) {
           const id = identity.actor + ':hour:' + serial;
           const op = { id, actor: identity.actor, nick: identity.nick, roots: world.roots, kind: 'earn', t, cost: 0, serial };
@@ -79,19 +87,35 @@ test('空归档保持后台模拟，有记录时继续归档和整理', async t 
       chunks: Object.keys(saved.world.archives.chunks).length };
   }, archiveId);
   assert.deepEqual(compacted, { live: false, saved: false, chunks: 1 });
+  await page.waitForFunction(tick => archiveFixture().world.data.tick > tick, await page.evaluate(() => archiveFixture().world.data.tick));
+  assert.equal(workers, workersBefore, '清理已有归档的热副本应保留模拟线程');
 
-  const archived = await page.evaluate(async () => {
-    const { world, archiveStore, earn, scan } = archiveFixture();
+  await page.evaluate(async () => {
+    const { world, earn, scan, holdArchiveSave } = archiveFixture();
     const { ARCHIVE } = await import('./archive.js');
-    const { get } = await import('./storage.js');
     const op = await earn(2, Date.now() - 2 * ARCHIVE.period);
     world.data.ops[op.id] = op;
-    await scan();
+    const { saving, release } = holdArchiveSave();
+    window.finishArchive = { scan: scan(), release, id: op.id };
+    await saving;
+    window.positionsAtSave = Object.values(world.data.fishes).map(f => [f.id, f.x, f.y]);
+  });
+  await page.waitForFunction(() => positionsAtSave.some(([id, x, y]) => {
+    const fish = archiveFixture().world.data.fishes[id];
+    return fish && (fish.x !== x || fish.y !== y);
+  }), null, { timeout: 8000 });
+  const archived = await page.evaluate(async () => {
+    const { world, archiveStore } = archiveFixture();
+    const { get } = await import('./storage.js');
+    const { release, scan, id } = finishArchive;
+    release();
+    await scan;
     const saved = await get('checkpoint', { observeCheckpoint: false });
-    const chunk = archiveStore.ids.ops.get(op.id);
-    return { live: Object.hasOwn(world.data.ops, op.id), saved: Object.hasOwn(saved.world.ops, op.id),
+    const chunk = archiveStore.ids.ops.get(id);
+    return { live: Object.hasOwn(world.data.ops, id), saved: Object.hasOwn(saved.world.ops, id),
       chunks: Object.keys(saved.world.archives.chunks).length, stored: !!(await get('archive:' + chunk)) };
   });
   assert.deepEqual(archived, { live: false, saved: false, chunks: 2, stored: true });
+  assert.equal(workers, workersBefore, '写入非空归档期间继续使用同一模拟线程');
   assert.deepEqual(errors, []);
 });
