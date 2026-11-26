@@ -4,7 +4,7 @@ import { CONFIG, World, chooseClaim } from '../www/engine.js';
 import { ARCHIVE_FIELDS, ArchiveStore, encodeArchive, prepareCompaction } from '../www/archive.js';
 import { SimulationClient, subscribeSimulationChanges } from '../www/simulation-client.js';
 import { WorkerSimulation } from '../www/simulation-worker.js';
-import { applyInputRows, setParticipantName } from '../www/simulation-changes.js';
+import { applyInputRows, setParticipantName, worldEdited } from '../www/simulation-changes.js';
 import { CONTACT_TIME, updateContacts } from '../www/breeding.js';
 
 const start = Date.UTC(2025, 5, 15, 12, 17);
@@ -65,6 +65,50 @@ test('追赶中在第一步交接真实归档，保留鱼的最后一餐并清�
       assert(copy.archives.summary.grassMeals.has(fish));
     }
     assert.equal(await store.get('chars', 'history').then(c => c.path[0].target), fish);
+  } finally { resume.resolve(); client.close(); }
+});
+
+test('本地归档等待期间远端接手同一餐，下一步清除线程刚读到的旧进食记录', async () => {
+  const world = new World(start, root, { populate: false, ambient: false });
+  const worker = new WorkerSimulation(), client = new SimulationClient(() => localWorker(undefined, worker));
+  const reading = Promise.withResolvers(), resume = Promise.withResolvers();
+  async function meal(target, t) {
+    const records = Object.fromEntries(ARCHIVE_FIELDS.map(field => [field, {}]));
+    records.chars.history = { id: 'history', kind: 'burn', wild: { source: 'floor:1' }, path: [{ reason: 'eat', target, t }] };
+    return encodeArchive(records, world.data.roots);
+  }
+  const initial = await meal('A', start - 1), remote = await meal('B', start - 2), local = await meal('C', start - 3);
+  const store = new ArchiveStore({ load: async () => {
+    store.load = () => initial.encoded;
+    reading.resolve();
+    await resume.promise;
+    return initial.encoded;
+  } });
+  world.attachArchives(store);
+  try {
+    await store.ingest(initial, chooseClaim);
+    await client.advance(world, start + CONFIG.step);
+    store.cache.clear();
+    store.packs.clear();
+    world.data.chars.history = local.raw.records.chars.history;
+    const targets = new Set();
+    const pending = store.ingest(local, chooseClaim, targets);
+    await reading.promise;
+    await store.ingest(remote, chooseClaim);
+    worldEdited(world);
+    await client.advance(world, start + 2 * CONFIG.step);
+    assert.deepEqual([...worker.archive.summary.grassMeals], ['B']);
+    resume.resolve();
+    await pending;
+    const compact = await prepareCompaction(world, store);
+    await client.archiveAtStepBoundary(world, () => ({
+      removed: compact(), meals: Array.from(targets, id => [id, store.summary.lastMeals.get(id), store.summary.grassMeals.has(id)])
+    }));
+    await client.advance(world, start + 3 * CONFIG.step);
+    for (const summary of [store.summary, worker.archive.summary]) {
+      assert.deepEqual([...summary.grassMeals], ['C']);
+      assert.deepEqual([...summary.lastMeals], [['C', start - 3]]);
+    }
   } finally { resume.resolve(); client.close(); }
 });
 
