@@ -73,7 +73,7 @@ class PictureState {
 }
 
 function sameMetadata(old, next) {
-  return old?.id === next.id && old.roots.length === next.roots.length && next.roots.every(root => old.roots.includes(root)) &&
+  return old?.id === next.id && Array.isArray(old.roots) && old.roots.length === next.roots.length && next.roots.every(root => old.roots.includes(root)) &&
     old.participants === next.participants && Object.keys(next.counts).every(key => old.counts?.[key] === next.counts[key]);
 }
 
@@ -81,6 +81,9 @@ export class CheckpointPictures {
   constructor(getWorld, render) {
     this.getWorld = getWorld;
     this.render = render;
+  }
+  reuse(picture) {
+    if (typeof picture.image === 'string' && /^data:image\/(webp|png);base64,/.test(picture.image)) this.latest = picture;
   }
   beforePatch(world, patch) {
     if (this.state?.world === world) this.state.beforePatch(patch.tables);

@@ -116,3 +116,19 @@ test('合影编码期间投食会重拍，昵称更新只需刷新元数据', as
   pictures.changed(world, { tables: { participants: {} } }, 'input');
   assert.equal(pictures.atCut(prepared).participants, 2);
 });
+
+test('恢复时可以保留同一片海的存档合影，资料变更或缺图时重新生成', async () => {
+  const world = makeWorld('A');
+  const image = 'data:image/webp;base64,AAA=';
+  const take = async saved => {
+    const pictures = new CheckpointPictures(() => world, async () => 'new image');
+    pictures.reuse(saved);
+    return pictures.atCut(await pictures.prepare());
+  };
+  const saved = { id: 'A', roots: ['A'], image, at: 1, counts: world.counts(), participants: 1 };
+  assert.deepEqual(await take(saved), saved);
+  assert.equal((await take({ ...saved, roots: ['B'] })).image, 'new image');
+  assert.equal((await take({ ...saved, roots: null })).image, 'new image');
+  assert.equal((await take({ ...saved, counts: { ...saved.counts, fish: 10 } })).image, 'new image');
+  assert.equal((await take({ ...saved, image: '' })).image, 'new image');
+});
