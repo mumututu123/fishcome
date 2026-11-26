@@ -136,15 +136,30 @@ export function lifeContext(world, now, scenery, groups) {
 export function updateLife(world, now, context) {
   const life = state(world, now), elapsed = now - life.at;
   if (elapsed < 1000 && elapsed >= 0) return;
-  const dt = elapsed > 0 && elapsed <= 2500 ? Math.min(1, elapsed / 1000) : 0, pairs = new Set();
+  const dt = elapsed > 0 && elapsed <= 2500 ? Math.min(1, elapsed / 1000) : 0;
+  const updated = new Set();
+  let fresh = {}, freshCount = 0, lastKey;
   for (const [id, others] of context.neighbors) for (const other of others) {
-    const key = pairKey(id, other.id); if (pairs.has(key)) continue; pairs.add(key);
-    const [a, b] = [id, other.id].sort(), old = life.bonds[key], continuous = old && now - old.lastNear <= 2500;
+    const a = id < other.id ? id : other.id, b = id < other.id ? other.id : id;
+    const key = a + '|' + b, old = life.bonds[key];
+    if (old ? updated.has(key) : fresh[key] || lastKey && key.localeCompare(lastKey) > 0) continue;
+    const continuous = old && now - old.lastNear <= 2500;
     const seconds = Math.min(3600, (old?.seconds || 0) + dt);
     if ((old?.seconds || 0) < LIFE.familiar && seconds >= LIFE.familiar) recordStory(world, 'friend', a, now, { other: b });
     if (dt > 0 && old?.seconds >= LIFE.familiar && now - old.lastNear >= LIFE.reunion) recordStory(world, 'reunion', a, now, { other: b });
-    life.bonds[key] = { a, b, seconds, at: now, lastNear: now, run: continuous ? Math.min(120, old.run + dt) : 0 };
+    const bond = { a, b, seconds, at: now, lastNear: now, run: continuous ? Math.min(120, old.run + dt) : 0 };
+    if (old) { life.bonds[key] = bond; updated.add(key); continue; }
+    fresh[key] = bond;
+    // New contacts all have the same timestamp and at most one second of
+    // familiarity. Only the first bondLimit keys can survive the final trim.
+    if (++freshCount === LIFE.bondLimit * 2) {
+      const keys = Object.keys(fresh).sort((x, y) => x.localeCompare(y)).slice(0, LIFE.bondLimit);
+      lastKey = keys.at(-1);
+      fresh = Object.fromEntries(keys.map(key => [key, fresh[key]]));
+      freshCount = keys.length;
+    }
   }
+  Object.assign(life.bonds, fresh);
   for (const [id, spot] of context.scenes) {
     if (distance(context.points.get(id), spot) > 7) continue;
     const old = life.places[id], seconds = Math.min(3600, (old?.scene === spot.id ? old.seconds : 0) + dt);

@@ -1,10 +1,14 @@
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
+const { execFileSync } = require('node:child_process');
 const assert = require('node:assert/strict');
 const { chromium } = require(process.env.TIDE_TEST_MODULES ? path.join(process.env.TIDE_TEST_MODULES, 'playwright') : 'playwright');
 
 const www = path.resolve(__dirname, '../www');
+const oldArg = process.argv.find(value => value.startsWith('--legacy-ref='));
+const oldCommit = oldArg && execFileSync('git', ['rev-parse', '--verify', oldArg.slice('--legacy-ref='.length) + '^{commit}'], { cwd: path.dirname(www), encoding: 'utf8' }).trim();
+if (oldCommit) assert(/^[0-9a-f]{40}$/.test(oldCommit));
 let origin, browser;
 const server = http.createServer((request, response) => {
   const route = new URL(request.url, origin).pathname;
@@ -14,22 +18,280 @@ const server = http.createServer((request, response) => {
     response.end(JSON.stringify(route === '/local/meta' ? { token: 'test', url: origin } : { ok: true, clients: [], hints: [] }));
     return;
   }
-  const file = path.join(www, route === '/' ? 'index.html' : route.slice(1));
+  const legacy = oldCommit && route.startsWith('/legacy/');
+  const asset = legacy ? route.slice('/legacy/'.length) || 'index.html' : route.slice(1) || 'index.html';
+  const file = path.join(www, asset);
   if (!file.startsWith(www + path.sep) || !fs.existsSync(file)) { response.writeHead(404).end(); return; }
   const types = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml' };
   response.setHeader('Content-Type', types[path.extname(file)] || 'application/octet-stream');
-  response.end(fs.readFileSync(file));
+  if (legacy) {
+    try { response.end(execFileSync('git', ['show', oldCommit + ':www/' + asset], { cwd: path.dirname(www) })); }
+    catch { response.writeHead(404).end(); }
+  } else response.end(fs.readFileSync(file));
 });
+
+async function exercisePages(page, count) {
+  await page.goto(origin + '/welcome.html');
+  const result = await page.evaluate(async count => {
+    const { database, get, putMany, replaceFromBackup } = await import('./storage.js');
+    const { noteCheckpointChanges } = await import('./checkpoint-pages.js');
+    const db = await database();
+    const legacy = { world: { tick: 1, breeding: { old: { status: 'born' } } } };
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction('items', 'readwrite');
+      tx.objectStore('items').put(legacy, 'checkpoint');
+      tx.oncomplete = resolve; tx.onerror = () => reject(tx.error);
+    });
+    if ((await get('checkpoint')).world.breeding.old.status !== 'born') throw new Error('无法读取旧版存档');
+
+    const start = 1735689600000;
+    const record = i => ({ id: 'r' + i, status: 'cancelled', male: 'm' + i, female: 'f' + i, started: start + i, at: start + i + 500, reason: 'parent-gone' });
+    const world = { tick: 2, breeding: {} };
+    for (let i = 0; i < count; i++) world.breeding['r' + i] = record(i);
+    const save = () => putMany(() => [['known', [world.tick]], ['checkpoint', { at: world.tick, world }]], { simulationChanges: true });
+    let pageWrites = 0, recordWrites = 0;
+    const originalPut = IDBObjectStore.prototype.put;
+    IDBObjectStore.prototype.put = function(value, key) {
+      if (Array.isArray(key) && key[0] === 'checkpoint-page') { pageWrites++; recordWrites += value.length; }
+      return originalPut.call(this, value, key);
+    };
+    const measure = async () => {
+      pageWrites = recordWrites = 0;
+      const frameTimes = [];
+      let previous = await new Promise(requestAnimationFrame), frame;
+      const observe = now => {
+        frameTimes.push(now - previous);
+        previous = now;
+        frame = requestAnimationFrame(observe);
+      };
+      frame = requestAnimationFrame(observe);
+      const t = performance.now();
+      let ms;
+      try {
+        await save();
+        ms = performance.now() - t;
+        await new Promise(requestAnimationFrame);
+      } finally { cancelAnimationFrame(frame); }
+      return { ms, pageWrites, recordWrites, frames: frameTimes.length,
+        maxFrameMs: Math.max(...frameTimes), framesOver50: frameTimes.filter(time => time > 50).length };
+    };
+    try {
+      const initial = await measure();
+      if (initial.recordWrites !== count) throw new Error('首次保存记录数不符');
+      const mid = Math.floor(count / 2);
+      world.tick++;
+      world.breeding['r' + mid].reason = 'conflicting-pair';
+      delete world.breeding.r0;
+      world.breeding['r' + count] = record(count);
+      noteCheckpointChanges(world, { tables: { breeding: { set: [['r' + mid, world.breeding['r' + mid]], ['r' + count, world.breeding['r' + count]]], remove: ['r0'] } } });
+      const changed = await measure();
+      const idle = await measure();
+      if (changed.pageWrites !== 3 || changed.recordWrites > 768 || idle.pageWrites !== 0) throw new Error('少量更新或空闲保存重写了无关记录页');
+
+      const t = performance.now();
+      const saved = await get('checkpoint'), recoveryMs = performance.now() - t;
+      if (saved.at !== 3 || saved.world.tick !== 3 || (await get('known'))[0] !== 3 || Object.hasOwn(saved.world.breeding, 'r0')) throw new Error('恢复版本或删除状态不一致');
+      let n = 0;
+      for (const id in saved.world.breeding) {
+        n++;
+        const row = saved.world.breeding[id];
+        if (id !== 'r' + n || row.id !== id || row.male !== 'm' + n || row.female !== 'f' + n || row.status !== 'cancelled' ||
+            row.started !== start + n || row.at !== start + n + 500 || row.reason !== (n === mid ? 'conflicting-pair' : 'parent-gone')) throw new Error('恢复内容或顺序错误 ' + id);
+      }
+      if (n !== count) throw new Error('恢复记录数量不符');
+      // Foreground/import paths may mutate a row in place without sending individual record IDs.
+      world.breeding.r1.reason = 'corrected';
+      noteCheckpointChanges(world, null);
+      const scanned = await measure();
+      if (scanned.pageWrites !== 1 || scanned.recordWrites >= count) throw new Error('前台修改重写了无关记录页');
+      if (count <= 2048) {
+        if ((await get('checkpoint')).world.breeding.r1.reason !== 'corrected') throw new Error('前台修改未保存');
+        const previous = world.tick;
+        world.tick++;
+        world.breeding.r1.reason = () => {};
+        noteCheckpointChanges(world, { tables: { breeding: { set: [['r1', world.breeding.r1]], remove: [] } } });
+        let failure;
+        try { await save(); } catch (error) { failure = error.name; }
+        if (failure !== 'DataCloneError' || (await get('known'))[0] !== previous || (await get('checkpoint')).at !== previous) throw new Error('失败写入未整笔回滚');
+        world.breeding.r1.reason = 'retry';
+        await save();
+        if ((await get('checkpoint')).world.breeding.r1.reason !== 'retry') throw new Error('写入失败后的重试丢失改动');
+        try { await replaceFromBackup([['known', () => {}]]); } catch (error) { if (error.name !== 'DataCloneError') throw error; }
+        await replaceFromBackup([['checkpoint', { world: { fishes: { only: { x: 1 } } } }]]);
+        let obsoleteWrite;
+        try { await save(); } catch (error) { obsoleteWrite = error.message; }
+        if (!obsoleteWrite) throw new Error('导入完成后旧页面仍能覆盖新存档');
+        const imported = await get('checkpoint');
+        if (imported.world.breeding || Object.keys(imported.world.fishes).join() !== 'only') throw new Error('导入后残留上一个世界的数据');
+      }
+      return { count, chromium: navigator.userAgent, initial, changed, idle, scanned, recoveryMs };
+    } finally { IDBObjectStore.prototype.put = originalPut; }
+  }, count);
+  if (count > 2048) {
+    await page.reload();
+    result.coldRecoveryMs = await page.evaluate(async count => {
+      const { get } = await import('./storage.js');
+      const start = performance.now(), saved = await get('checkpoint'), elapsed = performance.now() - start;
+      const rows = saved.world.breeding;
+      if (Object.keys(rows).length !== count || rows.r1.reason !== 'corrected' || rows['r' + count].id !== 'r' + count || rows.r0) throw new Error('新页面恢复失败');
+      return elapsed;
+    }, count);
+  }
+  return result;
+}
+
+async function concurrentCheckpoints(context) {
+  const writer = await context.newPage(), other = await context.newPage();
+  await Promise.all([writer.goto(origin + '/welcome.html'), other.goto(origin + '/welcome.html')]);
+  const snapshot = await writer.evaluate(async () => {
+    const { putMany } = await import('./storage.js');
+    const { beforeCheckpointPatch, noteCheckpointChanges } = await import('./checkpoint-pages.js');
+    const world = { tick: 1, fishes: {} };
+    for (let i = 0; i < 16384; i++) world.fishes['f' + i] = { x: i };
+    const save = (captureCheckpoint = true) => putMany(() => [['known', ['local']], ['checkpoint', { world, at: world.tick }]], { simulationChanges: true, captureCheckpoint });
+    const original = IDBObjectStore.prototype.put;
+    let edited = false;
+    IDBObjectStore.prototype.put = function(value, key) {
+      if (!edited && Array.isArray(key)) {
+        edited = true;
+        queueMicrotask(() => {
+          const patch = { tables: { fishes: { set: [['f12000', { x: -3 }], ['new', { x: -1 }]], remove: ['f15000'] } } };
+          beforeCheckpointPatch(world, patch);
+          delete world.fishes.f15000;
+          for (const [id, row] of patch.tables.fishes.set) world.fishes[id] = row;
+          world.tick++;
+          noteCheckpointChanges(world, patch);
+        });
+      }
+      return original.call(this, value, key);
+    };
+    try {
+      const before = await save(), after = await save();
+      window.persistWorld = save;
+      return [before.at, before.world.fishes.f12000.x, before.world.fishes.f15000.x, !!before.world.fishes.new,
+        after.at, after.world.fishes.f12000.x, !!after.world.fishes.f15000, after.world.fishes.new.x];
+    } finally { IDBObjectStore.prototype.put = original; }
+  });
+  assert.deepEqual(snapshot, [1, 12000, 15000, false, 2, -3, false, -1]);
+  await other.evaluate(async () => {
+    const { putMany } = await import('./storage.js');
+    await putMany([['known', ['newer']], ['checkpoint', { at: 12, world: { tick: 12, fishes: { alien: { x: 9 } }, scenes: { scene: {} } } }]]);
+  });
+  const conflicts = await writer.evaluate(async () => {
+    const errors = [];
+    for (let i = 0; i < 2; i++) try { await window.persistWorld(false); } catch (error) { errors.push(error.message); }
+    return errors;
+  });
+  assert.equal(conflicts.length, 2);
+  assert(conflicts.every(message => message.includes('另一个页面已保存更新')));
+  const replica = await writer.evaluate(async () => {
+    const local = await window.persistWorld(true);
+    return [local.at, Object.keys(local.world.fishes).length, local.world.fishes.new.x, !!local.world.fishes.alien];
+  });
+  assert.deepEqual(replica, [2, 16384, -1, false]);
+  const restored = await other.evaluate(async () => {
+    const { get } = await import('./storage.js'), { world } = await get('checkpoint');
+    return [world.tick, Object.keys(world.fishes).length, world.fishes.alien.x, !!world.fishes.new, !!world.scenes, await get('known')];
+  });
+  assert.deepEqual(restored, [12, 1, 9, false, true, ['newer']]);
+}
+
+async function exerciseLegacy(page) {
+  const old = await page.context().newPage();
+  await old.goto(origin + '/welcome.html');
+  const nick = '旧版独立身份', message = '旧版独立进度';
+  if (oldCommit) {
+    await old.evaluate(async nick => {
+      const { get, set } = await import('/legacy/storage.js');
+      const identity = await get('identity'); identity.nick = nick; await set('identity', identity);
+    }, nick);
+    await old.goto(origin + '/legacy/');
+    await old.waitForFunction(nick => window.tide?.identity.nick === nick, nick);
+    await old.locator('#chatInput').fill(message);
+    await old.locator('#chatForm button').click();
+    await old.waitForFunction(async text => {
+      const { get } = await import('/legacy/storage.js');
+      return Object.values((await get('checkpoint')).world.chats).some(chat => chat.body.text === text);
+    }, message);
+  } else {
+    // v0.2.3 writes plain identity and world values to these original v1 keys.
+    await old.evaluate(async nick => {
+      const db = await (await import('/storage.js')).database();
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction('items', 'readwrite'), store = tx.objectStore('items');
+        const cp = store.get('checkpoint'), me = store.get('identity');
+        cp.onsuccess = () => { const { world, at, picture, lastOnlineAt } = cp.result; store.put({ world, at: at + 1, picture, lastOnlineAt }, 'checkpoint'); };
+        me.onsuccess = () => store.put({ ...me.result, nick }, 'identity');
+        tx.oncomplete = resolve; tx.onabort = () => reject(tx.error);
+      });
+    }, nick);
+  }
+  await old.close();
+  assert.notEqual(await page.evaluate(() => tide.identity.nick), nick);
+  await page.locator('#closeConnection').click();
+  await page.locator('#connect').click();
+  const downloading = page.waitForEvent('download');
+  await page.locator('[data-legacy-backup="live"]').click();
+  const bytes = [];
+  for await (const part of await (await downloading).createReadStream()) bytes.push(part);
+  const backup = JSON.parse(Buffer.concat(bytes).toString('utf8'));
+  assert.equal(backup.identity.nick, nick);
+  assert.equal(backup.format, 'tide-backup-1');
+  if (oldCommit) assert(Object.values(backup.checkpoint.world.chats).some(chat => chat.body.text === message));
+  await page.evaluate(async () => {
+    const { get, putMany } = await import('/storage.js');
+    const checkpoint = await get('checkpoint');
+    await putMany([['checkpoint', checkpoint]], { mirrorLegacy: true });
+  });
+  await page.locator('#closeConnection').click();
+  await page.locator('#connect').click();
+  await page.locator('[data-legacy-backup]:not([data-legacy-backup="live"])').first().waitFor();
+  const legacy = await page.evaluate(async () => {
+    const { getOldBranch } = await import('/storage.js');
+    const id = document.querySelector('[data-legacy-backup]').dataset.legacyBackup;
+    const archived = await getOldBranch(id);
+    return [archived.identity.nick, !!archived.checkpoint.world];
+  });
+  assert.deepEqual(legacy, [nick, true]);
+  if (oldCommit) {
+    const rollback = await page.context().newPage();
+    await rollback.goto(origin + '/legacy/');
+    await rollback.waitForFunction(() => window.tide);
+    assert.notEqual(await rollback.evaluate(() => tide.identity.nick), nick);
+    assert.deepEqual(await rollback.evaluate(() => Object.keys(tide.world.data.roots)), await page.evaluate(() => Object.keys(tide.world.data.roots)));
+    await rollback.close();
+  }
+}
 
 async function main() {
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   origin = `http://127.0.0.1:${server.address().port}`;
   browser = await chromium.launch({ headless: true });
-  const page = await browser.newPage();
+  const countArg = process.argv.find(value => value.startsWith('--records='));
+  const count = countArg ? Number(countArg.slice('--records='.length)) : 1537;
+  assert(Number.isSafeInteger(count) && count >= 1024);
+  const isolated = await browser.newContext();
+  try {
+    console.log(JSON.stringify(await exercisePages(await isolated.newPage(), count)));
+    if (!countArg) await concurrentCheckpoints(isolated);
+  }
+  finally { await isolated.close(); }
+  if (countArg) return;
+  const appContext = await browser.newContext();
+  const page = await appContext.newPage();
   await page.goto(origin);
+  await page.evaluate(async () => {
+    const { World } = await import('/engine.js');
+    const { subscribeSimulationChanges } = await import('/simulation-client.js');
+    World.prototype.step = () => { throw new Error('页面主线程执行了模拟步骤'); };
+    window.completedSimulationSteps = 0;
+    subscribeSimulationChanges((_, patch) => { if (patch?.values.tick) window.completedSimulationSteps++; });
+  });
   await page.locator('#nickInput').fill('自动存档测试');
   await page.locator('#welcomeForm .primary').click();
   await page.waitForFunction(() => window.tide);
+  await page.waitForFunction(() => window.completedSimulationSteps >= 2);
+  assert(page.workers().some(worker => new URL(worker.url()).pathname === '/simulation-worker.js'));
 
   const before = await page.evaluate(async () => {
     const { World } = await import('/engine.js');
@@ -88,11 +350,19 @@ async function main() {
   assert.deepEqual(Object.keys(backup.checkpoint.world.roots), before.roots);
   assert.deepEqual(backup.checkpoint.picture.roots, before.roots);
 
+  await exerciseLegacy(page);
+  backup.identity.nick = '恢复存档测试';
+  const imported = page.waitForEvent('framenavigated', frame => frame === page.mainFrame());
+  await page.locator('#importBackup').setInputFiles({
+    name: '测试备份.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(backup))
+  });
+  await imported;
+  await page.waitForFunction(() => window.tide?.identity.nick === '恢复存档测试');
   await page.goto(origin + '/welcome.html');
   await page.goto(origin);
   await page.waitForFunction(() => window.tide);
   assert.deepEqual(await page.evaluate(() => Object.keys(tide.world.data.roots)), before.roots);
-  console.log('Chromium 验证通过：定时存档、同版本写入、失败回滚、下载备份、离开后重新打开');
+  console.log('Chromium 验证通过：增量存档、跨标签版本冲突、失败回滚、备份导出导入、重新打开');
 }
 
 main().catch(error => { console.error(error); process.exitCode = 1; }).finally(async () => {

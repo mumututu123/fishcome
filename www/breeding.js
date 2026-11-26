@@ -66,7 +66,7 @@ export function writeBreedingRecord(table, id, record) {
 
   if (!index) return;
   if (reactivates) activeIndexes.delete(table);
-  else if (active) { index.records.set(id, record); index.byFish = null; }
+  else if (active) { index.records.set(id, table[id]); index.byFish = null; }
   else markTerminal(index, id);
 }
 export function contactCells(male, mc, female, fc, scenery) {
@@ -143,20 +143,25 @@ export function finishBreeding(world, now, transition) {
 export function updateContacts(world, now, groups, scenery) {
   world.data.contacts ||= {}; world.data.breeding ||= {};
   const taken = new Set(activeRecords(world.data).flatMap(record => [record.male, record.female]));
-  const at = new Map(), eligible = new Map(), pairs = new Map();
+  const males = [], females = [], pairs = new Map();
   for (const [id, cells] of groups) {
     const fish = world.data.fishes[id], gender = fishOrigin(world.data, id)?.gender;
     if (!fish || taken.has(id) || capturedFish(world.data, id, now) || !['male', 'female'].includes(gender)) continue;
-    eligible.set(id, { fish, gender, cells });
-    for (const cell of cells) { const p = cellPosition(fish, cell), k = key(p.x, p.y); if (!at.has(k)) at.set(k, new Set()); at.get(k).add(id); }
+    (gender === 'male' ? males : females).push(fish);
   }
-  for (const [id, { fish, gender, cells }] of eligible) {
-    if (gender !== 'male') continue;
-    for (const cell of cells) {
+  const at = new Map();
+  if (males.length) for (const fish of females) for (const cell of groups.get(fish.id)) {
+    const p = cellPosition(fish, cell), k = key(p.x, p.y);
+    if (!at.has(k)) at.set(k, []);
+    at.get(k).push(fish.id);
+  }
+  if (at.size) for (const fish of males) {
+    const id = fish.id;
+    for (const cell of groups.get(id)) {
       const p = cellPosition(fish, cell);
       for (const [dx, dy] of NEIGHBORS) {
         if (dx && dy && (scenery.has(key(p.x + dx, p.y)) || scenery.has(key(p.x, p.y + dy)))) continue;
-        for (const other of at.get(key(p.x + dx, p.y + dy)) || []) if (eligible.get(other).gender === 'female') pairs.set(`${id}|${other}`, { male: id, female: other });
+        for (const other of at.get(key(p.x + dx, p.y + dy)) || []) pairs.set(`${id}|${other}`, { male: id, female: other });
       }
     }
   }

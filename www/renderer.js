@@ -7,6 +7,7 @@ import { echoCells, friendSignals } from './easter-eggs.js';
 import { activeEvent, eventPosition } from './random-events.js';
 import { eventGlyphs } from './random-event-visuals.js';
 import { activeLegend, legendGeometry } from './legends.js';
+import { ViewportCells } from './viewport.js';
 const FONT = "'Microsoft YaHei',Consolas,monospace";
 export { MONUMENT } from './engine.js';
 export class Renderer {
@@ -25,11 +26,38 @@ export class Renderer {
     ctx.fillStyle = '#6dbfc54d'; ctx.fillRect(0, top, w, Math.max(1, size / 7));
     ctx.fillStyle = '#6dbfc510'; ctx.fillRect(0, top, w, size);
     ctx.strokeStyle = '#b8eeee05'; ctx.lineWidth = 1; for (let y = Math.max(0, Math.floor(top)); y < h; y += size) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke(); }
-    if (world) for (let x = Math.floor(cam.x - w / (2 * size)) - 1; x <= Math.ceil(cam.x + w / (2 * size)); x++) {
+    if (world) for (let x = Math.floor(cam.x - w / (2 * size)) - 1; x <= Math.ceil(cam.x + w / (2 * size)); x += Math.max(1, Math.floor(1 / size))) {
       const depth = world.floorAt(x), px = (x - cam.x) * size + w / 2, py = (depth - cam.y) * size + h / 2;
       ctx.fillStyle = '#102d36'; ctx.fillRect(px, py, size + 1, Math.max(0, h - py));
       if (py > -size && py < h) this.glyph(ctx, '底', '#527d72', px, py, size, .8);
     }
+  }
+  worldChanged(world, patch) {
+    if (this.cachedWorld !== world) return;
+    if (!patch) { this.viewport = null; return; }
+    if (this.viewport) {
+      this.viewport.update(patch.tables || {});
+      this.indexedTick = world.data.tick;
+      world.dirty = false;
+    }
+  }
+  cellIndex(world) {
+    if (this.cachedWorld !== world) {
+      if (this.cachedWorld) delete this.cachedWorld.surfaceCandidates;
+      world.surfaceCandidates = x => {
+        const index = this.viewport;
+        if (this.cachedWorld === world && index && !index.remaining && !world.dirty && this.indexedTick === world.data.tick) {
+          return index.query(x, x, 0, 0);
+        }
+      };
+    }
+    if (!this.viewport || this.cachedWorld !== world || world.dirty || this.indexedTick !== world.data.tick) {
+      this.viewport = new ViewportCells(world.data, true);
+      this.cachedWorld = world;
+      this.indexedTick = world.data.tick;
+      world.dirty = false;
+    }
+    return this.viewport;
   }
   draw(world, now = performance.now()) {
     this.world = world;
@@ -39,22 +67,29 @@ export class Renderer {
     const left = this.camera.x - this.width / 2 / size - 2, right = this.camera.x + this.width / 2 / size + 2, top = this.camera.y - this.height / 2 / size - 2, bottom = this.camera.y + this.height / 2 / size + 2;
     this.weather(world, size);
     const visible = p => Math.abs(deltaX(p.x, this.camera.x)) <= (right - left) / 2 && p.y >= top && p.y <= bottom;
-    if (this.cachedWorld !== world || world.dirty || !this.characters || this.echoTick !== world.data.tick) { this.characters = Object.values(world.data.chars); this.echoes = echoCells(world.data, this.characters); this.echoTick = world.data.tick; this.cachedWorld = world; world.dirty = false; }
-    const characters = this.characters;
+    const index = this.cellIndex(world);
+    index.advance();
+    this.paintedCells ||= new Map();
+    this.paintedCells.clear();
+    this.paintedLeft = this.camera.x - this.width / (2 * size);
+    this.paintedTop = this.camera.y - this.height / (2 * size);
+    this.paintedSize = size;
+    const characters = index.query(left - 2, right + 2, top - 2, bottom + 2);
+    if (this.characters !== characters) { this.characters = characters; this.echoes = echoCells(world.data, characters); }
     const legend = activeLegend(world.data, Date.now());
     if (legend) this.drawLegend(world, legend, Date.now(), size, visible, false);
     const occasion = activeEvent(world.data, Date.now());
     if (occasion?.kind === 'whale') this.drawEvent(world, occasion, Date.now(), size, visible);
-    for (const c of characters) if (c.kind === 'scene') { const s = world.data.scenes[c.entity]; if (!s) continue; const p = { x: s.x + c.x, y: s.y + c.y }; if (!visible(p)) continue; const pixel = this.screen(p.x, p.y), selected = this.selected === c.entity && (!c.chat || this.selectedCell === c.id), echo = this.echoes.has(c.id); paint.glyph(ctx, c.ch, echo ? '#d7efe1' : c.color, pixel.x, pixel.y, size, selected ? 1 : echo ? .8 + .2 * Math.sin(Date.now() / 450) : .85, echo, c.kind); if (selected) { ctx.strokeStyle = '#b7f7de55'; ctx.strokeRect(pixel.x, pixel.y, size, size); } }
+    for (const c of characters) if (c.kind === 'scene') { const s = world.data.scenes[c.entity]; if (!s) continue; const p = { x: s.x + c.x, y: s.y + c.y }; if (!visible(p)) continue; this.paintedCells.set(worldKey(p.x, p.y), c); const pixel = this.screen(p.x, p.y), selected = this.selected === c.entity && (!c.chat || this.selectedCell === c.id), echo = this.echoes.has(c.id); paint.glyph(ctx, c.ch, echo ? '#d7efe1' : c.color, pixel.x, pixel.y, size, selected ? 1 : echo ? .8 + .2 * Math.sin(Date.now() / 450) : .85, echo, c.kind); if (selected) { ctx.strokeStyle = '#b7f7de55'; ctx.strokeRect(pixel.x, pixel.y, size, size); } }
     this.scene3d?.drawFishLinks?.(this, world, characters, size, visible);
-    for (const c of characters) if (c.kind === 'fish' && c.entity !== this.observedFish) { const f = world.data.fishes[c.entity]; if (!f) continue; const p = cellPosition(f, c); if (!visible(p)) continue; const pixel = this.screen(p.x, p.y); paint.glyph(ctx, c.ch, c.color, pixel.x, pixel.y, size, 1, EYES.has(c.ch), c.kind, c, f.facing); }
-    if (this.observedFish) for (const c of characters) if (c.kind === 'fish' && c.entity === this.observedFish) { const f = world.data.fishes[c.entity]; if (!f) continue; const p = cellPosition(f, c); if (!visible(p)) continue; const pixel = this.screen(p.x, p.y); ctx.fillStyle = '#9aeee015'; ctx.fillRect(pixel.x, pixel.y, size, size); paint.glyph(ctx, c.ch, c.color, pixel.x, pixel.y, size, 1, EYES.has(c.ch), c.kind, c, f.facing); ctx.strokeStyle = '#9aeee077'; ctx.lineWidth = 1; ctx.strokeRect(pixel.x, pixel.y, size, size); }
+    for (const c of characters) if (c.kind === 'fish' && c.entity !== this.observedFish) { const f = world.data.fishes[c.entity]; if (!f) continue; const p = cellPosition(f, c); if (!visible(p)) continue; this.paintedCells.set(worldKey(p.x, p.y), c); const pixel = this.screen(p.x, p.y); paint.glyph(ctx, c.ch, c.color, pixel.x, pixel.y, size, 1, EYES.has(c.ch), c.kind, c, f.facing); }
+    if (this.observedFish) for (const c of characters) if (c.kind === 'fish' && c.entity === this.observedFish) { const f = world.data.fishes[c.entity]; if (!f) continue; const p = cellPosition(f, c); if (!visible(p)) continue; this.paintedCells.set(worldKey(p.x, p.y), c); const pixel = this.screen(p.x, p.y); ctx.fillStyle = '#9aeee015'; ctx.fillRect(pixel.x, pixel.y, size, size); paint.glyph(ctx, c.ch, c.color, pixel.x, pixel.y, size, 1, EYES.has(c.ch), c.kind, c, f.facing); ctx.strokeStyle = '#9aeee077'; ctx.lineWidth = 1; ctx.strokeRect(pixel.x, pixel.y, size, size); }
     for (const c of characters) if ((c.kind === 'food' || c.kind === 'seaweed') && visible(c)) { const pixel = c.kind === 'seaweed' ? this.seaweedScreen(c) : this.screen(c.x, c.y); paint.glyph(ctx, c.ch, c.color, pixel.x, pixel.y, size, c.kind === 'seaweed' ? weedAlpha(c, world.data.ecology, Date.now()) : 1, false, c.kind); if (c.kind === 'food' && world.data.tick - c.born >= CONFIG.foodLife) { ctx.strokeStyle = '#84a2b355'; ctx.strokeRect(pixel.x + size * .2, pixel.y + size * .2, size * .6, size * .6); } }
     const bubbleNow = Date.now();
     if (legend) this.drawLegend(world, legend, bubbleNow, size, visible, true);
     for (const bubble of Object.values(world.data.bubbles || {})) { const state = bubbleState(bubble, bubbleNow); if (!state || state.y > bottom || state.y + state.size < top || Math.abs(deltaX(state.x + state.size / 2, this.camera.x)) > (right - left) / 2 + state.size) continue; for (let y = 0; y < state.size; y++) for (let x = 0; x < state.size; x++) { const p = { x: state.x + x, y: state.y + y }; if (visible(p)) { const pixel = this.screen(p.x, p.y); paint.glyph(ctx, bubbleGlyph(bubble), BUBBLE_COLOR, pixel.x, pixel.y, size, 1, false, 'bubble'); } } }
     for (const signal of friendSignals(world.data, bubbleNow)) {
-      const fish = world.data.fishes[signal.fish], cells = characters.filter(c => c.kind === 'fish' && c.entity === signal.fish); if (!cells.length) continue;
+      const fish = world.data.fishes[signal.fish], cells = index.fishCells(signal.fish); if (!cells.length) continue;
       const xs = cells.map(c => fish.facing * c.x), p = { x: fish.x + (Math.min(...xs) + Math.max(...xs)) / 2, y: fish.y + Math.min(...cells.map(c => c.y)) - 1.4 }; if (!visible(p)) continue;
       const pixel = this.screen(p.x, p.y); this.glyph(ctx, signal.ch, '#d5eee0', pixel.x, pixel.y, size, signal.alpha, true);
     }
@@ -75,7 +110,8 @@ export class Renderer {
     }
   }
   drawEvent(world, event, now, size, visible) {
-    for (const glyph of eventGlyphs(world.data, event, now, this.characters)) {
+    const bodies = (event.fishes || []).flatMap(id => this.viewport.fishCells(id));
+    for (const glyph of eventGlyphs(world.data, event, now, bodies)) {
       if (!visible(glyph) || !world.waterAt(Math.round(glyph.x), Math.round(glyph.y))) continue;
       const pixel = this.screen(glyph.x, glyph.y); this.glyph(this.ctx, glyph.ch, glyph.color, pixel.x, pixel.y, size, glyph.alpha, glyph.glow);
     }
@@ -103,12 +139,52 @@ export class Renderer {
     }
     ctx.restore();
   }
-  hit(x, y) { if (!this.world) return null; const p = this.point(x, y), monument = this.world.monument; if (p.x >= monument.x && p.x < monument.x + 8 && p.y >= monument.y && p.y < monument.y + 5) return { kind: 'monument' }; for (const c of Object.values(this.world.data.chars).reverse()) { if (c.kind === 'fish') { const f = this.world.data.fishes[c.entity]; if (!f) continue; const at = cellPosition(f, c); if (worldKey(at.x, at.y) === worldKey(p.x, p.y)) return { kind: 'fish', id: f.id }; } else if (c.kind === 'scene') { const s = this.world.data.scenes[c.entity]; if (s && worldKey(s.x + c.x, s.y + c.y) === worldKey(p.x, p.y)) return { kind: 'scene', id: s.id, cell: c.id }; } } return this.eventHit(x, y); }
-  snapshot(world) {
-    const canvas = document.createElement('canvas'); const size = 6; canvas.width = CONFIG.width * size; canvas.height = CONFIG.depth * size; const ctx = canvas.getContext('2d'); this.background(ctx, canvas.width, canvas.height, { x: CONFIG.width / 2, y: CONFIG.depth / 2 }, size, world);
+  hit(x, y) {
+    if (!this.world) return null;
+    const p = { x: wrapX(Math.floor(this.paintedLeft + x / this.paintedSize)), y: Math.floor(this.paintedTop + y / this.paintedSize) };
+    const monument = this.world.monument;
+    if (p.x >= monument.x && p.x < monument.x + 8 && p.y >= monument.y && p.y < monument.y + 5) return { kind: 'monument' };
+    // Select the last painted frame, including while the next index is building.
+    const painted = this.paintedCells?.get(worldKey(p.x, p.y));
+    const live = painted && this.world.data.chars[painted.id];
+    if (live && live.kind === painted.kind && live.entity === painted.entity) {
+      if (live.kind === 'fish' && this.world.data.fishes[live.entity]) return { kind: 'fish', id: live.entity };
+      if (live.kind === 'scene' && this.world.data.scenes[live.entity]) return { kind: 'scene', id: live.entity, cell: live.id };
+    }
+    return this.eventHit(x, y);
+  }
+  *paintSnapshot(world, canvas) {
+    const size = Math.min(6, 6000 / CONFIG.width);
+    canvas.width = Math.ceil(CONFIG.width * size); canvas.height = Math.ceil(CONFIG.depth * size); const ctx = canvas.getContext('2d'); this.background(ctx, canvas.width, canvas.height, { x: CONFIG.width / 2, y: CONFIG.depth / 2 }, size, world);
     const legend = activeLegend(world.data, world.data.tick); if (legend) for (const c of legendGeometry(world.data, legend, world.data.tick, world.sceneryMap())) if (legend.kind === 'ship' || world.waterAt(c.x, c.y)) this.glyph(ctx, c.ch, c.role === 'beam' ? '#a8e5ff' : '#91b3a4', c.x * size, c.y * size, size);
-    for (const c of Object.values(world.data.chars)) { let p; if (c.kind === 'scene') { const s = world.data.scenes[c.entity]; if (s) p = { x: s.x + c.x, y: s.y + c.y }; } else if (c.kind === 'fish') { const f = world.data.fishes[c.entity]; if (f) p = cellPosition(f, c); } else if (c.kind === 'food' || c.kind === 'seaweed') p = c; if (p) this.glyph(ctx, c.ch, c.color, wrapX(p.x) * size, p.y * size, size); }
+    let visited = 0;
+    for (const id in world.data.chars) {
+      if (++visited % 256 === 0) yield;
+      const c = world.data.chars[id]; if (!c) continue;
+      let p; if (c.kind === 'scene') { const s = world.data.scenes[c.entity]; if (s) p = { x: s.x + c.x, y: s.y + c.y }; } else if (c.kind === 'fish') { const f = world.data.fishes[c.entity]; if (f) p = cellPosition(f, c); } else if (c.kind === 'food' || c.kind === 'seaweed') p = c; if (p) this.glyph(ctx, c.ch, c.color, wrapX(p.x) * size, p.y * size, size); }
     for (const bubble of Object.values(world.data.bubbles || {})) { const state = bubbleState(bubble, world.data.tick); if (!state) continue; for (let y = 0; y < state.size; y++) for (let x = 0; x < state.size; x++) this.glyph(ctx, bubbleGlyph(bubble), BUBBLE_COLOR, wrapX(state.x + x) * size, (state.y + y) * size, size); }
+  }
+  snapshot(world) {
+    const canvas = document.createElement('canvas');
+    const painting = this.paintSnapshot(world, canvas);
+    while (!painting.next().done) { /* synchronous backup/export reader */ }
     return canvas.toDataURL('image/webp', .82);
+  }
+  async snapshotAsync(world) {
+    const canvas = document.createElement('canvas');
+    let start = performance.now();
+    for (const _ of this.paintSnapshot(world, canvas)) {
+      if (performance.now() - start < 5) continue;
+      await new Promise(resolve => setTimeout(resolve, 0));
+      start = performance.now();
+    }
+    const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/webp', .82));
+    if (!blob) throw new Error('无法生成世界合影');
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = () => reject(reader.error);
+      reader.readAsDataURL(blob);
+    });
   }
 }

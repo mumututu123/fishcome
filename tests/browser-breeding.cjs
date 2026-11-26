@@ -6,23 +6,27 @@ const assert = require('node:assert/strict');
 const { chromium } = require(process.env.TIDE_TEST_MODULES ? path.join(process.env.TIDE_TEST_MODULES, 'playwright') : 'playwright');
 const project = path.resolve(__dirname, '..'), ports = [39331, 39332], children = [], errors = []; let browser;
 const concurrent = process.argv.includes('--concurrent-births');
+const historyRows = Number(process.argv.find(arg => arg.startsWith('--history='))?.slice(10) || 0);
+assert(Number.isSafeInteger(historyRows) && historyRows >= 0);
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 async function until(check, message) { const deadline = Date.now() + 20000; while (Date.now() < deadline) { if (await check()) return; await pause(150); } throw new Error(message); }
 async function open(context, port, nick) {
   const page = await context.newPage(); page.on('pageerror', error => errors.push(error.message)); await page.goto(`http://127.0.0.1:${port}`);
   if (nick) { await page.locator('#nickInput').fill(nick); await page.locator('#welcomeForm .primary').click(); }
-  await page.waitForFunction(() => window.tide); return page;
+  try { await page.waitForFunction(() => window.tide, null, { timeout: historyRows ? 120000 : 30000 }); }
+  catch (error) { throw new Error([error.message, await page.locator('#networkStatus').textContent(), ...errors].join(' | ')); }
+  return page;
 }
 async function main() {
-  for (const port of ports) { const child = spawn(launcherPath, ['--headless', '--loopback', '--port', String(port)], { windowsHide: true, stdio: 'ignore' }); children.push(child); await until(async () => { try { return (await fetch(`http://127.0.0.1:${port}/health`)).ok; } catch { return false; } }, '启动器未就绪'); }
+  for (const port of ports) { const executable = port === ports[1] && process.env.TIDE_TEST_PEER_LAUNCHER || launcherPath; const child = spawn(executable, ['--headless', '--loopback', '--port', String(port)], { windowsHide: true, stdio: 'ignore' }); children.push(child); await until(async () => { try { return (await fetch(`http://127.0.0.1:${port}/health`)).ok; } catch { return false; } }, '启动器未就绪'); }
   browser = await chromium.launch({ headless: true });
   const first = await browser.newContext({ viewport: { width: 1440, height: 900 } }), second = await browser.newContext({ viewport: { width: 1440, height: 900 } });
   let a = await open(first, ports[0], '父鱼作者'), b = await open(second, ports[1], '母鱼作者'); await a.close(); await b.close();
   const setupB = await second.newPage(); await setupB.goto(`http://127.0.0.1:${ports[1]}/welcome.html`); const motherIdentity = await setupB.evaluate(async () => (await import('./storage.js')).get('identity')); await setupB.close();
   const setup = await first.newPage(); await setup.goto(`http://127.0.0.1:${ports[0]}/welcome.html`);
-  const fixture = await setup.evaluate(async ({ motherIdentity, concurrent }) => {
-    const { World, maskNick } = await import('./engine.js'), { BREEDING_TIME, updateContacts, finishBreeding } = await import('./breeding.js'), { HOUR } = await import('./seaweed.js'), { get, set, signer } = await import('./storage.js'), { Network } = await import('./network.js');
-    const identity = await get('identity'), checkpoint = await get('checkpoint'), now = Date.now(), start = now - BREEDING_TIME + (concurrent ? -10000 : 20000), created = start - 10000, world = new World(created, Object.keys(checkpoint.world.roots)[0]);
+  const fixture = await setup.evaluate(async ({ motherIdentity, concurrent, historyRows }) => {
+    const { World, maskNick } = await import('./engine.js'), { BREEDING_TIME, breedingId, updateContacts, finishBreeding } = await import('./breeding.js'), { HOUR } = await import('./seaweed.js'), { get, set, signer } = await import('./storage.js'), { Network } = await import('./network.js');
+    const identity = await get('identity'), checkpoint = await get('checkpoint'), now = Date.now(), start = now - BREEDING_TIME + (concurrent ? -10000 : 20000), created = start - 10000 - historyRows, world = new World(created, Object.keys(checkpoint.world.roots)[0]);
     const senders = [identity, motherIdentity].map(id => new Network(id, {}, () => {}, () => {})); for (let index = 0; index < 2; index++) senders[index].sign = await signer(index ? motherIdentity : identity);
     async function apply(index, body) { const author = index ? motherIdentity : identity, op = { id: crypto.randomUUID(), actor: author.actor, nick: maskNick(author.nick), roots: [world.id], t: created, ...body }, proof = await senders[index].makeEnvelope('op', op); const result = world.apply({ ...op, proof }); if (!result.ok) throw new Error(result.error); return op.id; }
     const male = await apply(0, { kind: 'fish', name: '蓝爸', gender: 'male', x: 390, y: 20, cells: [0, 1, 2].map(x => ({ x, y: 0, ch: 'Q', color: '#79b8ff' })), cost: 3 });
@@ -31,6 +35,22 @@ async function main() {
     await apply(1, { kind: 'scene', x: 389, y: 19, cells: [...Array.from({ length: 8 }, (_, x) => ({ x, y: 2, ch: '#', color: '#678999' })), { x: 7, y: 1, ch: '#', color: '#678999' }], cost: 9 });
     for (let elapsed = 0; elapsed <= 5000; elapsed += 500) updateContacts(world, start + elapsed, world.fishGroups(), world.sceneryMap());
     const record = Object.values(world.data.breeding)[0]; if (!record) throw new Error('未进入繁殖'); world.data.tick = now; world.data.seaweedHour = Math.floor(now / HOUR);
+    if (historyRows) {
+      // Distinct cancellation records on the same signed parents model the hot
+      // history before compaction. Their timing is synthetic, not a gameplay rate.
+      const enc = new TextEncoder();
+      let bytes = 2;
+      for (let i = 0; i < historyRows; i++) {
+        const started = created + 1 + i, id = breedingId(male, female, started);
+        const historical = { ...record, id, started, ends: started + BREEDING_TIME,
+          status: 'cancelled', at: started + 1, reason: 'conflicting-pair' };
+        world.data.breeding[id] = historical;
+        bytes += enc.encode(JSON.stringify(id) + ':' + JSON.stringify(historical)).length + (i > 0 ? 1 : 0);
+      }
+      checkpoint.world = world.data; checkpoint.lastOnlineAt = now;
+      await set('checkpoint', checkpoint);
+      return { male, female, created, bytes };
+    }
     if (concurrent) {
       const active = world.serialize();
       const complete = birth => {
@@ -49,7 +69,7 @@ async function main() {
       return { id, early: record.ends, late: record.ends + 500, breeding: record.id, second: late };
     }
     checkpoint.world = world.serialize(); checkpoint.lastOnlineAt = now; await set('checkpoint', checkpoint); return { male, female, breeding: record.id, fatherActor: identity.actor, motherActor: motherIdentity.actor };
-  }, { motherIdentity, concurrent }); await setup.close();
+  }, { motherIdentity, concurrent, historyRows }); await setup.close();
   if (concurrent) {
     const seed = await second.newPage();
     await seed.goto(`http://127.0.0.1:${ports[1]}/welcome.html`);
@@ -66,7 +86,30 @@ async function main() {
     assert.equal(await birthTime(a, fixture.id), fixture.early);
     assert.equal(await birthTime(b, fixture.id), fixture.late);
   }
+  const joiningAt = Date.now();
   await b.locator('#connect').click(); await b.locator('#peerUrl').fill(`http://127.0.0.1:${ports[0]}`); await b.locator('#connectionForm .primary').click();
+  if (historyRows) {
+    await b.waitForFunction(() => document.querySelector('#toast').textContent.includes('已接入伙伴'), null,
+      { timeout: 180000, polling: 100 });
+    const joinedMs = Date.now() - joiningAt;
+    const verify = async ({ fixture, historyRows }) => {
+      const { breedingId } = await import('./breeding.js');
+      const { get } = await import('./storage.js');
+      const records = (await get('checkpoint')).world.breeding;
+      for (let i = 0; i < historyRows; i++) {
+        const started = fixture.created + 1 + i;
+        const row = records[breedingId(fixture.male, fixture.female, started)];
+        if (row?.status !== 'cancelled' || row.male !== fixture.male || row.at !== started + 1) throw new Error('历史缺失 ' + i);
+      }
+      return tide.network.stats.rejected;
+    };
+    assert.equal(await b.evaluate(verify, { fixture, historyRows }), 0);
+    await b.reload(); await b.waitForFunction(() => window.tide, null, { timeout: 120000 });
+    assert.equal(await b.evaluate(verify, { fixture, historyRows }), 0);
+    assert.deepEqual(errors, []);
+    console.log(JSON.stringify({ historyRows, breedingBytes: fixture.bytes, joinedMs, restored: true }));
+    return;
+  }
   if (concurrent) {
     const consistent = ({ id, early, breeding }) => {
       const data = window.tide?.world.data;

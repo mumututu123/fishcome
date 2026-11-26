@@ -93,6 +93,14 @@ async function verifyBrowserPeerUpdate(startLauncher, v1, v2) {
     page2.on('pageerror', err => errors.push(err.stack));
     await page2.goto(`http://127.0.0.1:${portA}/`);
     await page2.waitForFunction(() => window.tide && tide.balance() === 18);
+    const chat = async (tab, text) => {
+      await tab.locator('#chatInput').fill(text);
+      await tab.locator('#chatForm button').click();
+      await tab.waitForFunction(text => Object.values(tide.world.data.chats).some(record => record.body.text === text), text);
+    };
+    await chat(page2, '第二页的更新前记录');
+    await page2.waitForFunction(async () => Object.values((await (await import('./storage.js')).get('checkpoint')).world.chats).some(record => record.body.text === '第二页的更新前记录'));
+    await chat(page, '第一页的更新前记录');
     await page2.locator('#makeFish').click();
     await page2.locator('#glyphInput').fill('草');
     await page2.locator('#prepareBeads').click();
@@ -118,6 +126,9 @@ async function verifyBrowserPeerUpdate(startLauncher, v1, v2) {
     await navPromise;
     await page.waitForFunction(() => window.tide && document.getElementById('currentVersion')?.textContent?.includes('0.2.0'), undefined, { timeout: 15000 });
     assert.equal(await page.evaluate(() => tide.balance()), 18, '更新重启后余额必须保持 18');
+    const texts = await page.evaluate(() => Object.values(tide.world.data.chats).map(record => record.body.text));
+    assert(texts.includes('第一页的更新前记录') && texts.includes('第二页的更新前记录'), '交接时两个标签页的签名聊天均应保存');
+    await page2.waitForFunction(() => window.tide && document.getElementById('currentVersion')?.textContent?.includes('0.2.0'));
     assert(await page.evaluate(() => Object.values(tide.world.data.fishes).some(f => f.name === '升鱼')), '更新重启后创建的鱼必须保留');
 
     // 实测慢速下载：展示进度条并在下载中取消下载

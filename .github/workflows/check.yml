@@ -40,3 +40,9 @@ jobs:
       - name: Verify browser checkpoint saves
         working-directory: source
         run: node tests/browser-save.cjs
+      - name: Verify interrupted first join in Chromium
+        working-directory: source
+        run: node tests/browser-replica-scale.cjs 10000
+      - name: Verify feeding, camera input and background steps in Chromium
+        working-directory: source
+        run: node tests/browser-fish-capacity.cjs 1000 15

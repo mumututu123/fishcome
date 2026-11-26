@@ -6,6 +6,29 @@ import { restoreCheckpoint } from '../www/lifecycle.js';
 import { LIFE, personality, personalityText, weatherAt, lifeContext, updateLife, idleMotion, fishLifeText, recordStory, mergeLife, newLife, validateLife, spawnPlankton, planktonSource, validPlankton, freshPlankton, pairKey, storiesFor, storyText, returnStory } from '../www/life.js';
 import { fishCatalog } from '../www/fish-profile.js';
 const t = Math.floor((Date.now() - 3600000) / 180000) * 180000 + 80000;
+
+test('密集鱼群只保留规定数量的关系，已熟悉的鱼即使最终被裁掉也能留下故事', () => {
+  const at = Date.UTC(2025, 5, 15, 12, 17);
+  const w = new World(at, 'stable', { populate: false });
+  const points = new Map(Array.from({ length: 160 }, (_, i) => {
+    const id = 'fish-' + String(159 - i).padStart(3, '0');
+    w.data.fishes[id] = { id, x: i, y: 15 };
+    return [id, w.data.fishes[id]];
+  }));
+  const neighbors = new Map(), allKeys = new Set();
+  for (const [id] of points) {
+    const others = [...points.values()].filter(f => f.id !== id);
+    neighbors.set(id, others);
+    for (const fish of others) allKeys.add(pairKey(id, fish.id));
+  }
+  const lastPair = pairKey('fish-158', 'fish-159');
+  w.data.life.bonds[lastPair] = { a: 'fish-158', b: 'fish-159', at, seconds: LIFE.familiar - 1, lastNear: at, run: 0 };
+  updateLife(w, at + 1000, { neighbors, points, scenes: new Map() });
+  const expected = [...allKeys].sort((a, b) => a.localeCompare(b)).slice(0, LIFE.bondLimit);
+  assert.deepEqual(Object.keys(w.data.life.bonds), expected);
+  assert(!w.data.life.bonds[lastPair]);
+  assert(w.data.life.stories['friend:fish-158:fish-159']);
+});
 const cell = (x, y, ch = 'o') => ({ x, y, ch, color: '#88aacc' });
 function world() { return new World(t, crypto.randomUUID(), { populate: false }); }
 function fish(w, x = 20, y = 20, actor = 'alice', id = crypto.randomUUID(), ch = 'o') {

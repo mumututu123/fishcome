@@ -1,12 +1,21 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { World, chooseClaim, clone } from '../www/engine.js';
-import { ARCHIVE, ARCHIVE_FIELDS, ArchiveStore, archivePlan, archiveChunks, encodeArchive, decodeArchive, assembleFragments, emptyArchiveState, mergeArchiveState, compactKnown } from '../www/archive.js';
+import { ARCHIVE, ARCHIVE_FIELDS, ArchiveStore, archivePlan, archivePlanAsync, reachesArchiveThreshold, archiveChunks, encodeArchive, decodeArchive, assembleFragments, emptyArchiveState, mergeArchiveState, compactKnown } from '../www/archive.js';
 import { newLife } from '../www/life.js';
 import { fishCatalog } from '../www/fish-profile.js';
 import { signer, actorId, verifyEnvelope } from '../www/storage.js';
 import { Network } from '../www/network.js';
 const now = Date.now(), old = now - 10 * 86400000, glyph = (x, y, ch = 'Q') => ({ x, y, ch, color: '#88aacc' });
+test('分批检查归档大小保留 UTF-8 字节阈值和原有归档选择', async () => {
+  const { w } = await fixture();
+  w.data.participants['引号"'] = '鱼🌊';
+  w.data.optional = undefined;
+  const bytes = Buffer.byteLength(JSON.stringify(w.data));
+  assert.equal(await reachesArchiveThreshold(w.data, bytes), true);
+  assert.equal(await reachesArchiveThreshold(w.data, bytes + 1), false);
+  assert.deepEqual(await archivePlanAsync(w.data, now, { pressure: true }), archivePlan(w.data, now, { pressure: true }));
+});
 const blank = () => Object.fromEntries(ARCHIVE_FIELDS.map(f => [f, {}]));
 async function identity() { const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']), pub = await crypto.subtle.exportKey('jwk', pair.publicKey), secret = await crypto.subtle.exportKey('jwk', pair.privateKey); return { actor: await actorId(pub), pub, secret, nick: '档案测试' }; }
 async function fixture() {
