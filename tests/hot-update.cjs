@@ -7,7 +7,7 @@ const path = require('node:path');
 const { chromium } = require(process.env.TIDE_TEST_MODULES ? path.join(process.env.TIDE_TEST_MODULES, 'playwright') : 'playwright');
 const { assetName, availablePort, waitForHealth, postLocal, printVersion, withReleaseFixtures } = require('./release-fixtures.cjs');
 
-async function verifyBrowserPeerUpdate(startLauncher, v1, v2) {
+async function verifyBrowserPeerUpdate(startLauncher, v1, v2, { legacyCheckpoint = false } = {}) {
   // 写入 node-a 自己的 join.json，验证热更新后不被覆盖
   const preservedInvite = 'http://127.0.0.1:39999';
   const nodeAJoinPath = path.join(v1.dir, 'join.json');
@@ -88,19 +88,34 @@ async function verifyBrowserPeerUpdate(startLauncher, v1, v2) {
     await page.locator('#updateBadgeDot').waitFor({ state: 'visible' });
     assert.equal(await page.locator('#updateBadgeDot').textContent(), '待重启');
 
-    // 打开第二个标签页并在画板画 1 个未投放字符，验证跨标签页草稿保护不会丢弃已准备的更新包
-    const page2 = await context.newPage();
-    page2.on('pageerror', err => errors.push(err.stack));
-    await page2.goto(`http://127.0.0.1:${portA}/`);
-    await page2.waitForFunction(() => window.tide && tide.balance() === 18);
     const chat = async (tab, text) => {
       await tab.locator('#chatInput').fill(text);
       await tab.locator('#chatForm button').click();
       await tab.waitForFunction(text => Object.values(tide.world.data.chats).some(record => record.body.text === text), text);
     };
-    await chat(page2, '第二页的更新前记录');
-    await page2.waitForFunction(async () => Object.values((await (await import('./storage.js')).get('checkpoint')).world.chats).some(record => record.body.text === '第二页的更新前记录'));
-    await chat(page, '第一页的更新前记录');
+    const savedText = '打开第二页前已存档的聊天';
+    await chat(page, savedText);
+    async function hasSavedChat(text) {
+      const { get } = await import('./storage.js');
+      return Object.values((await get('checkpoint')).world.chats).some(record => record.body.text === text);
+    }
+    await page.waitForFunction(hasSavedChat, savedText);
+    const page2 = await context.newPage();
+    page2.on('pageerror', err => errors.push(err.stack));
+    await page2.goto(`http://127.0.0.1:${portA}/`);
+    await page2.waitForFunction(text => window.tide && tide.balance() === 18 && Object.values(tide.world.data.chats).some(record => record.body.text === text), savedText);
+    const expectedChats = [savedText];
+    if (!legacyCheckpoint) {
+      const firstChat = '第一页的更新前记录', secondChat = '第二页的更新前记录';
+      await chat(page2, secondChat);
+      await page2.waitForFunction(hasSavedChat, secondChat);
+      await page.waitForFunction(text => {
+        const prior = Object.values(tide.world.data.chats).find(record => record.body.text === text);
+        return prior && Date.now() - prior.body.t >= 1500;
+      }, savedText);
+      await chat(page, firstChat);
+      expectedChats.push(firstChat, secondChat);
+    }
     await page2.locator('#makeFish').click();
     await page2.locator('#glyphInput').fill('草');
     await page2.locator('#prepareBeads').click();
@@ -127,7 +142,7 @@ async function verifyBrowserPeerUpdate(startLauncher, v1, v2) {
     await page.waitForFunction(() => window.tide && document.getElementById('currentVersion')?.textContent?.includes('0.2.0'), undefined, { timeout: 15000 });
     assert.equal(await page.evaluate(() => tide.balance()), 18, '更新重启后余额必须保持 18');
     const texts = await page.evaluate(() => Object.values(tide.world.data.chats).map(record => record.body.text));
-    assert(texts.includes('第一页的更新前记录') && texts.includes('第二页的更新前记录'), '交接时两个标签页的签名聊天均应保存');
+    for (const text of expectedChats) assert(texts.includes(text), `热更新后遗失聊天：${text}`);
     await page2.waitForFunction(() => window.tide && document.getElementById('currentVersion')?.textContent?.includes('0.2.0'));
     assert(await page.evaluate(() => Object.values(tide.world.data.fishes).some(f => f.name === '升鱼')), '更新重启后创建的鱼必须保留');
 
