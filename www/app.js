@@ -24,7 +24,7 @@ import { memoryForCell, ancestralGlyph, ancestralText } from './easter-eggs.js';
 import { activeEvent, eventSchedule, eventTitle, eventPosition, eventLetter, radioTranscript, eventNarration } from './random-events.js';
 import { activeLegend, legendSchedule, legendTitle, legendPosition, capturedFish } from './legends.js';
 import { POPULATION, illnessOf } from './population.js';
-import { ARCHIVE, ARCHIVE_FIELDS, ArchiveStore, archivePlanAsync, reachesArchiveThreshold, archiveChunks, emptyArchiveState, mergeArchiveState, compactKnown } from './archive.js';
+import { ARCHIVE, ARCHIVE_FIELDS, ArchiveStore, archivePlanAsync, reachesArchiveThreshold, archiveChunks, emptyArchiveState, mergeArchiveState, prepareCompaction, compactKnown } from './archive.js';
 import { WORLD_RULES, rulesCompatible } from './rules.js';
 import { assetPlatformLabel, classifyPeerCompatibility, detectUpdateSource, formatUpdateBytes, normalizeAssetSuffix, pickHigherVersionPeers } from './update.js';
 const $ = id => document.getElementById(id);
@@ -155,27 +155,36 @@ async function ensureArchives(data, peer, bundle, target = archiveStore, current
   return loadReplicaArchives(data, target, load, { current, persist, diagnostics, beforeIngest, ingest });
 }
 async function archiveWorld(now = Date.now()) {
-  if (updateFrozen || archiveScanning || !amLeader() || now - archiveCheckAt < 60000) return;
+  if (updateFrozen || archiveScanning || replacingCheckpoint || !amLeader() || now - archiveCheckAt < 60000) return;
   archiveCheckAt = now; archiveScanning = true;
   const target = world, store = archiveStore;
+  const isCurrent = () => target === world && store === archiveStore;
+  const canArchive = () => isCurrent() && !updateFrozen && !replacingCheckpoint && amLeader();
   try {
     const pressure = await reachesArchiveThreshold(target.data);
     if (now - (target.data.archives?.at || 0) < ARCHIVE.period && !pressure) return;
     const plan = await archivePlanAsync(target.data, now, { pressure });
-    if (target !== world || store !== archiveStore || updateFrozen || !amLeader()) return;
-    if (!Object.keys(store.manifests).length && Object.values(plan).every(table => !Object.keys(table).length)) {
-      target.data.archives.at = now;
-      return;
+    if (!canArchive()) return;
+    const hasNewRecords = Object.values(plan).some(table => Object.keys(table).length);
+    if (hasNewRecords) {
+      archiveBusy = true;
+      const chunks = await archiveChunks(plan, target.data.roots);
+      if (!canArchive()) return;
+      await putMany(chunks.map(chunk => ['archive:' + chunk.manifest.id, chunk.encoded]));
+      if (!isCurrent()) return;
+      for (const chunk of chunks) { await store.ingest(chunk, chooseClaim); target.data.archives ||= emptyArchiveState(); target.data.archives.chunks[chunk.manifest.id] = chunk.manifest; }
     }
+    const compact = await prepareCompaction(target, store);
+    if (!isCurrent() || (!hasNewRecords && !canArchive())) return;
+    const compacted = compact();
+    target.data.archives.at = now;
+    if (!hasNewRecords && !compacted) return;
     archiveBusy = true;
-    const chunks = await archiveChunks(plan, target.data.roots);
-    await putMany(chunks.map(chunk => ['archive:' + chunk.manifest.id, chunk.encoded])); if (world !== target) return;
-    for (const chunk of chunks) { await store.ingest(chunk, chooseClaim); target.data.archives ||= emptyArchiveState(); target.data.archives.chunks[chunk.manifest.id] = chunk.manifest; }
-    await compactKnown(target, store); if (world !== target || archiveStore !== store) return;
-    target.data.archives.at = now; target.dirty = true; target.foodRevision++; target.attachArchives(store); worldBroadcast.reset();
+    if (!compacted) { target.dirty = true; target.foodRevision++; }
+    target.attachArchives(store); worldBroadcast.reset();
     await save(); await broadcastWorld(); renderChat();
   } catch (error) {
-    if (archiveBusy && target === world) worldEdited(target);
+    if (archiveBusy && isCurrent()) worldEdited(target);
     status = '记忆整理稍后重试：' + error.message;
   } finally { archiveBusy = false; archiveScanning = false; }
 }

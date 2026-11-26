@@ -2,7 +2,8 @@ import { chooseReferral } from './referral.js';
 import { mergeTravel } from './fish-status.js';
 
 export const ARCHIVE = Object.freeze({ age: 7 * 86400000, period: 86400000, threshold: 8 * 1024 * 1024, chunkSize: 256 * 1024, maxChunk: 1024 * 1024, fragmentSize: 384 * 1024, maxRecord: 32 * 1024 * 1024 });
-export const ARCHIVE_FIELDS = ['ops', 'chars', 'breeding', 'travel', 'chats', 'chatSources', 'fishes', 'scenes'];
+const compactableFields = ['ops', 'chars', 'breeding', 'travel', 'chats'];
+export const ARCHIVE_FIELDS = [...compactableFields, 'chatSources', 'fishes', 'scenes'];
 export const emptyArchiveState = (at = 0) => ({ version: 1, at, chunks: {} });
 const json = value => JSON.stringify(value);
 const same = (a, b) => json(a) === json(b);
@@ -45,7 +46,7 @@ function* archiveCandidates(data, now, pressure) {
   const cutoff = now - (pressure ? ARCHIVE.period : ARCHIVE.age);
   const records = Object.fromEntries(ARCHIVE_FIELDS.map(field => [field, {}]));
   let keep, scanned = 0;
-  for (const field of ['ops', 'chars', 'breeding', 'travel', 'chats']) {
+  for (const field of compactableFields) {
     for (const id in data[field]) {
       if (++scanned % 512 === 0) yield;
       const record = data[field][id];
@@ -304,15 +305,34 @@ export class ArchiveStore {
     return result;
   }
 }
-export async function compactKnown(world, store) {
-  if (!Object.keys(store.manifests).length) return;
-  const keep = archiveDependencies(world.data), candidates = [];
-  for (const field of ['ops', 'chars', 'breeding', 'travel', 'chats']) for (const [id, record] of Object.entries(world.data[field])) {
-    if (keep[field].has(id) || !store.ids[field].has(id) || field === 'chars' && record.kind !== 'burn') continue;
-    candidates.push([field, id, await store.get(field, id)]);
+export async function prepareCompaction(world, store) {
+  const { data } = world, revision = store.revision, candidates = [];
+  let keep;
+  for (const field of compactableFields) {
+    const index = store.ids[field];
+    if (!index.size) continue;
+    for (const id of Object.keys(data[field])) {
+      if (!index.has(id) || field === 'chars' && data.chars[id]?.kind !== 'burn') continue;
+      keep ??= archiveDependencies(data);
+      if (keep[field].has(id)) continue;
+      const archived = await store.get(field, id);
+      if (archived) candidates.push([field, id, archived]);
+    }
   }
-  // Recheck references after asynchronous disk reads; a new fish or edit may now need a proof.
-  const current = archiveDependencies(world.data);
-  for (const [field, id, record] of candidates) if (!current[field].has(id) && same(world.data[field][id], record)) delete world.data[field][id];
-  world.dirty = true; world.foodRevision++;
+  return () => {
+    if (!candidates.length || revision !== store.revision) return false;
+    const current = archiveDependencies(world.data);
+    let changed = false;
+    for (const [field, id, record] of candidates) {
+      if (current[field].has(id) || !same(world.data[field][id], record)) continue;
+      delete world.data[field][id];
+      changed = true;
+    }
+    if (changed) { world.dirty = true; world.foodRevision++; }
+    return changed;
+  };
+}
+export async function compactKnown(world, store) {
+  const compact = await prepareCompaction(world, store);
+  return compact();
 }
