@@ -11,13 +11,14 @@ import { validInitialOp, initialSources } from './genesis.js';
 import { validateLife, validPlankton } from './life.js';
 import { validEcology } from './ecology.js';
 import { validLegends, validGhostCell } from './legends.js';
-import { ARCHIVE_FIELDS, assembleFragments, decodeArchive, validArchiveState } from './archive.js';
+import { ARCHIVE_FIELDS, assembleFragments, decodeArchive, mergeArchiveRecord, validArchiveState } from './archive.js';
 import { buildOriginSources, inspectFishOrigin } from './diagnostics.js';
 
 const opBody = op => { const { proof, ...body } = op; return body; };
-export async function verifyChats(messages = {}, store, current = {}) {
+export async function verifyChats(messages = {}, store, current = {}, roots) {
   for (const [id, message] of Object.entries(messages)) {
     if (!validChatMessage(message) || id !== message.id) throw new Error('聊天记录无效');
+    if (roots && !message.body.roots.some(root => Object.hasOwn(roots, root))) throw new Error('聊天不属于当前世界');
     const known = [current.chats?.[id], current.chatSources?.[id]];
     for (const field of ['chats', 'chatSources']) if (store?.ids[field].has(id)) known.push(await store.get(field, id));
     const copies = known.filter(Boolean);
@@ -45,12 +46,11 @@ export async function verifyReplica(data, extra = {}, store, { current = {}, con
   if (data.seaweedHour !== undefined && (!Number.isInteger(data.seaweedHour) || data.seaweedHour < 0 || data.seaweedHour > Math.floor((Date.now() + 60000) / HOUR))) throw new Error('海草生长时钟无效');
   if (data.bubbleMinute !== undefined && (!Number.isInteger(data.bubbleMinute) || data.bubbleMinute < 0 || data.bubbleMinute > Math.floor((Date.now() + 60000) / MINUTE))) throw new Error('气泡生成时钟无效');
   if (data.bubbles !== undefined && (!data.bubbles || typeof data.bubbles !== 'object' || Array.isArray(data.bubbles) || Object.keys(data.bubbles).length > 200000)) throw new Error('气泡记录无效');
-  const bubbleSources = { ...extra.chars, ...current.chars, ...data.chars };
-  // Check branch-local structure here; reconcile the source's final history during merge.
-  for (const [id, bubble] of Object.entries(data.bubbles || {})) if (id !== bubble.id || !validBubble(bubble, bubbleSources, false) || bubble.born > Date.now() + 60000) throw new Error('气泡缺少合法海草来源');
-  await verifyChats(data.chats, store, current);
-  await verifyChats(data.chatSources, store, { ...current, chats: { ...current.chats, ...data.chats } });
   const sources = buildOriginSources(data, extra, current);
+  // Check branch-local structure here; reconcile the source's final history during merge.
+  for (const [id, bubble] of Object.entries(data.bubbles || {})) if (id !== bubble.id || !validBubble(bubble, sources.chars, false) || bubble.born > Date.now() + 60000) throw new Error('气泡缺少合法海草来源');
+  await verifyChats(data.chats, store, current, sources.roots);
+  await verifyChats(data.chatSources, store, { ...current, chats: { ...current.chats, ...data.chats } });
   if (!validateLife(data.life, sources)) throw new Error('鱼生记录无效');
   if (!validLegends(data.legends, sources)) throw new Error('稀有异象记录无效');
   if (data.breeding !== undefined && (!data.breeding || typeof data.breeding !== 'object' || Array.isArray(data.breeding) || Object.keys(data.breeding).length > 500000)) throw new Error('繁殖记录无效');
@@ -136,7 +136,7 @@ function verifyArchiveBirthSources(chunks, sources) {
   }
 }
 
-export async function loadReplicaArchives(data, target, load, { current = {}, persist, diagnostics } = {}) {
+export async function loadReplicaArchives(data, target, load, { current = {}, persist, beforeIngest, ingest, diagnostics } = {}) {
   if (!validArchiveState(data.archives)) throw new Error('归档目录无效');
   const chunks = [];
   for (const [id, manifest] of Object.entries(data.archives?.chunks || {})) {
@@ -152,7 +152,10 @@ export async function loadReplicaArchives(data, target, load, { current = {}, pe
     }
     for (const [root, at] of Object.entries(roots)) if (data.roots[root] !== at) throw new Error('归档不属于这个世界');
   }
-  if (!chunks.length) return;
+  if (!chunks.length) {
+    if (beforeIngest) await beforeIngest(await target.dependencies(data, current), current);
+    return;
+  }
   await assembleFragments(chunks, data.archives, async id => ({ manifest: target.manifests[id], raw: await target.raw(id) }));
   const pool = Object.fromEntries(ARCHIVE_FIELDS.map(f => [f, {}])); for (const chunk of chunks) for (const field of ARCHIVE_FIELDS) Object.assign(pool[field], (chunk.logical || chunk.raw.records)[field]);
   const prior = await target.dependencies({ ...data, ...Object.fromEntries(ARCHIVE_FIELDS.map(f => [f, { ...data[f], ...pool[f] }])) }, current);
@@ -169,6 +172,18 @@ export async function loadReplicaArchives(data, target, load, { current = {}, pe
   }
   await verifyChats(data.chats, target, checked);
   await verifyChats(data.chatSources, target, { ...checked, chats: { ...checked.chats, ...data.chats } });
+  if (beforeIngest) {
+    for (const chunk of chunks) {
+      const records = chunk.logical || chunk.raw.records;
+      for (const field of ARCHIVE_FIELDS) for (const [id, record] of Object.entries(records[field])) {
+        let old = prior[field][id];
+        if (!old && target.ids[field].has(id)) old = await target.get(field, id);
+        prior[field][id] = mergeArchiveRecord(field, old, record, chooseClaim);
+      }
+    }
+    await beforeIngest(prior, checked);
+  }
   if (persist) await persist(chunks);
-  for (const chunk of chunks) await target.ingest(chunk, chooseClaim);
+  if (ingest) await ingest(chunks);
+  else for (const chunk of chunks) await target.ingest(chunk, chooseClaim);
 }

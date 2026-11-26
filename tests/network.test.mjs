@@ -26,6 +26,62 @@ const flush = () => new Promise(resolve => setImmediate(resolve));
 async function until(check) { for (let i = 0; i < 10000; i++) { if (check()) return; await flush(); } throw new Error('握手未进入预期状态'); }
 const url = 'http://127.0.0.1:39241';
 
+test('未通过签名校验的消息只记录一次拒收原因', async () => {
+  const reasons = [], frames = [];
+  const receiver = new Network({ actor: 'receiver' }, {}, () => assert.fail('无效消息进入了世界'), () => {},
+    (error, peer) => reasons.push([error.message, peer.node]));
+  const sender = new Network({ actor: 'sender' });
+  sender.sign = async () => '无效签名';
+  const peer = { node: 'sender', packets: new Map() };
+  receiver.attach(peer, {});
+  await sender.directControl({ queued: 0, sendQueue: Promise.resolve(), dc: {
+    readyState: 'open', bufferedAmount: 0, send: frame => frames.push(frame.buffer)
+  } }, 'beat', {});
+  for (const data of frames) peer.dc.onmessage({ data });
+  await until(() => receiver.stats.rejected);
+  assert.deepEqual(reasons, [['消息标识或签名无效', 'sender']]);
+  assert.equal(receiver.stats.rejected, 1);
+});
+
+test('分块签名复用不可变文本并保留发送时的页码', async t => {
+  const network = new Network({ actor: 'a'.repeat(64) });
+  network.sign = async () => 'signature';
+  const page = { id: crypto.randomUUID(), kind: 'world', index: 2, text: '海'.repeat(65536), last: false };
+  const copy = globalThis.structuredClone;
+  t.mock.method(globalThis, 'structuredClone', value => {
+    assert(!Object.hasOwn(value, 'text'), '每一页的不可变文本不应重新分配');
+    return copy(value);
+  });
+  const sending = network.makeEnvelope('replicaPage', page);
+  page.index++;
+  const { body } = await sending;
+  assert.equal(body.index, 2);
+  assert.equal(body.text, page.text);
+});
+
+test('旧伙伴接收已截取的世界时复用快照，并在签名前固定握手资料', async () => {
+  const network = new Network({ actor: 'a'.repeat(64) });
+  network.sign = async () => 'signature';
+  network.fitsLegacy = async () => true;
+  network.encode = async () => new Uint8Array();
+  network.send = async () => {};
+  const peer = { replicaPages: false };
+  network.replicaPeers = () => [peer];
+  const world = { tick: 1 };
+  const update = await network.broadcast('world', { world }, { capturedWorld: true });
+  assert.equal(update.body.world, world);
+  const cards = [{ status: 'ended' }];
+  let release;
+  network.sign = () => new Promise(resolve => { release = () => resolve('signature'); });
+  const pending = network.direct(peer, 'hello', { world, cards }, undefined, { capturedWorld: true });
+  await until(() => release);
+  cards[0].status = 'corrected';
+  release();
+  const hello = await pending;
+  assert.equal(hello.body.world, world);
+  assert.equal(hello.body.cards[0].status, 'ended');
+});
+
 test('自动连接尚在握手时手动连接复用同一次尝试，等直连成功才返回', async t => {
   const { network, offers } = fixture(t);
   let finished = 0;

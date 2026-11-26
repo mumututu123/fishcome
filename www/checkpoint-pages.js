@@ -11,7 +11,8 @@ const ABSENT = Symbol('absent');
 export const checkpointChanged = Symbol('checkpoint changed');
 let committed;
 let observedRevision;
-const revisionOf = head => head?.format === FORMAT ? head.revision : head ? compatibilityMark(head).stamp : 'empty';
+export const pagedRevision = head => head?.format === FORMAT ? head.revision : undefined;
+const revisionOf = head => pagedRevision(head) ?? (head ? compatibilityMark(head).stamp : 'empty');
 
 export function beforeCheckpointPatch(data, patch) {
   const capture = captures.get(data);
@@ -175,7 +176,7 @@ function* detachedCheckpoint(head, capture) {
 
 export function beginCheckpoint(store, prior, checkpoint, options, done, fail) {
   const expected = options.reconciledRevision ?? observedRevision;
-  const stale = options.simulationChanges && expected !== undefined && revisionOf(prior) !== expected;
+  const stale = (options.simulationChanges || options.requireObservedRevision) && expected !== undefined && revisionOf(prior) !== expected;
   if (stale && !options.captureCheckpoint) {
     const error = new Error('另一个页面已保存更新。请刷新本页载入最新存档。');
     error.name = 'CheckpointConflictError';
@@ -252,9 +253,21 @@ export function checkpointCommitted(cache) {
 }
 
 export function readCheckpoint(store, head, resolve, reject, remember = true) {
-  if (remember && observedRevision === undefined) observedRevision = revisionOf(head);
-  if (head?.format !== FORMAT) { resolve(head); return; }
-  const checkpoint = head.checkpoint, counts = Object.fromEntries(Object.keys(head.lengths).map(field => [field, 0]));
+  const finish = value => {
+    if (remember && observedRevision === undefined) observedRevision = revisionOf(head);
+    resolve(value);
+  };
+  if (head?.format !== FORMAT) { finish(head); return; }
+  const checkpoint = head.checkpoint;
+  const invalid = () => reject(new Error('本地存档的记录页不完整'));
+  if (!checkpoint?.world || !head.lengths || typeof head.lengths !== 'object' || Array.isArray(head.lengths)) { invalid(); return; }
+  const counts = {};
+  for (const [field, length] of Object.entries(head.lengths)) {
+    const table = checkpoint.world[field];
+    if (!worldTables.has(field) || !table || typeof table !== 'object' || Array.isArray(table) ||
+        !Number.isSafeInteger(length) || length < 0) { invalid(); return; }
+    counts[field] = 0;
+  }
   const tables = remember && committed?.revision !== head.revision ? new Map(
     Object.keys(counts).map(field => [field, { pages: [], byId: new Map(), source: new WeakRef(checkpoint.world[field]) }])
   ) : null;
@@ -264,20 +277,22 @@ export function readCheckpoint(store, head, resolve, reject, remember = true) {
     const cursor = request.result;
     if (cursor) {
       const [, field, number] = cursor.key;
-      if (!Object.hasOwn(counts, field) || number !== counts[field]++ || !Array.isArray(cursor.value)) {
-        reject(new Error('本地存档的记录页不完整')); return;
-      }
-      const table = tables?.get(field), rows = cursor.value;
-      if (table) table.pages.push(rows.map(([id]) => id));
-      for (const [id, value] of rows) {
+      const rows = cursor.value;
+      if (!Object.hasOwn(counts, field) || number !== counts[field]++ || !Array.isArray(rows)) { invalid(); return; }
+      const table = tables?.get(field), page = table && [];
+      for (const row of rows) {
+        if (!Array.isArray(row) || row.length !== 2 || typeof row[0] !== 'string' ||
+            Object.hasOwn(checkpoint.world[field], row[0])) { invalid(); return; }
+        const [id, value] = row;
         Object.defineProperty(checkpoint.world[field], id, { value, enumerable: true, writable: true, configurable: true });
-        if (table) table.byId.set(id, number);
+        if (table) { page.push(id); table.byId.set(id, number); }
       }
+      if (table) table.pages.push(page);
       cursor.continue();
     } else if (Object.entries(counts).some(([field, count]) => count !== head.lengths[field])) reject(new Error('本地存档缺少记录页'));
     else {
       if (tables) committed = { revision: head.revision, data: new WeakRef(checkpoint.world), tables };
-      resolve(checkpoint);
+      finish(checkpoint);
     }
   };
 }

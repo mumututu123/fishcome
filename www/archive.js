@@ -168,23 +168,42 @@ export function mergeArchiveState(a, b) {
 }
 export function operationValue(op, actor) { return (op.kind === 'referral' && op.inviter === actor ? 10 : 0) + (op.actor === actor ? op.kind === 'earn' ? 1 : -(op.cost || 0) : 0); }
 function opSummary(op) { return { id: op.id, kind: op.kind, actor: op.actor, cost: op.cost, inviter: op.inviter, t: op.t }; }
+export function mergeArchiveRecord(field, old, record, chooseChar) {
+  if (!old) return record;
+  if (field === 'chars') return chooseChar(old, record);
+  if (field === 'ops') {
+    if (old.kind === 'referral' && record.kind === 'referral') return chooseReferral(old, record);
+    const { proof: oldProof, ...left } = old, { proof: newProof, ...right } = record;
+    if (!same(left, right)) throw new Error('归档操作记录不可覆盖');
+    return old;
+  }
+  if (field === 'chats' || field === 'chatSources') {
+    if (!same(old, record)) throw new Error('归档聊天记录不可覆盖');
+    return old;
+  }
+  if (field === 'travel') return mergeTravel(old, record);
+  if (field === 'breeding') {
+    const born = record.status === 'born', oldBorn = old.status === 'born', terminal = record.status !== 'active', oldTerminal = old.status !== 'active';
+    if (born !== oldBorn) return born ? record : old;
+    if (terminal !== oldTerminal) return terminal ? record : old;
+    if (record.at !== old.at) return (born ? record.at < old.at : record.at > old.at) ? record : old;
+    return json(record).localeCompare(json(old)) > 0 ? record : old;
+  }
+  return (record.posAt || 0) > (old.posAt || 0) || record.posAt === old.posAt && json(record).localeCompare(json(old)) > 0 ? record : old;
+}
 export class ArchiveStore {
   constructor({ load } = {}) { this.load = load; this.packs = new Map(); this.manifests = {}; this.rootsByChunk = new Map(); this.ids = Object.fromEntries(ARCHIVE_FIELDS.map(f => [f, new Map()])); this.cache = new Map(); this.bigCache = new Map(); this.overrides = Object.fromEntries(ARCHIVE_FIELDS.map(f => [f, {}])); this.summary = { ops: {}, ledger: {}, serials: {}, catalog: {}, lastMeals: new Map(), grassMeals: new Set(), mealSources: new Map() }; }
   async ingest(chunk, chooseChar) {
     if (this.manifests[chunk.manifest.id]) return;
+    const revision = this.revision;
     const changes = [];
     for (const field of ARCHIVE_FIELDS) for (const [id, record] of Object.entries((chunk.logical || chunk.raw.records)[field])) if (this.ids[field].has(id)) {
-      const old = await this.get(field, id); let chosen = old;
-      if (field === 'chars') chosen = chooseChar(old, record);
-      else if (field === 'ops') { if (old.kind === 'referral' && record.kind === 'referral') chosen = chooseReferral(old, record); else { const { proof: p, ...a } = old, { proof: q, ...b } = record; if (!same(a, b)) throw new Error('归档操作记录不可覆盖'); } }
-      else if (field === 'chats' || field === 'chatSources') { if (!same(old, record)) throw new Error('归档聊天记录不可覆盖'); }
-      else if (field === 'travel') chosen = mergeTravel(old, record);
-      else if (field === 'breeding') {
-        const born = record.status === 'born', oldBorn = old.status === 'born', terminal = record.status !== 'active', oldTerminal = old.status !== 'active';
-        if (born && !oldBorn || !oldBorn && terminal && !oldTerminal || born === oldBorn && terminal === oldTerminal && ((born ? record.at < old.at : record.at > old.at) || record.at === old.at && json(record).localeCompare(json(old)) > 0)) chosen = record;
-      } else if ((record.posAt || 0) > (old.posAt || 0) || record.posAt === old.posAt && json(record).localeCompare(json(old)) > 0) chosen = record;
+      const old = await this.get(field, id), chosen = mergeArchiveRecord(field, old, record, chooseChar);
       if (!same(old, chosen)) changes.push({ field, id, old, chosen });
     }
+    // Reading a cold record yields. Resolve overlapping imports against the
+    // latest winner before updating the per-account summaries.
+    if (this.revision !== revision) return this.ingest(chunk, chooseChar);
     this.addVerified(chunk);
     for (const { field, id, old, chosen } of changes) {
       this.overrides[field][id] = chosen;

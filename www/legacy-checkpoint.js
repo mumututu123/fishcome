@@ -24,6 +24,22 @@ export function readOldBundle(store, ready) {
   }
 }
 
+// A checkpoint-only repair may be the first paged write on a legacy profile.
+// Detach its metadata before either application can change the legacy slots.
+export function migrateOldMetadata(store, bundle, ready) {
+  let remaining = META.length;
+  for (const name of META) {
+    const key = currentKey(name), request = store.get(key);
+    request.onsuccess = () => {
+      if (request.result === undefined) {
+        const value = bundle[name] ?? (name === 'known' ? [] : name === 'histories' ? {} : undefined);
+        if (value !== undefined) store.put(value, key);
+      }
+      if (!--remaining) ready();
+    };
+  }
+}
+
 export function preserveOldBranch(store, head, bundle) {
   if (diverged(head, bundle.checkpoint)) store.put(bundle, [BRANCH, (bundle.checkpoint.at || Date.now()) + '-' + crypto.randomUUID()]);
 }

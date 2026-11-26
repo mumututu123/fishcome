@@ -1,7 +1,7 @@
 import { World, CONFIG, clone, EYES, bounds, validGlyph, displayNick, hash, sceneryCount, chooseClaim } from './engine.js';
 import { SimulationClient, subscribeSimulationChanges } from './simulation-client.js';
 import { setParticipantName, subscribeBeforeSimulationPatch, worldEdited } from './simulation-changes.js';
-import { get, getMany, set, putMany, readHandoffCheckpoint, replaceFromBackup, getOldBranch, newIdentity, signer, verifyEnvelope, actorId, download } from './storage.js';
+import { get, getMany, readCheckpointVersion, sameStoredCheckpoint, putMany, readHandoffCheckpoint, replaceFromBackup, getOldBranch, newIdentity, signer, verifyEnvelope, actorId, download } from './storage.js';
 import { beforeCheckpointPatch, noteCheckpointChanges } from './checkpoint-pages.js';
 import { CheckpointPictures } from './checkpoint-picture.js';
 import { Network } from './network.js';
@@ -52,7 +52,10 @@ let myFishView = 'list', pedigreeFish = null, pedigreeKey = '';
 const fishDate = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
 let lastSnapshot = 0, lastHello = new Set(), lastMeter = Date.now(), lastSave = 0, lastPictureTime = 0, lastChat = 0, selfBeat = 0, lastLeader = '', status = '', started = false, lastRepair = 0;
 const worldBroadcast = new WorldBroadcast(subscribeSimulationChanges);
-async function captureReplica() { return (await saveInternal({ capture: true })).world; }
+async function captureReplica() {
+  if (!started) throw new Error('世界尚未启动，暂时无法同步');
+  return (await saveInternal({ capture: true })).world;
+}
 let geometryRepair = false, fishRepairWaiting = 0;
 let updateFrozen = false, updateRestarting = false, activeRestartTaskId = '', activeSavePromise = null, preparedUpdate = null, peerUpdateCandidate = '', activeUpdateTaskId = '', updatePollTimer = null, peerProbeBusy = false, updateStateSeq = 0;
 let updateForcePendingAck = false, updateForceDraftAck = false, updateForceReason = '';
@@ -71,9 +74,14 @@ function rejectOperation(id) { rejectedOps.add(id); inbox.delete(id); }
 let lastOnlineAt = Date.now();
 const diagnostics = new DiagnosticLog();
 let diagScanResult = null, scanSequence = 0, replacingCheckpoint = false;
+let repairWrite;
+function invalidateRepairWrite() {
+  repairWrite?.abort(new Error('运行中的世界已更新，请重新扫描'));
+}
 const saveGeneration = get('saveGeneration').then(value => value ?? 0);
 async function saveItems(entries) {
-  if (replacingCheckpoint) return;
+  invalidateRepairWrite();
+  if (!started || replacingCheckpoint) return;
   return putMany(entries, { generation: await saveGeneration });
 }
 const historyQueues = new Map();
@@ -129,15 +137,21 @@ async function requestArchive(id, peer) {
     throw new Error('缺少历史归档，等待持有记忆的伙伴重新接入');
   })(); archiveRequests.set(id, task); try { return await task; } finally { archiveRequests.delete(id); }
 }
-async function ensureArchives(data, peer, bundle, target = archiveStore, current = {}) {
+async function ensureArchives(data, peer, bundle, target = archiveStore, current = {}, beforeIngest) {
   const load = async id => bundle ? bundle[id] : await get('archive:' + id) || (peer && await requestArchive(id, peer));
   const persist = peer && (chunks => putMany(chunks.map(chunk => ['archive:' + chunk.manifest.id, chunk.encoded])));
-  const live = target === archiveStore;
-  if (live) archiveImports++;
-  try { return await loadReplicaArchives(data, target, load, { current, persist, diagnostics }); }
-  finally {
-    if (live) { archiveImports--; if (target === archiveStore) worldEdited(world); }
-  }
+  const ingest = async chunks => {
+    const live = target === archiveStore, revision = target.revision;
+    if (live) archiveImports++;
+    try { for (const chunk of chunks) await target.ingest(chunk, chooseClaim); }
+    finally {
+      if (live) {
+        archiveImports--;
+        if (target === archiveStore && revision !== target.revision) worldEdited(world);
+      }
+    }
+  };
+  return loadReplicaArchives(data, target, load, { current, persist, diagnostics, beforeIngest, ingest });
 }
 async function archiveWorld(now = Date.now()) {
   if (updateFrozen || archiveScanning || !amLeader() || now - archiveCheckAt < 60000) return;
@@ -181,9 +195,26 @@ async function verifyLocalCheckpoint(data, archived, store, options = {}) {
     return repaired;
   }
 }
+async function mergeVerifiedWorld(data, peer, context, { local = false } = {}) {
+  const target = world, store = archiveStore, revision = store.revision;
+  let incoming = data, archived;
+  await ensureArchives(data, peer, null, store, target.data, async (sources, current) => {
+    archived = sources;
+    const options = { context, current, diagnostics };
+    if (local) incoming = await verifyLocalCheckpoint(data, sources, store, options);
+    else await verifyReplica(data, sources, store, options);
+  });
+  // Overlapping archive rows have a canonical winner after ingestion.
+  if (revision !== store.revision) archived = await store.dependencies(incoming, target.data);
+  if (target !== world || store !== archiveStore) throw new Error('运行世界已更换，请重新同步');
+  target.merge(incoming, archived);
+  target.attachArchives(store);
+}
 async function mergeReplica(data, peer, context = 'merge') {
-  await ensureArchives(data, peer, null, archiveStore, world.data); const archived = await archiveStore.dependencies(data, world.data);
-  await verifyReplica(data, archived, archiveStore, { context, current: world.data, diagnostics }); const previousTerrain = world.data.terrain.seed; world.merge(data, archived); world.attachArchives(archiveStore); await compactKnown(world, archiveStore); if (world.data.terrain.seed !== previousTerrain) geometryRepair = true;
+  const previousTerrain = world.data.terrain.seed;
+  await mergeVerifiedWorld(data, peer, context);
+  await compactKnown(world, archiveStore);
+  if (world.data.terrain.seed !== previousTerrain) geometryRepair = true;
   worldEdited(world);
   for (const member of active()) world.data.participants[member.actor] = member.nick; if (identity) world.data.participants[identity.actor] = identity.nick;
   // An expired local copy can be restored only after hearing its roots from a live peer.
@@ -193,16 +224,12 @@ async function mergeReplica(data, peer, context = 'merge') {
     await ensureArchives(checkpoint.world, peer, null, checkpointStore);
     const older = await checkpointStore.dependencies(checkpoint.world);
     const local = await verifyLocalCheckpoint(checkpoint.world, older, checkpointStore);
-    await ensureArchives(local, peer, null, archiveStore, world.data);
-    const shared = await archiveStore.dependencies(local, world.data);
-    await verifyReplica(local, shared, archiveStore, { current: world.data, diagnostics, context: 'checkpoint' });
-    world.merge(local, shared);
-    world.attachArchives(archiveStore);
+    await mergeVerifiedWorld(local, peer, 'checkpoint');
     if (priorCheckpoint === checkpoint) priorCheckpoint = null;
     recovered = true;
   }
   reconcileHistory(); syncIncomeSerial(); await save(); renderChat();
-  if (recovered) await network.broadcast('merge', { world: await captureReplica() });
+  if (recovered) await network.broadcast('merge', { world: await captureReplica() }, { capturedWorld: true });
 }
 function resumeAfterInactivity(now = Date.now()) { if (!resumeTask) resumeTask = resumeWorld(now).finally(() => { resumeTask = null; }); return resumeTask; }
 async function resumeWorld(now) {
@@ -227,8 +254,11 @@ function reconcileHistory() {
   let changed = false; for (const card of Object.values(histories)) if (card.roots.some(r => world.roots.includes(r)) && card.status !== 'corrected') { card.status = 'corrected'; changed = true; } if (changed) saveItems([['histories', histories]]).catch(() => {});
 }
 function validHistoryCard(card) {
-  return Array.isArray(card?.roots) && card.roots.length > 0 && card.roots.every(id => typeof id === 'string' && id.length > 0) &&
-    typeof card.image === 'string' && card.image.length <= 3000000 && /^data:image\/(webp|png);base64,/.test(card.image);
+  if (!Array.isArray(card?.roots) || !card.roots.length || !card.roots.every(id => typeof id === 'string' && /^[0-9a-f-]{36}$/i.test(id)) ||
+      typeof card.image !== 'string' || card.image.length > 3000000 || !/^data:image\/(webp|png);base64,/.test(card.image)) return false;
+  const roots = new Set(card.roots);
+  return Object.keys(card.archiveRoots || {}).every(root => roots.has(root)) &&
+    Object.values(card.chats || {}).every(message => Array.isArray(message?.body?.roots) && message.body.roots.some(root => roots.has(root)));
 }
 function acceptHistory(card, persist = true) {
   if (!validHistoryCard(card)) return;
@@ -257,12 +287,12 @@ async function onMessage(message, peer) {
       network.close(peer); update(); return;
     }
     if (message.from !== peer.node || body.member?.id !== message.from || body.member.actor !== message.actor) return;
+    const newKnowledge = Object.keys(body.world.roots || {}).some(r => !world.data.roots[r]) || Object.keys(body.world.ops || {}).some(id => !world.data.ops[id]) || Object.keys(body.world.chats || {}).some(id => !world.data.chats[id]) || Object.keys(body.world.chatSources || {}).some(id => !world.data.chatSources[id]);
+    await mergeReplica(body.world, peer, 'hello'); geometryRepair = true;
     const own = body.member; members.set(own.id, { ...own, url: peer.url, at: Date.now() }); remember(peer.url);
     rememberAuthor(message.actor, own.nick);
     for (const m of body.members || []) remember(m.url);
-    const newKnowledge = Object.keys(body.world.roots || {}).some(r => !world.data.roots[r]) || Object.keys(body.world.ops || {}).some(id => !world.data.ops[id]) || Object.keys(body.world.chats || {}).some(id => !world.data.chats[id]) || Object.keys(body.world.chatSources || {}).some(id => !world.data.chatSources[id]);
-    await mergeReplica(body.world, peer, 'hello'); geometryRepair = true;
-    if (newKnowledge) await network.broadcast('merge', { world: body.world });
+    if (newKnowledge) await network.broadcast('merge', { world: body.world }, { capturedWorld: true });
     reconcileHistory(); syncIncomeSerial(); lastPictureTime = 0;
     for (const card of body.cards || []) { await receiveHistory(card, peer); }
     await save();
@@ -274,7 +304,7 @@ async function onMessage(message, peer) {
   } else if (message.kind === 'merge') {
     await mergeReplica(body.world, peer, 'merge'); geometryRepair = true; reconcileHistory(); syncIncomeSerial(); update();
   } else if (message.kind === 'replicaRequest') {
-    if (body.to === network.node) await network.broadcast('merge', { world: await captureReplica() });
+    if (body.to === network.node) await network.broadcast('merge', { world: await captureReplica() }, { capturedWorld: true });
   } else if (message.kind === 'world') {
     if (message.from !== leader()) return;
     try { await mergeReplica(body.world, peer, body.delta ? 'world-delta' : 'world-full'); }
@@ -327,7 +357,7 @@ async function networkChange(error) {
     lastHello.add(p.id);
     try {
       await network.direct(p, 'hello', { rules: WORLD_RULES, member: member(), members: active(), world: await captureReplica(), cards: Object.values(histories).slice(0, 3), historyIndex: Object.keys(histories) },
-        () => worldBroadcast.captureJoined(world.data, captureReplica));
+        () => worldBroadcast.captureJoined(world.data, captureReplica), { capturedWorld: true });
       if (!p.replicaPages) worldBroadcast.reset();
     } catch (error) {
       network.close(p, error);
@@ -643,10 +673,10 @@ async function receiveHistory(card, peer) {
 subscribeSimulationChanges((current, patch) => noteCheckpointChanges(current.data, patch));
 subscribeBeforeSimulationPatch((current, patch) => beforeCheckpointPatch(current.data, patch));
 async function saveInternal({ capture = false, mirrorLegacy = false, reconciledRevision } = {}) {
-  if (!identity || !started || replacingCheckpoint) return;
+  if (replacingCheckpoint) throw new Error('正在更换存档');
   const changedPictureWorld = Symbol();
-  const generation = await saveGeneration;
   const task = (async () => {
+    const generation = await saveGeneration;
     for (;;) {
       const prepared = await pictures.prepare();
       try {
@@ -664,8 +694,9 @@ async function saveInternal({ capture = false, mirrorLegacy = false, reconciledR
   activeSavePromise = task;
   try { return await task; } finally { if (activeSavePromise === task) activeSavePromise = null; }
 }
-async function save() { if (updateFrozen) return; return saveInternal(); }
-async function saveHandoff(mirrorLegacy = false) {
+async function save() { if (!started || updateFrozen || replacingCheckpoint) return; return saveInternal(); }
+async function saveHandoff({ mirrorLegacy = false, startup = false } = {}) {
+  if (!started && !startup) throw new Error('世界尚未启动，暂时无法交接进度');
   let revision;
   if (activeSavePromise) {
     try { await activeSavePromise; }
@@ -675,13 +706,11 @@ async function saveHandoff(mirrorLegacy = false) {
     try { return await saveInternal({ mirrorLegacy, reconciledRevision: revision }); }
     catch (error) { if (error.name !== 'CheckpointConflictError') throw error; }
     const saved = await readHandoffCheckpoint(), other = saved.identity, data = saved.checkpoint.world;
+    if (saved.generation !== await saveGeneration) throw new Error('存档已在其他页面更换，请刷新后再试');
     if (other?.actor !== identity.actor || !world.roots.some(id => Object.hasOwn(data.roots, id))) {
       throw new Error('两个页面打开了不同的身份或世界。请先分别导出进度，再从最新页面继续。');
     }
-    await ensureArchives(data, null, null, archiveStore, world.data);
-    const archived = await archiveStore.dependencies(data, world.data);
-    world.merge(await verifyLocalCheckpoint(data, archived, archiveStore, { current: world.data, context: 'handoff' }), archived);
-    world.attachArchives(archiveStore);
+    await mergeVerifiedWorld(data, null, 'handoff', { local: true });
     await compactKnown(world, archiveStore);
     for (const card of Object.values(saved.histories || {})) acceptHistory(card, false);
     known = [...new Set([...known, ...(saved.known || [])])];
@@ -714,7 +743,10 @@ async function start() {
   meta.assetSuffix = normalizeAssetSuffix(meta.assetSuffix);
   meta.url = await normalizeInvite(meta.url);
   $('currentVersion').textContent = `当前版本 ${meta.version || '未知'}`;
-  identity = await get('identity');
+  const [owner, cards, invites, previous, storedGeneration] = await getMany(['identity', 'histories', 'known', 'checkpoint', 'saveGeneration']);
+  if ((storedGeneration ?? 0) !== generation) throw new Error('存档已在其他页面更换，请刷新后再试');
+  identity = owner;
+  histories = cards || {};
   if (!identity) {
     const showDiagnostics = $('diagnosticsDialog').open;
     if (showDiagnostics) $('diagnosticsDialog').close();
@@ -735,8 +767,8 @@ async function start() {
   lifeSince = Number.isFinite(identity.lifeSeenAt) ? identity.lifeSeenAt : Date.now(); returnVisit = Date.now() - lifeSince > 60000;
   meta.url = await encodeInvite(await decodeInvite(meta.url), identity.actor);
   $('downloadPackage').href = '/download.zip?invite=' + encodeURIComponent(meta.url);
-  histories = await get('histories') || {}; known = await get('known') || []; const previous = await get('checkpoint'), now = Date.now();
-  const migrated = await Promise.allSettled((Array.isArray(known) ? known : []).map(normalizeInvite)); known = [...new Set(migrated.filter(result => result.status === 'fulfilled').map(result => result.value))]; await saveItems([['known', known]]);
+  const now = Date.now();
+  const migrated = await Promise.allSettled((Array.isArray(invites) ? invites : []).map(normalizeInvite)); known = [...new Set(migrated.filter(result => result.status === 'fulfilled').map(result => result.value))];
   if (previous?.world) await ensureArchives(previous.world);
   const expires = previous?.world && now - (previous.lastOnlineAt ?? previous.at ?? previous.world.tick) >= CONFIG.offlineLife;
   if (previous?.world) previous.world = await verifyLocalCheckpoint(previous.world, await archiveStore.dependencies(previous.world), archiveStore, { context: 'start' });
@@ -749,10 +781,12 @@ async function start() {
   network = new Network(identity, meta, onMessage, networkChange, (error, peer) => {
     diagnostics.record('warn', 'network', `已拒绝来自 ${peer?.node || 'unknown'} 的消息：${error?.message || error}`);
     if ($('diagnosticsDialog').open) renderDiagnosticsLogs();
-  }); await network.start(displayNick(identity.nick)); started = true; members.set(network.node, member());
+  }); await network.start(displayNick(identity.nick)); members.set(network.node, member());
   $('myUrl').value = meta.url;
   creator = new Creator(placement, balance, size => defaultFishName(identity.nick, world.myFishes(identity.actor).length + 1, size));
-  syncIncomeSerial(); renderChat(); await saveHandoff();
+  syncIncomeSerial(); renderChat(); await saveHandoff({ startup: true });
+  started = true;
+  if (network.live().length) networkChange().catch(error => { status = error.message; });
   syncUpdateStatus(); refreshPeerUpdates().catch(() => {});
   reconnect().catch(() => {}); update(); lastPictureTime = Date.now(); takePicture().catch(() => {});
   setInterval(tick, CONFIG.step); setInterval(() => { network.presence(active().filter(m => m.id !== network.node).map(m => ({ id: m.id, url: m.url }))).catch(() => {}); if (network.connections.size < 6) { const candidate = active().filter(m => m.id !== network.node && !network.has(m.id)).sort((a, b) => hash(`${network.node}:${a.id}`) - hash(`${network.node}:${b.id}`))[0]; if (candidate) network.connect(candidate.url, candidate.id).catch(() => {}); } }, 6000);
@@ -767,14 +801,15 @@ async function tick() {
   const now = Date.now(), elapsed = now - lastMeter; lastMeter = now;
   if (!updateFrozen && elapsed < 90000) identity.remainder = (identity.remainder || 0) + elapsed / 1000;
   await resumeAfterInactivity(now);
+  if (replacingCheckpoint) return;
   if (!updateFrozen && identity.remainder >= 3600) { identity.remainder -= 3600; identity.serial = (identity.serial || 0) + 1; await submit({ kind: 'earn', cost: 0, serial: identity.serial }); }
   members.set(network.node, member());
   if (now - selfBeat >= 3000 && network.live().length) { selfBeat = now; network.broadcast('beat', { member: member(), rootCount: world.roots.length, opCount: Object.keys(world.data.ops).length, chatCount: Object.keys(world.data.chats).length, chatSourceCount: Object.keys(world.data.chatSources).length }).catch(() => {}); }
   const currentLeader = leader(); if (currentLeader !== lastLeader) { simulation.close(); lastLeader = currentLeader; worldBroadcast.reset(); if (amLeader()) { geometryRepair = true; world.data.tick = Math.max(world.data.tick, now - 2000); for (const envelope of [...inbox.values()].sort((a, b) => a.body.t - b.body.t || a.body.id.localeCompare(b.body.id))) { if (!world.data.ops[envelope.body.id]) { const result = world.apply({ ...clone(envelope.body), proof: clone(envelope) }); if (!result.ok) rejectOperation(envelope.body.id); network.broadcast('ack', { id: envelope.body.id, result }).catch(() => {}); } } for (const id of pending.keys()) if (world.data.ops[id]) pending.delete(id); } }
   if (amLeader() && fishRepairWaiting && now - lastSave > 5000) geometryRepair = true;
-  if (amLeader() && !updateFrozen) {
+  if (amLeader() && !updateFrozen && !replacingCheckpoint) {
     const target = world;
-    simulation.advance(target, now, () => target === world && amLeader() && !updateFrozen && !archiveBusy && !archiveImports, {
+    simulation.advance(target, now, () => target === world && amLeader() && !updateFrozen && !replacingCheckpoint && !archiveBusy && !archiveImports, {
       geometry: geometryRepair, chat: world.data.pendingChatGlyphs && now - lastSave > 5000,
       done(result) {
         geometryRepair = false; fishRepairWaiting = result.fishWaiting;
@@ -1226,7 +1261,7 @@ async function applyPreparedUpdate(confirmForce = false) {
     return;
   }
   try {
-    await saveHandoff(true);
+    await saveHandoff({ mirrorLegacy: true });
   } catch (error) {
     updateChannel?.postMessage({ type: 'abort-restart', taskId: task.id });
     keepReadyWithWarn('本地进度保存失败：' + error.message + '。请重试，当前版本继续运行。');
@@ -1362,7 +1397,7 @@ $('backup').onclick = async () => {
     if (started) await resumeAfterInactivity();
     const [checkpoint, owner, cards = {}, invites = []] = started
       ? [await captureLocalCheckpoint(), clone(identity), clone(histories), [...known]]
-      : await getMany(['checkpoint', 'identity', 'histories', 'known']);
+      : await getMany(['checkpoint', 'identity', 'histories', 'known'], { observeCheckpoint: false });
     await downloadBackup('鱼来-身份与记忆备份.json', { format: 'tide-backup-1', identity: owner, histories: cards, known: invites, checkpoint });
   } catch (error) { diagnostics.record('error', 'backup', error.message); toast(error.message); }
 };
@@ -1400,7 +1435,7 @@ $('importBackup').onchange = async e => {
   if (updateFrozen) { toast('正在更新并重启，请稍候'); return; }
   try {
     const data = JSON.parse(await file.text());
-    if (data.format !== 'tide-backup-1' || !data.identity?.secret || (data.checkpoint && !data.checkpoint.world) ||
+    if (data.format !== 'tide-backup-1' || !data.identity?.secret || (Object.hasOwn(data, 'checkpoint') && !data.checkpoint?.world) ||
         await actorId(data.identity.pub) !== data.identity.actor) throw new Error('备份无效');
     // Import the key before committing an identity that will be needed at the next start.
     const sign = await signer(data.identity);
@@ -1424,10 +1459,12 @@ $('importBackup').onchange = async e => {
     if (replacingCheckpoint || updateFrozen) return;
     replacingCheckpoint = true;
     try {
-      if (activeSavePromise) await activeSavePromise;
+      // Early backups contained only the identity and account metadata.
+      // Keep the durable world at the same revision when updating its legacy mirror.
+      const retained = checkpoint ? undefined : (await get('checkpoint', { observeCheckpoint: false })) ?? null;
       await replaceFromBackup([['identity', data.identity], ['histories', data.histories || {}], ['known', data.known || []],
-        ...(checkpoint ? [['checkpoint', checkpoint]] : []), ...Array.from(chunks, id => ['archive:' + id, bundle[id]])],
-        { generation: await saveGeneration, replace: true });
+        ['checkpoint', checkpoint ?? retained], ...Array.from(chunks, id => ['archive:' + id, bundle[id]])],
+        { generation: await saveGeneration, replace: true, checkpoint: retained });
     } catch (error) { replacingCheckpoint = false; throw error; }
     try { await network?.stop(); } finally { location.reload(); }
   } catch (error) { diagnostics.record('error', 'import', error.message); toast(error.message); }
@@ -1457,8 +1494,9 @@ function renderDiagnosticsLogs() {
   $('diagLogs').scrollTop = $('diagLogs').scrollHeight;
 }
 async function diagnosticTarget() {
-  const stored = await get('checkpoint') ?? null;
-  const live = started, checkpoint = live ? await captureLocalCheckpoint() : stored;
+  const live = started;
+  const stored = live ? await readCheckpointVersion() : (await get('checkpoint', { observeCheckpoint: false })) ?? null;
+  const checkpoint = live ? await captureLocalCheckpoint() : stored;
   const target = checkpoint?.world, store = newArchiveStore();
   if (checkpoint && !target) throw new Error('本地存档缺少世界数据');
   if (target) await ensureArchives(target, null, null, store);
@@ -1545,10 +1583,11 @@ async function applyDiagnosticRepair(mode) {
   $('diagRepairResult').textContent = '正在核对修复后的存档…';
   let committed = false;
   let failed = false;
+  let unsubscribe;
   try {
     if (activeSavePromise) await activeSavePromise;
     const loaded = await diagnosticTarget();
-    if (!loaded.target || scan.targetKind !== loaded.targetKind || JSON.stringify(loaded.stored) !== JSON.stringify(scan.stored) ||
+    if (!loaded.target || scan.targetKind !== loaded.targetKind || !sameStoredCheckpoint(loaded.stored, scan.stored) ||
         (started && JSON.stringify(inspectFishOrigins(loaded.target, loaded.extra).issues) !== JSON.stringify(scan.report.issues))) {
       throw new Error('存档已更新，请重新扫描');
     }
@@ -1564,11 +1603,20 @@ async function applyDiagnosticRepair(mode) {
       $('diagRepairResult').textContent = '已取消清理。';
       return;
     }
-    if (started && JSON.stringify(world.data) !== JSON.stringify(loaded.target)) throw new Error('运行中的世界已更新，请重新扫描');
     const checkpoint = { ...loaded.checkpoint, world: repaired.data };
-    const entries = [['checkpoint', checkpoint]];
-    if (started) entries.push(['identity', identity], ['histories', histories], ['known', known]);
-    await putMany(entries, { checkpoint: loaded.stored, generation: await saveGeneration, replace: true, immutableSource: true, mirrorLegacy: true });
+    repairWrite = new AbortController();
+    if (started) unsubscribe = subscribeSimulationChanges((changed) => {
+      if (changed === world) invalidateRepairWrite();
+    });
+    await replaceFromBackup(() => {
+      if (sequence !== scanSequence || !$('diagnosticsDialog').open || updateFrozen ||
+          started !== (loaded.targetKind === 'memory') || (started && JSON.stringify(world.data) !== JSON.stringify(loaded.target))) {
+        throw new Error('运行中的世界已更新，请重新扫描');
+      }
+      const entries = [['checkpoint', checkpoint]];
+      if (started) entries.push(['identity', identity], ['histories', histories], ['known', known]);
+      return entries;
+    }, { checkpoint: loaded.stored, generation: await saveGeneration, replace: true, requireObservedRevision: started, signal: repairWrite.signal });
     committed = true;
     location.reload();
   } catch (error) {
@@ -1578,6 +1626,8 @@ async function applyDiagnosticRepair(mode) {
     $('diagRepairResult').hidden = false;
     renderDiagnosticsLogs();
   } finally {
+    unsubscribe?.();
+    repairWrite = undefined;
     if (!committed) {
       replacingCheckpoint = false;
       $('diagScanBtn').disabled = false;
@@ -1605,7 +1655,7 @@ bindSecretTap($('networkStatus'));
 for (const title of document.querySelectorAll('dialog:not(#diagnosticsDialog) h2')) bindSecretTap(title);
 $('closeDiagnostics').onclick = () => $('diagnosticsDialog').close();
 $('diagnosticsDialog').addEventListener('close', () => {
-  if (!$('diagnosticsDialog').open) { ++scanSequence; diagScanResult = null; }
+  if (!$('diagnosticsDialog').open) { invalidateRepairWrite(); ++scanSequence; diagScanResult = null; }
 });
 $('diagScanBtn').onclick = () => scanDiagnostics();
 $('diagAlignBtn').onclick = () => applyDiagnosticRepair('align');
@@ -1654,6 +1704,7 @@ function render(now) {
 render();
 if (new URLSearchParams(location.search).get('debug') === '1') openDiagnostics();
 start().catch(e => {
+  if (network && !started) network.stop().catch(() => {});
   diagnostics.record('error', 'start', e.message);
   toast(e.message);
   status = e.message;
