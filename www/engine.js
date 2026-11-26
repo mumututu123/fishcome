@@ -9,7 +9,7 @@ import { emptyArchiveState, mergeArchiveState, operationValue, archiveDependenci
 import { LIFE, newLife, lifeContext, updateLife, idleMotion, spawnPlankton, recordStory, mergeLife, validateLife, freshPlankton } from './life.js';
 import { REFERRAL_REWARD, referralError, chooseReferral } from './referral.js';
 import { WORLD_WIDTH, MAX_FLOOR, wrapX, worldKey, deltaX, nearX, makeTerrain, terrainOf, validTerrain, chooseTerrain, floorAt, waterAt } from './geography.js';
-import { canonicalBirthFish, canonicalBirthPath, fishOrigin, activeBreeding, finishBreeding, updateContacts, motionUnits, commitUnit, mergeBreeding, normalizeBreeding, normalizeBirthCells } from './breeding.js';
+import { canonicalBirthFish, canonicalBirthPath, fishOrigin, activeBreeding, finishBreeding, updateContacts, motionUnits, commitUnit, mergeBreeding, normalizeBreeding, normalizeBirthCells, writeBreedingRecord } from './breeding.js';
 import { newLegends, processLegends, capturedFish, retargetCapture, mergeLegends, settleLegendary, validLegends, legendSchedule } from './legends.js';
 export const CONFIG = Object.freeze({ width: WORLD_WIDTH, depth: MAX_FLOOR + 1, shallow: 60, sightShallow: 20, sightDeep: 10, step: 500, speed: 2, foodLife: 300000, hunger: 86400000, initial: 20, offlineLife: 240 * 60 * 60 * 1000 });
 export const MONUMENT = { x: 610, y: CONFIG.depth - 5, rows: ['  ____  ', ' /记忆\\ ', ' | 口 | ', ' |____| ', '________'] };
@@ -436,7 +436,14 @@ export class World {
       if (!old || (obj.posAt || 0) > (old.posAt || 0) || ((obj.posAt || 0) === (old.posAt || 0) && JSON.stringify(obj).localeCompare(JSON.stringify(old)) > 0)) this.data[type][id] = clone(obj);
     }
     const dependencies = archiveDependencies({ ...this.data, ops: { ...archived.ops, ...this.data.ops }, breeding: { ...archived.breeding, ...this.data.breeding } });
-    for (const field of ['ops', 'breeding']) for (const [id, record] of Object.entries(archived[field] || {})) { if (!this.data[field][id] && dependencies[field].has(id)) this.data[field][id] = clone(record); else if (!dependencies[field].has(id) && JSON.stringify(this.data[field][id]) === JSON.stringify(record)) delete this.data[field][id]; }
+    for (const field of ['ops', 'breeding']) for (const [id, record] of Object.entries(archived[field] || {})) {
+      const current = this.data[field][id], keep = dependencies[field].has(id);
+      if (keep && !current) {
+        const next = clone(record);
+        if (field === 'breeding') writeBreedingRecord(this.data.breeding, id, next);
+        else this.data[field][id] = next;
+      } else if (!keep && JSON.stringify(current) === JSON.stringify(record)) delete this.data[field][id];
+    }
     this.data.legends = mergeLegends(this.data.legends, other.legends, Math.max(this.data.tick, other.tick));
     settleLegendary(this, Math.max(this.data.tick, other.tick), transition);
     normalizeBirthCells(this); const groups = this.fishGroups();

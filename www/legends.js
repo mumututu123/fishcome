@@ -2,6 +2,7 @@ import { components, cellPosition, hash, key } from './engine.js';
 import { wrapX, deltaX, makeTerrain } from './geography.js';
 import { modelCells, legendaryModel, atomicPhase } from './legendary-models.js';
 import { recordStory } from './life.js';
+import { cancelBreeding } from './breeding.js';
 
 export const LEGENDS = Object.freeze({ period: 600000, cooldown: 7200000, opening: 2000, warning: 20000, limit: 64 });
 const terrains = new Map();
@@ -67,7 +68,7 @@ export function legendGeometry(data, event, now, scenery = null) {
 }
 function cancelPair(world, fish, now) {
   const r = world.breedingState(fish); if (!r) return;
-  r.status = 'cancelled'; r.reason = 'legend'; r.at = now;
+  cancelBreeding(world.data, r, now, 'legend');
   for (const id of [r.male, r.female]) if (world.data.fishes[id]) { world.data.fishes[id].cx = world.data.fishes[id].cy = 0; }
 }
 function story(world, kind, fish, at, s) { recordStory(world, kind, fish, at, { legendary: s.id, legendSeed: s.seed, legendSlot: s.slot }); }

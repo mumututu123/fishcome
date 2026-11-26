@@ -1,11 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { World, CONFIG, EYES, cellPosition, components, velocities, clone, hash } from './empty-world.mjs';
-import { CONTACT_TIME, BREEDING_TIME, updateContacts, finishBreeding, chooseOwner, motionUnits, commitUnit, validBreedingRecord, inheritedGlyph, repairLocalBirthTimes } from '../www/breeding.js';
+import { CONTACT_TIME, BREEDING_TIME, activeBreeding, breedingId, updateContacts, finishBreeding, chooseOwner, motionUnits, commitUnit, validBreedingRecord, inheritedGlyph, repairLocalBirthTimes } from '../www/breeding.js';
 import { restoreCheckpoint } from '../www/lifecycle.js';
 import { HOUR, GREENS, growthRoll, weedId, validWildCell } from '../www/seaweed.js';
 import { storiesFor } from '../www/life.js';
 import { fishCatalog } from '../www/fish-profile.js';
+import { LEGENDS, legendSchedule, settleLegendary } from '../www/legends.js';
 const t = Date.now() - 2 * BREEDING_TIME;
 const cell = (x, y, ch = 'Q') => ({ x, y, ch, color: '#88aacc' });
 function fish(world, gender, x, y, cells = [cell(0, 0), cell(1, 0), cell(2, 0)], actor = gender, suppliedId) {
@@ -18,9 +19,47 @@ function contacts(world, now) { updateContacts(world, now, world.fishGroups(), w
 function bind(world) { for (let i = 0; i <= CONTACT_TIME; i += CONFIG.step) contacts(world, t + i); return Object.values(world.data.breeding).find(record => record.status === 'active'); }
 const transition = (cell, next, record) => { Object.assign(cell, next); cell.path.push({ ...record, target: next.entity || '', x: next.x, y: next.y }); };
 
+test('查询配对和推进模拟时只遍历一次繁殖历史', () => {
+  const { world, male, female } = pair(), record = bind(world);
+  const history = Object.fromEntries(Array.from({ length: 1000 }, (_, index) => {
+    const id = `old-pair:${index}`;
+    return [id, { id, male, female, started: t - index - 1, status: 'cancelled' }];
+  }));
+  let scans = 0;
+  world.data.breeding = new Proxy({ ...history, [record.id]: record }, {
+    ownKeys(records) { scans++; return Reflect.ownKeys(records); },
+  });
+  for (let i = 0; i < 5; i++) {
+    assert.equal(activeBreeding(world.data, male), record);
+    assert.equal(world.breedingState(female), record);
+    assert.equal(activeBreeding(world.data, 'unpaired'), undefined);
+    world.step(t + CONTACT_TIME + (i + 1) * CONFIG.step);
+  }
+  assert(scans <= 1, `繁殖历史被遍历了 ${scans} 次`);
+});
+
+test('更换繁殖记录表后按原顺序查询，校正冲突时保留较早的配对', () => {
+  const { world, male, female } = pair(), first = bind(world);
+  assert.equal(world.breedingState(male), first);
+  const partner = fish(world, 'female', 40, 20, undefined, 'other');
+  const started = first.started + CONFIG.step, id = breedingId(male, partner, started);
+  const later = { ...clone(first), id, female: partner, started, ends: started + BREEDING_TIME, at: started };
+  world.data.breeding = { [id]: later, [first.id]: first };
+
+  assert.equal(world.breedingState(male), later);
+  assert.equal(world.breedingState(partner), later);
+  finishBreeding(world, started, transition);
+  assert.equal(later.reason, 'conflicting-pair');
+  assert.equal(world.breedingState(male), first);
+  assert.equal(world.breedingState(female), first);
+  assert.equal(world.breedingState(partner), undefined);
+});
+
 test('公母八邻域连续接触满5秒才绑定，中断、长时间休眠重置计时', () => {
-  const { world, female } = pair(); contacts(world, t); for (let i = 500; i < 5000; i += 500) contacts(world, t + i);
-  assert.equal(Object.keys(world.data.breeding).length, 0); contacts(world, t + 5000); assert.equal(Object.values(world.data.breeding)[0].ends, t + 5000 + BREEDING_TIME);
+  const { world, male, female } = pair(); assert.equal(world.breedingState(male), undefined);
+  contacts(world, t); for (let i = 500; i < 5000; i += 500) contacts(world, t + i);
+  assert.equal(Object.keys(world.data.breeding).length, 0); contacts(world, t + 5000); assert.equal(world.breedingState(male)?.ends, t + 5000 + BREEDING_TIME);
+  assert.equal(world.breedingState(female), world.breedingState(male));
   const interrupted = pair(); contacts(interrupted.world, t); contacts(interrupted.world, t + 500); interrupted.world.data.fishes[interrupted.female].x += 10; contacts(interrupted.world, t + 1000); assert.equal(Object.keys(interrupted.world.data.contacts).length, 0);
   interrupted.world.data.fishes[interrupted.female].x -= 10; contacts(interrupted.world, t + 1500); contacts(interrupted.world, t + 6500); assert.equal(Object.keys(interrupted.world.data.breeding).length, 0);
   const sameSex = pair(); sameSex.world.data.ops[sameSex.female].gender = 'male'; assert.equal(bind(sameSex.world), undefined);
@@ -89,13 +128,45 @@ test('出生后父母过小、父母断裂或小鱼不连通时取消出生，�
   for (const { world } of cases) { const record = bind(world); assert(record); const before = clone(world.data.chars); finishBreeding(world, record.ends, transition); assert.equal(record.status, 'cancelled'); assert.equal(world.counts().fish, 2); assert.deepEqual(world.data.chars, before); }
 });
 test('繁殖期间亲鱼消失取消绑定，饥饿丢失接触鱼元时不转移其他鱼元替代', () => {
-  const { world, male } = pair(), record = bind(world); delete world.data.fishes[male]; finishBreeding(world, t + 6000, transition); assert.equal(record.reason, 'parent-gone');
+  const { world, male, female } = pair(), record = bind(world); assert.equal(world.breedingState(female), record);
+  delete world.data.fishes[male]; finishBreeding(world, t + 6000, transition); assert.equal(record.reason, 'parent-gone');
+  assert.equal(world.breedingState(male), undefined); assert.equal(world.breedingState(female), undefined);
   const second = pair(), attempt = bind(second.world), removed = attempt.contact.male[0]; second.world.starve(second.male, t + 6000, removed); finishBreeding(second.world, attempt.ends, transition); assert.equal(attempt.status, 'cancelled'); assert.equal(second.world.data.chars[removed].kind, 'burn');
+});
+test('异象捕获一条亲鱼后两条亲鱼立即解除配对', () => {
+  const { world, male, female } = pair(), record = bind(world);
+  assert.equal(world.breedingState(male), record);
+  const slot = Math.ceil(record.started / LEGENDS.period);
+  let schedule;
+  for (let i = 0; schedule?.kind !== 'cthulhu'; i++) {
+    const seed = `breeding-legend-${i}`;
+    schedule = legendSchedule({ [seed]: t }, seed, slot);
+  }
+  const { seed, id } = schedule, at = schedule.started + LEGENDS.warning;
+  const { x, y, facing } = world.data.fishes[male], cells = world.fishCells(male).map(cell => cell.id).sort();
+  world.data.roots[seed] = t;
+  world.data.legends.events[id] = { seed, slot, at: schedule.started, arms: { 0: { fish: male, at, x, y, pose: { x, y, facing }, cells } }, minute: 0, drops: [] };
+  settleLegendary(world, at, transition);
+  assert.equal(record.reason, 'legend');
+  assert.equal(world.breedingState(male), undefined);
+  assert.equal(world.breedingState(female), undefined);
 });
 test('繁殖状态、出生归属、鱼元和运动记录跨存档与合流保存，旧快照不复活孕期或重复出生', () => {
   const { world } = pair(), record = bind(world), active = world.serialize();
   const restored = restoreCheckpoint({ world: active, at: t + 5000, lastOnlineAt: t + 5000 }, t + 6000).world; assert(restored.breedingState(record.male));
-  finishBreeding(restored, record.ends, transition); const born = restored.serialize(), peer = new World(t); peer.merge(born); peer.merge(active); peer.merge(born);
+  assert.deepEqual(restored.serialize().breeding, active.breeding);
+  const fromArchive = new World(t); assert.equal(fromArchive.breedingState(record.male), undefined);
+  fromArchive.merge({ ...active, breeding: {} }, { breeding: active.breeding });
+  assert.deepEqual(fromArchive.breedingState(record.male), active.breeding[record.id]);
+  const peer = new World(t); assert.equal(peer.breedingState(record.male), undefined);
+  peer.merge(active); const previous = peer.breedingState(record.male); assert.equal(previous, peer.data.breeding[record.id]);
+  commitUnit(motionUnits(world, world.fishGroups())[0], record.started + CONFIG.step);
+  peer.merge(world.serialize()); assert.notEqual(peer.breedingState(record.male), previous);
+  assert.equal(peer.breedingState(record.male), peer.data.breeding[record.id]);
+  finishBreeding(restored, record.ends, transition); const born = restored.serialize();
+  assert.equal(restored.breedingState(record.male), undefined);
+  assert.equal(peer.breedingState(record.male)?.status, 'active');
+  peer.merge(born); assert.equal(peer.breedingState(record.male), undefined); peer.merge(active); peer.merge(born);
   assert.equal(peer.counts().fish, 3); assert.equal(peer.data.breeding[record.id].status, 'born'); assert.equal(peer.breedingState(record.male), undefined); assert.equal(peer.fishCells(born.breeding[record.id].baby.id).length, 2);
   assert.equal(peer.data.travel[born.breeding[record.id].baby.id].since, record.ends);
 });
