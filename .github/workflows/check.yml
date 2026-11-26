@@ -46,7 +46,7 @@ jobs:
       - name: Verify startup and quiet reconnection in Chromium
         working-directory: source
         env:
-          TIDE_TEST_LAUNCHER: "${{ github.workspace }}/dist/release/${{ matrix.target == 'windows' && '鱼来.exe' || 'fishcome' }}"
+          TIDE_TEST_LAUNCHER: "./dist/release/${{ matrix.target == 'windows' && '鱼来.exe' || 'fishcome' }}"
         run: node tests/browser-startup-reconnect.cjs
       - name: Verify interrupted first join in Chromium
         working-directory: source
