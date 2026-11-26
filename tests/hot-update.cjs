@@ -21,7 +21,9 @@ async function verifyBrowserPeerUpdate(startLauncher, v1, v2, { legacyCheckpoint
   const healthA = await waitForHealth(portA, '0.1.1');
   const healthB = await waitForHealth(portB, '0.2.0');
   assert(healthA.rulesVersion && healthA.rules, '/health 必须返回联机规则版本');
-  assert.equal(healthA.rulesVersion, healthB.rulesVersion);
+  if (legacyCheckpoint) {
+    assert.notEqual(healthA.rulesVersion, healthB.rulesVersion, '旧版迁移应覆盖不同的联机规则');
+  } else assert.equal(healthA.rulesVersion, healthB.rulesVersion);
 
   const metaB = await (await fetch(`http://127.0.0.1:${portB}/local/meta`)).json();
   const statusB = await (await fetch(`http://127.0.0.1:${portB}/status`)).json();
@@ -140,6 +142,9 @@ async function verifyBrowserPeerUpdate(startLauncher, v1, v2, { legacyCheckpoint
     await page.locator('#forceApplyUpdateBtn').click();
     await navPromise;
     await page.waitForFunction(() => window.tide && document.getElementById('currentVersion')?.textContent?.includes('0.2.0'), undefined, { timeout: 15000 });
+    const upgraded = await waitForHealth(portA, '0.2.0');
+    assert.equal(upgraded.rulesVersion, healthB.rulesVersion, '更新后应采用目标版本的联机规则');
+    assert.deepEqual(upgraded.rules, healthB.rules);
     assert.equal(await page.evaluate(() => tide.balance()), 18, '更新重启后余额必须保持 18');
     const texts = await page.evaluate(() => Object.values(tide.world.data.chats).map(record => record.body.text));
     for (const text of expectedChats) assert(texts.includes(text), `热更新后遗失聊天：${text}`);
