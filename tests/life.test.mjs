@@ -1,10 +1,34 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { World, CONFIG, clone } from '../www/engine.js';
 import { restoreCheckpoint } from '../www/lifecycle.js';
 import { LIFE, personality, personalityText, weatherAt, lifeContext, updateLife, idleMotion, fishLifeText, recordStory, mergeLife, newLife, validateLife, spawnPlankton, planktonSource, validPlankton, freshPlankton, pairKey, storiesFor, storyText, returnStory } from '../www/life.js';
 import { fishCatalog } from '../www/fish-profile.js';
 const t = Math.floor((Date.now() - 3600000) / 180000) * 180000 + 80000;
+
+test('密集鱼群只保留规定数量的关系，已熟悉的鱼即使最终被裁掉也能留下故事', () => {
+  const at = Date.UTC(2025, 5, 15, 12, 17);
+  const w = new World(at, 'stable', { populate: false });
+  const points = new Map(Array.from({ length: 160 }, (_, i) => {
+    const id = 'fish-' + String(159 - i).padStart(3, '0');
+    w.data.fishes[id] = { id, x: i, y: 15 };
+    return [id, w.data.fishes[id]];
+  }));
+  const neighbors = new Map(), allKeys = new Set();
+  for (const [id] of points) {
+    const others = [...points.values()].filter(f => f.id !== id);
+    neighbors.set(id, others);
+    for (const fish of others) allKeys.add(pairKey(id, fish.id));
+  }
+  const lastPair = pairKey('fish-158', 'fish-159');
+  w.data.life.bonds[lastPair] = { a: 'fish-158', b: 'fish-159', at, seconds: LIFE.familiar - 1, lastNear: at, run: 0 };
+  updateLife(w, at + 1000, { neighbors, points, scenes: new Map() });
+  const expected = [...allKeys].sort((a, b) => a.localeCompare(b)).slice(0, LIFE.bondLimit);
+  assert.deepEqual(Object.keys(w.data.life.bonds), expected);
+  assert(!w.data.life.bonds[lastPair]);
+  assert(w.data.life.stories['friend:fish-158:fish-159']);
+});
 const cell = (x, y, ch = 'o') => ({ x, y, ch, color: '#88aacc' });
 function world() { return new World(t, crypto.randomUUID(), { populate: false }); }
 function fish(w, x = 20, y = 20, actor = 'alice', id = crypto.randomUUID(), ch = 'o') {
@@ -40,6 +64,43 @@ test('熟鱼在实际分开后重逢，休眠和全员离线不冒充相处或�
 test('环形海两侧可以认识熟鱼，隔着造景不会积累关系', () => {
   const w = world(), a = fish(w, 997), b = fish(w, 2, 20, 'bob'); track(w, 45); assert.equal(w.data.life.bonds[pairKey(a, b)].seconds, 45);
   const blocked = world(), x = fish(blocked, 20), y = fish(blocked, 26, 20, 'bob'); scene(blocked, 24, 20); track(blocked, 60); assert(!blocked.data.life.bonds[pairKey(x, y)]);
+});
+test('环形边界的遮挡、等距邻居和常去造景在完整模拟中保持原有结果', () => {
+  const start = 1749989820000, w = new World(start, 'life-neighbor-regression', { populate: false });
+  const id = n => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
+  function add(n, x, y, kind, cells) {
+    assert(w.apply({ id: id(n), actor: id(n), t: start, kind, gender: 'female', x, y, cells, cost: cells.length }).ok);
+  }
+  for (const [n, x, y] of [[1, 997, 20], [2, 991, 20], [3, 997, 26], [4, 3, 20], [5, 9, 14], [6, 9, 33], [7, 997, 38]]) {
+    add(n, x, y, 'fish', [cell(0, 0, 'Q'), cell(1, 0, 'Q')]);
+  }
+  add(8, 0, 20, 'scene', [cell(0, 0, '#'), cell(0, 1, '#')]);
+  add(9, 999, 32, 'scene', [cell(0, 0, '#'), cell(1, 0, '#')]);
+  w.data.life.haunts[id(3)] = { scene: id(9), x: 0, y: 32, at: start, away: false, visited: false, found: false };
+
+  const first = context(w, start);
+  assert.deepEqual(first.neighbors.get(id(1)).map(p => p.id), [id(2), id(3), id(5)]);
+  assert.deepEqual(first.scenes.get(id(7)), { id: id(9), x: 999, y: 32 });
+  assert.deepEqual(first.memories.get(id(3)), { near: true, exists: true, spot: { id: id(9), x: 0, y: 32 } });
+
+  for (let i = 1; i <= 120; i++) w.step(start + i * CONFIG.step);
+  const { fishes, life } = w.serialize();
+  const state = JSON.stringify({ fishes, life }, (_, value) => value && typeof value === 'object' && !Array.isArray(value)
+    ? Object.fromEntries(Object.keys(value).sort().map(key => [key, value[key]])) : value);
+  assert.equal(createHash('sha256').update(state).digest('hex'), '122247f3e711c3b2cad080a2f05e1a606440380e020d22db56d3f55f3b22c18d');
+});
+test('旧存档的分数坐标保留距离边界上的单向视线', () => {
+  const w = world(), a = fish(w, 7, 20), b = crypto.randomUUID();
+  assert(w.apply({ id: b, actor: 'bob', t, kind: 'fish', x: 20, y: 9, cells: [cell(0, 0), cell(0, 1)], cost: 2 }).ok);
+  const saved = w.serialize();
+  saved.fishes[a].x = 7.4999999999999;
+  saved.fishes[b].y = 9.499999999999998;
+  const restored = restoreCheckpoint({ world: saved, lastOnlineAt: t }, t).world;
+  assert.deepEqual(context(restored, t).neighbors.get(a).map(p => p.id), [b]);
+  scene(restored, 17, 13);
+  const blocked = context(restored, t);
+  assert.deepEqual(blocked.neighbors.get(a), []);
+  assert.deepEqual(blocked.neighbors.get(b).map(p => p.id), [a]);
 });
 test('三条附近鱼会短暂同游，一分钟内自动散开，双鱼不组成鱼群', () => {
   const w = world(), ids = [fish(w, 20), fish(w, 25, 20, 'bob'), fish(w, 30, 20, 'carol')], at = Math.ceil(t / 60000) * 60000 + 1000;

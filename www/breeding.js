@@ -7,13 +7,68 @@ import { densityField, contactTime } from './ecology.js';
 
 export const CONTACT_TIME = 5000;
 export const BREEDING_TIME = 3600000;
+const activeIndexes = new WeakMap();
+
 export function breedingId(male, female, started) { const pair = `${male}:${female}`; return `breed:${started}:${hash(pair).toString(16)}-${hash('pair:' + pair).toString(16)}`; }
 export function fishOrigin(data, id) {
   const op = data.ops[id]; if (op?.kind === 'fish') return { actor: op.actor, nick: op.nick, gender: op.gender, created: op.t, name: op.name, size: op.cells.length };
   const record = typeof id === 'string' && id.startsWith('born:') ? data.breeding?.[id.slice(5)] : null;
   return record?.status === 'born' && record.baby?.id === id ? record.baby : data.archivedCatalog?.[id];
 }
-export function activeBreeding(data, id) { return Object.values(data.breeding || {}).find(record => record.status === 'active' && (record.male === id || record.female === id)); }
+function activeIndex(table) {
+  let index = activeIndexes.get(table);
+  if (!index) {
+    const records = new Map();
+    for (const id of Object.keys(table)) {
+      const record = table[id];
+      if (record.status === 'active') records.set(id, record);
+    }
+    index = { records, byFish: null };
+    activeIndexes.set(table, index);
+  }
+  return index;
+}
+export function activeBreeding(data, id) {
+  if (!data.breeding) return;
+  const index = activeIndex(data.breeding);
+  if (!index.byFish) {
+    index.byFish = new Map();
+    for (const record of index.records.values()) {
+      if (!index.byFish.has(record.male)) index.byFish.set(record.male, record);
+      if (!index.byFish.has(record.female)) index.byFish.set(record.female, record);
+    }
+  }
+  return index.byFish.get(id);
+}
+function activeRecords(data) { return data.breeding ? [...activeIndex(data.breeding).records.values()] : []; }
+export function breedingForBroadcast(table, full) {
+  const index = activeIndex(table), pending = index.pendingTerminal;
+  // Start tracking the next packet before signing or sending this one.
+  index.pendingTerminal = new Set();
+  if (full || !pending) return table;
+  const records = Object.fromEntries(index.records);
+  for (const id of pending) if (Object.hasOwn(table, id)) records[id] = table[id];
+  return records;
+}
+export function stopBreedingBroadcast(table) {
+  const index = activeIndexes.get(table);
+  if (index) index.pendingTerminal = null;
+}
+function markTerminal(index, id) {
+  index.pendingTerminal?.add(id);
+  if (index.records.delete(id)) index.byFish = null;
+}
+export function writeBreedingRecord(table, id, record) {
+  const index = activeIndexes.get(table);
+  const active = record?.status === 'active';
+  const reactivates = index && active && Object.hasOwn(table, id) && !index.records.has(id);
+  table[id] = record;
+
+  if (!index) return;
+  if (reactivates) activeIndexes.delete(table);
+  else if (active) { index.records.set(id, table[id]); index.byFish = null; }
+  else markTerminal(index, id);
+}
 export function contactCells(male, mc, female, fc, scenery) {
   const at = new Map(fc.map(cell => { const p = cellPosition(female, cell); return [key(p.x, p.y), cell]; }));
   const fathers = new Set(), mothers = new Set();
@@ -27,14 +82,22 @@ export function contactCells(male, mc, female, fc, scenery) {
   return { male: [...fathers].sort(), female: [...mothers].sort() };
 }
 function pose(fish) { return { x: fish.x, y: fish.y, facing: fish.facing }; }
-function cancel(record, now, reason) { record.status = 'cancelled'; record.reason = reason; record.at = now; }
+function settleRecord(data, record, status, now) {
+  record.status = status; record.at = now;
+  const index = activeIndexes.get(data.breeding);
+  if (!index) return;
+  if (data.breeding[record.id] !== record) activeIndexes.delete(data.breeding);
+  else markTerminal(index, record.id);
+}
+export function cancelBreeding(data, record, now, reason) {
+  settleRecord(data, record, 'cancelled', now); record.reason = reason;
+}
 export function normalizeBreeding(world, now) {
   world.data.breeding ||= {}; world.data.contacts ||= {};
   const taken = new Set();
-  for (const record of Object.values(world.data.breeding).sort((a, b) => a.started - b.started || a.id.localeCompare(b.id))) {
-    if (record.status !== 'active') continue;
-    if (!world.data.fishes[record.male] || !world.data.fishes[record.female]) { cancel(record, now, 'parent-gone'); continue; }
-    if (taken.has(record.male) || taken.has(record.female)) { cancel(record, now, 'conflicting-pair'); continue; }
+  for (const record of activeRecords(world.data).sort((a, b) => a.started - b.started || a.id.localeCompare(b.id))) {
+    if (!world.data.fishes[record.male] || !world.data.fishes[record.female]) { cancelBreeding(world.data, record, now, 'parent-gone'); continue; }
+    if (taken.has(record.male) || taken.has(record.female)) { cancelBreeding(world.data, record, now, 'conflicting-pair'); continue; }
     taken.add(record.male); taken.add(record.female);
     if (record.pose) { Object.assign(world.data.fishes[record.male], record.pose.male); Object.assign(world.data.fishes[record.female], record.pose.female); }
   }
@@ -46,7 +109,7 @@ export function chooseOwner(record, fatherCount, motherCount, fatherRemaining, m
 }
 export function finishBreeding(world, now, transition) {
   normalizeBreeding(world, now);
-  for (const record of Object.values(world.data.breeding)) {
+  for (const record of activeRecords(world.data)) {
     if (record.status !== 'active' || now < record.ends) continue;
     const father = world.data.fishes[record.male], mother = world.data.fishes[record.female], fatherCells = world.fishCells(record.male), motherCells = world.fishCells(record.female);
     const selectedFather = fatherCells.filter(cell => record.contact.male.includes(cell.id)), selectedMother = motherCells.filter(cell => record.contact.female.includes(cell.id));
@@ -54,7 +117,7 @@ export function finishBreeding(world, now, transition) {
     const placed = selected.map(cell => { const p = cellPosition(cell.entity === father.id ? father : mother, cell); return { ...cell, x: nearX(p.x, father.x), y: p.y }; });
     const occupants = world.fishOccupants(), parents = new Set([father.id, mother.id]);
     const viable = remainingFather.length >= 2 && remainingMother.length >= 2 && components(remainingFather).length === 1 && components(remainingMother).length === 1 && selectedFather.length > 0 && selectedMother.length > 0 && selected.length >= 2 && new Set(placed.map(cell => key(cell.x, cell.y))).size === placed.length && components(placed).length === 1 && placed.every(cell => [...(occupants.get(key(cell.x, cell.y)) || [])].every(id => parents.has(id)));
-    if (!viable) { cancel(record, now, 'incomplete-bodies'); father.cx = father.cy = mother.cx = mother.cy = 0; world.dirty = true; continue; }
+    if (!viable) { cancelBreeding(world.data, record, now, 'incomplete-bodies'); father.cx = father.cy = mother.cx = mother.cy = 0; world.dirty = true; continue; }
     const id = `born:${record.id}`, owner = chooseOwner(record, selectedFather.length, selectedMother.length, remainingFather.length, remainingMother.length), parent = owner === father.id ? father : mother;
     const body = bounds(placed), gender = hash(`gender:${id}`) % 2 ? 'male' : 'female';
     const eye = placed.some(cell => EYES.has(cell.ch)) ? null : [...placed].sort((a, b) => a.id.localeCompare(b.id))[hash(`eye-cell:${id}`) % placed.length].id;
@@ -68,7 +131,7 @@ export function finishBreeding(world, now, transition) {
     record.baby = { id, actor: fishOrigin(world.data, parent.id)?.actor || parent.actor, nick: parent.nick, gender, created: now, parents: [father.id, mother.id], owner, fatherCount: selectedFather.length, motherCount: selectedMother.length, fatherRemaining: remainingFather.length, motherRemaining: remainingMother.length, cells: bornCells };
     const number = Object.values(world.data.fishes).filter(fish => fishOrigin(world.data, fish.id)?.actor === record.baby.actor).length + 1;
     Object.assign(record.baby, { name: defaultFishName(parent.nick || '鱼', number, selected.length), nameAuto: true, nameOrdinal: number });
-    record.status = 'born'; record.at = now;
+    settleRecord(world.data, record, 'born', now);
     world.data.fishes[id] = { id, actor: record.baby.actor, nick: record.baby.nick, gender, birth: record.id, parents: record.baby.parents, x: wrapX(body.minX), y: body.minY, facing: 1, created: now, lastFed: now, hungerAt: now + CONFIG.hunger, cx: 0, cy: 0, posAt: now };
     world.data.fishes[id].name = record.baby.name;
     world.data.travel[id] = { since: now, days: {} };
@@ -79,21 +142,26 @@ export function finishBreeding(world, now, transition) {
 }
 export function updateContacts(world, now, groups, scenery) {
   world.data.contacts ||= {}; world.data.breeding ||= {};
-  const taken = new Set(Object.values(world.data.breeding).filter(record => record.status === 'active').flatMap(record => [record.male, record.female]));
-  const at = new Map(), eligible = new Map(), pairs = new Map();
+  const taken = new Set(activeRecords(world.data).flatMap(record => [record.male, record.female]));
+  const males = [], females = [], pairs = new Map();
   for (const [id, cells] of groups) {
     const fish = world.data.fishes[id], gender = fishOrigin(world.data, id)?.gender;
     if (!fish || taken.has(id) || capturedFish(world.data, id, now) || !['male', 'female'].includes(gender)) continue;
-    eligible.set(id, { fish, gender, cells });
-    for (const cell of cells) { const p = cellPosition(fish, cell), k = key(p.x, p.y); if (!at.has(k)) at.set(k, new Set()); at.get(k).add(id); }
+    (gender === 'male' ? males : females).push(fish);
   }
-  for (const [id, { fish, gender, cells }] of eligible) {
-    if (gender !== 'male') continue;
-    for (const cell of cells) {
+  const at = new Map();
+  if (males.length) for (const fish of females) for (const cell of groups.get(fish.id)) {
+    const p = cellPosition(fish, cell), k = key(p.x, p.y);
+    if (!at.has(k)) at.set(k, []);
+    at.get(k).push(fish.id);
+  }
+  if (at.size) for (const fish of males) {
+    const id = fish.id;
+    for (const cell of groups.get(id)) {
       const p = cellPosition(fish, cell);
       for (const [dx, dy] of NEIGHBORS) {
         if (dx && dy && (scenery.has(key(p.x + dx, p.y)) || scenery.has(key(p.x, p.y + dy)))) continue;
-        for (const other of at.get(key(p.x + dx, p.y + dy)) || []) if (eligible.get(other).gender === 'female') pairs.set(`${id}|${other}`, { male: id, female: other });
+        for (const other of at.get(key(p.x + dx, p.y + dy)) || []) pairs.set(`${id}|${other}`, { male: id, female: other });
       }
     }
   }
@@ -110,7 +178,7 @@ export function updateContacts(world, now, groups, scenery) {
     const father = world.data.fishes[pair.male], mother = world.data.fishes[pair.female], fc = groups.get(pair.male), mc = groups.get(pair.female), all = [...fc.map(cell => cellPosition(father, cell)), ...mc.map(cell => cellPosition(mother, cell))];
     if (new Set(all.map(p => `${p.x},${p.y}`)).size !== all.length) continue;
     const started = now, id = breedingId(pair.male, pair.female, started), initialPose = { male: pose(father), female: pose(mother) };
-    world.data.breeding[id] = { id, ...pair, started, ends: started + BREEDING_TIME, at: now, status: 'active', contact: contactCells(father, fc, mother, mc, scenery), initialPose, pose: clone(initialPose), motion: { cx: 0, cy: 0 } };
+    writeBreedingRecord(world.data.breeding, id, { id, ...pair, started, ends: started + BREEDING_TIME, at: now, status: 'active', contact: contactCells(father, fc, mother, mc, scenery), initialPose, pose: clone(initialPose), motion: { cx: 0, cy: 0 } });
     taken.add(pair.male); taken.add(pair.female); delete contacts[key]; world.dirty = true;
   }
   world.data.contacts = Object.fromEntries(Object.entries(contacts).filter(([, pair]) => !taken.has(pair.male) && !taken.has(pair.female)));
@@ -118,8 +186,7 @@ export function updateContacts(world, now, groups, scenery) {
 }
 export function motionUnits(world, groups) {
   const result = [], paired = new Set();
-  for (const record of Object.values(world.data.breeding || {}).sort((a, b) => a.id.localeCompare(b.id))) {
-    if (record.status !== 'active') continue;
+  for (const record of activeRecords(world.data).sort((a, b) => a.id.localeCompare(b.id))) {
     const members = [world.data.fishes[record.male], world.data.fishes[record.female]];
     if (members.some(fish => !fish)) continue;
     const placed = members.flatMap(fish => (groups.get(fish.id) || []).map(cell => { const p = cellPosition(fish, cell); return { ...cell, x: nearX(p.x, members[0].x), y: p.y }; })), b = bounds(placed);
@@ -142,7 +209,7 @@ export function mergeBreeding(world, other, archived = {}) {
   for (const [id, record] of Object.entries(other.breeding || {})) {
     const old = world.data.breeding[id] || archived[id], terminal = record.status !== 'active', oldTerminal = old && old.status !== 'active';
     const born = record.status === 'born', oldBorn = old?.status === 'born';
-    if (!old || born && !oldBorn || !oldBorn && terminal && !oldTerminal || born === oldBorn && terminal === oldTerminal && ((born ? record.at < old.at : record.at > old.at) || record.at === old.at && JSON.stringify(record).localeCompare(JSON.stringify(old)) > 0)) world.data.breeding[id] = clone(record);
+    if (!old || born && !oldBorn || !oldBorn && terminal && !oldTerminal || born === oldBorn && terminal === oldTerminal && ((born ? record.at < old.at : record.at > old.at) || record.at === old.at && JSON.stringify(record).localeCompare(JSON.stringify(old)) > 0)) writeBreedingRecord(world.data.breeding, id, clone(record));
   }
   if ((other.contactAt || 0) > (world.data.contactAt || 0)) { world.data.contacts = clone(other.contacts || {}); world.data.contactAt = other.contactAt; }
 }

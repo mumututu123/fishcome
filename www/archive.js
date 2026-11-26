@@ -39,16 +39,67 @@ export function archiveDependencies(data) {
   for (const op of Object.values(data.ops)) if (op.kind === 'sceneEdit' && data.chars[op.cell]?.kind !== 'burn') keep.ops.add(op.id);
   return keep;
 }
-export function archivePlan(data, now, { pressure = false } = {}) {
-  const keep = archiveDependencies(data), cutoff = now - (pressure ? ARCHIVE.period : ARCHIVE.age), records = Object.fromEntries(ARCHIVE_FIELDS.map(field => [field, {}]));
-  for (const field of ARCHIVE_FIELDS) for (const [id, record] of Object.entries(data[field] || {})) {
-    if (field === 'fishes' || field === 'scenes' || field === 'chatSources') continue;
-    if (keep[field].has(id)) continue;
-    const at = field === 'ops' ? record.t : field === 'chars' ? Math.max(record.created || 0, record.moveAt || 0, ...record.path.map(e => e.t || 0)) : field === 'chats' ? record.body.t : field === 'breeding' ? record.at : Math.max(record.since || 0, ...Object.keys(record.days || {}).map(day => Date.parse(day + 'T23:59:59+08:00')));
-    if (at > cutoff || field === 'chars' && record.kind !== 'burn' || field === 'travel' && data.fishes[id] || field === 'breeding' && record.status === 'active') continue;
-    records[field][id] = record;
+function* archiveCandidates(data, now, pressure) {
+  const cutoff = now - (pressure ? ARCHIVE.period : ARCHIVE.age);
+  const records = Object.fromEntries(ARCHIVE_FIELDS.map(field => [field, {}]));
+  let keep, scanned = 0;
+  for (const field of ['ops', 'chars', 'breeding', 'travel', 'chats']) {
+    for (const id in data[field]) {
+      if (++scanned % 512 === 0) yield;
+      const record = data[field][id];
+      if (!record || field === 'chars' && record.kind !== 'burn' || field === 'travel' && data.fishes[id] || field === 'breeding' && record.status === 'active') continue;
+      const at = field === 'ops' ? record.t : field === 'chars' ? Math.max(record.created || 0, record.moveAt || 0, ...record.path.map(e => e.t || 0)) : field === 'chats' ? record.body.t : field === 'breeding' ? record.at : Math.max(record.since || 0, ...Object.keys(record.days || {}).map(day => Date.parse(day + 'T23:59:59+08:00')));
+      if (at > cutoff) continue;
+      keep ??= archiveDependencies(data);
+      if (!keep[field].has(id)) records[field][id] = record;
+    }
   }
   return records;
+}
+export function archivePlan(data, now, { pressure = false } = {}) {
+  const iterator = archiveCandidates(data, now, pressure);
+  let result;
+  do { result = iterator.next(); } while (!result.done);
+  return result.value;
+}
+async function runInSlices(iterator) {
+  let start = performance.now();
+  for (;;) {
+    const result = iterator.next();
+    if (result.done) return result.value;
+    if (performance.now() - start < 5) continue;
+    await new Promise(resolve => setTimeout(resolve, 0));
+    start = performance.now();
+  }
+}
+export function archivePlanAsync(data, now, { pressure = false } = {}) {
+  return runInSlices(archiveCandidates(data, now, pressure));
+}
+// Measure the same uncompressed JSON bytes as the archive threshold, stopping
+// as soon as the answer is known instead of allocating a whole-world string.
+export function reachesArchiveThreshold(data, limit = ARCHIVE.threshold) {
+  function* measure() {
+    let bytes = 2, fields = 0, rows = 0;
+    const length = s => encoder.encode(s).length;
+    for (const [field, value] of Object.entries(data)) {
+      if (value === undefined) continue;
+      bytes += length(json(field)) + 1 + (fields++ > 0 ? 1 : 0);
+      if (value && typeof value === 'object' && !Array.isArray(value)) {
+        bytes += 2;
+        let members = 0;
+        for (const id in value) {
+          const record = json(value[id]);
+          if (record === undefined) continue;
+          bytes += length(json(id)) + 1 + length(record) + (members++ > 0 ? 1 : 0);
+          if (bytes >= limit) return true;
+          if (++rows % 128 === 0) yield;
+        }
+      } else bytes += length(json(value));
+      if (bytes >= limit) return true;
+    }
+    return bytes >= limit;
+  }
+  return runInSlices(measure());
 }
 const encoder = new TextEncoder(), decoder = new TextDecoder();
 export async function archiveHash(bytes) { return [...new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))].map(n => n.toString(16).padStart(2, '0')).join(''); }
@@ -144,6 +195,7 @@ export class ArchiveStore {
   // addVerified is called only after original signatures/source records have been checked.
   addVerified(chunk) {
     const { manifest, encoded, raw } = chunk; if (this.manifests[manifest.id]) return;
+    this.revision = (this.revision || 0) + 1;
     this.packs.set(manifest.id, encoded); this.manifests[manifest.id] = manifest;
     const logical = chunk.logical || raw.records;
     if (raw.fragment && chunk.logical) { this.bigCache.set(raw.fragment.hash, logical[raw.fragment.field][raw.fragment.id]); while (this.bigCache.size > 2) this.bigCache.delete(this.bigCache.keys().next().value); }
