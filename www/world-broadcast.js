@@ -2,7 +2,7 @@ import { breedingForBroadcast, stopBreedingBroadcast } from './breeding.js';
 
 // These dictionaries merge by record ID. Contacts are different: a newer
 // contactAt replaces the entire contact table, including its unchanged rows.
-const rowFields = ['chars', 'fishes', 'scenes', 'participants', 'ops', 'chats', 'chatSources', 'travel'];
+const rowFields = ['chars', 'fishes', 'scenes', 'participants', 'ops', 'chats', 'chatSources', 'travel', 'rocks'];
 const sameRow = (left, right) => left === right || left !== undefined && JSON.stringify(left) === JSON.stringify(right);
 
 function packet(data, rows, breeding) {
@@ -10,7 +10,7 @@ function packet(data, rows, breeding) {
     protocol: 1, roots: data.roots, terrain: data.terrain, tick: data.tick,
     seaweedHour: data.seaweedHour, bubbleMinute: data.bubbleMinute, bubbles: data.bubbles,
     ...rows, breeding, contacts: data.contacts, contactAt: data.contactAt, notices: [],
-    life: data.life, legends: data.legends, ecology: data.ecology, archives: data.archives
+    life: data.life, legends: data.legends, ecology: data.ecology, population: data.population, archives: data.archives
   };
 }
 

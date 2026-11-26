@@ -5,6 +5,7 @@ export const WORLD_RULES = Object.freeze({
   "legends": 1,
   "feeding": 1,
   "ecology": 1,
+  "population": 2,
   "archives": 1
 });
 

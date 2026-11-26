@@ -49,7 +49,7 @@ export function updateSeaweed(world, now, config, monument, hash, transition) {
   for (let hour = world.data.seaweedHour + 1; hour <= currentHour; hour++) {
     const at = hour * HOUR, sources = [];
     for (let x = 0; x < config.width; x++) sources.push({ id: `floor:${x}`, x, y: bottom(x), created: 0 });
-    for (const { cell, scene } of scenery.values()) sources.push({ id: `cell:${cell.id}`, x: scene.x + cell.x, y: scene.y + cell.y, created: Math.max(cell.created || 0, scene.posAt || 0) });
+    for (const { cell, scene } of scenery.values()) if (!scene.natural) sources.push({ id: `cell:${cell.id}`, x: scene.x + cell.x, y: scene.y + cell.y, created: Math.max(cell.created || 0, scene.posAt || 0) });
     for (const cells of plants(world.data.chars).values()) { const tip = cells.at(-1); sources.push({ id: `tip:${tip.id}`, x: tip.x, y: tip.y, created: tip.created, plant: tip.entity, index: tip.wild.index + 1 }); }
     sources.sort((a, b) => a.id.localeCompare(b.id));
     for (const source of sources) {

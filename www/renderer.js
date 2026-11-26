@@ -7,6 +7,7 @@ import { echoCells, friendSignals } from './easter-eggs.js';
 import { activeEvent, eventPosition } from './random-events.js';
 import { eventGlyphs } from './random-event-visuals.js';
 import { activeLegend, legendGeometry } from './legends.js';
+import { predatorCells, illnessOf, POPULATION } from './population.js';
 import { ViewportCells } from './viewport.js';
 const FONT = "'Microsoft YaHei',Consolas,monospace";
 export { MONUMENT } from './engine.js';
@@ -33,6 +34,7 @@ export class Renderer {
     }
   }
   worldChanged(world, patch) {
+    if (!patch || patch.tables?.rocks) this.rockCells = null;
     if (this.cachedWorld !== world) return;
     if (!patch) { this.viewport = null; return; }
     if (this.viewport) {
@@ -67,6 +69,7 @@ export class Renderer {
     const left = this.camera.x - this.width / 2 / size - 2, right = this.camera.x + this.width / 2 / size + 2, top = this.camera.y - this.height / 2 / size - 2, bottom = this.camera.y + this.height / 2 / size + 2;
     this.weather(world, size);
     const visible = p => Math.abs(deltaX(p.x, this.camera.x)) <= (right - left) / 2 && p.y >= top && p.y <= bottom;
+    this.drawPopulation(world, size, visible);
     const index = this.cellIndex(world);
     index.advance();
     this.paintedCells ||= new Map();
@@ -86,6 +89,12 @@ export class Renderer {
     if (this.observedFish) for (const c of characters) if (c.kind === 'fish' && c.entity === this.observedFish) { const f = world.data.fishes[c.entity]; if (!f) continue; const p = cellPosition(f, c); if (!visible(p)) continue; this.paintedCells.set(worldKey(p.x, p.y), c); const pixel = this.screen(p.x, p.y); ctx.fillStyle = '#9aeee015'; ctx.fillRect(pixel.x, pixel.y, size, size); paint.glyph(ctx, c.ch, c.color, pixel.x, pixel.y, size, 1, EYES.has(c.ch), c.kind, c, f.facing); ctx.strokeStyle = '#9aeee077'; ctx.lineWidth = 1; ctx.strokeRect(pixel.x, pixel.y, size, size); }
     for (const c of characters) if ((c.kind === 'food' || c.kind === 'seaweed') && visible(c)) { const pixel = c.kind === 'seaweed' ? this.seaweedScreen(c) : this.screen(c.x, c.y); paint.glyph(ctx, c.ch, c.color, pixel.x, pixel.y, size, c.kind === 'seaweed' ? weedAlpha(c, world.data.ecology, Date.now()) : 1, false, c.kind); if (c.kind === 'food' && world.data.tick - c.born >= CONFIG.foodLife) { ctx.strokeStyle = '#84a2b355'; ctx.strokeRect(pixel.x + size * .2, pixel.y + size * .2, size * .6, size * .6); } }
     const bubbleNow = Date.now();
+    const sick = new Set();
+    for (const c of characters) if (c.kind === 'fish' && !sick.has(c.entity) && illnessOf(world.data, c.entity)) {
+      sick.add(c.entity); const f = world.data.fishes[c.entity]; if (!f) continue;
+      const p = cellPosition(f, c), pixel = this.screen(p.x, p.y - 1.2);
+      if (visible(p)) this.glyph(ctx, '郁', '#c1a0d8', pixel.x, pixel.y, size, .9);
+    }
     if (legend) this.drawLegend(world, legend, bubbleNow, size, visible, true);
     for (const bubble of Object.values(world.data.bubbles || {})) { const state = bubbleState(bubble, bubbleNow); if (!state || state.y > bottom || state.y + state.size < top || Math.abs(deltaX(state.x + state.size / 2, this.camera.x)) > (right - left) / 2 + state.size) continue; for (let y = 0; y < state.size; y++) for (let x = 0; x < state.size; x++) { const p = { x: state.x + x, y: state.y + y }; if (visible(p)) { const pixel = this.screen(p.x, p.y); paint.glyph(ctx, bubbleGlyph(bubble), BUBBLE_COLOR, pixel.x, pixel.y, size, 1, false, 'bubble'); } } }
     for (const signal of friendSignals(world.data, bubbleNow)) {
@@ -96,6 +105,16 @@ export class Renderer {
     if (occasion && occasion.kind !== 'whale') this.drawEvent(world, occasion, bubbleNow, size, visible);
     const monument = world.monument; monument.rows.forEach((row, dy) => Array.from(row).forEach((ch, dx) => { if (ch === ' ') return; const p = { x: monument.x + dx, y: monument.y + dy }; if (visible(p)) { const pixel = this.screen(p.x, p.y); paint.glyph(ctx, ch, '#b8b797', pixel.x, pixel.y, size, 1, false, 'monument'); } }));
     if (this.preview) { const p = this.preview; for (const c of p.cells || [{ x: 0, y: 0, ch: p.ch, color: p.color }]) { const pixel = this.screen(p.x + c.x, p.y + c.y); ctx.fillStyle = '#9fecd918'; ctx.fillRect(pixel.x, pixel.y, size, size); paint.glyph(ctx, c.ch, p.valid === false ? '#efaa99' : c.color, pixel.x, pixel.y, size, .65, false, p.kind === 'fish' ? 'fishPreview' : p.kind === 'scene' ? 'beadPreview' : 'preview'); } }
+  }
+  drawPopulation(world, size, visible) {
+    if (this.rockWorld !== world || !this.rockCells) { this.rockCells = Object.values(world.data.rocks || {}); this.rockWorld = world; }
+    const paint = this.scene3d || this;
+    for (const c of this.rockCells) if (visible(c)) { const p = this.screen(c.x, c.y); paint.glyph(this.ctx, '岩', '#7c838b', p.x, p.y, size, .95, false, 'scene'); }
+    for (const npc of Object.values(world.data.population?.predators || {})) for (const c of predatorCells(npc)) if (visible(c)) { const p = this.screen(c.x, c.y); paint.glyph(this.ctx, c.ch, c.color, p.x, p.y, size, 1, c.ch === '鲨', 'legend'); }
+    const e = world.data.population?.eruption;
+    if (!e) return;
+    if (Date.now() < e.at + POPULATION.warning) { const p = { x: e.x, y: world.floorAt(e.x) - 2 }; if (visible(p)) { const pixel = this.screen(p.x, p.y); this.glyph(this.ctx, '震', '#eeb07a', pixel.x, pixel.y, size, .9, true); } }
+    for (const c of Object.values(e.particles)) if (visible(c)) { const p = this.screen(c.x, c.y), hot = Date.now() < c.born + POPULATION.cooling; paint.glyph(this.ctx, hot ? '浆' : '岩', hot ? '#ff493b' : '#7c838b', p.x, p.y, size, 1, hot, hot ? 'breath' : 'scene'); }
   }
   drawLegend(world, legend, now, size, visible, beam) {
     const paint = this.scene3d || this;
@@ -117,6 +136,10 @@ export class Renderer {
     }
   }
   eventHit(x, y) {
+    const point = this.point(x, y), state = this.world.data.population, eruption = state?.eruption;
+    if (Object.values(state?.predators || {}).some(p => predatorCells(p).some(c => c.x === point.x && c.y === point.y))) return { kind: 'ecosystem', id: 'predator' };
+    if (eruption && (Object.values(eruption.particles).some(c => c.x === point.x && c.y === point.y) || Date.now() < eruption.at + POPULATION.warning && Math.abs(deltaX(point.x, eruption.x)) <= 2 && point.y >= this.world.floorAt(eruption.x) - 3)) return { kind: 'ecosystem', id: 'volcano' };
+    if ((this.rockCells || []).some(c => c.x === point.x && c.y === point.y)) return { kind: 'ecosystem', id: 'rock' };
     const legend = activeLegend(this.world.data, Date.now());
     if (legend) for (const c of legendGeometry(this.world.data, legend, Date.now(), this.world.sceneryMap())) { const p = this.screen(c.x, c.y), size = this.cell * this.scale; if (x >= p.x && x <= p.x + size && y >= p.y && y <= p.y + size) return { kind: 'legend', id: legend.id }; }
     const event = activeEvent(this.world.data, Date.now()); if (event?.kind !== 'bottle') return null;
@@ -158,6 +181,9 @@ export class Renderer {
     canvas.width = Math.ceil(CONFIG.width * size); canvas.height = Math.ceil(CONFIG.depth * size); const ctx = canvas.getContext('2d'); this.background(ctx, canvas.width, canvas.height, { x: CONFIG.width / 2, y: CONFIG.depth / 2 }, size, world);
     const legend = activeLegend(world.data, world.data.tick); if (legend) for (const c of legendGeometry(world.data, legend, world.data.tick, world.sceneryMap())) if (legend.kind === 'ship' || world.waterAt(c.x, c.y)) this.glyph(ctx, c.ch, c.role === 'beam' ? '#a8e5ff' : '#91b3a4', c.x * size, c.y * size, size);
     let visited = 0;
+    for (const c of Object.values(world.data.rocks || {})) { if (++visited % 256 === 0) yield; this.glyph(ctx, '岩', '#7c838b', c.x * size, c.y * size, size); }
+    for (const p of Object.values(world.data.population?.predators || {})) for (const c of predatorCells(p)) this.glyph(ctx, c.ch, c.color, c.x * size, c.y * size, size);
+    for (const c of Object.values(world.data.population?.eruption?.particles || {})) { const hot = world.data.tick < c.born + POPULATION.cooling; this.glyph(ctx, hot ? '浆' : '岩', hot ? '#ff493b' : '#7c838b', c.x * size, c.y * size, size); }
     for (const id in world.data.chars) {
       if (++visited % 256 === 0) yield;
       const c = world.data.chars[id]; if (!c) continue;
