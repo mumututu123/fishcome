@@ -14,7 +14,7 @@ async function main({ root, buildVersion, startLauncher }) {
   unpackZip(legacyArchive, legacySource);
   const legacy = buildVersion('0.1.1', 'legacy', legacySource);
   const current = buildVersion('0.2.0', 'current');
-  await verifyBrowserPeerUpdate(startLauncher, legacy, current, { legacyCheckpoint: true });
+  await verifyBrowserPeerUpdate(startLauncher, legacy, current, { legacyCheckpoint: true, allowRuleUpgrade: true });
 }
 
 if (process.platform !== 'win32') throw new Error('旧启动器迁移验证需要 Windows');
