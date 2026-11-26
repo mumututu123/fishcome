@@ -1,16 +1,18 @@
 const assert = require('node:assert/strict');
 const path = require('node:path');
-const { test } = require('node:test');
+const { test, before, after } = require('node:test');
 const { chromium } = require('playwright');
 
 const origin = 'http://127.0.0.1:39671';
 const assets = path.resolve(__dirname, '../www');
 
-// Serve the working tree and isolate launcher responses and IndexedDB for each profile.
+let browser;
+before(async () => { browser = await chromium.launch({ executablePath: chromium.executablePath() }); });
+after(() => browser?.close());
+
 async function profile(t, { mobile = false, register } = {}) {
-  const browser = await chromium.launch({ executablePath: chromium.executablePath() });
-  t.after(() => browser.close());
   const context = await browser.newContext(mobile ? { viewport: { width: 320, height: 568 }, hasTouch: true } : {});
+  t.after(() => context.close());
   const page = await context.newPage();
   const errors = [];
   context.on('weberror', event => errors.push(event.error().message));
@@ -181,6 +183,7 @@ test('首次保存遇到另一页面更换存档，诊断与备份都读取更�
       return world.id;
     });
   } finally { release(); }
+  await page.bringToFront();
   await page.waitForFunction(() => document.querySelector('#networkStatus').textContent.includes('其他页面'));
   await page.keyboard.press('Control+Shift+d');
   const scan = (await exported(page)).scan;
