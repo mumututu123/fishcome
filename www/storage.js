@@ -25,6 +25,7 @@ export async function get(name) {
     };
   });
 }
+export function getMany(names) { return Promise.all(names.map(name => get(name))); }
 export function set(name, value) { return putMany([[name, value]]); }
 // The update handoff must merge one coherent checkpoint and its account
 // metadata before a compare-and-swap against this exact revision.
@@ -63,10 +64,10 @@ export async function putMany(source, options) {
 
 // The old page can still receive pagehide, timer or network callbacks after
 // import. Once this transaction commits only the newly loaded page may save.
-export async function replaceFromBackup(entries) {
+export async function replaceFromBackup(entries, options = {}) {
   if (restoringBackup) throw new Error('正在载入备份');
   restoringBackup = true;
-  try { await writeEntries(entries, { immutableSource: true, mirrorLegacy: true }); }
+  try { await writeEntries(entries, { ...options, immutableSource: true, mirrorLegacy: true }); }
   catch (error) { restoringBackup = false; throw error; }
 }
 
@@ -97,16 +98,42 @@ async function writeEntries(source, options = {}) {
             }, abort);
           } else store.put(value, currentKey(name));
         }
+        if (options.replace && options.generation !== undefined) store.put(options.generation + 1, currentKey('saveGeneration'));
       } catch (error) { abort(error); }
     };
-    if (typeof source !== 'function' && !source.some(([name]) => name === 'checkpoint')) write();
-    else {
+    const proceed = () => {
+      if (typeof source !== 'function' && !source.some(([name]) => name === 'checkpoint')) write();
+      else {
+        const head = store.get(PAGE_HEAD);
+        head.onsuccess = () => {
+          if (!head.result || options.mirrorLegacy) readOldBundle(store, bundle => write(head.result ?? bundle.checkpoint, bundle));
+          else write(head.result);
+        };
+      }
+    };
+    const verifyCheckpointAndProceed = () => {
+      if (options.checkpoint === undefined) { proceed(); return; }
       const head = store.get(PAGE_HEAD);
+      head.onerror = () => abort(head.error);
       head.onsuccess = () => {
-        if (!head.result || options.mirrorLegacy) readOldBundle(store, bundle => write(head.result ?? bundle.checkpoint, bundle));
-        else write(head.result);
+        const compare = current => {
+          if (JSON.stringify(current ?? null) !== JSON.stringify(options.checkpoint)) abort(new Error('扫描后存档已更新，请重新扫描'));
+          else proceed();
+        };
+        if (head.result === undefined) {
+          const old = store.get('checkpoint');
+          old.onerror = () => abort(old.error);
+          old.onsuccess = () => readCheckpoint(store, old.result, compare, abort);
+        } else readCheckpoint(store, head.result, compare, abort);
       };
-    }
+    };
+    if (options.generation === undefined) { verifyCheckpointAndProceed(); return; }
+    const check = store.get(currentKey('saveGeneration'));
+    check.onerror = () => abort(check.error);
+    check.onsuccess = () => {
+      if ((check.result ?? 0) !== options.generation) abort(new Error('存档已在其他页面更换，请刷新后再试'));
+      else verifyCheckpointAndProceed();
+    };
   });
 }
 export function download(name, data) { const url = URL.createObjectURL(new Blob([JSON.stringify(data)], { type: 'application/json' })); const a = document.createElement('a'); a.href = url; a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(url), 10000); }
@@ -114,7 +141,7 @@ export function download(name, data) { const url = URL.createObjectURL(new Blob(
 const enc = new TextEncoder();
 const actorHashes = new Map();
 export async function actorId(jwk) { const text = `${jwk.crv}:${jwk.x}:${jwk.y}`; if (actorHashes.has(text)) return actorHashes.get(text); const bytes = await crypto.subtle.digest('SHA-256', enc.encode(text)); const id = [...new Uint8Array(bytes)].map(b => b.toString(16).padStart(2, '0')).join(''); actorHashes.set(text, id); return id; }
-export async function newIdentity(nick) { const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']); const pub = await crypto.subtle.exportKey('jwk', pair.publicKey), secret = await crypto.subtle.exportKey('jwk', pair.privateKey); const identity = { nick, pub, secret, actor: await actorId(pub), remainder: 0, serial: 0, registration: { at: Date.now(), joined: false } }; await set('identity', identity); return identity; }
+export async function newIdentity(nick, generation) { const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']); const pub = await crypto.subtle.exportKey('jwk', pair.publicKey), secret = await crypto.subtle.exportKey('jwk', pair.privateKey); const identity = { nick, pub, secret, actor: await actorId(pub), remainder: 0, serial: 0, registration: { at: Date.now(), joined: false } }; await putMany([['identity', identity]], { generation }); return identity; }
 export async function signer(identity) { const key = await crypto.subtle.importKey('jwk', identity.secret, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign']); return async value => { const bytes = await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, key, enc.encode(JSON.stringify(value))); return btoa(String.fromCharCode(...new Uint8Array(bytes))); }; }
 const keys = new Map();
 export async function verifyEnvelope(message) {

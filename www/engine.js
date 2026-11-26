@@ -5,7 +5,7 @@ import { HOUR, updateSeaweed } from './seaweed.js';
 import { MINUTE, updateBubbles, mergeBubbles } from './bubbles.js';
 import { initialLife, initialSources, validInitialOp } from './genesis.js';
 import { fishNameError } from './fish-profile.js';
-import { newEcology, ensureEcology, updateEcology, validEcology, mergeEcology } from './ecology.js';
+import { newEcology, updateEcology, validEcology, mergeEcology } from './ecology.js';
 import { emptyArchiveState, mergeArchiveState, operationValue, archiveDependencies } from './archive.js';
 import { LIFE, newLife, lifeContext, updateLife, idleMotion, spawnPlankton, recordStory, mergeLife, validateLife, freshPlankton } from './life.js';
 import { REFERRAL_REWARD, referralError, chooseReferral } from './referral.js';
@@ -78,6 +78,21 @@ export function chooseClaim(a, b) {
   return ordinal(JSON.stringify(a), JSON.stringify(b)) >= 0 ? a : b;
 }
 function transition(c, next, record) { Object.assign(c, next); c.path.push({ ...record, target: next.entity || '', x: next.x, y: next.y }); }
+
+export function validateOperation(op, roots) {
+  if (op?.genesis !== undefined && !validInitialOp(op, initialSources(roots))) return '初始鱼记录被修改或无效';
+  if (!op || typeof op.id !== 'string' || typeof op.actor !== 'string' || !Number.isFinite(op.t) || !['fish', 'scene', 'food', 'sceneMove', 'sceneDelete', 'sceneRotate', 'sceneScale', 'sceneEdit', 'earn', 'referral'].includes(op.kind)) return '不支持的操作';
+  if (op.genesis === undefined && op.t > Date.now() + 60000) return '操作时间无效';
+  if (!['earn', 'referral'].includes(op.kind) && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(op.id)) return '操作标识无效';
+  if (!Number.isInteger(op.cost) || op.cost < 0 || (!['fish', 'scene', 'food', 'sceneScale'].includes(op.kind) && op.cost !== 0)) return '鱼元费用无效';
+  if (['fish', 'scene'].includes(op.kind)) { const e = validateDrawing(op.cells, op.kind); if (e) return e; if (op.cost !== op.cells.length) return '鱼元费用不一致'; }
+  if (op.kind === 'fish' && op.gender !== undefined && !['male', 'female'].includes(op.gender)) return '鱼的性别无效';
+  if (op.kind === 'fish' && fishNameError(op.name, op.cells.length)) return fishNameError(op.name, op.cells.length);
+  if (op.kind === 'food' && (!validGlyph(op.ch) || !/^#[0-9a-f]{6}$/i.test(op.color) || op.cost !== 1 || op.y !== 0)) return '鱼食只能从水面投放';
+  if (op.kind === 'earn' && (op.cost !== 0 || !Number.isInteger(op.serial) || op.serial < 1 || op.id !== `${op.actor}:hour:${op.serial}`)) return '在线奖励无效';
+  if (op.kind === 'referral') return referralError(op);
+  return '';
+}
 
 export class World {
   constructor(now = Date.now(), id = crypto.randomUUID(), { populate = true, ambient = true } = {}) {
@@ -250,20 +265,7 @@ export class World {
     }
     return { waiting, fishWaiting: fishRepair.waiting, fishMoved: fishRepair.moved };
   }
-  validOp(op) {
-    if (op?.genesis !== undefined && !validInitialOp(op, initialSources(this.data.roots))) return '初始鱼记录被修改或无效';
-    if (!op || typeof op.id !== 'string' || typeof op.actor !== 'string' || !Number.isFinite(op.t) || !['fish', 'scene', 'food', 'sceneMove', 'sceneDelete', 'sceneRotate', 'sceneScale', 'sceneEdit', 'earn', 'referral'].includes(op.kind)) return '不支持的操作';
-    if (op.genesis === undefined && op.t > Date.now() + 60000) return '操作时间无效';
-    if (!['earn', 'referral'].includes(op.kind) && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(op.id)) return '操作标识无效';
-    if (!Number.isInteger(op.cost) || op.cost < 0 || (!['fish', 'scene', 'food', 'sceneScale'].includes(op.kind) && op.cost !== 0)) return '鱼元费用无效';
-    if (['fish', 'scene'].includes(op.kind)) { const e = validateDrawing(op.cells, op.kind); if (e) return e; if (op.cost !== op.cells.length) return '鱼元费用不一致'; }
-    if (op.kind === 'fish' && op.gender !== undefined && !['male', 'female'].includes(op.gender)) return '鱼的性别无效';
-    if (op.kind === 'fish' && fishNameError(op.name, op.cells.length)) return fishNameError(op.name, op.cells.length);
-    if (op.kind === 'food' && (!validGlyph(op.ch) || !/^#[0-9a-f]{6}$/i.test(op.color) || op.cost !== 1 || op.y !== 0)) return '鱼食只能从水面投放';
-    if (op.kind === 'earn' && (op.cost !== 0 || !Number.isInteger(op.serial) || op.serial < 1 || op.id !== `${op.actor}:hour:${op.serial}`)) return '在线奖励无效';
-    if (op.kind === 'referral') return referralError(op);
-    return '';
-  }
+  validOp(op) { return validateOperation(op, this.data.roots); }
   apply(op, archivedOp) {
     const prior = this.data.ops[op.id];
     if (prior || this.archives?.ids.ops.has(op.id)) {
@@ -482,10 +484,10 @@ export class World {
     }
     Object.assign(this.data.participants, other.participants);
     this.data.seaweedHour = Math.max(this.data.seaweedHour ?? Math.floor(this.data.tick / HOUR), other.seaweedHour ?? Math.floor(other.tick / HOUR));
-    const competingBirths = [];
+    const competingBirths = new Map();
     for (const [id, record] of Object.entries(other.breeding || {})) {
       const previous = this.data.breeding[id] || archived.breeding?.[id];
-      if (previous?.status === 'born' && record.status === 'born' && previous.baby.created !== record.baby.created) competingBirths.push(id);
+      if (previous?.status === 'born' && record.status === 'born' && JSON.stringify(previous.baby) !== JSON.stringify(record.baby)) competingBirths.set(id, previous);
     }
     mergeBreeding(this, other, archived.breeding);
     for (const [id, record] of Object.entries(other.travel || {})) this.data.travel[id] = mergeTravel(this.data.travel[id], record);
@@ -495,8 +497,13 @@ export class World {
       if (this.data.chatSources[id] && JSON.stringify(this.data.chatSources[id]) !== JSON.stringify(message)) throw new Error('已有聊天沉积来源不可覆盖');
       this.data.chatSources[id] = clone(message);
     }
-    const birthRecords = Object.fromEntries(competingBirths.map(id => [id, this.data.breeding[id] || archived.breeding?.[id]]));
-    const reconcilePath = competingBirths.length ? cell => canonicalBirthPath(cell, birthRecords) : cell => cell;
+    const birthRecords = {}, alternatives = {};
+    for (const [id, previous] of competingBirths) {
+      const winner = this.data.breeding[id] || archived.breeding[id];
+      birthRecords[id] = winner;
+      alternatives[id] = winner === previous ? other.breeding[id] : previous;
+    }
+    const reconcilePath = competingBirths.size ? cell => canonicalBirthPath(cell, birthRecords, alternatives) : cell => cell;
     for (const [id, c] of Object.entries(other.chars)) {
       const cold = archived.chars?.[id], previous = this.data.chars[id] || cold;
       const old = previous && reconcilePath(previous), next = reconcilePath(c);
@@ -506,7 +513,7 @@ export class World {
       const grace = [old?.ecoGraceAt, c.ecoGraceAt].filter(Number.isFinite);
       if (grace.length) this.data.chars[id].ecoGraceAt = Math.min(...grace);
     }
-    if (competingBirths.length) for (const [id, c] of Object.entries(this.data.chars)) if (!Object.hasOwn(other.chars, id)) this.data.chars[id] = reconcilePath(c);
+    if (competingBirths.size) for (const [id, c] of Object.entries(this.data.chars)) if (!Object.hasOwn(other.chars, id)) this.data.chars[id] = reconcilePath(c);
     const birthOf = id => id.startsWith('born:') ? this.data.breeding[id.slice(5)] || archived.breeding?.[id.slice(5)] : undefined;
     for (const [id, fish] of Object.entries(this.data.fishes)) this.data.fishes[id] = canonicalBirthFish(fish, birthOf(id));
     for (const type of ['fishes', 'scenes']) for (const [id, incoming] of Object.entries(other[type])) {
