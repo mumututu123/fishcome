@@ -42,6 +42,12 @@ test('真实合流只提醒一次，同一身份刷新两次后仍能双向同�
   await b.waitForFunction(() => Object.keys(tide.world.data.roots).length === 2);
   const state = page => page.evaluate(() => ({ actor: tide.identity.actor, roots: Object.keys(tide.world.data.roots).sort() }));
   const expected = await state(b);
+  await b.waitForFunction(async roots => {
+    const { get } = await import('/storage.js');
+    const saved = await get('checkpoint', { observeCheckpoint: false });
+    const storedRoots = Object.keys(saved?.world?.roots ?? {});
+    return storedRoots.length === roots.length && roots.every(root => storedRoots.includes(root));
+  }, expected.roots, { polling: 50 });
   async function chat(from, to, message) {
     await from.locator('#chatInput').fill(message);
     await from.locator('#chatForm button').click();
@@ -52,6 +58,7 @@ test('真实合流只提醒一次，同一身份刷新两次后仍能双向同�
     const priorNode = await b.evaluate(() => tide.network.node);
     await b.reload();
     await b.waitForFunction(() => window.tide);
+    assert.deepEqual(await state(b), expected, '刷新后应从本地存档恢复已合流的世界');
     const currentNode = await b.evaluate(() => tide.network.node);
     assert.notEqual(currentNode, priorNode);
     await a.waitForFunction(node => tide.network.peers.some(peer => peer.node === node), currentNode);
