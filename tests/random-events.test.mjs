@@ -12,13 +12,13 @@ const t = Math.floor((Date.now() - 24 * 3600000) / EVENTS.period) * EVENTS.perio
 function make() { return new World(t, crypto.randomUUID(), { populate: false }); }
 const cells = [{ x: 0, y: 0, ch: 'o', color: '#88aacc' }, { x: 1, y: 0, ch: '鱼', color: '#88aacc' }];
 function populated(w) {
-  const fishes = [];
-  for (let i = 0; i < 4; i++) { const id = crypto.randomUUID(); assert(w.apply({ id, kind: 'fish', actor: `author-${i}`, nick: '鱼', t, x: 370 + i * 3, y: 24, cells, cost: 2, gender: 'male' }).ok); fishes.push(id); }
-  for (const a of fishes) for (const b of fishes) if (a < b) w.data.life.bonds[pairKey(a, b)] = { a, b, seconds: 50, run: 0, at: t, lastNear: t };
-  for (let i = 0; i < 5; i++) w.data.chars[`grass-${i}`] = { id: `grass-${i}`, kind: 'seaweed', x: 373 + i, y: 28, created: t - 3600000, wild: { source: 'floor:373' }, path: [], ch: '草', color: '#88aa88' };
+  const at = w.data.tick, fishes = [];
+  for (let i = 0; i < 4; i++) { const id = crypto.randomUUID(); assert(w.apply({ id, kind: 'fish', actor: `author-${i}`, nick: '鱼', t: at, x: 370 + i * 3, y: 24, cells, cost: 2, gender: 'male' }).ok); fishes.push(id); }
+  for (const a of fishes) for (const b of fishes) if (a < b) w.data.life.bonds[pairKey(a, b)] = { a, b, seconds: 50, run: 0, at, lastNear: at };
+  for (let i = 0; i < 5; i++) w.data.chars[`grass-${i}`] = { id: `grass-${i}`, kind: 'seaweed', x: 373 + i, y: 28, created: at - 3600000, wild: { source: 'floor:373' }, path: [], ch: '草', color: '#88aa88' };
   return fishes;
 }
-function schedule(w, kind, rare) { let slot = Math.floor(Math.max(t, w.data.tick) / EVENTS.period) + 1, found; do { found = eventSchedule(w.data.roots, w.id, slot++); } while (!found || found.kind !== kind || rare !== undefined && found.rare !== rare); return found; }
+function schedule(w, kind, rare) { let slot = Math.floor(w.data.tick / EVENTS.period) + 1, found; do { found = eventSchedule(w.data.roots, w.id, slot++); } while (!found || found.kind !== kind || rare !== undefined && found.rare !== rare); return found; }
 const context = (w, at) => lifeContext(w, at, w.sceneryMap(), w.fishGroups());
 function startEvent(w, kind) { const s = schedule(w, kind); w.data.tick = s.started; updateEvents(w, s.started, context(w, s.started), true, recordStory); return activeEvent(w.data, s.started); }
 const sources = w => ({ roots: w.data.roots, ops: w.data.ops, breeding: w.data.breeding, chars: w.data.chars });
@@ -92,7 +92,7 @@ test('漂流瓶与流星支持环形接缝，稀有来信与电台文字稳定',
 });
 
 test('完整模拟在开场连续运行时生成事件，重复结算不补抽，分散鱼不组成会议', () => {
-  const w = make(); populated(w); const s = schedule(w, 'bottle');
+  const w = new World(Date.UTC(2025, 0, 1), 'ambient-opening', { populate: false }); populated(w); const s = schedule(w, 'bottle');
   w.data.tick = w.data.life.at = s.started - 1500; w.data.seaweedHour = Math.floor(s.started / 3600000); w.data.bubbleMinute = Math.floor(s.started / 60000);
   for (let offset = -1000; offset <= 1500; offset += 500) w.step(s.started + offset);
   assert.equal(activeEvent(w.data, s.started + 1500)?.id, s.id); const count = Object.keys(w.data.life.events).length;

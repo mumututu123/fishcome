@@ -1,4 +1,4 @@
-import { wrapX, deltaX, worldKey } from './geography.js';
+import { WORLD_WIDTH, wrapX, deltaX, worldKey } from './geography.js';
 import { EVENTS, updateEvents, validEvent, eventSchedule, eventNarration, eventMotion } from './random-events.js';
 import { validLegendStory } from './legends.js';
 
@@ -46,18 +46,66 @@ function clearLine(a, b, scenery) {
   return true;
 }
 function indexPoints(points) {
-  const bins = new Map();
-  for (const p of points) { const key = `${Math.floor(wrapX(p.x) / 10)},${Math.floor(p.y / 10)}`; if (!bins.has(key)) bins.set(key, []); bins.get(key).push(p); }
-  return p => { const found = []; for (let dx = -2; dx <= 2; dx++) for (let dy = -2; dy <= 2; dy++) found.push(...bins.get(`${(Math.floor(wrapX(p.x) / 10) + dx + 100) % 100},${Math.floor(p.y / 10) + dy}`) || []); return found; };
+  const size = 10, columns = WORLD_WIDTH / size, bins = Array(columns);
+  for (const p of points) {
+    const column = Math.floor(wrapX(p.x) / size), row = Math.floor(p.y / size);
+    const rows = bins[column] ??= new Map();
+    if (!rows.has(row)) rows.set(row, []);
+    rows.get(row).push(p);
+  }
+  return (p, radius) => {
+    // Include boundary cells even when deltaX rounds a saved fractional coordinate.
+    const extent = radius + Number.EPSILON * WORLD_WIDTH * 4;
+    const x = wrapX(p.x), row = Math.floor(p.y / size);
+    const firstColumn = Math.floor((x - extent) / size), lastColumn = Math.floor((x + extent) / size);
+    const firstOffset = Math.floor((p.y - extent) / size) - row, lastOffset = Math.floor((p.y + extent) / size) - row;
+    const found = [];
+    for (let column = firstColumn; column <= lastColumn; column++) {
+      const rows = bins[(column + columns) % columns];
+      if (!rows) continue;
+      for (let offset = firstOffset; offset <= lastOffset; offset++) {
+        const bin = rows.get(row + offset);
+        if (bin) for (const point of bin) found.push(point);
+      }
+    }
+    return found;
+  };
 }
 export function lifeContext(world, now, scenery, groups) {
   const points = new Map();
-  for (const [id, cells] of groups) { const f = world.data.fishes[id]; if (!f || !cells.length) continue; const xs = cells.map(c => c.x), ys = cells.map(c => c.y); points.set(id, { id, x: wrapX(f.x + f.facing * (Math.min(...xs) + Math.max(...xs)) / 2), y: f.y + (Math.min(...ys) + Math.max(...ys)) / 2, halfWidth: (Math.max(...xs) - Math.min(...xs)) / 2, halfHeight: (Math.max(...ys) - Math.min(...ys)) / 2 }); }
+  for (const [id, cells] of groups) {
+    const f = world.data.fishes[id];
+    if (!f || !cells.length) continue;
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    for (const { x, y } of cells) {
+      minX = Math.min(minX, x); maxX = Math.max(maxX, x);
+      minY = Math.min(minY, y); maxY = Math.max(maxY, y);
+    }
+    points.set(id, { id, x: wrapX(f.x + f.facing * (minX + maxX) / 2), y: f.y + (minY + maxY) / 2, halfWidth: (maxX - minX) / 2, halfHeight: (maxY - minY) / 2 });
+  }
   const nearby = indexPoints(points.values()), neighbors = new Map(), scenes = new Map();
-  const scenePoints = [...scenery.values()].filter(({ scene }) => world.data.ops[scene.id]?.kind === 'scene').map(({ scene, cell }) => ({ id: scene.id, x: wrapX(scene.x + cell.x), y: scene.y + cell.y })), nearScene = indexPoints(scenePoints);
+  const sceneryPoints = [...scenery.values()].map(({ scene, cell }) => ({ id: scene.id, x: wrapX(scene.x + cell.x), y: scene.y + cell.y }));
+  const nearScenery = sceneryPoints.length ? indexPoints(sceneryPoints) : null;
   for (const p of points.values()) {
-    neighbors.set(p.id, nearby(p).filter(q => q.id !== p.id && distance(p, q) <= 12 && clearLine(p, q, scenery)).sort((a, b) => distance(p, a) - distance(p, b) || a.id.localeCompare(b.id)));
-    const spots = nearScene(p).filter(q => distance(p, q) <= 16).sort((a, b) => distance(p, a) - distance(p, b) || a.id.localeCompare(b.id)); if (spots.length) scenes.set(p.id, spots[0]);
+    const spots = nearScenery?.(p, 16) || [], visible = [];
+    for (const q of nearby(p, 12)) {
+      if (q === p) continue;
+      const separation = distance(p, q);
+      if (separation <= 12 && (!spots.length || clearLine(p, q, scenery))) visible.push({ point: q, separation });
+    }
+    visible.sort((a, b) => a.separation - b.separation || a.point.id.localeCompare(b.point.id));
+    neighbors.set(p.id, visible.map(({ point }) => point));
+
+    let closest, closestDistance = 16;
+    for (const q of spots) {
+      if (world.data.ops[q.id]?.kind !== 'scene') continue;
+      const separation = distance(p, q);
+      if (separation <= closestDistance && (!closest || separation < closestDistance || q.id.localeCompare(closest.id) < 0)) {
+        closest = q;
+        closestDistance = separation;
+      }
+    }
+    if (closest) scenes.set(p.id, closest);
   }
   const school = new Map(), taken = new Set(), slot = Math.floor(now / 60000);
   if (now % 60000 < 18000) for (const p of [...points.values()].sort((a, b) => a.id.localeCompare(b.id))) {
@@ -70,8 +118,18 @@ export function lifeContext(world, now, scenery, groups) {
   const memories = new Map();
   for (const [id, home] of Object.entries(world.data.life?.haunts || {})) {
     const p = points.get(id); if (!p) continue;
-    const spot = nearScene(p).filter(q => q.id === home.scene && distance(p, q) <= 7).sort((a, b) => distance(p, a) - distance(p, b) || a.x - b.x || a.y - b.y)[0];
-    memories.set(id, { near: distance(p, home) <= 7, exists: nearScene(home).some(q => q.id === home.scene && distance(home, q) <= 7), spot });
+    const sceneExists = nearScenery && world.data.ops[home.scene]?.kind === 'scene';
+    let spot, closestDistance = 7;
+    if (sceneExists) for (const q of nearScenery(p, 7)) {
+      if (q.id !== home.scene) continue;
+      const separation = distance(p, q);
+      if (separation <= closestDistance && (!spot || separation < closestDistance || (q.x - spot.x || q.y - spot.y) < 0)) {
+        spot = q;
+        closestDistance = separation;
+      }
+    }
+    const exists = !!sceneExists && nearScenery(home, 7).some(q => q.id === home.scene && distance(home, q) <= 7);
+    memories.set(id, { near: distance(p, home) <= 7, exists, spot });
   }
   return { points, neighbors, scenes, memories, school, weather: weatherAt(world.data, now) };
 }
