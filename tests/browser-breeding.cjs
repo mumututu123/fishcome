@@ -69,8 +69,8 @@ async function main() {
   await b.locator('#connect').click(); await b.locator('#peerUrl').fill(`http://127.0.0.1:${ports[0]}`); await b.locator('#connectionForm .primary').click();
   if (concurrent) {
     const consistent = ({ id, early, breeding }) => {
-      const data = tide.world.data;
-      return data.fishes[id]?.created === early && data.breeding[breeding]?.baby.created === early &&
+      const data = window.tide?.world.data;
+      return data?.fishes[id]?.created === early && data.breeding[breeding]?.baby?.created === early &&
         Object.values(data.chars).some(cell => cell.entity === id && cell.path.some(event => event.birth === breeding && event.t === early));
     };
     for (const page of [a, b]) await page.waitForFunction(consistent, fixture);

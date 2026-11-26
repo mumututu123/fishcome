@@ -1,6 +1,7 @@
 import { World, CONFIG, clone, EYES, bounds, validGlyph, displayNick, hash, sceneryCount, chooseClaim } from './engine.js';
 import { get, set, putMany, newIdentity, verifyEnvelope, actorId, download } from './storage.js';
 import { Network } from './network.js';
+import { WorldBroadcast } from './world-broadcast.js';
 import { Renderer } from './renderer.js';
 import { Creator } from './creator.js';
 import { restoreCheckpoint } from './lifecycle.js';
@@ -33,8 +34,8 @@ const myFishCards = new Map();
 let lifeSince = Date.now(), returnVisit = false, lifeMessage = null;
 let myFishView = 'list', pedigreeFish = null, pedigreeKey = '';
 const fishDate = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
-let lastSnapshot = 0, snapshotBusy = false, lastHello = new Set(), lastMeter = Date.now(), lastSave = 0, lastPictureTime = 0, lastChat = 0, selfBeat = 0, lastLeader = '', status = '', started = false, lastRepair = 0;
-let lastFull = 0, sentOps = new Set(), sentChars = new Map(), sentChats = new Set(), sentChatSources = new Set(), sentTravel = new Map();
+let lastSnapshot = 0, lastHello = new Set(), lastMeter = Date.now(), lastSave = 0, lastPictureTime = 0, lastChat = 0, selfBeat = 0, lastLeader = '', status = '', started = false, lastRepair = 0;
+const worldBroadcast = new WorldBroadcast();
 let geometryRepair = false, fishRepairWaiting = 0;
 let updateFrozen = false, updateRestarting = false, activeRestartTaskId = '', activeSavePromise = null, preparedUpdate = null, peerUpdateCandidate = '', activeUpdateTaskId = '', updatePollTimer = null, peerProbeBusy = false, updateStateSeq = 0;
 let updateForcePendingAck = false, updateForceDraftAck = false, updateForceReason = '';
@@ -123,7 +124,7 @@ async function archiveWorld(now = Date.now()) {
     await putMany(chunks.map(chunk => ['archive:' + chunk.manifest.id, chunk.encoded])); if (world !== target) return;
     for (const chunk of chunks) { await store.ingest(chunk, chooseClaim); target.data.archives ||= emptyArchiveState(); target.data.archives.chunks[chunk.manifest.id] = chunk.manifest; }
     await compactKnown(target, store); if (world !== target || archiveStore !== store) return;
-    target.data.archives.at = now; target.dirty = true; target.foodRevision++; target.attachArchives(store); lastFull = 0;
+    target.data.archives.at = now; target.dirty = true; target.foodRevision++; target.attachArchives(store); worldBroadcast.reset();
     await save(); await broadcastWorld(); renderChat();
   } catch (error) { status = '记忆整理稍后重试：' + error.message; } finally { archiveBusy = false; }
 }
@@ -234,7 +235,7 @@ async function resumeWorld(now) {
       chatLimit = 80; renderChat();
       lastPicture = null; pending.clear(); inbox.clear(); selected = null; trackedFish = null; renderer.selected = null; renderer.observedFish = null; $('inspector').hidden = true; cancelMode();
     } else { world.resolveLegends(now); world.data.tick = now; }
-    members.clear(); members.set(network.node, member()); lastHello.clear(); lastLeader = ''; lastFull = 0; sentChars.clear(); sentOps.clear(); sentChats.clear(); sentChatSources.clear(); sentTravel.clear(); lastPictureTime = 0;
+    members.clear(); members.set(network.node, member()); lastHello.clear(); lastLeader = ''; worldBroadcast.reset(); lastPictureTime = 0;
   }
   lastOnlineAt = Math.max(lastOnlineAt, now);
   if (elapsed > 120000) { networkChange().catch(() => {}); reconnect().catch(() => {}); }
@@ -324,17 +325,9 @@ async function networkChange(error) {
 }
 async function probeGone(id, url) { if (!id || id === network.node || !members.has(id)) return; try { url = await normalizeInvite(url); const s = await network.local('probe', { url }); if (!(s.clients || []).some(c => c.id === id)) { members.delete(id); await network.broadcast('lost', { id, url }); update(); } } catch { /* Membership lease expires if the publishing computer is unreachable. */ } }
 async function broadcastWorld() {
-  if (snapshotBusy || !amLeader()) return; snapshotBusy = true;
-  try {
-    const full = Date.now() - lastFull > 30000, data = world.data, chars = {}, ops = {}, chats = {}, chatSources = {}, travel = {}, nextMarks = new Map(), travelMarks = new Map();
-    for (const [id, c] of Object.entries(data.chars)) { const mark = `${c.kind}:${c.entity}:${c.x}:${c.y}:${c.ch}:${c.color}:${c.editAt || 0}:${c.moveAt || 0}:${JSON.stringify(c.path)}`; nextMarks.set(id, mark); if (full || sentChars.get(id) !== mark) chars[id] = c; }
-    for (const [id, op] of Object.entries(data.ops)) if (full || !sentOps.has(id)) ops[id] = op;
-    for (const [id, message] of Object.entries(data.chats)) if (full || !sentChats.has(id)) chats[id] = message;
-    for (const [id, message] of Object.entries(data.chatSources)) if (full || !sentChatSources.has(id)) chatSources[id] = message;
-    for (const [id, record] of Object.entries(data.travel)) { const mark = JSON.stringify(record); travelMarks.set(id, mark); if (full || sentTravel.get(id) !== mark) travel[id] = record; }
-    await network.broadcast('world', { delta: !full, world: { protocol: 1, roots: data.roots, terrain: data.terrain, tick: data.tick, seaweedHour: data.seaweedHour, bubbleMinute: data.bubbleMinute, bubbles: data.bubbles, chars, fishes: data.fishes, breeding: data.breeding, contacts: data.contacts, contactAt: data.contactAt, scenes: data.scenes, participants: data.participants, ops, notices: [], chats, chatSources, travel, life: data.life, legends: data.legends, ecology: data.ecology, archives: data.archives } });
-    sentChars = nextMarks; sentOps = new Set(Object.keys(data.ops)); sentChats = new Set(Object.keys(data.chats)); sentChatSources = new Set(Object.keys(data.chatSources)); sentTravel = travelMarks; if (full) lastFull = Date.now();
-  } catch (e) { status = e.message; } finally { snapshotBusy = false; }
+  if (!amLeader()) return;
+  try { await worldBroadcast.send(network, world.data); }
+  catch (error) { status = error.message; }
 }
 async function submit(payload) {
   if (updateFrozen) { toast('正在更新并重启，请稍候'); return; }
@@ -606,16 +599,18 @@ async function receiveHistory(card, peer, bundle) {
   if (card.roots.some(root => world.roots.includes(root))) for (const message of Object.values(await store.chats(Infinity, card.chats || {}, card.archives))) { const result = world.addChat(message); if (!result.ok) throw new Error(result.error); }
   renderChat();
 }
-function currentCheckpoint() { return { world: world.serialize(), picture: lastPicture || localPicture(), at: Date.now(), lastOnlineAt }; }
+function currentCheckpoint(data = world.serialize()) { return { world: data, picture: lastPicture || localPicture(), at: Date.now(), lastOnlineAt }; }
 async function saveInternal() {
   if (!identity) return;
-  if (!lastPicture || JSON.stringify(lastPicture.counts) !== JSON.stringify(world.counts()) || lastPicture.roots.length !== world.roots.length || !world.roots.every(root => lastPicture.roots.includes(root)) || lastPicture.participants !== (Object.keys(world.data.participants).length || 1)) lastPicture = localPicture();
-  const task = putMany([['identity', identity], ['histories', histories], ['known', known], ['checkpoint', currentCheckpoint()]]);
+  const task = putMany(() => {
+    if (!lastPicture || JSON.stringify(lastPicture.counts) !== JSON.stringify(world.counts()) || lastPicture.roots.length !== world.roots.length || !world.roots.every(root => lastPicture.roots.includes(root)) || lastPicture.participants !== (Object.keys(world.data.participants).length || 1)) lastPicture = localPicture();
+    return [['identity', identity], ['histories', histories], ['known', known], ['checkpoint', currentCheckpoint(world.data)]];
+  });
   activeSavePromise = task;
   try { await task; } finally { if (activeSavePromise === task) activeSavePromise = null; }
 }
 async function save() { if (updateFrozen) return; return saveInternal(); }
-async function takePicture() { if (!amLeader()) return; lastPicture = localPicture(); await network.broadcast('picture', lastPicture); }
+async function takePicture() { if (!amLeader()) return; lastPicture = localPicture(); if (network.live().length) await network.broadcast('picture', lastPicture); }
 async function reconnect() {
   const params = new URLSearchParams(location.search), input = params.get('join') || meta.joinUrl;
   if (params.has('join')) { params.delete('join'); history.replaceState(null, '', location.pathname + (params.size ? '?' + params.toString() : '') + location.hash); }
@@ -649,7 +644,7 @@ async function start() {
   syncUpdateStatus(); refreshPeerUpdates().catch(() => {});
   reconnect().catch(() => {}); update(); lastPictureTime = Date.now(); takePicture().catch(() => {});
   setInterval(tick, CONFIG.step); setInterval(() => { network.presence(active().filter(m => m.id !== network.node).map(m => ({ id: m.id, url: m.url }))).catch(() => {}); if (network.connections.size < 6) { const candidate = active().filter(m => m.id !== network.node && !network.has(m.id)).sort((a, b) => hash(`${network.node}:${a.id}`) - hash(`${network.node}:${b.id}`))[0]; if (candidate) network.connect(candidate.url, candidate.id).catch(() => {}); } }, 6000);
-  document.addEventListener('visibilitychange', async () => { if (!document.hidden) { lifeSince = identity.lifeSeenAt || Date.now(); returnVisit = Date.now() - lifeSince > 60000; lifeMessage = null; } await resumeAfterInactivity(); network.broadcast('beat', { member: member() }).catch(() => {}); save().catch(() => {}); });
+  document.addEventListener('visibilitychange', async () => { if (!document.hidden) { lifeSince = identity.lifeSeenAt || Date.now(); returnVisit = Date.now() - lifeSince > 60000; lifeMessage = null; } await resumeAfterInactivity(); if (network.live().length) network.broadcast('beat', { member: member() }).catch(() => {}); save().catch(() => {}); });
   window.addEventListener('pagehide', () => { const blob = new Blob([JSON.stringify({ node: network.node, token: meta.token })], { type: 'application/json' }); navigator.sendBeacon('/local/unregister', blob); if (updateFrozen || updateRestarting) return; lastPicture = localPicture(); save().catch(() => {}); });
   // Exposes read-only diagnostics for the project's automated browser checks.
   window.tide = { get world() { return { data: world.serialize(), counts: world.counts() }; }, get network() { return { node: network.node, leader: leader(), peers: network.live().map(p => ({ node: p.node, url: p.url })), stats: clone(network.stats) }; }, get identity() { return { actor: identity.actor, nick: displayNick(identity.nick) }; }, get histories() { return clone(histories); }, get view() { return { camera: clone(renderer.camera), scale: renderer.scale, followingFish: trackedFish, selected: clone(selected) }; }, balance };
@@ -660,8 +655,8 @@ async function tick() {
   await resumeAfterInactivity(now);
   if (!updateFrozen && identity.remainder >= 3600) { identity.remainder -= 3600; identity.serial = (identity.serial || 0) + 1; await submit({ kind: 'earn', cost: 0, serial: identity.serial }); }
   members.set(network.node, member());
-  if (now - selfBeat >= 3000) { selfBeat = now; network.broadcast('beat', { member: member(), rootCount: world.roots.length, opCount: Object.keys(world.data.ops).length, chatCount: Object.keys(world.data.chats).length, chatSourceCount: Object.keys(world.data.chatSources).length }).catch(() => {}); }
-  const currentLeader = leader(); if (currentLeader !== lastLeader) { lastLeader = currentLeader; lastFull = 0; sentChars.clear(); sentOps.clear(); sentChats.clear(); sentChatSources.clear(); sentTravel.clear(); if (amLeader()) { geometryRepair = true; world.data.tick = Math.max(world.data.tick, now - 2000); for (const envelope of [...inbox.values()].sort((a, b) => a.body.t - b.body.t || a.body.id.localeCompare(b.body.id))) { if (!world.data.ops[envelope.body.id]) { const result = world.apply({ ...clone(envelope.body), proof: clone(envelope) }); if (!result.ok) rejectOperation(envelope.body.id); network.broadcast('ack', { id: envelope.body.id, result }).catch(() => {}); } } for (const id of pending.keys()) if (world.data.ops[id]) pending.delete(id); } }
+  if (now - selfBeat >= 3000 && network.live().length) { selfBeat = now; network.broadcast('beat', { member: member(), rootCount: world.roots.length, opCount: Object.keys(world.data.ops).length, chatCount: Object.keys(world.data.chats).length, chatSourceCount: Object.keys(world.data.chatSources).length }).catch(() => {}); }
+  const currentLeader = leader(); if (currentLeader !== lastLeader) { lastLeader = currentLeader; worldBroadcast.reset(); if (amLeader()) { geometryRepair = true; world.data.tick = Math.max(world.data.tick, now - 2000); for (const envelope of [...inbox.values()].sort((a, b) => a.body.t - b.body.t || a.body.id.localeCompare(b.body.id))) { if (!world.data.ops[envelope.body.id]) { const result = world.apply({ ...clone(envelope.body), proof: clone(envelope) }); if (!result.ok) rejectOperation(envelope.body.id); network.broadcast('ack', { id: envelope.body.id, result }).catch(() => {}); } } for (const id of pending.keys()) if (world.data.ops[id]) pending.delete(id); } }
   if (amLeader() && fishRepairWaiting && now - lastSave > 5000) geometryRepair = true;
   if (amLeader() && geometryRepair) { const result = world.reconcileGeometry(now); geometryRepair = false; fishRepairWaiting = result.fishWaiting; if (result.fishWaiting) toast('世界空间不足，部分重叠鱼仍在等待空位'); else if (result.waiting) toast('世界空间不足，部分合流造景仍待安置'); }
   if (amLeader() && world.data.pendingChatGlyphs && now - lastSave > 5000) world.reconcileChatFloor(now);

@@ -1,7 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { World, CONFIG, EYES, cellPosition, components, velocities, clone, hash } from './empty-world.mjs';
-import { CONTACT_TIME, BREEDING_TIME, activeBreeding, breedingId, updateContacts, finishBreeding, chooseOwner, motionUnits, commitUnit, validBreedingRecord, inheritedGlyph, repairLocalBirthTimes } from '../www/breeding.js';
+import { CONTACT_TIME, BREEDING_TIME, activeBreeding, breedingId, cancelBreeding, updateContacts, finishBreeding, chooseOwner, motionUnits, commitUnit, validBreedingRecord, inheritedGlyph, repairLocalBirthTimes } from '../www/breeding.js';
+import { WorldBroadcast } from '../www/world-broadcast.js';
+import { Network } from '../www/network.js';
+import { actorId, signer } from '../www/storage.js';
 import { restoreCheckpoint } from '../www/lifecycle.js';
 import { HOUR, GREENS, growthRoll, weedId, validWildCell } from '../www/seaweed.js';
 import { storiesFor } from '../www/life.js';
@@ -18,6 +21,116 @@ function pair(fatherCells, motherCells, motherX = 23, motherY = 20) {
 function contacts(world, now) { updateContacts(world, now, world.fishGroups(), world.sceneryMap()); }
 function bind(world) { for (let i = 0; i <= CONTACT_TIME; i += CONFIG.step) contacts(world, t + i); return Object.values(world.data.breeding).find(record => record.status === 'active'); }
 const transition = (cell, next, record) => { Object.assign(cell, next); cell.path.push({ ...record, target: next.entity || '', x: next.x, y: next.y }); };
+
+test('全量签名时发生的出生及新配对取消在下一包抵达，随后只发有变化的凭据', async () => {
+  const { world } = pair(), first = bind(world), peer = new World(t);
+  const keys = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
+  const pub = await crypto.subtle.exportKey('jwk', keys.publicKey), secret = await crypto.subtle.exportKey('jwk', keys.privateKey);
+  const sender = new Network({ actor: await actorId(pub), pub }, {}), channel = new WorldBroadcast(), frames = [], packets = [];
+  sender.sign = await signer({ secret });
+  sender.connections.set('peer', { sendQueue: Promise.resolve(), queued: 0, dc: {
+    readyState: 'open', bufferedAmount: 0, send: frame => frames.push(frame.buffer)
+  } });
+  const receiver = new Network({ actor: 'peer' }, {}, message => { peer.merge(message.body.world); packets.push(message.body); });
+  const from = { packets: new Map() };
+  async function deliver(sending) {
+    await sending;
+    const count = packets.length;
+    for (const frame of frames.splice(0)) await receiver.receive(from, frame);
+    assert.equal(receiver.stats.rejected, 0);
+    assert.equal(packets.length, count + 1);
+    return packets.at(-1);
+  }
+
+  const fullInFlight = channel.send(sender, world.data, t);
+  const father = fish(world, 'male', 40, 20, undefined, 'new-father');
+  fish(world, 'female', 43, 20, undefined, 'new-mother');
+  for (let i = 0; i <= CONTACT_TIME; i += CONFIG.step) contacts(world, first.started + i);
+  const second = world.breedingState(father);
+  cancelBreeding(world.data, second, second.started, 'a');
+  finishBreeding(world, first.ends + CONFIG.step, transition);
+
+  const initial = await deliver(fullInFlight);
+  assert.equal(initial.delta, false);
+  assert.equal(peer.data.breeding[first.id].status, 'active');
+  assert.equal(peer.data.breeding[second.id], undefined);
+  const finished = clone(world.data.breeding), nextInFlight = channel.send(sender, world.data, t + 1000);
+  const concurrent = new World(t);
+  concurrent.merge(initial.world);
+  finishBreeding(concurrent, first.ends, transition);
+  world.merge(concurrent.serialize());
+  const replacement = world.serialize();
+  replacement.breeding[second.id].reason = 'z';
+  world.merge(replacement);
+  assert.equal(world.data.breeding[second.id].at, second.started);
+  const next = await deliver(nextInFlight);
+  assert.equal(next.delta, true);
+  assert.equal(peer.data.breeding[second.id].reason, 'a');
+  assert.equal(peer.data.breeding[first.id].status, 'born');
+  assert.deepEqual(peer.data.breeding, finished);
+  const correction = await deliver(channel.send(sender, world.data, t + 2000));
+  assert.deepEqual(Object.keys(correction.world.breeding).sort(), [first.id, second.id].sort());
+  assert.equal(peer.data.breeding[second.id].reason, 'z');
+  assert.equal(peer.data.fishes[first.baby.id].created, first.ends);
+  for (const c of peer.fishCells(first.baby.id)) assert.equal(c.path.find(e => e.birth === first.id).t, first.ends);
+  assert.deepEqual(peer.data.breeding, world.data.breeding);
+  assert.deepEqual((await deliver(channel.send(sender, world.data, t + 3000))).world.breeding, {});
+});
+
+test('无人接收时不读世界；首包、选主重置、断线重连与周期修复都发送完整历史', async () => {
+  const channel = new WorldBroadcast(), packets = [];
+  let connected = false;
+  const network = { live: () => connected ? [1] : [], broadcast: (kind, body) => packets.push(body) };
+  const unreadable = new Proxy({}, { get() { throw new Error('空闲广播仍在读世界'); } });
+  await channel.send(network, unreadable, t);
+  assert.equal(packets.length, 0);
+  const { world } = pair(), record = bind(world);
+  cancelBreeding(world.data, record, record.started, 'parent-gone');
+  connected = true;
+  async function check(now, full) {
+    await channel.send(network, world.data, now);
+    assert.equal(packets.at(-1).delta, !full);
+    assert.deepEqual(Object.keys(packets.at(-1).world.breeding), full ? [record.id] : []);
+  }
+  await check(t, true);
+  await check(t + 1000, false);
+  channel.reset();
+  await check(t + 2000, true);
+  await check(t + 32001, true);
+  connected = false;
+  await channel.send(network, unreadable, t + 33000);
+  connected = true;
+  await check(t + 34000, true);
+  world.data.breeding = clone(world.data.breeding);
+  await check(t + 35000, true);
+  assert.deepEqual(packets.at(-1).world.ops, world.data.ops);
+  const sending = channel.send(network, world.data, t + 36000);
+  channel.reset();
+  await sending;
+  await check(t + 37000, true);
+});
+
+test('正常广播读取最新合体位置，不再读取已送达的繁殖历史', async () => {
+  const { world } = pair(), history = bind(world);
+  cancelBreeding(world.data, history, history.started, 'incomplete-bodies');
+  const father = fish(world, 'male', 40, 20, undefined, 'new-father');
+  fish(world, 'female', 43, 20, undefined, 'new-mother');
+  for (let i = 0; i <= CONTACT_TIME; i += CONFIG.step) contacts(world, history.started + i);
+  const pairRecord = world.breedingState(father);
+  const channel = new WorldBroadcast(), network = { live: () => [1], broadcast: (kind, body) => body };
+  const full = await channel.send(network, world.data, t);
+  assert.equal(full.world.breeding[history.id].status, 'cancelled');
+  Object.defineProperty(world.data.breeding, history.id, {
+    get() { throw new Error('增量广播仍在读取已发送的历史'); }, enumerable: true
+  });
+  const unit = motionUnits(world, world.fishGroups()).find(unit => unit.id === pairRecord.id);
+  unit.fish.x += 1;
+  commitUnit(unit, pairRecord.started + CONFIG.step);
+  const delta = await channel.send(network, world.data, t + 1000);
+  assert.equal(delta.delta, true);
+  assert.equal(delta.world.breeding[history.id], undefined);
+  assert.equal(delta.world.breeding[pairRecord.id].pose.male.x, full.world.breeding[pairRecord.id].pose.male.x + 1);
+});
 
 test('查询配对和推进模拟时只遍历一次繁殖历史', () => {
   const { world, male, female } = pair(), record = bind(world);

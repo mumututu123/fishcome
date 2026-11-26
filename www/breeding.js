@@ -41,6 +41,23 @@ export function activeBreeding(data, id) {
   return index.byFish.get(id);
 }
 function activeRecords(data) { return data.breeding ? [...activeIndex(data.breeding).records.values()] : []; }
+export function breedingForBroadcast(table, full) {
+  const index = activeIndex(table), pending = index.pendingTerminal;
+  // Start tracking the next packet before signing or sending this one.
+  index.pendingTerminal = new Set();
+  if (full || !pending) return table;
+  const records = Object.fromEntries(index.records);
+  for (const id of pending) if (Object.hasOwn(table, id)) records[id] = table[id];
+  return records;
+}
+export function stopBreedingBroadcast(table) {
+  const index = activeIndexes.get(table);
+  if (index) index.pendingTerminal = null;
+}
+function markTerminal(index, id) {
+  index.pendingTerminal?.add(id);
+  if (index.records.delete(id)) index.byFish = null;
+}
 export function writeBreedingRecord(table, id, record) {
   const index = activeIndexes.get(table);
   const active = record?.status === 'active';
@@ -50,7 +67,7 @@ export function writeBreedingRecord(table, id, record) {
   if (!index) return;
   if (reactivates) activeIndexes.delete(table);
   else if (active) { index.records.set(id, record); index.byFish = null; }
-  else if (index.records.delete(id)) index.byFish = null;
+  else markTerminal(index, id);
 }
 export function contactCells(male, mc, female, fc, scenery) {
   const at = new Map(fc.map(cell => { const p = cellPosition(female, cell); return [key(p.x, p.y), cell]; }));
@@ -70,7 +87,7 @@ function settleRecord(data, record, status, now) {
   const index = activeIndexes.get(data.breeding);
   if (!index) return;
   if (data.breeding[record.id] !== record) activeIndexes.delete(data.breeding);
-  else if (index.records.delete(record.id)) index.byFish = null;
+  else markTerminal(index, record.id);
 }
 export function cancelBreeding(data, record, now, reason) {
   settleRecord(data, record, 'cancelled', now); record.reason = reason;
