@@ -48,6 +48,38 @@ function changedRows(data, base, pending) {
   return rows;
 }
 
+// A running sea sends thousands of fish and bond records with only scalar fields.
+// Detach those rows without serializing their fields a second time. Older fish
+// can carry nested ancestry, which still needs its own deep copy.
+function detachRows(rows) {
+  const result = { ...rows };
+  for (const id of Object.keys(result)) {
+    const row = result[id];
+    if (!row || Object.getPrototypeOf(row) !== Object.prototype) {
+      result[id] = structuredClone(row);
+      continue;
+    }
+    const copy = { ...row };
+    result[id] = copy;
+    for (const field in copy) {
+      const value = copy[field], type = typeof value;
+      if ((value !== null && type === 'object') || type === 'function' || type === 'symbol') {
+        result[id] = structuredClone(row);
+        break;
+      }
+    }
+  }
+  return result;
+}
+
+function captureDelta(delta) {
+  const { fishes, life } = delta;
+  const snapshot = structuredClone({ ...delta, fishes: null, life: life?.bonds ? { ...life, bonds: null } : life });
+  snapshot.fishes = detachRows(fishes);
+  if (life?.bonds) snapshot.life.bonds = detachRows(life.bonds);
+  return snapshot;
+}
+
 function encodeSwims(fishes, directions) {
   if (!directions?.length) return;
   // Ordinals refer to the fish rows already present in the signed world.
@@ -224,7 +256,7 @@ export class WorldBroadcast {
       const generation = this.generation, breeding = breedingForBroadcast(data.breeding, !previous);
       let world, swims;
       if (previous) {
-        world = structuredClone(packet(data, changedRows(data, previous, pending), breeding));
+        world = captureDelta(packet(data, changedRows(data, previous, pending), breeding));
         if (world.tick === previous.tick + CONFIG.step) swims = encodeSwims(world.fishes, directions);
         previous.tick = world.tick;
         // Retain only the latest detached value for each live row. Ongoing
