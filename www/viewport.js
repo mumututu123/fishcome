@@ -5,6 +5,25 @@ const columns = Math.ceil(WORLD_WIDTH / side);
 const sector = (x, y) => Math.floor(wrapX(x) / side) + columns * Math.floor(y / side);
 const drawable = kind => kind === 'fish' || kind === 'scene' || kind === 'food' || kind === 'seaweed';
 
+// Every cell is still in its old sector if both whole poses fit in one sector.
+// Test the unwrapped interval first: the last sea column is only eight cells wide.
+function staysInSector(group, pose) {
+  if (!group.reach) {
+    let x = 0, y = 0;
+    for (const entry of group) {
+      x = Math.max(x, Math.abs(entry.x));
+      y = Math.max(y, Math.abs(entry.y));
+    }
+    group.reach = { x, y };
+  }
+  const lowX = Math.min(group.x, pose.x) - group.reach.x, highX = Math.max(group.x, pose.x) + group.reach.x;
+  if (lowX < 0 || highX >= WORLD_WIDTH || highX - lowX >= side) return false;
+  const left = wrapX(lowX), right = wrapX(highX);
+  return left <= right && Math.floor(left / side) === Math.floor(right / side) &&
+    Math.floor((Math.min(group.y, pose.y) - group.reach.y) / side) ===
+    Math.floor((Math.max(group.y, pose.y) + group.reach.y) / side);
+}
+
 // Several cells can share an owner. Moving the owner changes their sectors
 // without changing the insertion order used by painting and hit testing.
 export class ViewportCells {
@@ -75,6 +94,7 @@ export class ViewportCells {
     this.move(entry, undefined);
     if (entry.owner) {
       entry.owner.delete(entry);
+      entry.owner.reach = null;
       if (!entry.owner.size) this.owners[entry.kind].delete(entry.entity);
     }
     this.cells.delete(id);
@@ -94,6 +114,7 @@ export class ViewportCells {
       }
       entry.owner = owners.get(cell.entity);
       entry.owner.add(entry);
+      entry.owner.reach = null;
     }
     this.cells.set(id, entry);
     this.place(entry);
@@ -102,8 +123,9 @@ export class ViewportCells {
 
   moveOwner(group, pose) {
     if (!group || group.x === pose?.x && group.y === pose?.y && group.facing === pose?.facing) return;
+    const inside = Math.abs(group.facing) === 1 && Math.abs(pose?.facing) === 1 && staysInSector(group, pose);
     group.x = pose?.x; group.y = pose?.y; group.facing = pose?.facing;
-    for (const entry of group) this.place(entry);
+    if (!inside) for (const entry of group) this.place(entry);
   }
 
   reconcile() {
@@ -124,6 +146,7 @@ export class ViewportCells {
         entry.cell = cell;
         if (entry.x !== cell.x || entry.y !== cell.y) {
           entry.x = cell.x; entry.y = cell.y;
+          if (entry.owner) entry.owner.reach = null;
           this.place(entry);
         }
       }

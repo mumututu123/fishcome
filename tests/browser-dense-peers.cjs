@@ -8,23 +8,37 @@ const path = require('node:path');
 const { setTimeout: pause } = require('node:timers/promises');
 const { parseArgs } = require('node:util');
 const { unpackZip, launcherName, withReleaseFixtures } = require('./release-fixtures.cjs');
+const { recordDraw, frameSummary, startTrace, readPresentations } = require('./browser-refresh-budget.cjs');
 
 const { positionals, values } = parseArgs({ allowPositionals: true, options: {
   profile: { type: 'string' }, source: { type: 'string' }, seconds: { type: 'string', default: '10' },
-  'full-updates': { type: 'string' }, drop: { type: 'boolean' }, help: { type: 'boolean' }
+  'full-updates': { type: 'string' }, drop: { type: 'boolean' }, help: { type: 'boolean' },
+  backup: { type: 'string' }, trace: { type: 'string' }, report: { type: 'string' }, 'refresh-budget': { type: 'boolean' },
+  'archive-rounds': { type: 'string', default: '0' }, 'plain-live': { type: 'string' },
+  'forget-live-base': { type: 'boolean' }, 'switch-leader': { type: 'boolean' }
 } });
 if (values.help) {
-  console.log('用法：node tests/browser-dense-peers.cjs [120|5000] [--seconds=35] [--full-updates=0|1] [--drop] [--profile=跟随端.cpuprofile]');
+  console.log('用法：node tests/browser-dense-peers.cjs [鱼数] [--seconds=35] [--full-updates=0|1] [--drop] [--profile=跟随端.cpuprofile]');
   console.log('默认使用仓库发行构建工具，临时构建两套启动器。也可用 TIDE_DENSE_LAUNCHER_A 和 TIDE_DENSE_LAUNCHER_B 指定两套隔离的启动器，另以 --source=对照工作区指定网页来源。');
   console.log('--drop 蓄意漏发一个已提交的半秒更新，检查后续能否继续同步。');
+  console.log('--backup=本地存档 使用真实存档和归档；--trace=本地跟踪文件 记录浏览器呈现；--report=汇总文件 保存验收数据；--refresh-budget 严格检查每次刷新不超过 20 毫秒（需 --trace）。');
+  console.log('--archive-rounds=3 在观测期间连续生成并同步 3 个新归档包（需 --backup）。');
+  console.log('--plain-live=A|B|both 模拟不支持紧凑发送的端；--forget-live-base 模拟跟随端遗失上一版本；--switch-leader 在观测后切换协调端。');
   process.exit(0);
 }
-const count = Number(positionals[0] || 120);
+const backup = values.backup && JSON.parse(readFileSync(values.backup, 'utf8'));
+const count = backup ? Object.keys(backup.world.fishes).length : Number(positionals[0] || 120);
 const seconds = Number(values.seconds);
 const expectedFull = values['full-updates'] === undefined ? undefined : Number(values['full-updates']);
+const archiveRounds = Number(values['archive-rounds']);
 assert(positionals.length < 2 && Number.isSafeInteger(count) && count >= 2 && count <= 5500);
 assert(Number.isSafeInteger(seconds) && seconds >= 6 && seconds <= 90);
 assert(expectedFull === undefined || Number.isSafeInteger(expectedFull) && expectedFull >= 0);
+assert(!backup || !positionals.length, '使用真实存档时，鱼数从存档读取');
+assert(!values['refresh-budget'] || values.trace, '严格验收需要记录浏览器呈现');
+assert(Number.isSafeInteger(archiveRounds) && archiveRounds >= 0 && archiveRounds <= 3 && (!archiveRounds || backup), '归档轮次应为 0–3，写新归档需要真实存档');
+assert(!values['plain-live'] || ['A', 'B', 'both'].includes(values['plain-live']), '--plain-live 应为 A、B 或 both');
+assert(!values['forget-live-base'] || !values['plain-live'], '遗失基准测试需要两端支持紧凑发送');
 const launchers = [process.env.TIDE_DENSE_LAUNCHER_A, process.env.TIDE_DENSE_LAUNCHER_B];
 assert(!launchers.some(Boolean) || launchers.every(Boolean) && path.dirname(launchers[0]) !== path.dirname(launchers[1]), '请指定两个独立临时目录中的启动器');
 assert(!values.source || launchers.every(Boolean), '--source 需要相同规则的显式启动器');
@@ -32,8 +46,66 @@ const { chromium } = require(process.env.TIDE_TEST_MODULES ? path.join(process.e
 const www = values.source ? path.resolve(values.source, 'www') : path.resolve(__dirname, '../www');
 const browsers = [], children = [], observed = [], errors = [];
 const phaseModules = { '/archive.js': 'compactKnown', '/replica.js': 'verifyReplica', '/storage.js': 'putMany' };
+const observeCommit = `
+const reportApplied = simulationApplied;
+simulationApplied = (world, patch) => {
+  globalThis.denseCommitted?.(world, patch, performance.timeOrigin + performance.now());
+  return reportApplied(world, patch);
+};
+`;
+const observeReplicaPages = `
+const sendLivePacket = ReplicaTransfers.prototype.sendLivePacket;
+ReplicaTransfers.prototype.sendLivePacket = async function (peer, lane, body) {
+  const startAt = Date.now(), start = performance.now();
+  const id = await sendLivePacket.call(this, peer, lane, body);
+  window.denseLiveTransfers.push({ tick: body.world.tick, compact: Boolean(body.rowBase), resent: !id, startAt,
+    at: Date.now(), ms: performance.now() - start });
+  return id;
+};
+const receivePage = ReplicaTransfers.prototype.receive;
+ReplicaTransfers.prototype.receive = async function (message, peer) {
+  if (window.denseForgetArmed && message.body.kind === 'live' && message.body.index === 0 &&
+      message.body.text.split('\\n', 1)[0].includes('"rowBase":')) {
+    this.rowsReceived.delete(peer);
+    window.denseForgetArmed = false;
+  }
+  const state = this.incoming.get(message.from + ':' + message.body.id);
+  const next = state?.next, end = state?.endIndex;
+  try { return await receivePage.call(this, message, peer); }
+  catch (error) {
+    window.denseReplicaFailures.push({ kind: message.body.kind, index: message.body.index, last: message.body.last,
+      next, end, error: error.message });
+    throw error;
+  }
+};
+`;
 const instrument = `
-const testData = { frames: [], steps: [], applied: [], sends: [], receives: [], merges: [], saves: [] };
+const testData = { frames: [], steps: [], stepRequests: [], applied: [], sends: [], receives: [], merges: [], worldMerges: [], saves: [], liveBytes: [] };
+const stepRequests = new WeakMap();
+const originalRequest = SimulationClient.prototype.request;
+SimulationClient.prototype.request = function (message) {
+  if (message.kind === 'step') {
+    const sequence = testData.stepRequests.length;
+    if (${Boolean(values.trace)}) {
+      const name = 'tide.request.' + window.densePage + '.' + sequence;
+      performance.mark(name);
+      performance.clearMarks(name);
+    }
+    const start = performance.now(), row = { sequence, startAt: performance.timeOrigin + start, tick: message.base + CONFIG.step };
+    stepRequests.set(message, { row, start });
+    testData.stepRequests.push(row);
+  }
+  return originalRequest.call(this, message);
+};
+const originalCompute = SimulationClient.prototype.compute;
+SimulationClient.prototype.compute = async function (target, message, ownsWorld) {
+  let result;
+  try { return result = await originalCompute.call(this, target, message, ownsWorld); }
+  finally {
+    const request = stepRequests.get(message), end = performance.now();
+    if (request) Object.assign(request.row, { ms: end - request.start, committed: Boolean(result && target === world) });
+  }
+};
 const originalOnMessage = onMessage;
 onMessage = async (message, peer) => {
   const at = Date.now(), start = performance.now();
@@ -44,6 +116,7 @@ onMessage = async (message, peer) => {
   finally {
     if (['hello', 'merge', 'world', 'archiveChunk'].includes(message.kind)) testData.receives.push({ kind: message.kind,
       tick: message.body.world?.tick, delta: message.body.delta, before, after: world.data.tick,
+      ...(message.kind === 'world' && message.body.delta && { rows: Object.fromEntries(['fishes', 'chars', 'breeding', 'contacts', 'travel', 'ops', 'scenes'].map(field => [field, Object.keys(message.body.world[field] || {}).length])) }),
       startAt: at, at: Date.now(), ms: performance.now() - start, failed });
   }
 };
@@ -67,45 +140,78 @@ Network.prototype.broadcast = async function (kind, body, ...args) {
   try { return await originalBroadcast.call(this, kind, body, ...args); }
   finally { testData.sends.push({ tick: body.world.tick, delta: body.delta, at, done: Date.now() }); }
 };
+const originalEncode = Network.prototype.encode;
+Network.prototype.encode = async function (message) {
+  const encoded = await originalEncode.call(this, message);
+  if (message.kind === 'replicaPage' && message.body.kind === 'live') {
+    testData.liveBytes.push({ at: Date.now(), bytes: encoded.byteLength + Math.ceil(encoded.byteLength / 16000) * 44 });
+  }
+  return encoded;
+};
 const originalSave = save;
 save = async (...args) => {
   const tick = world.data.tick, start = performance.now();
   try { return await originalSave(...args); }
   finally { testData.saves.push({ tick, ms: performance.now() - start, at: Date.now() }); }
 };
-subscribeSimulationChanges((target, patch) => {
+window.denseCommitted = (target, patch, at) => {
   if (target !== world || !Number.isFinite(patch?.values.tick)) return;
-  (amLeader() ? testData.steps : testData.applied).push({ tick: patch.values.tick, at: Date.now() });
-});
+  (amLeader() ? testData.steps : testData.applied).push({ tick: patch.values.tick, at });
+};
 for (const [object, method, name] of [
   [World.prototype, 'merge', 'World.merge'], [pictures, 'prepare', 'pictures.prepare'], [renderer, 'cellIndex', 'renderer.cellIndex']
 ]) {
   const original = object[method];
   object[method] = function (...args) {
     const previous = method === 'merge' && this === world && this.data.tick;
-    const result = window.denseObserve(name, original, this, args);
+    if (!previous) return window.denseObserve(name, original, this, args);
+    const archiveCount = Object.keys(this.data.archives?.chunks || {}).length;
+    const start = performance.now(), at = performance.timeOrigin + start;
+    const result = window.denseObserve(name, original, this, args), ms = performance.now() - start;
+    const [incoming, archived, origin] = args;
+    testData.worldMerges.push({ at, ms, before: previous, after: this.data.tick, incomingTick: incoming.tick,
+      routine: origin === 'replica', newArchives: Object.keys(this.data.archives?.chunks || {}).length - archiveCount,
+      incomingChars: Object.keys(incoming.chars).length, incomingOps: Object.keys(incoming.ops).length,
+      incomingScenes: Object.keys(incoming.scenes).length, incomingBreeding: Object.keys(incoming.breeding || {}).length,
+      archiveChars: Object.keys(archived?.chars || {}).length, archiveOps: Object.keys(archived?.ops || {}).length });
     if (previous && !amLeader() && this.data.tick > previous) testData.applied.push({ tick: this.data.tick, at: Date.now() });
     return result;
   };
 }
-const originalDraw = renderer.draw.bind(renderer);
-let lastFrame = 0;
-renderer.draw = (...args) => {
-  const at = performance.now();
-  originalDraw(...args);
-  testData.frames.push({ at: Date.now(), frame: lastFrame ? at - lastFrame : 0, draw: performance.now()-at,
-    visible: Math.floor((renderer.paintedFish?.length || 0) / 3) });
-  lastFrame = at;
-};
+(${recordDraw.toString()})(renderer, testData.frames, window.densePage, ${Boolean(values.trace)});
 window.denseSurvey = () => ({ ...testData, node: network?.node, leader: network && leader(), peers: network?.live().length,
+  page: window.densePage, timeOrigin: performance.timeOrigin,
   tick: world.data.tick, fish: Object.keys(world.data.fishes).length, rejected: network?.stats.rejected,
-  phases: window.densePhases, longTasks: window.denseLongTasks,
+  phases: window.densePhases, longTasks: window.denseLongTasks, replicaFailures: window.denseReplicaFailures,
+  liveTransfers: window.denseLiveTransfers,
   logs: diagnostics.list().filter(log => log.level === 'warn' || log.level === 'error').slice(-10) });
 window.denseJoinSettled = () => {
   if (!network?.replicaPeers().length) return false;
   const full = testData.receives.filter(row => ['hello', 'merge'].includes(row.kind) || row.kind === 'world' && !row.delta).at(-1);
   return full && Date.now() - full.at >= 800 && !network.replicas.outgoing.size &&
     [...network.replicas.incoming.values()].every(state => state.kind === 'world' || state.kind === 'live');
+};
+window.denseArchiveRound = async serial => {
+  if (!amLeader()) throw new Error('归档轮次开始时协调端已切换');
+  const t = Date.now() - 8 * ARCHIVE.period;
+  const op = { id: identity.actor + ':hour:' + serial, actor: identity.actor, nick: identity.nick,
+    roots: world.roots, kind: 'earn', t, cost: 0, serial };
+  const proof = await network.makeEnvelope('op', op);
+  const result = await simulation.atStepBoundary(() => world.apply({ ...op, proof }));
+  if (!result?.ok || result.duplicate) throw new Error('未写入本轮待归档的签名操作');
+  archiveCheckAt = 0;
+  await archiveWorld();
+  const id = archiveStore.ids.ops.get(op.id);
+  if (!id || world.data.ops[op.id] || !world.data.archives.chunks[id]) throw new Error('签名操作未移入新归档');
+  return { id, at: Date.now(), tick: world.data.tick };
+};
+window.denseHasArchive = id => Boolean(world.data.archives.chunks[id] && archiveStore.manifests[id]);
+window.denseForgetLiveBase = () => { window.denseForgetArmed = true; return true; };
+window.denseReplaceLeaderVisibility = id => {
+  const previous = members.get(id);
+  if (!previous) throw new Error('找不到原协调端');
+  if (id === network.node) Object.defineProperty(document, 'hidden', { configurable: true, value: true });
+  members.set(id, { ...previous, visible: false });
 };
 `;
 
@@ -151,20 +257,21 @@ async function withLaunchers(run) {
 }
 async function openPage(browser, origin, options, assets) {
   const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
-  await context.addInitScript(() => {
-    window.densePhases = []; window.denseLongTasks = [];
+  await context.addInitScript(label => {
+    window.densePage = label;
+    window.densePhases = []; window.denseLongTasks = []; window.denseReplicaFailures = []; window.denseLiveTransfers = [];
     const longTasks = new PerformanceObserver(list => {
       for (const task of list.getEntries()) window.denseLongTasks.push({ at: performance.timeOrigin + task.startTime, ms: task.duration });
     });
     longTasks.observe({ type: 'longtask', buffered: true });
-    window.denseObserve = (phase, action, receiver, args) => {
+    window.denseObserve = (phase, action, receiver, args, context) => {
       const start = performance.now(), at = performance.timeOrigin + start;
       const result = Reflect.apply(action, receiver, args), sync = performance.now() - start;
-      const done = () => { window.densePhases.push({ phase, at, sync, total: performance.now() - start }); };
+      const done = () => { window.densePhases.push({ phase, context, at, sync, total: performance.now() - start }); };
       if (result instanceof Promise) result.then(done, done); else done();
       return result;
     };
-  });
+  }, options);
   await context.route(`${origin}/**`, async route => {
     const { pathname } = new URL(route.request().url());
     if (pathname === '/fixture') return route.fulfill({ contentType: 'text/html', body: '<title>密集海验收</title>' });
@@ -174,9 +281,16 @@ async function openPage(browser, origin, options, assets) {
     if (!file.startsWith(assets + path.sep)) return route.fulfill({ status: 404 });
     try {
       if (pathname === '/app.js') return route.fulfill({ contentType: 'text/javascript', body: readFileSync(file, 'utf8') + instrument });
+      if (pathname === '/replica-stream.js') return route.fulfill({ contentType: 'text/javascript', body: readFileSync(file, 'utf8') + observeReplicaPages });
+      if (pathname === '/simulation-changes.js') return route.fulfill({ contentType: 'text/javascript', body: readFileSync(file, 'utf8') + observeCommit });
+      if (pathname === '/network.js' && ['both', options].includes(values['plain-live'])) {
+        const source = readFileSync(file, 'utf8').replace('const replicaRowsVersion = 1;', 'const replicaRowsVersion = 0;');
+        return route.fulfill({ contentType: 'text/javascript', body: source });
+      }
       if (Object.hasOwn(phaseModules, pathname)) {
         const name = phaseModules[pathname];
-        const observe = `\nif (globalThis.denseObserve) { const original = ${name}; ${name} = (...args) => globalThis.denseObserve('${name}', original, undefined, args); }`;
+        const context = name === 'verifyReplica' ? ', args[3]?.context' : '';
+        const observe = `\nif (globalThis.denseObserve) { const original = ${name}; ${name} = (...args) => globalThis.denseObserve('${name}', original, undefined, args${context}); }`;
         return route.fulfill({ contentType: 'text/javascript', body: readFileSync(file, 'utf8') + observe });
       }
       return await route.fulfill({ path: file });
@@ -194,7 +308,8 @@ function stats(values) {
   if (!n) return { n };
   const round = ms => Math.round(ms * 10) / 10, middle = Math.floor(n / 2);
   const median = n % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
-  return { n, min: round(sorted[0]), median: round(median), p95: round(sorted[Math.ceil(n * .95) - 1]), max: round(sorted.at(-1)) };
+  return { n, min: round(sorted[0]), median: round(median), p95: round(sorted[Math.ceil(n * .95) - 1]),
+    p99: round(sorted[Math.ceil(n * .99) - 1]), max: round(sorted.at(-1)) };
 }
 
 function gapDetails(steps, coordinator, follower) {
@@ -214,7 +329,9 @@ function gapDetails(steps, coordinator, follower) {
     pendingReceives: follower.receives.filter(row => row.kind === 'world' && overlap(row.startAt, row.at) > 0)
       .map(({ tick, delta, startAt, at }) => ({ tick, delta, startAfterMs: startAt - from.at, endAfterMs: at - from.at })),
     overlappingPhases: follower.phases.filter(row => row.phase !== 'renderer.cellIndex' && overlap(row.at, row.at + row.total) >= 5)
-      .map(({ phase, at, sync, total }) => ({ phase, startAfterMs: Math.round(at - from.at), syncMs: Math.round(sync), totalMs: Math.round(total) })),
+      .map(({ phase, context, at, sync, total }) => ({ phase, context, startAfterMs: Math.round(at - from.at), syncMs: Math.round(sync), totalMs: Math.round(total) })),
+    overlappingMerges: follower.worldMerges.filter(row => overlap(row.at, row.at + row.ms) >= 5)
+      .map(({ at, ...row }) => ({ ...row, afterMs: Math.round(at - from.at) })),
     longTasks: follower.longTasks.filter(task => overlap(task.at, task.at + task.ms) > 0)
       .map(task => ({ startAfterMs: Math.round(task.at - from.at), ms: task.ms }))
   };
@@ -239,6 +356,46 @@ async function main([urlA, urlB], assets) {
   const browser = await chromium.launch({ headless: true });
   browsers.push(browser);
   const [a, b] = await Promise.all([openPage(browser, urlA, 'A', assets), openPage(browser, urlB, 'B', assets)]);
+  const fixture = backup ? await seedBackup([a, b]) : await seedSynthetic(a, b);
+  console.log(`fixture ready ${count}`);
+  const began = Date.now();
+  const cold = await Promise.all([[a, urlA], [b, urlB]].map(async ([page, url]) => {
+    await page.goto(url + '/');
+    await page.waitForFunction(() => window.tide && denseSurvey().frames.some(frame => frame.visible > 0), null, { polling: 50, timeout: 60000 });
+    return Date.now() - began;
+  }));
+  console.log(`app ready ${cold.join(', ')}`);
+  await b.locator('#connect').click();
+  await b.locator('#peerUrl').fill(urlA);
+  const joining = Date.now();
+  await b.locator('#connectionForm .primary').click();
+  await Promise.all([a, b].map(page => page.waitForFunction(({ count, real }) => {
+    const event = denseSurvey();
+    return event.peers > 0 && (real ? event.fish > 0 : event.fish === count) &&
+      event.receives.some(message => message.kind === 'hello' && !message.failed);
+  }, { count, real: Boolean(backup) }, { polling: 100, timeout: count < 200 ? 20000 : 95000 })));
+  const joined = Date.now();
+  await Promise.all([a, b].map(page => page.waitForFunction(() => denseJoinSettled(), null, { polling: 125, timeout: 45000 })));
+  const stopTrace = values.trace && await startTrace(browser);
+  if (stopTrace) await pause(300);
+  const recent = Date.now();
+  await survey({ a, b, fixture, cold, joining, joined, recent, stopTrace, browserVersion: browser.version() });
+}
+
+async function seedBackup(pages) {
+  const { world, lastOnlineAt, archiveChunks } = backup;
+  const archiveIds = Object.keys(world.archives?.chunks || {});
+  assert(archiveIds.length && archiveIds.every(id => archiveChunks?.[id]?.length), '存档缺少历史归档内容');
+  await Promise.all(pages.map((page, index) => page.evaluate(async ({ world, lastOnlineAt, archiveChunks, index }) => {
+    const { newIdentity, putMany } = await import('/storage.js');
+    await newIdentity(`验收${index + 1}`);
+    await putMany([['checkpoint', { world, at: world.tick, lastOnlineAt }],
+      ...Object.entries(archiveChunks).map(([id, bytes]) => ['archive:' + id, bytes])]);
+  }, { world, lastOnlineAt, archiveChunks, index })));
+  return { archiveIds };
+}
+
+async function seedSynthetic(a, b) {
   const text = await a.evaluate(async count => {
     const { makeFishWorld } = await import('/capacity-fish.mjs');
     const { World, CONFIG } = await import('/engine.js');
@@ -294,25 +451,10 @@ async function main([urlA, urlB], assets) {
     await newIdentity('验收乙');
     await putMany([['checkpoint', checkpoint]]);
   }, fixture.checkpoint);
-  console.log(`fixture ready ${count}`);
-  const began = Date.now();
-  const cold = await Promise.all([[a, urlA], [b, urlB]].map(async ([page, url]) => {
-    await page.goto(url + '/');
-    await page.waitForFunction(() => window.tide && denseSurvey().frames.some(frame => frame.visible > 0), null, { polling: 50, timeout: 40000 });
-    return Date.now() - began;
-  }));
-  console.log(`app ready ${cold.join(', ')}`);
-  await b.locator('#connect').click();
-  await b.locator('#peerUrl').fill(urlA);
-  const joining = Date.now();
-  await b.locator('#connectionForm .primary').click();
-  await Promise.all([a, b].map(page => page.waitForFunction(count => {
-    const event = denseSurvey();
-    return event.peers > 0 && event.fish === count && event.receives.some(message => message.kind === 'hello' && !message.failed);
-  }, count, { polling: 100, timeout: count < 200 ? 20000 : 95000 })));
-  const joined = Date.now();
-  await Promise.all([a, b].map(page => page.waitForFunction(() => denseJoinSettled(), null, { polling: 125, timeout: 45000 })));
-  const recent = Date.now();
+  return { joinedFish: fixture.joinedFish, archiveIds: [fixture.archiveId] };
+}
+
+async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace, browserVersion }) {
   const firstLeads = await a.evaluate(() => { const { node, leader } = denseSurvey(); return node === leader; });
   let profiler, profileStartedAt;
   if (values.profile) {
@@ -324,9 +466,17 @@ async function main([urlA, urlB], assets) {
   }
   let dropTimer;
   if (values.drop) dropTimer = setTimeout(() => (firstLeads ? a : b).evaluate(() => { window.denseDropNext = true; }).catch(() => {}), 2500);
+  const forgotten = values['forget-live-base'] && pause(3200).then(() => (firstLeads ? b : a).evaluate(() => denseForgetLiveBase()));
+  const archiveRun = runArchiveRounds(archiveRounds, firstLeads ? a : b, firstLeads ? b : a, fixture.archiveIds);
+  // Keep reporting the acceptance metrics if an in-window archive round fails.
+  const archiveResult = archiveRun.then(rounds => ({ rounds }), error => ({ error: error.message }));
   try { await pause(seconds * 1000); }
   finally { clearTimeout(dropTimer); }
   const ended = Date.now(), sampled = event => event.at >= recent && event.at <= ended;
+  await Promise.all([a, b].map(page => page.waitForFunction(end => denseSurvey().frames.at(-1)?.at >= end, ended, { polling: 50, timeout: 10000 })));
+  if (stopTrace) await pause(200);
+  const trace = stopTrace && await stopTrace(values.trace);
+  const { rounds = [], error: archiveError } = await archiveResult;
   let profileSummary;
   if (profiler) {
     const { profile } = await profiler.send('Profiler.stop');
@@ -335,56 +485,117 @@ async function main([urlA, urlB], assets) {
     profileSummary = profileTimes(profile);
   }
   const pages = await Promise.all([a, b].map(page => page.evaluate(() => denseSurvey())));
-  const saved = await b.evaluate(async ({ joinedFish, archiveId }) => {
+  const archiveIds = [...fixture.archiveIds, ...rounds.map(round => round.id)];
+  const saved = await Promise.all((backup ? [a, b] : [b]).map(page => page.evaluate(async ({ joinedFish, archiveIds }) => {
     const { get } = await import('/storage.js');
     const checkpoint = await get('checkpoint', { observeCheckpoint: false });
-    return { fish: !!checkpoint.world.fishes[joinedFish], archive: !!checkpoint.world.archives.chunks[archiveId],
-      archivedBytes: (await get('archive:' + archiveId))?.length || 0, tick: checkpoint.world.tick };
-  }, { joinedFish: fixture.joinedFish, archiveId: fixture.archiveId });
-  assert(saved.fish && saved.archive && saved.archivedBytes > 0, JSON.stringify(saved));
+    const payloads = await Promise.all(archiveIds.map(async id => checkpoint.world.archives.chunks[id] ? atob(await get('archive:' + id) || '').length : 0));
+    return { fish: joinedFish ? !!checkpoint.world.fishes[joinedFish] : Object.keys(checkpoint.world.fishes).length,
+      archiveCount: payloads.filter(Boolean).length, archivedBytes: payloads.reduce((sum, n) => sum + n, 0), tick: checkpoint.world.tick };
+  }, { joinedFish: fixture.joinedFish, archiveIds })));
+  assert(saved.every(row => row.fish && row.archiveCount === archiveIds.length && row.archivedBytes > 0), JSON.stringify(saved));
   const coordinator = pages.find(data => data.leader === data.node), follower = pages.find(data => data.leader !== data.node);
   assert(coordinator && follower, '加入后没有共同协调者');
   const leaderSteps = coordinator.steps.filter(sampled);
   const received = follower.receives.filter(event => event.kind === 'world' && sampled(event) && !event.failed && event.after > event.before);
-  const transport = received.map(event => event.at - coordinator.sends.find(send => send.tick === event.tick)?.at).filter(Number.isFinite);
+  const sentAt = new Map();
+  for (const send of coordinator.sends) if (!send.dropped && !sentAt.has(send.tick)) sentAt.set(send.tick, send.at);
+  const elapsedAfterSend = (event, timestamp) => timestamp - sentAt.get(event.tick);
+  const matchedLatency = ms => Number.isFinite(ms) && ms >= 0;
+  const transport = received.map(event => elapsedAfterSend(event, event.at)).filter(matchedLatency);
+  const sendToMessage = received.map(event => elapsedAfterSend(event, event.startAt)).filter(matchedLatency);
   const actualSteps = [...new Map(follower.applied.filter(sampled).map(event => [event.tick, event])).values()];
-  const appliedAfterSend = actualSteps.map(event => event.at - coordinator.sends.find(send => send.tick === event.tick)?.at).filter(Number.isFinite);
+  const appliedAfterSend = actualSteps.map(event => elapsedAfterSend(event, event.at)).filter(matchedLatency);
   const leaderProgress = progress(leaderSteps, recent, ended), followerProgress = progress(actualSteps, recent, ended);
+  const requests = coordinator.stepRequests.filter(row => row.startAt >= recent && row.startAt < ended);
+  if (trace) {
+    const prefix = 'tide.request.' + coordinator.page + '.';
+    const stamps = new Map(trace.traceEvents.filter(event => event.name.startsWith(prefix))
+      .map(event => [Number(event.name.slice(prefix.length)), event.args.data.callTime]));
+    for (const request of requests) request.traceAt = stamps.get(request.sequence);
+  }
+  const completed = requests.filter(row => row.committed).map(row => row.ms);
+  const over20 = completed.filter(ms => ms > 20).length;
+  const stepComplete = { ...stats(completed), requested: requests.length, aborted: requests.filter(row => row.committed === false).length,
+    pending: requests.filter(row => row.committed === undefined).length,
+    over20, over20Pct: completed.length && Math.round(over20 / completed.length * 10000) / 100 };
   const summaries = pages.map(page => {
     const frames = page.frames.filter(sampled), noFish = frames.filter(frame => !frame.visible).length;
     const phases = {};
     for (const row of page.phases.filter(sampled)) (phases[row.phase] ||= []).push(row);
-    return { leader: page.node === page.leader, frames: stats(frames.map(event => event.frame)), draw: stats(frames.map(event => event.draw)),
+    const presentations = trace && readPresentations(trace.traceEvents, page, recent, ended);
+    return { leader: page.node === page.leader, fish: page.fish, ...frameSummary(page, presentations, recent, ended, coordinator.steps, requests),
       visible: stats(frames.map(event => event.visible)), noFish, rejected: page.rejected, saves: stats(page.saves.filter(sampled).map(event => event.ms)),
       phases: Object.fromEntries(Object.entries(phases).map(([name, rows]) => [name, { sync: stats(rows.map(row => row.sync)), total: stats(rows.map(row => row.total)) }])),
       longestTasks: page.longTasks.filter(sampled).sort((a, b) => b.ms - a.ms).slice(0, 8),
-      failed: page.receives.filter(event => event.failed), logs: page.logs };
+      failed: page.receives.filter(event => event.failed), replicaFailures: page.replicaFailures, logs: page.logs };
   });
   const dropped = coordinator.sends.filter(event => event.dropped && sampled(event));
   const recovered = dropped.length === 1 && actualSteps.some(event => event.tick < dropped[0].tick) &&
     !actualSteps.some(event => event.tick === dropped[0].tick) && actualSteps.some(event => event.tick > dropped[0].tick);
   const fullUpdates = follower.receives.filter(event => event.kind === 'world' && sampled(event) && !event.delta && !event.failed).length;
-  console.log(JSON.stringify({ count, cold, joinedMs: joined - joining, settledMs: recent - joining, steadyMs: ended - recent,
-    saved, leaderProgress, followerProgress,
+  const transfers = coordinator.liveTransfers.filter(sampled);
+  const liveWire = { bytes: coordinator.liveBytes.filter(sampled).reduce((sum, row) => sum + row.bytes, 0),
+    plain: transfers.filter(row => !row.compact).length, compact: transfers.filter(row => row.compact && !row.resent).length,
+    missingBase: transfers.filter(row => row.resent).length, elapsed: stats(transfers.map(row => row.ms)) };
+  const switched = values['switch-leader'] && await switchLeader([a, b], coordinator.node, follower.node);
+  const replicaRows = Object.fromEntries(['fishes', 'chars', 'breeding', 'contacts', 'travel', 'ops', 'scenes']
+    .map(field => [field, stats(received.flatMap(row => row.rows ? [row.rows[field]] : []))]));
+  const report = JSON.stringify({ count, realBackup: Boolean(backup), browserVersion, cold, joinedMs: joined - joining, settledMs: recent - joining, steadyMs: ended - recent,
+    saved, liveWire, ...(switched ? { switched } : {}),
+    archiveRounds: rounds.map(({ at, tick, deliveredAt }) => ({ afterMs: at - recent, tick, deliveredAfterMs: deliveredAt - recent })), archiveError,
+    leaderProgress, followerProgress, stepComplete, replicaRows,
     stepGaps: stats(leaderSteps.slice(1).map((step, index) => step.at - leaderSteps[index].at)),
     tickGaps: [...new Set(leaderSteps.slice(1).map((step, index) => step.tick - leaderSteps[index].tick))],
     receiveCount: received.length, deltaCount: received.filter(event => event.delta).length, fullUpdates, receiveMs: stats(received.map(event => event.ms)),
-    followerSteps: actualSteps.length, sendToCommittedMs: stats(appliedAfterSend), sendToFinishedMs: stats(transport),
+    followerSteps: actualSteps.length, sendToMessageMs: stats(sendToMessage), sendToCommittedMs: stats(appliedAfterSend), sendToFinishedMs: stats(transport),
     followerStepGaps: stats(actualSteps.slice(1).map((step, index) => step.at - actualSteps[index].at)),
     followerTickGaps: stats(actualSteps.slice(1).map((step, index) => step.tick - actualSteps[index].tick)),
     longestFollowerGap: gapDetails(actualSteps, coordinator, follower),
     receiveTickGaps: [...new Set(received.slice(1).map((event, index) => event.after - received[index].after))],
     helloMs: pages.map(page => page.merges.filter(event => event.type === 'hello').map(event => event.ms)), ...(values.drop ? { dropped, recovered } : {}),
-    summaries, profileStartedAt, profileSummary, errors }, null, 2));
+    summaries, profileStartedAt, profileSummary, errors }, null, 2);
+  if (values.report) await writeFile(values.report, report + '\n');
+  console.log(report);
   assertProgress(leaderProgress, ended - recent, '主端');
   assertProgress(followerProgress, ended - recent, '跟随端');
   assert(leaderSteps.slice(1).every((step, index) => step.tick - leaderSteps[index].tick === 500), '生态步时间跳跃');
   assert(actualSteps.slice(1).every((step, index) => step.tick > actualSteps[index].tick && (step.tick - actualSteps[index].tick) % 500 === 0), '跟随端收到非半秒边界的世界步');
   if (values.drop) assert(recovered, '跟随端应跳过未发布的更新并继续提交');
+  if (values['plain-live']) assert(liveWire.plain > 0 && liveWire.compact === 0 && liveWire.missingBase === 0, '旧版应继续接收原实时分块');
+  if (forgotten) assert(await forgotten && liveWire.missingBase === 1 && liveWire.plain > 0 && liveWire.compact > 0, '遗失版本后应先重放原分块再恢复紧凑发送');
   if (expectedFull !== undefined) assert.equal(fullUpdates, expectedFull, '测试区间的定期全量同步次数不符');
   assert(pages.every(page => page.peers === 1), '两端在观测结束时仍应直连');
   assert(summaries.every(page => page.frames.n >= 20 && page.noFish === 0 && page.rejected === 0), '画面中断或接收拒绝');
   assert.deepEqual(errors, []);
+  assert(!archiveError && rounds.every(round => sampled(round) && round.deliveredAt <= ended), archiveError || '至少一轮归档未在采样期间传递');
+  if (values['refresh-budget']) assert(stepComplete.n >= 9 && stepComplete.over20 === 0 && summaries.every(page => page.draw.over20 === 0 &&
+    [page.presented, page.visibleMotion].every(row => row.over20 === 0 && row.n >= 20 && row.startCovered && row.endCovered) &&
+    page.requestToConfirmedFrame.over20 === 0 && page.requestToConfirmedFrame.requestsWithoutObservedFrame === 0),
+    '单步提交、实际呈现间隔或请求至同一步首张确认画面超过 20 毫秒');
+}
+
+async function switchLeader(pages, oldLeader, newLeader) {
+  const before = await Promise.all(pages.map(page => page.evaluate(() => denseSurvey().tick)));
+  await Promise.all(pages.map(page => page.evaluate(old => denseReplaceLeaderVisibility(old), oldLeader)));
+  await Promise.all(pages.map(page => page.waitForFunction(({ newLeader, tick }) => {
+    const state = denseSurvey();
+    return state.leader === newLeader && state.tick >= tick + 1500 && state.peers === 1;
+  }, { newLeader, tick: Math.max(...before) }, { polling: 100, timeout: 15000 })));
+  return { progressed: await Promise.all(pages.map(page => page.evaluate(() => denseSurvey().tick))).then(ticks => ticks.map((tick, i) => tick - before[i])) };
+}
+
+async function runArchiveRounds(count, leader, follower, known) {
+  const written = new Set(known), rounds = [];
+  for (let i = 0; i < count; i++) {
+    await pause(1000);
+    const round = await leader.evaluate(serial => denseArchiveRound(serial), 100000 + i);
+    assert(!written.has(round.id), '本轮归档重复使用了旧包');
+    written.add(round.id);
+    await follower.waitForFunction(id => denseHasArchive(id), round.id, { polling: 100, timeout: 12000 });
+    rounds.push({ ...round, deliveredAt: Date.now() });
+  }
+  return rounds;
 }
 
 function profileTimes(profile) {

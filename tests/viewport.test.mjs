@@ -47,6 +47,44 @@ test('鱼在同一分区游动或只有计时改变时，画面复用已经选�
   assert.deepEqual(index.query(32, 32, 3, 3), [cell]);
 });
 
+test('整条鱼留在同一分区时免逐格更新，鱼体增长与重新合流后仍在正确的分区', () => {
+  const body = (id, x, y = 0) => ({ id, kind: 'fish', entity: 'f', x, y });
+  const data = { fishes: { f: { x: 12, y: 10, facing: 1 } }, scenes: {},
+    chars: { a: body('a', -1), b: body('b', 1) } };
+  const index = new ViewportCells(data);
+  let placements = 0;
+  const place = index.place.bind(index);
+  index.place = entry => { placements++; place(entry); };
+  const move = (x, y, facing) => {
+    data.fishes.f = { x, y, facing };
+    index.update({ fishes: { set: [['f', data.fishes.f]], remove: [] } });
+  };
+  function check() {
+    const rebuilt = new ViewportCells(data);
+    for (const x of [0, 32, 64, 960, 992]) for (const y of [0, 32]) {
+      assert.deepEqual(index.query(x, x, y, y), rebuilt.query(x, x, y, y));
+    }
+  }
+  move(13, 11, -1);
+  assert.equal(placements, 0);
+  move(12, 10, 1);
+  data.chars.c = body('c', 19, 21);
+  index.update({ chars: { set: [['c', data.chars.c]], remove: [] } });
+  move(13, 11, 1);
+  check();
+  delete data.chars.c;
+  index.update({ chars: { set: [], remove: ['c'] } });
+  move(12, 10, 1);
+  data.chars.a.x = 19;
+  index.reconcile();
+  move(13, 10, 1);
+  check();
+  for (const x of [991.9999999999999, 992, 999.5, 0, 1, 998]) {
+    move(x, 31.5, -1);
+    check();
+  }
+});
+
 test('画面依次播放已结算的横移、下潜，海域接缝上点击跟随绘制位置', async () => {
   const { World } = await import('../www/engine.js');
   const { Renderer } = await import('../www/renderer.js');
