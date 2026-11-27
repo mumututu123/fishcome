@@ -1,4 +1,5 @@
 import { worldTables } from './simulation-changes.js';
+import { DAY, shanghaiDay } from './fish-status.js';
 
 // One record per line lets the receiver assemble tables without retaining the wire text.
 // A record may span several signed pages, including in the middle of a surrogate pair.
@@ -70,10 +71,30 @@ const RESUME_MS = 120000;
 const ACK_MS = 30000;
 const delay = () => new Promise(resolve => setTimeout(resolve, 0));
 
+export function replicaRowEquality(tick) {
+  const day = Number.isFinite(tick) && Math.abs(tick) < 8.64e15 - DAY ? shanghaiDay(tick) : undefined;
+  return (field, before, after) => {
+    if (before === after) return true;
+    let left, right;
+    if (field === 'fishes') {
+      left = before?.posAt;
+      right = after?.posAt;
+    } else if (field === 'travel' && day !== undefined) {
+      left = before?.days?.[day];
+      right = after?.days?.[day];
+    }
+    // A changed clock or distance proves these JSON records differ. In
+    // particular, equal clocks do not imply equal positions or other fields.
+    if (left !== right && Number.isFinite(left) && Number.isFinite(right)) return false;
+    return JSON.stringify(before) === JSON.stringify(after);
+  };
+}
+
 // Both inputs are immutable, committed checkpoints. Keep roots and world-level
 // clocks for merge/validation. Existing record conflict rules handle the rows.
 export async function changesSince(baseline, current) {
   const delta = { ...current };
+  const sameRow = replicaRowEquality(current.tick);
   let rows = 0, slice = performance.now();
   for (const field of worldTables) {
     // mergeBreeding replaces the complete contact map when contactAt advances.
@@ -81,7 +102,7 @@ export async function changesSince(baseline, current) {
     const changed = {}, old = baseline[field] || {};
     for (const id in current[field]) if (Object.hasOwn(current[field], id)) {
       const value = current[field][id], before = old[id];
-      if (!Object.hasOwn(old, id) || value !== before && JSON.stringify(value) !== JSON.stringify(before)) changed[id] = value;
+      if (!Object.hasOwn(old, id) || !sameRow(field, before, value)) changed[id] = value;
       if (++rows % 128 === 0 && performance.now() - slice >= 5) { await delay(); slice = performance.now(); }
     }
     delta[field] = changed;

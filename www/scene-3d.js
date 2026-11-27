@@ -523,7 +523,7 @@ export class Scene3D {
     this.fishPoses.clear();
     const ctx = renderer.ctx; ctx.save(); ctx.lineCap = 'round';
     for (const { cell, other, dx, dy, color } of this.fishLinks) {
-      const fish = world.data.fishes[cell.entity]; if (!fish) continue;
+      const fish = renderer.fishPose(world, cell.entity); if (!fish) continue;
       const p = { x: fish.x + fish.facing * cell.x, y: fish.y + cell.y }; if (!visible(p)) continue;
       const pixel = renderer.screen(p.x, p.y), a = this.fishPose(cell, fish.facing), b = this.fishPose(other, fish.facing);
       const ax = pixel.x + size * (.5 + a.offsetX), ay = pixel.y + size * (.5 + a.offsetY);

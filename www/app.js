@@ -5,7 +5,7 @@ import { get, getMany, readCheckpointVersion, sameStoredCheckpoint, putMany, rea
 import { beforeCheckpointPatch, noteCheckpointChanges } from './checkpoint-pages.js';
 import { CheckpointPictures } from './checkpoint-picture.js';
 import { Network } from './network.js';
-import { WorldBroadcast } from './world-broadcast.js';
+import { ReplicaSwims, WorldBroadcast } from './world-broadcast.js';
 import { DiagnosticLog, inspectFishOrigins, repairFishOriginIssues, diagnosticSummary } from './diagnostics.js';
 import { loadReplicaArchives, verifyChats, verifyReplica } from './replica.js';
 import { Renderer } from './renderer.js';
@@ -51,8 +51,14 @@ const myFishCards = new Map();
 let lifeSince = Date.now(), returnVisit = false, lifeMessage = null;
 let myFishView = 'list', pedigreeFish = null, pedigreeKey = '';
 const fishDate = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
-let lastSnapshot = 0, lastHello = new Set(), lastMeter = Date.now(), lastSave = 0, lastPictureTime = 0, lastChat = 0, selfBeat = 0, lastLeader = '', status = '', started = false, lastRepair = 0;
+let lastHello = new Set(), lastMeter = Date.now(), lastSave = 0, lastPictureTime = 0, lastChat = 0, selfBeat = 0, lastLeader = '', status = '', started = false, lastRepair = 0;
 const worldBroadcast = new WorldBroadcast(subscribeSimulationChanges);
+const replicaSwims = new ReplicaSwims();
+subscribeSimulationChanges((target, patch) => {
+  if (target === world && started && !updateFrozen && !replacingCheckpoint && Number.isFinite(patch?.values?.tick)) {
+    broadcastWorld(patch.swims);
+  }
+});
 async function captureReplica() {
   if (!started) throw new Error('世界尚未启动，暂时无法同步');
   return (await saveInternal({ capture: true })).world;
@@ -214,7 +220,7 @@ async function verifyLocalCheckpoint(data, archived, store, options = {}) {
     return repaired;
   }
 }
-async function mergeVerifiedWorld(data, peer, context, { local = false } = {}) {
+async function mergeVerifiedWorld(data, peer, context, { local = false, worldMessage } = {}) {
   const target = world, store = archiveStore, revision = store.revision;
   let incoming = data, archived;
   await ensureArchives(data, peer, null, store, target.data, async (sources, current) => {
@@ -227,13 +233,17 @@ async function mergeVerifiedWorld(data, peer, context, { local = false } = {}) {
   if (revision !== store.revision) archived = await store.dependencies(incoming, target.data);
   if (target !== world || store !== archiveStore) throw new Error('运行世界已更换，请重新同步');
   const rootCount = target.roots.length;
-  target.merge(incoming, archived);
+  const apply = () => target.merge(incoming, archived);
+  let movement;
+  if (worldMessage && worldMessage.from !== network.node && worldMessage.from === leader()) {
+    movement = replicaSwims.merge(target.data, worldMessage, apply);
+  } else { apply(); replicaSwims.reset(); }
   target.attachArchives(store);
-  return target.roots.length > rootCount;
+  return { joinedWorld: target.roots.length > rootCount, movement };
 }
-async function mergeReplica(data, peer, context = 'merge') {
+async function mergeReplica(data, peer, context = 'merge', worldMessage) {
   const previousTerrain = world.data.terrain.seed;
-  const joinedWorld = await mergeVerifiedWorld(data, peer, context);
+  const { joinedWorld, movement } = await mergeVerifiedWorld(data, peer, context, { worldMessage });
   await compactKnown(world, archiveStore);
   if (world.data.terrain.seed !== previousTerrain) geometryRepair = true;
   worldEdited(world);
@@ -248,6 +258,9 @@ async function mergeReplica(data, peer, context = 'merge') {
     await mergeVerifiedWorld(local, peer, 'checkpoint');
     if (priorCheckpoint === checkpoint) priorCheckpoint = null;
     recovered = true;
+  }
+  if (movement && movement === replicaSwims.latest && movement.data === world.data && movement.tick === world.data.tick && movement.from === leader()) {
+    renderer.presentSwims(world, movement.directions);
   }
   reconcileHistory(); syncIncomeSerial(); await save(); renderChat();
   if (joinedWorld) toast('两片海合流了');
@@ -267,7 +280,7 @@ async function resumeWorld(now) {
       chatLimit = 80; renderChat();
       pictures.latest = null; pending.clear(); inbox.clear(); selected = null; trackedFish = null; renderer.selected = null; renderer.observedFish = null; $('inspector').hidden = true; cancelMode();
     } else { world.resolveLegends(now); world.resolvePopulation(now); world.data.tick = now; }
-    members.clear(); members.set(network.node, member()); lastHello.clear(); lastLeader = ''; worldBroadcast.reset(); lastPictureTime = 0;
+    members.clear(); members.set(network.node, member()); lastHello.clear(); lastLeader = ''; worldBroadcast.reset(); replicaSwims.reset(); lastPictureTime = 0;
   }
   lastOnlineAt = Math.max(lastOnlineAt, now);
   if (elapsed > 120000) { networkChange().catch(() => {}); reconnect().catch(() => {}); }
@@ -329,7 +342,7 @@ async function onMessage(message, peer) {
     if (body.to === network.node) await network.broadcast('merge', { world: await captureReplica() }, { capturedWorld: true });
   } else if (message.kind === 'world') {
     if (message.from !== leader()) return;
-    try { await mergeReplica(body.world, peer, body.delta ? 'world-delta' : 'world-full'); }
+    try { await mergeReplica(body.world, peer, body.delta ? 'world-delta' : 'world-full', message); }
     catch (error) {
       if (body.delta && Date.now() - lastRepair > 5000) {
         lastRepair = Date.now();
@@ -343,7 +356,13 @@ async function onMessage(message, peer) {
     if (rejectedOps.has(body.id)) return;
     if (body.kind === 'referral' && !await verifyReferral(body)) return;
     inbox.set(body.id, clone(message));
-    if (amLeader()) { const result = world.apply({ ...clone(body), proof: clone(message) }, await archiveStore.get('ops', body.id)); if (result.ok) await save(); else rejectOperation(body.id); await network.broadcast('ack', { id: body.id, result }); if (result.ok) await broadcastWorld(); }
+    if (amLeader()) {
+      const result = await applyAtBoundary(message, true);
+      if (!result) return;
+      if (result.ok) await save(); else rejectOperation(body.id);
+      await network.broadcast('ack', { id: body.id, result });
+      if (result.ok) await broadcastWorld();
+    }
   } else if (message.kind === 'ack') {
     if (message.from !== leader()) return; if (!body.result.ok) rejectOperation(body.id); const op = pending.get(body.id); if (op && !body.result.ok) { pending.delete(body.id); toast(body.result.error); update(); }
   } else if (message.kind === 'chat') {
@@ -368,7 +387,9 @@ async function completeReferral(peer, peerActor) {
     if (inviter === identity.actor) { registration.joined = true; await save(); return; }
     const op = { id: `${identity.actor}:referral`, actor: identity.actor, nick: displayNick(identity.nick), t: Date.now(), roots: [world.id], cost: 0, kind: 'referral', inviter, registeredAt: registration.at, invitation };
     const message = await network.makeEnvelope('op', op);
-    const result = world.apply({ ...op, proof: message }, await archiveStore.get('ops', op.id)); if (!result.ok) throw new Error(result.error);
+    const result = await applyAtBoundary(message, false);
+    if (!result) return;
+    if (!result.ok) throw new Error(result.error);
     registration.joined = true; registration.referral = message; await save(); await network.broadcastEnvelope(message);
   } finally { referralBusy = false; }
 }
@@ -390,10 +411,18 @@ async function networkChange(error) {
   network.presence(active().filter(m => m.id !== network.node).map(m => ({ id: m.id, url: m.url }))).catch(() => {}); update();
 }
 async function probeGone(id, url) { if (!id || id === network.node || !members.has(id)) return; try { url = await normalizeInvite(url); const s = await network.local('probe', { url }); if (!(s.clients || []).some(c => c.id === id)) { members.delete(id); await network.broadcast('lost', { id, url }); update(); } } catch { /* Membership lease expires if the publishing computer is unreachable. */ } }
-async function broadcastWorld() {
+async function broadcastWorld(directions) {
   if (!amLeader()) return;
-  try { await worldBroadcast.send(network, world.data, Date.now(), captureReplica); }
+  try { await worldBroadcast.send(network, world.data, Date.now(), captureReplica, directions); }
   catch (error) { status = error.message; }
+}
+async function applyAtBoundary(message, requiresLeader) {
+  const target = world, store = archiveStore;
+  const archived = await store.get('ops', message.body.id);
+  return simulation.atStepBoundary(() => {
+    if (target !== world || store !== archiveStore || replacingCheckpoint || updateFrozen || (requiresLeader && !amLeader())) return null;
+    return target.apply({ ...clone(message.body), proof: clone(message) }, archived);
+  });
 }
 async function submit(payload) {
   if (updateFrozen) { toast('正在更新并重启，请稍候'); return; }
@@ -401,7 +430,21 @@ async function submit(payload) {
   if (updateFrozen) { toast('正在更新并重启，请稍候'); return; }
   if (!identity) return; const op = { id: payload.kind === 'earn' ? `${identity.actor}:hour:${payload.serial}` : crypto.randomUUID(), actor: identity.actor, nick: displayNick(identity.nick), t: Date.now(), roots: [world.id], cost: 0, ...payload };
   if (op.cost > 0 && op.cost > balance()) { toast('鱼元余额不足'); return; } pending.set(op.id, op); update();
-  try { const message = await network.broadcast('op', op); if (rejectedOps.has(op.id)) { pending.delete(op.id); update(); return; } inbox.set(op.id, clone(message)); if (amLeader()) { const result = world.apply({ ...clone(op), proof: message }, await archiveStore.get('ops', op.id)); pending.delete(op.id); if (!result.ok) { rejectOperation(op.id); toast(result.error); } else await save(); await broadcastWorld(); } else { setTimeout(() => { if (pending.has(op.id)) toast('这次投放仍在等待确认，连接恢复后同步'); }, 12000); } } catch (e) { pending.delete(op.id); toast(e.message); } update();
+  try {
+    const message = await network.broadcast('op', op);
+    if (rejectedOps.has(op.id)) { pending.delete(op.id); update(); return; }
+    inbox.set(op.id, clone(message));
+    const result = amLeader() && await applyAtBoundary(message, true);
+    if (result) {
+      pending.delete(op.id);
+      if (!result.ok) { rejectOperation(op.id); toast(result.error); }
+      else await save();
+      await broadcastWorld();
+    } else {
+      setTimeout(() => { if (pending.has(op.id)) toast('这次投放仍在等待确认，连接恢复后同步'); }, 12000);
+    }
+  } catch (e) { pending.delete(op.id); toast(e.message); }
+  update();
 }
 function cancelMode() { mode = null; renderer.preview = null; $('modeBanner').hidden = true; $('sea').style.cursor = 'grab'; }
 function stopObserving() { selected = null; trackedFish = null; renderer.selected = null; renderer.observedFish = null; $('inspector').hidden = true; }
@@ -433,7 +476,7 @@ function focusFish(id, follow = false) {
   if (innerWidth <= 700) { document.querySelector('.chat').classList.add('collapsed'); $('collapseChat').textContent = '+'; }
   const rect = observationRect(), body = followBounds = bounds(world.fishCells(id));
   renderer.zoom(Math.min(1.25, Math.max(1, renderer.scale), Math.max(80, rect.right - rect.left) / (renderer.cell * (body.width + 4)), Math.max(80, rect.bottom - rect.top) / (renderer.cell * (body.height + 4))));
-  moveCameraToFish(fish, body); update();
+  moveCameraToFish(renderer.fishPose(world, id, performance.now()), body); update();
 }
 function drawFishThumbnail(canvas, fish, cells) {
   const ctx = canvas.getContext('2d'), body = bounds(cells), size = Math.min(12, 76 / Math.max(1, body.width), 52 / Math.max(1, body.height));
@@ -847,7 +890,7 @@ async function tick() {
   if (!updateFrozen && identity.remainder >= 3600) { identity.remainder -= 3600; identity.serial = (identity.serial || 0) + 1; await submit({ kind: 'earn', cost: 0, serial: identity.serial }); }
   members.set(network.node, member());
   if (now - selfBeat >= 3000 && network.live().length) { selfBeat = now; network.broadcast('beat', { member: member(), rootCount: world.roots.length, opCount: Object.keys(world.data.ops).length, chatCount: Object.keys(world.data.chats).length, chatSourceCount: Object.keys(world.data.chatSources).length }).catch(() => {}); }
-  const currentLeader = leader(); if (currentLeader !== lastLeader) { simulation.close(); lastLeader = currentLeader; worldBroadcast.reset(); if (amLeader()) { geometryRepair = true; world.data.tick = Math.max(world.data.tick, now - 2000); for (const envelope of [...inbox.values()].sort((a, b) => a.body.t - b.body.t || a.body.id.localeCompare(b.body.id))) { if (!world.data.ops[envelope.body.id]) { const result = world.apply({ ...clone(envelope.body), proof: clone(envelope) }); if (!result.ok) rejectOperation(envelope.body.id); network.broadcast('ack', { id: envelope.body.id, result }).catch(() => {}); } } for (const id of pending.keys()) if (world.data.ops[id]) pending.delete(id); } }
+  const currentLeader = leader(); if (currentLeader !== lastLeader) { simulation.close(); lastLeader = currentLeader; worldBroadcast.reset(); replicaSwims.reset(); renderer.presentSwims(world); if (amLeader()) { geometryRepair = true; world.data.tick = Math.max(world.data.tick, now - 2000); for (const envelope of [...inbox.values()].sort((a, b) => a.body.t - b.body.t || a.body.id.localeCompare(b.body.id))) { if (!world.data.ops[envelope.body.id]) { const result = world.apply({ ...clone(envelope.body), proof: clone(envelope) }); if (!result.ok) rejectOperation(envelope.body.id); network.broadcast('ack', { id: envelope.body.id, result }).catch(() => {}); } } for (const id of pending.keys()) if (world.data.ops[id]) pending.delete(id); } }
   if (amLeader() && fishRepairWaiting && now - lastSave > 5000) geometryRepair = true;
   if (amLeader() && !updateFrozen && !replacingCheckpoint) {
     const target = world;
@@ -863,7 +906,6 @@ async function tick() {
         status = '后台模拟已暂停，刷新页面可重试。' + error.message;
         toast(status);
       });
-    if (now - lastSnapshot >= 1000) { lastSnapshot = now; broadcastWorld(); }
   } else simulation.close();
   if (now - lastSave > 5000) { lastSave = now; save().catch(e => toast('本地保存失败：' + e.message)); }
   if (amLeader() && now - lastPictureTime > 30000) { lastPictureTime = now; takePicture().catch(() => {}); }
@@ -1733,7 +1775,7 @@ document.addEventListener('keyup', e => heldShortcuts.delete(e.code || e.key.toL
 window.addEventListener('blur', () => heldShortcuts.clear());
 function render(now) {
   if (trackedFish) {
-    const fish = world.data.fishes[trackedFish];
+    const fish = renderer.fishPose(world, trackedFish, now);
     if (fish && followBounds) moveCameraToFish(fish, followBounds);
     else { trackedFish = null; toast('这条鱼已不再存活'); }
   }

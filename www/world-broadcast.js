@@ -1,9 +1,13 @@
 import { breedingForBroadcast, stopBreedingBroadcast } from './breeding.js';
+import { replicaRowEquality } from './replica-stream.js';
+import { CONFIG } from './engine.js';
+import { deltaX } from './geography.js';
+import { capturedFishIds } from './legends.js';
 
 // These dictionaries merge by record ID. Contacts are different: a newer
 // contactAt replaces the entire contact table, including its unchanged rows.
 const rowFields = ['chars', 'fishes', 'scenes', 'participants', 'ops', 'chats', 'chatSources', 'travel', 'rocks'];
-const sameRow = (left, right) => left === right || left !== undefined && JSON.stringify(left) === JSON.stringify(right);
+const integerPosition = fish => Number.isInteger(fish.x) && fish.x >= 0 && fish.x < CONFIG.width && Number.isSafeInteger(fish.y);
 
 function packet(data, rows, breeding) {
   return {
@@ -17,18 +21,20 @@ function packet(data, rows, breeding) {
 function fullRows(data) { return Object.fromEntries(rowFields.map(field => [field, data[field] || {}])); }
 
 function baseline(world, breeding, at) {
-  return { initial: fullRows(world), updates: Object.fromEntries(rowFields.map(field => [field, new Map()])), breeding, fullAt: at };
+  return { initial: fullRows(world), updates: Object.fromEntries(rowFields.map(field => [field, new Map()])), breeding, fullAt: at, tick: world.tick };
 }
 
 function changedRows(data, base, pending) {
   const rows = {};
+  const sameRow = replicaRowEquality(data.tick);
   for (const field of rowFields) {
     const table = data[field] || {}, initial = base.initial[field], updates = base.updates[field];
     const changed = rows[field] = {};
     const check = id => {
       if (!Object.hasOwn(table, id)) { updates.set(id, undefined); return; }
       const sent = updates.has(id) ? updates.get(id) : initial[id];
-      if (!sameRow(sent, table[id])) changed[id] = table[id];
+      const value = table[id];
+      if (sent === undefined ? value !== undefined : !sameRow(field, sent, value)) changed[id] = value;
     };
     if (pending) {
       for (const id of pending.get(field) || []) check(id);
@@ -41,6 +47,86 @@ function changedRows(data, base, pending) {
     }
   }
   return rows;
+}
+
+function encodeSwims(fishes, directions) {
+  if (!directions?.length) return;
+  // Ordinals refer to the fish rows already present in the signed world.
+  const byFish = new Map(), result = [];
+  for (let direction = 0; direction < 9; direction++) {
+    if (direction === 4 || !directions[direction]) continue;
+    for (const id of directions[direction]) byFish.set(id, direction);
+  }
+  let index = 0;
+  for (const id in fishes) if (Object.hasOwn(fishes, id)) {
+    const direction = byFish.get(id);
+    if (direction !== undefined) (result[direction] ||= []).push(index);
+    index++;
+  }
+  if (result.length) return result;
+}
+
+function sameReplicaWorld(left, right) {
+  const roots = Object.keys(left.roots);
+  return left.terrain?.seed === right.terrain?.seed && left.terrain?.createdAt === right.terrain?.createdAt &&
+    roots.length === Object.keys(right.roots).length && roots.every(root => Object.hasOwn(right.roots, root) && left.roots[root] === right.roots[root]);
+}
+
+function decodeSwims(data, incoming, encoded) {
+  if (!Array.isArray(encoded) || encoded.length > 9 || encoded[4] != null) return;
+  const ids = Object.keys(incoming.fishes), seen = new Set(), dirs = [], captured = capturedFishIds(data, data.tick);
+  const changedBodies = new Set();
+  for (const [id, cell] of Object.entries(incoming.chars || {})) {
+    const before = data.chars[id];
+    if (before?.kind === 'fish') changedBodies.add(before.entity);
+    if (cell.kind === 'fish') changedBodies.add(cell.entity);
+  }
+  for (let direction = 0; direction < encoded.length; direction++) {
+    const indices = encoded[direction];
+    if (indices == null) continue;
+    if (!Array.isArray(indices) || indices.length > ids.length) return;
+    const dx = direction % 3 - 1, dy = Math.floor(direction / 3) - 1;
+    for (const index of indices) {
+      if (!Number.isInteger(index) || index < 0 || index >= ids.length || seen.has(index)) return;
+      seen.add(index);
+      const id = ids[index], before = data.fishes[id], after = incoming.fishes[id];
+      if (before && before.posAt === data.tick && after.posAt === incoming.tick && !captured.has(id) && !changedBodies.has(id) &&
+          before.actor === after.actor && before.created === after.created && before.facing === after.facing &&
+          integerPosition(before) && integerPosition(after) &&
+          (after.facing === -1 || after.facing === 1) && deltaX(after.x, before.x) === dx && after.y - before.y === dy) {
+        (dirs[direction] ||= []).push(id);
+      }
+    }
+  }
+  return dirs;
+}
+
+export class ReplicaSwims {
+  reset() { this.latest = null; }
+
+  // The caller has authenticated and verified the packet. Capture origins at
+  // the actual merge boundary and publish only positions that won the merge.
+  merge(data, { from, actor, body }, apply) {
+    const incoming = body.world, tick = data.tick, previous = this.latest;
+    const sameWorld = sameReplicaWorld(data, incoming);
+    const contiguous = sameWorld && body.delta === true && previous?.data === data && previous.from === from && previous.actor === actor &&
+      previous.tick === tick && incoming.tick === tick + CONFIG.step;
+    const directions = contiguous ? decodeSwims(data, incoming, body.swims) : undefined;
+    apply();
+    const mergedWorld = sameReplicaWorld(data, incoming);
+    if (!sameWorld || !mergedWorld) this.reset();
+    if (data.tick !== incoming.tick || !mergedWorld) return;
+    if (directions?.length) {
+      const captured = capturedFishIds(data, data.tick);
+      for (let direction = 0; direction < directions.length; direction++) if (directions[direction]) {
+        directions[direction] = directions[direction].filter(id => {
+          const pose = data.fishes[id], sent = incoming.fishes[id];
+          return pose?.posAt === incoming.tick && pose.x === sent.x && pose.y === sent.y && pose.facing === sent.facing && !captured.has(id);
+        });
+      }
+    }
+    return this.latest = { data, from, actor, tick: incoming.tick, directions: directions?.some(ids => ids.length) ? directions : undefined };
+  }
 }
 
 export class WorldBroadcast {
@@ -90,8 +176,8 @@ export class WorldBroadcast {
     } finally { this.busy = false; }
   }
 
-  async send(network, data, now = Date.now(), captureFull) {
-    if (!network.live().length) { this.reset(); return; }
+  async send(network, data, now = Date.now(), captureFull, directions) {
+    if (!network.live().length) { if (this.source) this.reset(); return; }
     if ((network.replicaPeers && !network.replicaPeers().length) || this.busy) return;
     this.busy = true;
     try {
@@ -99,13 +185,16 @@ export class WorldBroadcast {
       const previous = this.previous && now - this.previous.fullAt <= 30000 ? this.previous : null;
       const pending = this.takeChanges(data);
       const generation = this.generation, breeding = breedingForBroadcast(data.breeding, !previous);
-      let world;
+      let world, swims;
       if (previous) {
         world = structuredClone(packet(data, changedRows(data, previous, pending), breeding));
+        if (world.tick === previous.tick + CONFIG.step) swims = encodeSwims(world.fishes, directions);
+        previous.tick = world.tick;
         // The baseline shares immutable rows with the last captured version.
         // Keep later writes separate while joins still read that version.
         for (const field of rowFields) {
-          for (const [id, value] of Object.entries(world[field])) previous.updates[field].set(id, value);
+          const rows = world[field], updates = previous.updates[field];
+          for (const id in rows) if (Object.hasOwn(rows, id)) updates.set(id, rows[id]);
         }
       } else {
         const source = captureFull ? await captureFull() : data;
@@ -114,7 +203,7 @@ export class WorldBroadcast {
         world = captureFull ? full : structuredClone(full);
         this.previous = baseline(world, data.breeding, now);
       }
-      return await network.broadcast('world', { delta: !!previous, world }, { capturedWorld: true });
+      return await network.broadcast('world', { delta: !!previous, ...(swims ? { swims } : {}), world }, { capturedWorld: true });
     } catch (error) {
       this.reset();
       throw error;
