@@ -1,7 +1,16 @@
 export const WORLD_WIDTH = 1000;
 export const MIN_FLOOR = 80, MAX_FLOOR = 100;
 export const wrapX = x => ((x % WORLD_WIDTH) + WORLD_WIDTH) % WORLD_WIDTH;
-export const worldKey = (x, y) => `${wrapX(x)},${y}`;
+// Integer water cells recur across movement, contacts and sight. Reuse their
+// string keys; old fractional coordinates keep the original wrap semantics.
+const waterKeys = Array.from({ length: MAX_FLOOR }, () => []);
+export function worldKey(x, y) {
+  if (Number.isInteger(x) && Number.isInteger(y) && y >= 0 && y < MAX_FLOOR) {
+    const column = x >= 0 && x < WORLD_WIDTH ? x : wrapX(x);
+    return waterKeys[y][column] ??= `${column},${y}`;
+  }
+  return `${wrapX(x)},${y}`;
+}
 export const deltaX = (x, reference) => wrapX(x - reference + WORLD_WIDTH / 2) - WORLD_WIDTH / 2;
 export const nearX = (x, reference) => reference + deltaX(x, reference);
 function random(seed) { let value = 2166136261; for (const ch of seed) value = Math.imul(value ^ ch.codePointAt(0), 16777619); return value >>> 0; }

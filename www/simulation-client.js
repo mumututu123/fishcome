@@ -1,6 +1,7 @@
 import { CONFIG } from './engine.js';
 import { fishOrigin, writeBreedingRecord } from './breeding.js';
 import { simulationWillApply, simulationApplied, subscribeSimulationChanges, worldRevision, worldTables } from './simulation-changes.js';
+import { expandSimulationPatch } from './simulation-delta.js';
 export { subscribeSimulationChanges } from './simulation-changes.js';
 
 function* initialRows(world) {
@@ -33,7 +34,8 @@ function* initialRows(world) {
   for (const id of summary.grassMeals) yield ['@grassMeals', id, true];
 }
 
-function applyResult(world, { patch, foodRevision }) {
+function applyResult(world, { patch: delta, foodRevision }) {
+  const patch = expandSimulationPatch(world.data, delta);
   simulationWillApply(world, patch);
   for (const [field, changes] of Object.entries(patch.tables)) {
     const table = world.data[field] ||= {};
@@ -78,17 +80,20 @@ export class SimulationClient {
       this.worker.postMessage(message);
     });
   }
-  archiveAtStepBoundary(world, commit) {
+  atStepBoundary(commit) {
     return new Promise((resolve, reject) => {
       const apply = () => {
-        try {
-          const change = commit();
-          if (change && this.owner === world) this.archiveChanges.push(change);
-          resolve(!!change);
-        } catch (error) { reject(error); }
+        try { resolve(commit()); } catch (error) { reject(error); }
       };
       if (this.task) (this.boundaries ||= []).push(apply);
       else apply();
+    });
+  }
+  archiveAtStepBoundary(world, commit) {
+    return this.atStepBoundary(() => {
+      const change = commit();
+      if (change && this.owner === world) this.archiveChanges.push(change);
+      return !!change;
     });
   }
   finishBoundary() {
@@ -146,6 +151,7 @@ export class SimulationClient {
   }
   async compute(world, message, valid) {
     this.finishBoundary();
+    if (!valid()) { this.close(); return null; }
     if (this.archiveChanges.length) message.archives = this.archiveChanges.splice(0);
     message.names = Array.from(this.names);
     message.foods = Array.from(this.foods);
@@ -174,6 +180,7 @@ export class SimulationClient {
       rows = [];
     }
     const previous = Object.fromEntries(Object.keys(values).map(key => [key, world.data[key]]));
+    if (result.patch.life) previous.life = world.data.life;
     await this.request({ kind: 'restore', rows, previous, foodRevision: result.foodRevision });
     if (!valid() || !this.worker) this.close();
     return null;

@@ -6,18 +6,27 @@ export function newEcology(now, legacy = false) { return { version: 1, activated
 export function ensureEcology(world, now, legacy = false) { return world.data.ecology ||= newEcology(now, legacy); }
 export function validEcology(state, now = Date.now() + 60000) { return state === undefined || !!state && state.version === 1 && typeof state.legacy === 'boolean' && Number.isFinite(state.activated) && state.activated >= 0 && state.activated <= now && Number.isInteger(state.hour) && state.hour >= 0 && state.hour <= Math.floor(now / 3600000); }
 export function mergeEcology(a, b) { if (!a) return b; if (!b) return a; return { version: 1, activated: Math.min(a.activated, b.activated), legacy: a.legacy || b.legacy, hour: Math.max(a.hour, b.hour) }; }
-export function densityField(world, scenery = world.sceneryMap()) {
+export function densityField(world, scenery = world.sceneryMap(), occupiedByFish) {
   const width = 1000, floors = Array.from({ length: width }, (_, x) => world.floorAt(x)), height = Math.max(...floors), stride = width + 1;
   const occupied = new Uint8Array(width * height), used = new Uint32Array(stride * (height + 1)), wet = new Uint32Array(used.length);
   const mark = (x, y) => { if (Number.isInteger(y) && y >= 0 && y < height) occupied[y * width + wrapX(x)] = 1; };
   for (const { scene, cell } of scenery.values()) mark(scene.x + cell.x, scene.y + cell.y);
-  for (const c of Object.values(world.data.chars)) {
+  for (const c of occupiedByFish ? world.charValues('food', 'seaweed') : world.charValues()) {
     if (['food', 'seaweed'].includes(c.kind)) mark(c.x, c.y);
     if (c.kind === 'fish') { const f = world.data.fishes[c.entity]; if (f) mark(f.x + f.facing * c.x, f.y + c.y); }
   }
   const monument = world.monument; for (const [dy, row] of monument.rows.entries()) for (const [dx, ch] of Array.from(row).entries()) if (ch !== ' ') mark(monument.x + dx, monument.y + dy);
   // Summed-area tables make every local density query constant-time, even on hourly turnover.
-  for (let y = 0; y < height; y++) { let rowWet = 0, rowUsed = 0; for (let x = 0; x < width; x++) { const water = y < floors[x]; rowWet += +water; rowUsed += water ? occupied[y * width + x] : 0; const index = (y + 1) * stride + x + 1; wet[index] = wet[index - stride] + rowWet; used[index] = used[index - stride] + rowUsed; } }
+  for (let y = 0; y < height; y++) {
+    let rowWet = 0, rowUsed = 0;
+    for (let x = 0; x < width; x++) {
+      const cell = y * width + x;
+      if (y < floors[x]) { rowWet++; if (occupied[cell] || occupiedByFish?.[cell]) rowUsed++; }
+      const index = (y + 1) * stride + x + 1;
+      wet[index] = wet[index - stride] + rowWet;
+      used[index] = used[index - stride] + rowUsed;
+    }
+  }
   const rectangle = (table, left, right, top, bottom) => table[(bottom + 1) * stride + right + 1] - table[top * stride + right + 1] - table[(bottom + 1) * stride + left] + table[top * stride + left];
   const cache = new Map();
   return (cx, cy) => {
@@ -46,11 +55,11 @@ export function naturalSediment(cell, data) {
 export function settleAt(cell) { return Math.max(...cell.path.filter(event => event.reason === 'expire').map(event => event.t)); }
 export function updateEcology(world, now, transition) {
   const state = ensureEcology(world, now), deadPlants = new Map();
-  for (const c of Object.values(world.data.chars)) {
+  for (const c of world.charValues('food', 'seaweed')) {
     if (c.kind === 'seaweed' && now >= weedExpires(c, state)) { if (!deadPlants.has(c.entity)) deadPlants.set(c.entity, []); deadPlants.get(c.entity).push({ index: c.wild.index, at: weedExpires(c, state) }); transition(c, { kind: 'burn', entity: '' }, { id: `wither:${c.id}`, t: weedExpires(c, state), reason: 'wither' }); world.foodRevision++; world.dirty = true; }
     else if (c.kind === 'food' && looseWither(c) && now >= c.born + ECOLOGY.looseLife) { transition(c, { kind: 'burn', entity: '' }, { id: `wither-dissolve:${c.id}:${c.born}`, t: c.born + ECOLOGY.looseLife, reason: 'wither-dissolve' }); world.dirty = true; }
   }
-  for (const c of Object.values(world.data.chars)) if (c.kind === 'seaweed') {
+  if (deadPlants.size) for (const c of world.charValues('seaweed')) {
     const cuts = (deadPlants.get(c.entity) || []).filter(cut => cut.index < c.wild.index); if (!cuts.length) continue;
     const at = Math.min(...cuts.map(cut => cut.at)); transition(c, { kind: 'food', entity: '', born: at, fall: 0 }, { id: `wither-loose:${c.id}:${at}`, t: at, reason: 'wither-loose' });
     if (now >= at + ECOLOGY.looseLife) transition(c, { kind: 'burn', entity: '' }, { id: `wither-dissolve:${c.id}:${at}`, t: at + ECOLOGY.looseLife, reason: 'wither-dissolve' });
@@ -58,8 +67,9 @@ export function updateEcology(world, now, transition) {
   }
   const hour = Math.floor(now / 3600000); if (hour <= state.hour) return;
   const density = densityField(world), edited = new Set(Object.values(world.data.ops).filter(op => op.kind === 'sceneEdit').map(op => op.cell));
-  for (const c of Object.values(world.data.chars)) {
-    if (c.kind !== 'scene' || c.chat || edited.has(c.id)) continue;
+  const scenes = world.charValues('scene');
+  for (const c of scenes) {
+    if (c.chat || edited.has(c.id)) continue;
     const settled = settleAt(c); if (!Number.isFinite(settled)) continue;
     const scene = world.data.scenes[c.entity]; if (!scene) continue;
     const x = wrapX(scene.x + c.x), y = scene.y + c.y, probability = density(x, y) >= .4 ? 500 : 200;
@@ -67,6 +77,6 @@ export function updateEcology(world, now, transition) {
     const first = Math.max(state.hour + 1, Math.ceil((settled + ECOLOGY.sedimentGrace) / 3600000));
     for (let h = first; h <= hour; h++) if (hash(`weathering:${c.id}:${h}`) % 10000 < probability) { transition(c, { kind: 'burn', entity: '' }, { id: `weathering:${c.id}:${h}`, t: h * 3600000, reason: 'weathering' }); world.dirty = true; break; }
   }
-  const remaining = new Set(Object.values(world.data.chars).filter(c => c.kind === 'scene').map(c => c.entity)); for (const id of Object.keys(world.data.scenes)) if (!remaining.has(id)) delete world.data.scenes[id];
+  const remaining = new Set(scenes.filter(c => c.kind === 'scene').map(c => c.entity)); for (const id of Object.keys(world.data.scenes)) if (!remaining.has(id)) delete world.data.scenes[id];
   state.hour = hour;
 }

@@ -4,11 +4,35 @@ import { CONFIG, World, chooseClaim } from '../www/engine.js';
 import { ARCHIVE_FIELDS, ArchiveStore, encodeArchive, prepareCompaction } from '../www/archive.js';
 import { SimulationClient, subscribeSimulationChanges } from '../www/simulation-client.js';
 import { WorkerSimulation } from '../www/simulation-worker.js';
-import { applyInputRows, setParticipantName, worldEdited } from '../www/simulation-changes.js';
+import { applyInputRows, setParticipantName, subscribeBeforeSimulationPatch, worldEdited } from '../www/simulation-changes.js';
 import { CONTACT_TIME, updateContacts } from '../www/breeding.js';
 
 const start = Date.UTC(2025, 5, 15, 12, 17);
 const root = '00000000-0000-4000-8000-000000000012';
+
+test('连续八步的在途投喂按提交顺序入海，每步只计算一次', async () => {
+  const world = new World(start, root, { populate: false, ambient: false });
+  const worker = new WorkerSimulation(), operations = [];
+  let requests = 0;
+  const client = new SimulationClient(() => localWorker(async message => {
+    if (message.kind !== 'step') return;
+    const index = requests++;
+    const op = { id: crypto.randomUUID(), kind: 'food', actor: 'visitor', nick: '喂鱼', x: index, y: 0, ch: '*', color: '#ace123', t: message.base, cost: 1 };
+    operations.push(client.atStepBoundary(() => {
+      assert.equal(world.data.tick, message.base + CONFIG.step);
+      assert(world.apply(op).ok);
+      return op.id;
+    }));
+  }, worker));
+  try {
+    await client.advance(world, start + 8 * CONFIG.step);
+    const ids = await Promise.all(operations);
+    assert.equal(requests, 8);
+    assert.equal(world.data.tick, start + 8 * CONFIG.step);
+    for (const id of ids) assert(world.data.chars[id]);
+    for (const id of ids.slice(0, -1)) assert.deepEqual(world.data.chars[id], worker.world.data.chars[id]);
+  } finally { client.close(); }
+});
 function localWorker(beforeReceive = () => {}, simulation = new WorkerSimulation()) {
   let closed = false;
   return {
@@ -140,6 +164,7 @@ test('后台模拟与同种子的前台基线逐步一致，已结束历史和�
 
 test('玩家操作使正在计算的旧步骤失效，重算后保持操作和世界状态', async () => {
   const a = new World(start, root), b = new World(start, root);
+  for (const world of [a, b]) world.data.life.at = start - 1000;
   let signal, resume;
   const gate = new Promise(resolve => { resume = resolve; });
   const issued = new Promise(resolve => { signal = resolve; });
@@ -162,6 +187,66 @@ test('玩家操作使正在计算的旧步骤失效，重算后保持操作和�
     assert(commands.includes('restore'));
     assert.equal(commands.filter(kind => kind === 'open').length, 1);
   } finally { resume(); client.close(); }
+});
+
+test('后台只发送变化的鱼记录与当日行程，订阅者收到完整记录和有序鱼生关系', async () => {
+  const expected = new World(start, root, { populate: false });
+  const fishes = [1, 2, 3, 4].map(i => `10000000-0000-4000-8000-00000000000${i}`);
+  for (const [i, id] of fishes.entries()) {
+    const cells = Array.from({ length: 3 }, (_, x) => ({ x, y: 0, ch: 'Q', color: '#ace123' }));
+    assert(expected.apply({ id, cells, actor: id, nick: '玩家', t: start, cost: 3, x: 20 + i * 5, y: 10, kind: 'fish' }).ok);
+    expected.data.travel[id] = { since: start, days: { '2025-06-14': 41 } };
+  }
+  expected.data.life.at = start - 1000;
+  const [a, b, c, d] = fishes;
+  expected.data.life.bonds[`${c}|${d}`] = { run: 12, a: c, b: d, seconds: 12, at: start, lastNear: start };
+  expected.data.life.bonds[`${a}|${d}`] = { a, b: d, seconds: 9, at: start, lastNear: start, run: 9 };
+  const world = new World(start, root, { populate: false });
+  world.data = expected.serialize();
+  const sent = [], before = [], after = [];
+  class ObservedWorker extends WorkerSimulation {
+    receive(message) {
+      const reply = super.receive(message);
+      if (reply) sent.push(reply.patch);
+      return reply;
+    }
+  }
+  const client = new SimulationClient(() => localWorker(undefined, new ObservedWorker()));
+  const stopBefore = subscribeBeforeSimulationPatch((target, patch) => {
+    if (target === world) before.push({ tick: world.data.tick, life: world.data.life, patch });
+  });
+  const stopAfter = subscribeSimulationChanges((target, patch) => { if (target === world && patch) after.push(patch); });
+  try {
+    for (let i = 1; i <= 8; i++) {
+      const now = start + i * CONFIG.step;
+      const previous = world.data.life;
+      expected.step(now);
+      await client.advance(world, now);
+      assert.deepEqual(world.serialize(), expected.serialize());
+      assert.deepEqual(Object.keys(world.data.life.bonds), Object.keys(expected.data.life.bonds));
+      for (const key of Object.keys(expected.data.life.bonds)) {
+        assert.deepEqual(Object.keys(world.data.life.bonds[key]), Object.keys(expected.data.life.bonds[key]));
+      }
+      assert.equal(before.at(-1).tick, now - CONFIG.step);
+      assert.equal(before.at(-1).life, previous);
+      assert.equal(before.at(-1).patch, after.at(-1));
+      for (const [id, fish] of after.at(-1).tables.fishes.set) assert.deepEqual(fish, world.data.fishes[id]);
+    }
+    for (const change of sent) for (const [, fields] of change.tables.fishes.set) {
+      assert.equal(Object.hasOwn(fields, 'actor'), false);
+      assert.equal(Object.hasOwn(fields, 'id'), false);
+    }
+    const travel = sent.flatMap(change => change.tables.travel?.set || []);
+    assert(travel.length > 0);
+    for (const [, fields, , days] of travel) {
+      assert.equal(Object.hasOwn(fields, 'since'), false);
+      assert.equal(Object.hasOwn(days[0], '2025-06-14'), false);
+    }
+    const life = sent.find(change => change.life?.bonds);
+    assert(life);
+    assert.equal(Object.hasOwn(life.values, 'life'), false);
+    assert(after.some(patch => patch.values.life?.bonds[`${a}|${b}`]));
+  } finally { stopBefore(); stopAfter(); client.close(); }
 });
 
 test('初始化和推进期间频繁改名继续使用同一线程，下一次自然沉积取最新昵称', async () => {

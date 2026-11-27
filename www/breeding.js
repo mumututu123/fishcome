@@ -2,7 +2,7 @@ import { CONFIG, EYES, NEIGHBORS, bounds, cellPosition, components, hash, clone,
 import { defaultFishName, fishNameError } from './fish-profile.js';
 import { wrapX, nearX, deltaX } from './geography.js';
 import { recordStory } from './life.js';
-import { capturedFish } from './legends.js';
+import { capturedFishIds } from './legends.js';
 import { densityField, contactTime } from './ecology.js';
 
 export const CONTACT_TIME = 5000;
@@ -140,46 +140,67 @@ export function finishBreeding(world, now, transition) {
     world.foodRevision++; world.dirty = true;
   }
 }
-export function updateContacts(world, now, groups, scenery) {
+function contactWait(density, father, fatherCells, mother, motherCells, scenery, firstMaleId) {
+  if (!density) return CONTACT_TIME;
+  const maleId = firstMaleId ?? contactCells(father, fatherCells, mother, motherCells, scenery).male[0];
+  const maleCell = fatherCells.find(cell => cell.id === maleId);
+  if (!maleCell) return CONTACT_TIME;
+  const maleCells = [maleCell];
+  let femaleCell, q;
+  // Fractional positions can touch the selected male cell without matching a grid neighbor.
+  for (const cell of motherCells) {
+    if (femaleCell && cell.id.localeCompare(femaleCell.id) >= 0) continue;
+    const position = cellPosition(mother, cell);
+    if (touching(father, maleCells, position, scenery)) { femaleCell = cell; q = position; }
+  }
+  if (!q) return CONTACT_TIME;
+  const p = cellPosition(father, maleCell);
+  return contactTime(density((p.x + nearX(q.x, p.x)) / 2, (p.y + q.y) / 2));
+}
+export function updateContacts(world, now, groups, scenery, captured = capturedFishIds(world.data, now), occupancy) {
   world.data.contacts ||= {}; world.data.breeding ||= {};
   const taken = new Set(activeRecords(world.data).flatMap(record => [record.male, record.female]));
-  const males = [], females = [], pairs = new Map();
-  for (const [id, cells] of groups) {
-    const fish = world.data.fishes[id], gender = fishOrigin(world.data, id)?.gender;
-    if (!fish || taken.has(id) || capturedFish(world.data, id, now) || !['male', 'female'].includes(gender)) continue;
-    (gender === 'male' ? males : females).push(fish);
+  const males = [], females = new Set(), pairs = new Map();
+  for (const id of groups.keys()) {
+    const fish = world.data.fishes[id];
+    if (!fish || taken.has(id) || captured.has(id)) continue;
+    const gender = fishOrigin(world.data, id)?.gender;
+    if (gender === 'male') males.push(fish);
+    if (gender === 'female') females.add(id);
   }
-  const at = new Map();
-  if (males.length) for (const fish of females) for (const cell of groups.get(fish.id)) {
-    const p = cellPosition(fish, cell), k = key(p.x, p.y);
-    if (!at.has(k)) at.set(k, []);
-    at.get(k).push(fish.id);
-  }
-  if (at.size) for (const fish of males) {
+  if (males.length && females.size) occupancy ||= world.movementGrid(groups);
+  if (females.size) for (const fish of males) {
     const id = fish.id;
     for (const cell of groups.get(id)) {
       const p = cellPosition(fish, cell);
       for (const [dx, dy] of NEIGHBORS) {
-        if (dx && dy && (scenery.has(key(p.x + dx, p.y)) || scenery.has(key(p.x, p.y + dy)))) continue;
-        for (const other of at.get(key(p.x + dx, p.y + dy)) || []) pairs.set(`${id}|${other}`, { male: id, female: other });
+        const x = p.x + dx, y = p.y + dy, occupants = occupancy.get(x, y);
+        if (!occupants || dx && dy && (scenery.has(key(x, p.y)) || scenery.has(key(p.x, y)))) continue;
+        const cellId = typeof cell.id === 'string' ? cell.id : null;
+        for (const other of occupants) {
+          if (!females.has(other)) continue;
+          const pairKey = `${id}|${other}`, pair = pairs.get(pairKey);
+          if (!pair) pairs.set(pairKey, { male: id, female: other, firstMaleId: cellId });
+          else if (pair.male !== id || pair.female !== other) pairs.set(pairKey, { male: id, female: other, firstMaleId: null });
+          else if (cellId === null || pair.firstMaleId !== null && cellId < pair.firstMaleId) pair.firstMaleId = cellId;
+        }
       }
     }
   }
-  const contacts = {}, density = world.ambient && pairs.size ? densityField(world, scenery) : null;
-  for (const [key, pair] of [...pairs].sort(([a], [b]) => a.localeCompare(b))) {
-    if (taken.has(pair.male) || taken.has(pair.female)) continue;
-    const f = world.data.fishes[pair.male], m = world.data.fishes[pair.female], contact = contactCells(f, groups.get(pair.male), m, groups.get(pair.female), scenery);
-    const maleCell = groups.get(pair.male).find(c => c.id === contact.male[0]), p = maleCell && cellPosition(f, maleCell), femaleCell = [...groups.get(pair.female)].sort((a, b) => a.id.localeCompare(b.id)).find(c => maleCell && touching(f, [maleCell], cellPosition(m, c), scenery)), q = femaleCell && cellPosition(m, femaleCell);
-    const wait = density && p && q ? contactTime(density((p.x + nearX(q.x, p.x)) / 2, (p.y + q.y) / 2)) : CONTACT_TIME;
+  const contacts = {}, density = world.ambient && pairs.size ? densityField(world, scenery, occupancy.integerCells ? occupancy.cells : undefined) : null;
+  for (const [key, { male, female, firstMaleId }] of [...pairs].sort(([a], [b]) => a.localeCompare(b))) {
+    if (taken.has(male) || taken.has(female)) continue;
+    const father = world.data.fishes[male], mother = world.data.fishes[female], fc = groups.get(male), mc = groups.get(female);
+    const wait = contactWait(density, father, fc, mother, mc, scenery, firstMaleId);
     if (!Number.isFinite(wait)) continue;
     const prior = world.data.contacts[key], since = prior && now >= prior.lastAt && now - prior.lastAt <= CONFIG.step * 2 ? prior.since : now;
-    contacts[key] = { ...pair, since, lastAt: now };
+    contacts[key] = { male, female, since, lastAt: now };
     if (now - since < wait) continue;
-    const father = world.data.fishes[pair.male], mother = world.data.fishes[pair.female], fc = groups.get(pair.male), mc = groups.get(pair.female), all = [...fc.map(cell => cellPosition(father, cell)), ...mc.map(cell => cellPosition(mother, cell))];
+    const all = [...fc.map(cell => cellPosition(father, cell)), ...mc.map(cell => cellPosition(mother, cell))];
     if (new Set(all.map(p => `${p.x},${p.y}`)).size !== all.length) continue;
-    const started = now, id = breedingId(pair.male, pair.female, started), initialPose = { male: pose(father), female: pose(mother) };
-    writeBreedingRecord(world.data.breeding, id, { id, ...pair, started, ends: started + BREEDING_TIME, at: now, status: 'active', contact: contactCells(father, fc, mother, mc, scenery), initialPose, pose: clone(initialPose), motion: { cx: 0, cy: 0 } });
-    taken.add(pair.male); taken.add(pair.female); delete contacts[key]; world.dirty = true;
+    const started = now, id = breedingId(male, female, started), initialPose = { male: pose(father), female: pose(mother) };
+    writeBreedingRecord(world.data.breeding, id, { id, male, female, started, ends: started + BREEDING_TIME, at: now, status: 'active', contact: contactCells(father, fc, mother, mc, scenery), initialPose, pose: clone(initialPose), motion: { cx: 0, cy: 0 } });
+    taken.add(male); taken.add(female); delete contacts[key]; world.dirty = true;
   }
   world.data.contacts = Object.fromEntries(Object.entries(contacts).filter(([, pair]) => !taken.has(pair.male) && !taken.has(pair.female)));
   world.data.contactAt = now;

@@ -10,8 +10,26 @@ export function feedingStatus(fish, now, recorded) {
   return { lastMealAt: last, nextMealAt, canEat: nextMealAt === undefined || now >= nextMealAt };
 }
 export function shanghaiDay(now) { return new Date(now + 8 * 60 * 60 * 1000).toISOString().slice(0, 10); }
+const daysInMonth = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+function validMovementDay(day) {
+  if (day.length !== 10 || !/^\d{4}-\d{2}-\d{2}$/.test(day)) return false;
+  const month = Number(day.slice(5, 7)), date = Number(day.slice(8, 10));
+  if (!date || month < 1 || month > 12) return false;
+  if (month === 2 && date === 29) {
+    const year = Number(day.slice(0, 4));
+    return year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  }
+  return date <= daysInMonth[month - 1];
+}
+function validTravelDays(days) {
+  for (const day in days) if (Object.hasOwn(days, day)) {
+    const distance = days[day];
+    if (!Number.isFinite(distance) || distance < 0 || !validMovementDay(day)) return false;
+  }
+  return true;
+}
 export function validTravel(record) {
-  return record && Number.isFinite(record.since) && record.since >= 0 && record.days && typeof record.days === 'object' && !Array.isArray(record.days) && Object.entries(record.days).every(([day, distance]) => /^\d{4}-\d{2}-\d{2}$/.test(day) && Number.isFinite(Date.parse(day)) && new Date(day + 'T00:00:00Z').toISOString().slice(0, 10) === day && Number.isFinite(distance) && distance >= 0);
+  return record && Number.isFinite(record.since) && record.since >= 0 && record.days && typeof record.days === 'object' && !Array.isArray(record.days) && validTravelDays(record.days);
 }
 export function mergeTravel(left, right) {
   if (!validTravel(right)) throw new Error('鱼运动记录无效');
