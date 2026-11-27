@@ -1,5 +1,5 @@
 import { World, CONFIG, clone, EYES, bounds, validGlyph, displayNick, hash, sceneryCount, chooseClaim } from './engine.js';
-import { SimulationClient, subscribeSimulationChanges } from './simulation-client.js';
+import { SimulationClient, startSimulationClock, subscribeSimulationChanges } from './simulation-client.js';
 import { setParticipantName, subscribeBeforeSimulationPatch, worldEdited } from './simulation-changes.js';
 import { atCheckpointBoundary, get, getMany, readCheckpointVersion, sameStoredCheckpoint, putMany, readHandoffCheckpoint, replaceFromBackup, getOldBranch, LEGACY_NOTICE_SEEN, claimLegacyNotice, newIdentity, signer, verifyEnvelope, actorId, download } from './storage.js';
 import { beforeCheckpointPatch, noteCheckpointChanges, noteCheckpointMerge } from './checkpoint-pages.js';
@@ -929,7 +929,8 @@ async function start() {
   if (network.live().length) networkChange().catch(error => { status = error.message; });
   syncUpdateStatus(); refreshPeerUpdates().catch(() => {});
   reconnect().catch(() => {}); update();
-  setInterval(tick, CONFIG.step); setInterval(() => { network.presence(active().filter(m => m.id !== network.node).map(m => ({ id: m.id, url: m.url }))).catch(() => {}); if (network.connections.size < 6) { const candidate = active().filter(m => m.id !== network.node && !network.has(m.id)).sort((a, b) => hash(`${network.node}:${a.id}`) - hash(`${network.node}:${b.id}`))[0]; if (candidate) network.connect(candidate.url, candidate.id).catch(() => {}); } }, 6000);
+  startSimulationClock(() => world.data.tick, tick);
+  setInterval(() => { network.presence(active().filter(m => m.id !== network.node).map(m => ({ id: m.id, url: m.url }))).catch(() => {}); if (network.connections.size < 6) { const candidate = active().filter(m => m.id !== network.node && !network.has(m.id)).sort((a, b) => hash(`${network.node}:${a.id}`) - hash(`${network.node}:${b.id}`))[0]; if (candidate) network.connect(candidate.url, candidate.id).catch(() => {}); } }, 6000);
   document.addEventListener('visibilitychange', async () => { if (!document.hidden) { lifeSince = identity.lifeSeenAt || Date.now(); returnVisit = Date.now() - lifeSince > 60000; lifeMessage = null; } await resumeAfterInactivity(); if (network.live().length) network.broadcast('beat', { member: member() }).catch(() => {}); save().catch(() => {}); });
   window.addEventListener('pagehide', () => { simulation.close(); const blob = new Blob([JSON.stringify({ node: network.node, token: meta.token })], { type: 'application/json' }); navigator.sendBeacon('/local/unregister', blob); if (updateFrozen || updateRestarting || replacingCheckpoint) return; save({ reusePicture: true }).catch(() => {}); });
   if (!sawLegacyNotice) refreshOldBackups(true);

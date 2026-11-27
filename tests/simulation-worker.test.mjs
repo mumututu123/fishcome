@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { CONFIG, World, chooseClaim } from '../www/engine.js';
 import { ARCHIVE_FIELDS, ArchiveStore, encodeArchive, prepareCompaction } from '../www/archive.js';
-import { SimulationClient, subscribeSimulationChanges } from '../www/simulation-client.js';
+import { SimulationClient, startSimulationClock, subscribeSimulationChanges } from '../www/simulation-client.js';
 import { WorkerSimulation } from '../www/simulation-worker.js';
 import { expandSimulationPatch } from '../www/simulation-delta.js';
 import { applyInputRows, setParticipantName, subscribeBeforeSimulationPatch, worldEdited } from '../www/simulation-changes.js';
@@ -10,6 +10,26 @@ import { CONTACT_TIME, updateContacts } from '../www/breeding.js';
 
 const start = Date.UTC(2025, 5, 15, 12, 17);
 const root = '00000000-0000-4000-8000-000000000012';
+
+test('半秒时钟对齐存档步，提前醒来只等剩余时间，迟醒也不累积偏移', t => {
+  let now = 1320, base = 1000, wake;
+  const requested = [], updates = [];
+  t.mock.method(Date, 'now', () => now);
+  t.mock.method(globalThis, 'setTimeout', (callback, delay) => { wake = callback; requested.push(delay); });
+  startSimulationClock(() => base, () => updates.push(now));
+  for (now of [1499, 1500, 2020, 2499, 2500]) wake();
+  assert.deepEqual(updates, [1500, 2020, 2500]);
+  assert.deepEqual(requested, [180, 1, 500, 480, 1, 500]);
+  // A handoff can supply a future tick with a different phase. A clock jump
+  // while suspended must also leave the next wake within one half-second.
+  base = 3110;
+  now = 3000; wake();
+  assert.equal(requested.at(-1), 110);
+  now = 1600; wake();
+  assert.equal(requested.at(-1), 10);
+  now = 7610; wake();
+  assert.equal(requested.at(-1), 500);
+});
 
 test('连续八步的在途投喂按提交顺序入海，每步只计算一次', async () => {
   const world = new World(start, root, { populate: false, ambient: false });

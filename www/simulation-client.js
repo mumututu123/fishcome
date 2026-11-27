@@ -4,6 +4,27 @@ import { simulationWillApply, simulationApplied, subscribeSimulationChanges, wor
 import { expandSimulationPatch, rowId } from './simulation-delta.js';
 export { subscribeSimulationChanges } from './simulation-changes.js';
 
+// The stored sea supplies the phase of the simulation clock. An independent
+// half-second interval can fire just before a step is due, then skip a whole turn.
+export function startSimulationClock(readTick, update) {
+  function schedule(now) {
+    const phase = (now - readTick()) % CONFIG.step;
+    const delay = phase < 0 ? -phase : CONFIG.step - phase;
+    const due = now + delay;
+    function wake() {
+      const at = Date.now(), remaining = due - at;
+      if (remaining > 0 && remaining <= CONFIG.step) {
+        setTimeout(wake, remaining);
+        return;
+      }
+      schedule(at);
+      update();
+    }
+    setTimeout(wake, delay);
+  }
+  schedule(Date.now());
+}
+
 function* initialRows(world) {
   let scanned = 0;
   for (const field of worldTables) {
