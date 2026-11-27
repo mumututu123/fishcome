@@ -128,6 +128,17 @@ export class WorkerSimulation {
       }
       this.tracker.reset();
     } else if (message.kind === 'step' || message.kind === 'repair') {
+      for (const { removed, meals } of message.archives || []) {
+        for (const [field, ids] of Object.entries(removed)) {
+          for (const id of ids) delete this.world.data[field]?.[id];
+        }
+        const { lastMeals, grassMeals } = this.archive.summary;
+        for (const [id, at, grass] of meals) {
+          if (at === undefined) lastMeals.delete(id); else lastMeals.set(id, at);
+          if (grass) grassMeals.add(id); else grassMeals.delete(id);
+        }
+        this.world.mealCache = null;
+      }
       for (const [id, nick] of message.names) this.world.data.participants[id] = nick;
       for (const [id, cell] of message.foods) this.world.data.chars[id] = cell;
       this.tracker.reset();
