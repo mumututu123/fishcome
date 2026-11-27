@@ -128,34 +128,44 @@ export class ViewportCells {
     if (!inside) for (const entry of group) this.place(entry);
   }
 
+  refresh(id, cell) {
+    const entry = this.cells.get(id);
+    if (!drawable(cell?.kind)) { this.remove(id); return; }
+    if (!entry || entry.kind !== cell.kind || entry.entity !== cell.entity) return this.put(id, cell);
+    entry.cell = cell;
+    if (entry.x !== cell.x || entry.y !== cell.y) {
+      entry.x = cell.x;
+      entry.y = cell.y;
+      if (entry.owner) entry.owner.reach = null;
+      this.place(entry);
+    }
+    return entry;
+  }
+
+  syncOwners() {
+    for (const [id, group] of this.owners.fish) this.moveOwner(group, this.data.fishes[id]);
+    for (const [id, group] of this.owners.scene) this.moveOwner(group, this.data.scenes[id]);
+  }
+
+  reconcileMerge(changedChars) {
+    this.queryKey = undefined;
+    for (const id of changedChars) this.refresh(id, this.data.chars[id]);
+    this.syncOwners();
+  }
+
   reconcile() {
-    const { chars, fishes, scenes } = this.data;
+    const { chars } = this.data;
     this.queryKey = undefined;
     this.remaining = null;
     this.appended.clear();
     let order = 0;
     for (const id in chars) {
-      const cell = chars[id];
-      let entry = this.cells.get(id);
-      if (!drawable(cell?.kind)) {
-        if (entry) this.remove(id);
-        continue;
-      }
-      if (!entry || entry.kind !== cell.kind || entry.entity !== cell.entity) entry = this.put(id, cell);
-      else {
-        entry.cell = cell;
-        if (entry.x !== cell.x || entry.y !== cell.y) {
-          entry.x = cell.x; entry.y = cell.y;
-          if (entry.owner) entry.owner.reach = null;
-          this.place(entry);
-        }
-      }
-      entry.order = order++;
+      const entry = this.refresh(id, chars[id]);
+      if (entry) entry.order = order++;
     }
     if (order !== this.cells.size) for (const id of this.cells.keys()) if (!Object.hasOwn(chars, id)) this.remove(id);
     this.order = order;
-    for (const [id, group] of this.owners.fish) this.moveOwner(group, fishes[id]);
-    for (const [id, group] of this.owners.scene) this.moveOwner(group, scenes[id]);
+    this.syncOwners();
   }
 
   update(tables) {

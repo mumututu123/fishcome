@@ -199,3 +199,51 @@ test('合流后绘制前仍可选中上一帧的鱼，水面候选只来自当�
   assert.equal(world.surfaceCandidates?.(10), undefined);
   assert.equal(renderer.hit(50, 50), null);
 });
+
+test('追随端提交合流后，鱼体换主人、食物沉积和跨接缝镜头的索引与整表重建一致', async () => {
+  const { World } = await import('../www/engine.js');
+  const { Renderer } = await import('../www/renderer.js');
+  const now = Date.now(), world = new World(now, 'test', { populate: false, ambient: false });
+  const runtime = Object.assign(Object.create(Renderer.prototype), {
+    width: 120, height: 100, scale: 1, cell: 10, camera: { x: 998, y: 10 }, ctx: {},
+    glyph() {}, background() {}, weather() {}, eventHit() { return null; }
+  });
+  const fish = (id, x) => ({ id, x, y: 10, facing: 1, created: now, hungerAt: now + 86400000, posAt: now });
+  const cell = (id, entity, x) => ({ id, kind: 'fish', entity, x, y: 0, ch: '鱼', path: [], moveAt: now });
+  world.data.fishes.f = fish('f', 999);
+  world.data.fishes.g = fish('g', 200);
+  Object.assign(world.data.chars, { a: cell('a', 'f', 0), b: cell('b', 'f', 1), c: cell('c', 'f', 2),
+    d: cell('d', 'g', 0), e: cell('e', 'g', 1), food: { id: 'food', kind: 'food', entity: '', x: 997, y: 10, ch: '食', path: [], moveAt: now } });
+  runtime.draw(world);
+  const index = runtime.currentIndex(world), tick = now + 500;
+  const move = (id, x) => ({ ...world.data.fishes[id], x, posAt: tick });
+  const incoming = { protocol: 1, tick, roots: world.data.roots, ops: {}, fishes: { f: move('f', 1), g: move('g', 999) },
+    scenes: { s: { id: 's', x: 100, y: 38, posAt: tick } },
+    chars: { b: { ...world.data.chars.b, entity: 'g', x: 2, moveAt: tick },
+      food: { ...world.data.chars.food, kind: 'scene', entity: 's', x: 0, y: 0, moveAt: tick },
+      plant: { id: 'plant', kind: 'seaweed', entity: '', x: 220, y: 45, ch: '草', path: [], moveAt: tick } } };
+  runtime.worldChanged(world, null);
+  const changed = world.merge(incoming, {}, 'replica', true);
+  runtime.applyMergedChars(world, index, changed.chars);
+  const reference = new ViewportCells(world.data);
+  const rows = items => items.map(item => [item.id, item.kind, item.entity, item.x, item.y]);
+  for (const [left, right, top, bottom] of [[-1, 2, 0, 31], [996, 1002, 0, 31], [91, 125, 32, 57], [210, 240, 32, 57]]) {
+    assert.deepEqual(rows(index.query(left, right, top, bottom)), rows(reference.query(left, right, top, bottom)));
+  }
+  assert.deepEqual(rows(index.fishCells('g')).map(row => row[0]).sort(), ['b', 'd', 'e']);
+  runtime.camera.x = 999;
+  runtime.draw(world);
+  assert.deepEqual(runtime.hit(71, 51), { kind: 'fish', id: 'g' });
+});
+
+test('旧存档合流新增整数键时，画面沿用实际字符顺序', async () => {
+  const { World } = await import('../www/engine.js');
+  const now = Date.now(), world = new World(now, 'test', { populate: false, ambient: false });
+  const food = id => ({ id, kind: 'food', entity: '', x: 20, y: 5, path: [] });
+  world.data.chars[2] = food('2');
+  const index = new ViewportCells(world.data);
+  const incoming = { protocol: 1, tick: now + 500, roots: world.data.roots, ops: {}, fishes: {}, scenes: {}, chars: { 1: food('1') } };
+  const changes = world.merge(incoming, {}, 'replica', true);
+  if (changes.chars) index.reconcileMerge(changes.chars); else index.reconcile();
+  assert.deepEqual(index.query(20, 20, 5, 5).map(cell => cell.id), ['1', '2']);
+});

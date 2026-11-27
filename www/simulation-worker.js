@@ -18,7 +18,7 @@ function trackWorld(source) {
   const proxies = new WeakMap(), originals = new WeakMap();
   const values = new Set(), rows = new Map(), lifeFields = new Set(), bondRows = new Map();
   const raw = object => originals.get(object) || object;
-  let characters, ecology, previousBonds, orderedBonds = false;
+  let characters, ecology, bodies, meals, previousBonds, orderedBonds = false;
   let fishRoster, poseRevision = 0;
   const characterViews = new Map();
   const allCharacters = () => characters ??= Object.values(raw(source.chars));
@@ -30,8 +30,51 @@ function trackWorld(source) {
     characterViews.set(key, { kinds, cells });
     return cells;
   }
-  function invalidateCharacterViews(previous, next) {
-    for (const [key, view] of characterViews) if (view.kinds.includes(previous) || view.kinds.includes(next)) characterViews.delete(key);
+  function invalidateCharacterViews(previous, next, sameRow = false) {
+    for (const [key, view] of characterViews) {
+      const before = view.kinds.includes(previous), after = view.kinds.includes(next);
+      if (sameRow ? before !== after : before || after) characterViews.delete(key);
+    }
+  }
+  function ecologyCharacters() {
+    if (!ecology) {
+      // Food settling into scenery keeps the same position in this combined
+      // view. It changes neither the shape of a swimmer nor a previous meal.
+      const cells = bodies && meals ? charValues('food', 'seaweed', 'scene') : allCharacters();
+      ecology = indexEcologyCharacters(cells, bodies, meals);
+      bodies = ecology.groups;
+      const { pastMeals, pastGrass, latestMeals } = ecology;
+      meals = { pastMeals, pastGrass, latestMeals };
+    }
+    return ecology;
+  }
+  function mealPath(path) { return path?.some(event => event?.reason === 'eat'); }
+  function noteCharacterChange(target, parent, key, value) {
+    if (parent.table) {
+      const previous = target[key];
+      if (previous?.kind === 'fish' || value?.kind === 'fish') bodies = undefined;
+      if (mealPath(previous?.path) || mealPath(value?.path)) meals = undefined;
+      characters = ecology = undefined;
+      invalidateCharacterViews(previous?.kind, value?.kind);
+      return;
+    }
+    if (parent.property === 'path') {
+      // A path edit can replace an event, edit its payload, or truncate its array.
+      const changesMeal = Array.isArray(target) ? key === 'length' || target[key]?.reason === 'eat' || value?.reason === 'eat'
+        : target.reason === 'eat' || key === 'reason' && value === 'eat';
+      if (changesMeal) meals = ecology = undefined;
+      return;
+    }
+    if (parent.property !== undefined) return;
+    if (key === 'kind') {
+      if (target.kind === 'fish' || value === 'fish') bodies = undefined;
+      if (target === raw(source.chars[parent.id])) invalidateCharacterViews(target.kind, value, true);
+      ecology = undefined;
+    } else if (target.kind === 'fish' && (key === 'entity' || key === 'x' || key === 'y' || key === 'id')) {
+      bodies = ecology = undefined;
+    } else if (key === 'path' && (mealPath(target.path) || mealPath(value)) || key === 'wild' && mealPath(target.path)) {
+      meals = ecology = undefined;
+    }
   }
   function tableChanges(field) {
     if (!rows.has(field)) rows.set(field, new Map());
@@ -76,19 +119,10 @@ function trackWorld(source) {
         field === 'travel' && parent.table && !value) fishRoster = undefined;
     if (parent.root && key === 'fishes' || field === 'fishes' && (parent.table || !property && (key === 'x' || key === 'y' || key === 'facing'))) poseRevision++;
     if (parent.root && key === 'chars') {
-      ecology = undefined;
+      ecology = bodies = meals = undefined;
       characters = undefined;
       characterViews.clear();
-    } else if (field === 'chars') {
-      if (parent.table) {
-        ecology = undefined;
-        characters = undefined;
-        invalidateCharacterViews(target[key]?.kind, value?.kind);
-      } else if (property === 'path' || !property && (key === 'kind' || key === 'entity' || key === 'path' || key === 'wild' || target.kind === 'fish' && (key === 'x' || key === 'y' || key === 'id'))) {
-        ecology = undefined;
-        if (key === 'kind' && target === raw(source.chars[id])) invalidateCharacterViews(target.kind, value);
-      }
-    }
+    } else if (field === 'chars') noteCharacterChange(target, parent, key, value);
     if (parent.root) {
       // The contact clock replaces the entire ordered table, including rows
       // that kept their value but moved after another pair joined or left.
@@ -216,7 +250,7 @@ function trackWorld(source) {
     // Callers enumerate this read-only list. Its rows still carry tracked writes.
     charValues,
     bondEntries: () => Object.entries(raw(source.life.bonds)),
-    ecologyCharacters: () => ecology ??= indexEcologyCharacters(allCharacters()),
+    ecologyCharacters,
     poseRevision: () => poseRevision,
     readFish: id => raw(source.fishes[id]),
     fishValues: () => fishRoster ??= Object.values(raw(source.fishes)),

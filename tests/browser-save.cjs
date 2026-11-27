@@ -140,6 +140,79 @@ async function exercisePages(page, count) {
   return result;
 }
 
+async function replicaCheckpointJournal(page) {
+  await page.goto(origin + '/welcome.html');
+  const result = await page.evaluate(async () => {
+    const { get, putMany } = await import('./storage.js');
+    const { noteCheckpointChanges, noteCheckpointMerge } = await import('./checkpoint-pages.js');
+    const world = { tick: 1, chars: Object.fromEntries(Array.from({ length: 9216 }, (_, n) => ['c' + n, { x: n }])), fishes: { f: { x: 1 } } };
+    const save = () => putMany(() => [['checkpoint', { world }]], { simulationChanges: true });
+    await save();
+    const original = IDBObjectStore.prototype.get;
+    let charReads = 0;
+    IDBObjectStore.prototype.get = function (key) {
+      if (Array.isArray(key) && key[1] === 'chars') charReads++;
+      return original.call(this, key);
+    };
+    const merge = (ids, apply) => {
+      const edit = {};
+      noteCheckpointChanges(world, null, edit);
+      apply();
+      edit.chars = new Set(ids);
+      noteCheckpointMerge(world, edit);
+    };
+    const check = async () => {
+      charReads = 0;
+      await save();
+      const saved = await get('checkpoint', { observeCheckpoint: false });
+      if (JSON.stringify(saved.world) !== JSON.stringify(world)) throw new Error('合流后的存档内容或字典顺序不一致');
+      return charReads;
+    };
+    try {
+      world.chars.c1 = { x: -1 };
+      noteCheckpointChanges(world, { tables: { chars: { set: [['c1', world.chars.c1]], remove: [] } } });
+      merge(['c400'], () => { world.chars.c400.x = 77; world.fishes.f.x = 99; });
+      const precise = await check();
+      merge(['c1'], () => { delete world.chars.c1; });
+      merge(['c1'], () => { world.chars.c1 = { x: 11 }; });
+      const reordered = await check();
+      noteCheckpointChanges(world, null, {});
+      world.chars.c600.x = -2;
+      merge([], () => { world.fishes.f.x++; });
+      const interrupted = await check();
+      const put = IDBObjectStore.prototype.put;
+      merge(['c600'], () => { world.chars.c600.x = -3; });
+      let rejected;
+      try {
+        IDBObjectStore.prototype.put = function (value, key) {
+          if (Array.isArray(key) && key[1] === 'chars') throw new Error('中断合流存档');
+          return put.call(this, value, key);
+        };
+        await save();
+      } catch (error) { rejected = error.message; }
+      finally { IDBObjectStore.prototype.put = put; }
+      const durable = await get('checkpoint', { observeCheckpoint: false });
+      await check();
+      const changed = Object.keys(world.chars).filter((_, n) => n % 256 === 0);
+      merge(changed, () => { for (const id of changed) world.chars[id].x++; });
+      await check();
+      const packed = (await get(['checkpoint-page', 'chars', 0])).length;
+      merge(['c8000'], () => { world.chars.c8000.path = Array.from({ length: 48 }, (_, n) => ({ reason: 'eat', t: n })); });
+      await check();
+      merge(changed, () => { for (const id of changed) world.chars[id].x++; });
+      await check();
+      const longHistory = (await get(['checkpoint-page', 'chars', 0])).length;
+      return { precise, reordered, interrupted, rejected, beforeRetry: durable.world.chars.c600.x, packed, longHistory };
+    } finally { IDBObjectStore.prototype.get = original; }
+  });
+  assert.equal(result.precise, 0);
+  assert(result.reordered > 0 && result.interrupted > 0);
+  assert.equal(result.rejected, '中断合流存档');
+  assert.equal(result.beforeRetry, -2);
+  assert.equal(result.packed, 1024);
+  assert.equal(result.longHistory, 256);
+}
+
 async function concurrentCheckpoints(context) {
   const writer = await context.newPage(), other = await context.newPage();
   await Promise.all([writer.goto(origin + '/welcome.html'), other.goto(origin + '/welcome.html')]);
@@ -281,7 +354,10 @@ async function main() {
   const isolated = await browser.newContext();
   try {
     console.log(JSON.stringify(await exercisePages(await isolated.newPage(), count)));
-    if (!countArg) await concurrentCheckpoints(isolated);
+    if (!countArg) {
+      await replicaCheckpointJournal(await isolated.newPage());
+      await concurrentCheckpoints(isolated);
+    }
   }
   finally { await isolated.close(); }
   if (countArg) return;

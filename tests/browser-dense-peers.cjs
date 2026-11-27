@@ -15,7 +15,7 @@ const { positionals, values } = parseArgs({ allowPositionals: true, options: {
   'full-updates': { type: 'string' }, drop: { type: 'boolean' }, help: { type: 'boolean' },
   backup: { type: 'string' }, trace: { type: 'string' }, report: { type: 'string' }, 'refresh-budget': { type: 'boolean' },
   'archive-rounds': { type: 'string', default: '0' }, 'plain-live': { type: 'string' },
-  'forget-live-base': { type: 'boolean' }, 'switch-leader': { type: 'boolean' }
+  'forget-live-base': { type: 'boolean' }, 'switch-leader': { type: 'boolean' }, 'rebuild-viewport': { type: 'boolean' }
 } });
 if (values.help) {
   console.log('用法：node tests/browser-dense-peers.cjs [鱼数] [--seconds=35] [--full-updates=0|1] [--drop] [--profile=跟随端.cpuprofile]');
@@ -24,6 +24,7 @@ if (values.help) {
   console.log('--backup=本地存档 使用真实存档和归档；--trace=本地跟踪文件 记录浏览器呈现；--report=汇总文件 保存验收数据；--refresh-budget 严格检查每次刷新不超过 20 毫秒（需 --trace）。');
   console.log('--archive-rounds=3 在观测期间连续生成并同步 3 个新归档包（需 --backup）。');
   console.log('--plain-live=A|B|both 模拟不支持紧凑发送的端；--forget-live-base 模拟跟随端遗失上一版本；--switch-leader 在观测后切换协调端。');
+  console.log('--rebuild-viewport 用接收端旧的整表画面索引方式对照。');
   process.exit(0);
 }
 const backup = values.backup && JSON.parse(readFileSync(values.backup, 'utf8'));
@@ -159,9 +160,11 @@ window.denseCommitted = (target, patch, at) => {
   (amLeader() ? testData.steps : testData.applied).push({ tick: patch.values.tick, at });
 };
 for (const [object, method, name] of [
-  [World.prototype, 'merge', 'World.merge'], [pictures, 'prepare', 'pictures.prepare'], [renderer, 'cellIndex', 'renderer.cellIndex']
+  [World.prototype, 'merge', 'World.merge'], [pictures, 'prepare', 'pictures.prepare'], [renderer, 'cellIndex', 'renderer.cellIndex'],
+  [renderer, 'applyMergedChars', 'renderer.applyMergedChars']
 ]) {
   const original = object[method];
+  if (typeof original !== 'function') continue;
   object[method] = function (...args) {
     const previous = method === 'merge' && this === world && this.data.tick;
     if (!previous) return window.denseObserve(name, original, this, args);
@@ -178,6 +181,7 @@ for (const [object, method, name] of [
     return result;
   };
 }
+if (${Boolean(values['rebuild-viewport'])}) renderer.applyMergedChars = () => {};
 (${recordDraw.toString()})(renderer, testData.frames, window.densePage, ${Boolean(values.trace)});
 window.denseSurvey = () => ({ ...testData, node: network?.node, leader: network && leader(), peers: network?.live().length,
   page: window.densePage, timeOrigin: performance.timeOrigin,

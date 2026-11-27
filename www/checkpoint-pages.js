@@ -4,6 +4,8 @@ import { PAGE_HEAD, compatibilityMark, mirrorOldVersion, preserveOldBranch } fro
 const FORMAT = 'tide-checkpoint-pages-1';
 const PREFIX = 'checkpoint-page';
 const PAGE_SIZE = 256;
+const DENSE_CHAR_PAGE = 1024;
+const MAX_DENSE_CHAR_UNITS = 1024;
 const pageRange = () => IDBKeyRange.bound([PREFIX], [PREFIX, []]);
 const pending = new WeakMap();
 const captures = new WeakMap();
@@ -41,10 +43,25 @@ export function beforeCheckpointPatch(data, patch) {
   }
 }
 
-export function noteCheckpointChanges(data, patch) {
+function trackedField(dirty, field) {
+  return dirty?.tables.has(field) ? dirty.tables.get(field) !== null : !dirty?.scan;
+}
+
+function recordChange(dirty, field, ids, id, exists) {
+  if (exists && ids.get(id) === 'removed') {
+    dirty.tables.set(field, null);
+    return false;
+  }
+  ids.set(id, exists ? 'changed' : 'removed');
+  return true;
+}
+
+export function noteCheckpointChanges(data, patch, merge) {
   let dirty = pending.get(data);
   if (!dirty) pending.set(data, dirty = { scan: false, tables: new Map() });
   if (!patch) {
+    const knownChars = trackedField(dirty, 'chars');
+    dirty.merge = merge && knownChars ? { handle: merge, chars: dirty.tables.get('chars') || new Map() } : undefined;
     dirty.scan = true;
     dirty.tables.clear();
     // Foreground edits may mutate arbitrary records in place. A partial copy
@@ -52,21 +69,55 @@ export function noteCheckpointChanges(data, patch) {
     captures.get(data)?.abort(checkpointChanged);
     return;
   }
-  if (dirty.scan) return;
+  if (patch.tables?.chars) dirty.merge = undefined;
   for (const [field, updates] of Object.entries(patch.tables || {})) {
+    if (!trackedField(dirty, field)) continue;
     let ids = dirty.tables.get(field);
     if (!ids) dirty.tables.set(field, ids = new Map());
     for (const id of updates.remove) ids.set(id, 'removed');
-    for (const [id] of updates.set) {
-      if (ids.get(id) === 'removed') { dirty.scan = true; dirty.tables.clear(); return; }
-      ids.set(id, 'changed');
-    }
+    for (const [id] of updates.set) if (!recordChange(dirty, field, ids, id, true)) break;
   }
+}
+
+export function noteCheckpointMerge(data, merge) {
+  const dirty = pending.get(data);
+  if (!merge || dirty?.merge?.handle !== merge) return;
+  const { chars } = dirty.merge;
+  dirty.merge = undefined;
+  if (!merge.chars) return;
+  dirty.tables.set('chars', chars);
+  for (const id of merge.chars) if (!recordChange(dirty, 'chars', chars, id, Object.hasOwn(data.chars, id))) break;
 }
 
 function lookup(capture, field, source, id) {
   const old = capture.before.get(field);
   return old?.has(id) ? old.get(id) : Object.hasOwn(source, id) ? source[id] : ABSENT;
+}
+
+function fitsDenseChar(row) {
+  if (row === ABSENT) return true;
+  let units = MAX_DENSE_CHAR_UNITS, nodes = 64;
+  function fits(value) {
+    if (--nodes < 0) return false;
+    if (typeof value === 'string') units -= value.length;
+    else if (value && typeof value === 'object') {
+      if (Array.isArray(value) ? value.length > nodes : Object.getPrototypeOf(value) !== Object.prototype) return false;
+      for (const key in value) if (Object.hasOwn(value, key)) {
+        units -= key.length + 1;
+        if (units < 0 || !fits(value[key])) return false;
+      }
+    } else units -= 8;
+    return units >= 0;
+  }
+  return fits(row);
+}
+
+function* firstLargeChar(capture, source, ids) {
+  let count = 0;
+  for (const id of ids) {
+    if (!fitsDenseChar(lookup(capture, 'chars', source, id))) return id;
+    if (++count % PAGE_SIZE === 0) yield;
+  }
 }
 
 function sameRecord(a, b) {
@@ -79,17 +130,17 @@ function sameRecord(a, b) {
 
 function append(table, id) {
   let n = table.pages.length - 1;
-  if (n < 0 || table.pages[n].length >= PAGE_SIZE) { n++; table.pages.push([]); }
+  if (n < 0 || table.pages[n].length >= table.capacity) { n++; table.pages.push([]); }
   table.pages[n].push(id);
   table.byId.set(id, n);
   return n;
 }
 
-function* scanLayout(capture, field, source, prior) {
+function* scanLayout(capture, field, source, prior, capacity = prior?.capacity || PAGE_SIZE) {
   const ids = capture.keys.get(field) ?? Object.keys(source);
   capture.keys.set(field, ids);
-  const compact = prior && prior.pages.length > 1 && (prior.pages.length - 1) * PAGE_SIZE > 2 * ids.length;
-  const table = { pages: [], byId: new Map(), source: new WeakRef(source) };
+  const compact = prior && prior.pages.length > 1 && (prior.pages.length - 1) * capacity > 2 * ids.length;
+  const table = { capacity, pages: [], byId: new Map(), source: new WeakRef(source) };
   let pos = 0;
   if (prior && !compact) {
     // Keep existing page boundaries across deletions so removing an early row
@@ -142,9 +193,24 @@ function* writePages(store, head, capture, dirty, reuse, incremental) {
       continue;
     }
     let table = prior, touched;
-    if (incremental && prior?.source.deref() === source) {
+    if (incremental && prior?.source.deref() === source && trackedField(dirty, field)) {
       touched = yield* updateLayout(capture, field, source, table, dirty?.tables.get(field));
-      if (table.pages.length > 1 && table.byId.size < (table.pages.length - 1) * PAGE_SIZE / 2) touched = null;
+      if (table.pages.length > 1 && table.byId.size < (table.pages.length - 1) * table.capacity / 2) touched = null;
+    }
+    const dense = field === 'chars' && prior?.capacity === DENSE_CHAR_PAGE;
+    const scattered = field === 'chars' && touched && prior.byId.size >= 8192 && touched.size * 2 > prior.pages.length;
+    if (dense || scattered) {
+      let large = prior.largeChar;
+      if (large === undefined || fitsDenseChar(lookup(capture, field, source, large))) {
+        const ids = dense && touched ? dirty?.tables.get(field)?.keys() || [] : capture.keys.get(field) ?? Object.keys(source);
+        large = yield* firstLargeChar(capture, source, ids);
+      }
+      const capacity = large === undefined ? DENSE_CHAR_PAGE : PAGE_SIZE;
+      if (capacity !== prior.capacity) {
+        table = yield* scanLayout(capture, field, source, null, capacity);
+        touched = table.pages.keys();
+      }
+      table.largeChar = large;
     }
     if (!touched) table = yield* scanLayout(capture, field, source, prior);
     for (const number of touched || table.pages.keys()) {
@@ -216,7 +282,7 @@ export function beginCheckpoint(store, prior, checkpoint, options, done, fail) {
   const reuse = prior?.format === FORMAT && committed?.revision === prior.revision;
   const dirty = pending.get(data);
   if (!stale) pending.delete(data);
-  const incremental = reuse && options.simulationChanges && committed.data.deref() === data && !dirty?.scan;
+  const incremental = reuse && options.simulationChanges && committed.data.deref() === data;
   let release;
   const read = new Promise(resolve => { release = resolve; });
   const finishRead = () => {
@@ -283,7 +349,7 @@ export function readCheckpoint(store, head, resolve, reject, remember = true) {
     counts[field] = 0;
   }
   const tables = remember && committed?.revision !== head.revision ? new Map(
-    Object.keys(counts).map(field => [field, { pages: [], byId: new Map(), source: new WeakRef(checkpoint.world[field]) }])
+    Object.keys(counts).map(field => [field, { capacity: PAGE_SIZE, pages: [], byId: new Map(), source: new WeakRef(checkpoint.world[field]) }])
   ) : null;
   const request = store.openCursor(pageRange());
   request.onerror = () => reject(request.error);
@@ -301,7 +367,10 @@ export function readCheckpoint(store, head, resolve, reject, remember = true) {
         Object.defineProperty(checkpoint.world[field], id, { value, enumerable: true, writable: true, configurable: true });
         if (table) { page.push(id); table.byId.set(id, number); }
       }
-      if (table) table.pages.push(page);
+      if (table) {
+        if (field === 'chars' && rows.length > PAGE_SIZE) table.capacity = DENSE_CHAR_PAGE;
+        table.pages.push(page);
+      }
       cursor.continue();
     } else if (Object.entries(counts).some(([field, count]) => count !== head.lengths[field])) reject(new Error('本地存档缺少记录页'));
     else {

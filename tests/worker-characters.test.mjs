@@ -100,6 +100,28 @@ test('后台生态索引读取当前鱼体和餐史，换主人、修改旧餐�
   check();
 });
 
+test('过期食物沉积保留活鱼的占位和餐史，真实进食单独更新', () => {
+  const { worker, send } = startWorker([{ ...food('body', 5), kind: 'fish', entity: 'adult' }, food('old', 10)]);
+  const w = worker.world;
+  send({ kind: 'restore', rows: [['fishes', 'adult', { id: 'adult', x: 5, y: 10, facing: 1 }]] });
+  const first = w.ecologyCharacters(), grid = w.movementGrid(first.groups), c = w.data.chars.old;
+  Object.assign(c, { kind: 'scene', entity: 'sand' });
+  c.path.push({ reason: 'expire', target: 'sand', t: start });
+  const settled = w.ecologyCharacters();
+  assert.deepEqual(settled, World.prototype.ecologyCharacters.call(w));
+  assert.equal(w.movementGrid(settled.groups), grid);
+  assert.equal(settled.latestMeals, first.latestMeals);
+  c.path.push({ reason: 'eat', target: 'adult', t: start + 1 });
+  const fed = w.ecologyCharacters();
+  assert.equal(fed.latestMeals.get('adult'), start + 1);
+  assert.equal(w.movementGrid(fed.groups), grid);
+  c.path.length = 0;
+  assert.equal(w.ecologyCharacters().latestMeals.size, 0);
+  c.kind = 'fish'; c.entity = 'adult';
+  assert.notEqual(w.movementGrid(w.fishGroups()), grid);
+  assert.deepEqual(w.ecologyCharacters(), World.prototype.ecologyCharacters.call(w));
+});
+
 test('后台复用上一轮占位时仍采纳旧姿态恢复、鱼元位移和重叠鱼的顺序', () => {
   const { worker, send } = startWorker(['a','b'].map((id, i) => ({ ...food(id, i), kind: 'fish', entity: id })));
   const { world } = worker;

@@ -2,7 +2,7 @@ import { World, CONFIG, clone, EYES, bounds, validGlyph, displayNick, hash, scen
 import { SimulationClient, subscribeSimulationChanges } from './simulation-client.js';
 import { setParticipantName, subscribeBeforeSimulationPatch, worldEdited } from './simulation-changes.js';
 import { atCheckpointBoundary, get, getMany, readCheckpointVersion, sameStoredCheckpoint, putMany, readHandoffCheckpoint, replaceFromBackup, getOldBranch, LEGACY_NOTICE_SEEN, claimLegacyNotice, newIdentity, signer, verifyEnvelope, actorId, download } from './storage.js';
-import { beforeCheckpointPatch, noteCheckpointChanges } from './checkpoint-pages.js';
+import { beforeCheckpointPatch, noteCheckpointChanges, noteCheckpointMerge } from './checkpoint-pages.js';
 import { CheckpointPictures } from './checkpoint-picture.js';
 import { Network } from './network.js';
 import { ReplicaRecovery, ReplicaSwims, WorldBroadcast } from './world-broadcast.js';
@@ -31,7 +31,7 @@ const $ = id => document.getElementById(id);
 const renderer = new Renderer($('sea'));
 const simulation = new SimulationClient();
 let displayedWorld, displayedFish, displayedScenes;
-subscribeSimulationChanges((target, patch) => renderer.worldChanged(target, patch));
+subscribeSimulationChanges((target, patch, origin) => renderer.worldChanged(target, patch, origin));
 subscribeSimulationChanges((target, patch) => {
   if (target !== displayedWorld) return;
   if (!patch) { displayedWorld = null; return; }
@@ -149,6 +149,11 @@ async function requestArchive(id, peer) {
     throw new Error('缺少历史归档，等待持有记忆的伙伴重新接入');
   })(); archiveRequests.set(id, task); try { return await task; } finally { archiveRequests.delete(id); }
 }
+function archiveMetadataChanged(target) {
+  const changes = { chars: new Set() };
+  worldEdited(target, 'archive', changes);
+  noteCheckpointMerge(target.data, changes);
+}
 async function ensureArchives(data, peer, bundle, target = archiveStore, current = {}, beforeIngest) {
   const load = async id => bundle ? bundle[id] : await get('archive:' + id) || (peer && await requestArchive(id, peer));
   const persist = peer && (chunks => putMany(chunks.map(chunk => ['archive:' + chunk.manifest.id, chunk.encoded])));
@@ -159,7 +164,7 @@ async function ensureArchives(data, peer, bundle, target = archiveStore, current
     finally {
       if (live) {
         archiveImports--;
-        if (target === archiveStore && revision !== target.revision) worldEdited(world);
+        if (target === archiveStore && revision !== target.revision) archiveMetadataChanged(world);
       }
     }
   };
@@ -254,7 +259,13 @@ async function mergeVerifiedWorld(data, peer, context, { local = false, worldMes
     }
     const rootCount = target.roots.length;
     const routine = delta && !needsReplicaSave(incoming, target.data, store);
-    const apply = () => target.merge(incoming, archived, routine ? 'replica' : undefined);
+    const apply = () => {
+      const index = delta && renderer.currentIndex(target);
+      let changes;
+      try { changes = target.merge(incoming, archived, routine ? 'replica' : undefined, delta); }
+      finally { if (delta) noteCheckpointMerge(target.data, changes); }
+      if (index) renderer.applyMergedChars(target, index, changes?.chars);
+    };
     let movement;
     if (worldMessage && worldMessage.from !== network.node) movement = replicaSwims.merge(target.data, worldMessage, apply);
     else { apply(); replicaSwims.reset(); }
@@ -285,7 +296,7 @@ async function mergeReplica(data, peer, context = 'merge', worldMessage) {
   }
   await compactKnown(world, archiveStore);
   if (world.data.terrain?.seed !== previousTerrain) geometryRepair = true;
-  worldEdited(world);
+  archiveMetadataChanged(world);
   for (const member of active()) world.data.participants[member.actor] = member.nick; if (identity) world.data.participants[identity.actor] = identity.nick;
   // An expired local copy can be restored only after hearing its roots from a live peer.
   const checkpoint = priorCheckpoint; let recovered = false;
@@ -790,7 +801,7 @@ async function receiveHistory(card, peer) {
   for (const message of joining) { const result = world.addChat(message); if (!result.ok) throw new Error(result.error); }
   renderChat();
 }
-subscribeSimulationChanges((current, patch) => noteCheckpointChanges(current.data, patch));
+subscribeSimulationChanges((current, patch, origin, merge) => noteCheckpointChanges(current.data, patch, merge));
 subscribeBeforeSimulationPatch((current, patch) => beforeCheckpointPatch(current.data, patch));
 async function saveInternal({ capture = false, mirrorLegacy = false, reconciledRevision, reusePicture = false } = {}) {
   if (replacingCheckpoint) throw new Error('正在更换存档');

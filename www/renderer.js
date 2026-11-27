@@ -33,7 +33,8 @@ export class Renderer {
       if (py > -size && py < h) this.glyph(ctx, '底', '#527d72', px, py, size, .8);
     }
   }
-  worldChanged(world, patch) {
+  worldChanged(world, patch, origin) {
+    if (!patch && origin === 'archive') return;
     if (!patch || patch.tables?.rocks) this.rockCells = null;
     if (this.cachedWorld !== world) return;
     if (!patch) {
@@ -48,6 +49,17 @@ export class Renderer {
       this.indexedTick = world.data.tick;
       world.dirty = false;
     }
+  }
+  currentIndex(world) {
+    const index = this.viewport;
+    if (this.cachedWorld === world && index?.data === world.data && !index.remaining && !this.indexInvalid && !world.dirty && this.indexedTick === world.data.tick) return index;
+  }
+  applyMergedChars(world, index, changedChars) {
+    if (!index || !changedChars || this.viewport !== index || world.data !== index.data) return;
+    index.reconcileMerge(changedChars);
+    this.indexInvalid = false;
+    this.indexedTick = world.data.tick;
+    world.dirty = false;
   }
   presentSwims(world, directions) {
     if (world !== this.cachedWorld) return;
@@ -81,12 +93,7 @@ export class Renderer {
     if (this.cachedWorld !== world) {
       this.swims = null;
       if (this.cachedWorld) delete this.cachedWorld.surfaceCandidates;
-      world.surfaceCandidates = x => {
-        const index = this.viewport;
-        if (this.cachedWorld === world && index?.data === world.data && !index.remaining && !this.indexInvalid && !world.dirty && this.indexedTick === world.data.tick) {
-          return index.query(x, x, 0, 0);
-        }
-      };
+      world.surfaceCandidates = x => this.currentIndex(world)?.query(x, x, 0, 0);
     }
     if (this.viewport?.data !== world.data || this.cachedWorld !== world) {
       this.viewport = new ViewportCells(world.data, true);

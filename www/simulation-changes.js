@@ -18,9 +18,9 @@ export function subscribeSimulationChanges(listener) {
 
 export function worldRevision(world) { return revisions.get(world) || 0; }
 
-export function worldEdited(world, origin) {
+export function worldEdited(world, origin, merge) {
   revisions.set(world, worldRevision(world) + 1);
-  for (const listener of listeners) listener(world, null, origin);
+  for (const listener of listeners) listener(world, null, origin, merge);
 }
 
 export function simulationApplied(world, patch) {

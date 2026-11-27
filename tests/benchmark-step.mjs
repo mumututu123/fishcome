@@ -8,11 +8,13 @@ import { parseArgs } from 'node:util';
 
 const { values } = parseArgs({ options: {
   checkpoint: { type: 'string' }, source: { type: 'string' }, reference: { type: 'string' }, fish: { type: 'string' },
+  'resume-at': { type: 'string' },
   budget: { type: 'string' }, samples: { type: 'boolean' }, pace: { type: 'boolean' },
   steps: { type: 'string', default: '24' }, warmup: { type: 'string', default: '6' }, help: { type: 'boolean' }
 } });
 if (values.help) {
   console.log('用法：node tests/benchmark-step.mjs [--steps=24] [--warmup=6] [--fish=5000 | --checkpoint=备份.json] [--source=被测工作区] [--reference=原版工作区] [--budget=20] [--samples] [--pace]');
+  console.log('--resume-at=含时区的时间 从备份恢复到指定时刻，保留离线期间到期的自然事件；默认按备份本身的时刻复播。');
   process.exit(0);
 }
 const steps = Number(values.steps), warmup = Number(values.warmup), fish = Number(values.fish ?? 5000);
@@ -22,6 +24,8 @@ assert(Number.isSafeInteger(steps) && steps > 0, '--steps 必须为正整数');
 assert(Number.isSafeInteger(warmup) && warmup >= 0, '--warmup 必须为非负整数');
 assert(Number.isSafeInteger(fish) && fish > 0 && fish <= 5500, '--fish 必须介于 1 和 5500');
 assert(!(values.checkpoint && values.fish), '--checkpoint 与 --fish 只选一个');
+const resumeAt = values['resume-at'] === undefined ? undefined : Date.parse(values['resume-at']);
+assert(resumeAt === undefined || values.checkpoint && Number.isFinite(resumeAt) && /(?:Z|[+-]\d{2}:\d{2})$/i.test(values['resume-at']), '--resume-at 需要真实备份和含时区的有效日期');
 
 let checkpoint;
 if (values.checkpoint) {
@@ -29,7 +33,7 @@ if (values.checkpoint) {
   const world = input.checkpoint?.world ?? input.world ?? input;
   assert(world?.protocol === 1 && Number.isFinite(world.tick) && world.fishes && world.chars, '文件没有可读取的鱼来世界');
   const archiveChunks = Object.fromEntries(Object.keys(world.archives?.chunks || {}).map(id => [id, input.archiveChunks?.[id]]));
-  checkpoint = { world, archiveChunks };
+  checkpoint = { world, archiveChunks, lastOnlineAt: input.checkpoint?.lastOnlineAt ?? input.lastOnlineAt ?? world.tick, resumeAt };
 }
 const www = values.source ? resolve(values.source, 'www') : fileURLToPath(new URL('../www', import.meta.url));
 const reference = values.reference ? resolve(values.reference, 'www') : www;
@@ -70,9 +74,11 @@ try {
     if (checkpoint) {
       const { restoreCheckpoint } = separateReference ? await import('/reference/lifecycle.js') : await import('/lifecycle.js');
       const { loadReplicaArchives } = await import('/replica.js');
-      const { world, archiveChunks } = checkpoint;
+      const { world, archiveChunks, lastOnlineAt, resumeAt } = checkpoint;
       await loadReplicaArchives(world, archives, id => archiveChunks[id]);
-      ecology = restoreCheckpoint({ world, lastOnlineAt: world.tick }, world.tick).world;
+      const restored = restoreCheckpoint({ world, lastOnlineAt: resumeAt === undefined ? world.tick : lastOnlineAt }, resumeAt ?? world.tick);
+      if (restored.expired) throw new Error('指定时间已超出这片海的离线寿命，无法以此存档验证原鱼群');
+      ecology = restored.world;
     } else {
       const { makeFishWorld } = await import('/capacity-fish.mjs');
       const body = Array.from({ length: 9 }, (_, i) => ({ x: i % 3, y: Math.floor(i / 3), ch: i === 3 ? 'o' : '鱼', color: '#8be7df' }));
@@ -174,7 +180,7 @@ try {
         compare(swims, workerSwims || [], [`第 ${i} 步`, 'swims']);
       }
       compare(committed.data, replay.data, ['计时与独立复核的最终世界']);
-      return { initial, steps, warmup, paced: pace, checkedSteps: patches, stepIntervalMs: CONFIG.step, workerOpenMs: rounded(workerOpenMs),
+      return { initial, steps, warmup, paced: pace, ...(checkpoint?.resumeAt === undefined ? {} : { resumeAt: checkpoint.resumeAt }), checkedSteps: patches, stepIntervalMs: CONFIG.step, workerOpenMs: rounded(workerOpenMs),
         ...(samples ? { samples: roundTrips.map((wall, i) => ({
           total: rounded(wall), ...Object.fromEntries(Object.entries(phases).map(([phase, times]) => [phase, rounded(times[i])]))
         })) } : {}),
