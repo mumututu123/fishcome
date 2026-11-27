@@ -36,12 +36,12 @@ export class DiagnosticLog {
   }
 }
 
-export function buildOriginSources(data, extra = {}, current = null) {
+export function buildOriginSources(data, extra = {}, current = null, chars) {
   return {
     ops: { ...extra?.ops, ...current?.ops, ...data?.ops },
     breeding: { ...extra?.breeding, ...current?.breeding, ...data?.breeding },
     roots: { ...current?.roots, ...data?.roots },
-    chars: { ...extra?.chars, ...current?.chars, ...data?.chars }
+    chars: chars ?? { ...extra?.chars, ...current?.chars, ...data?.chars }
   };
 }
 

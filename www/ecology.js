@@ -1,4 +1,4 @@
-import { wrapX, deltaX, worldKey } from './geography.js';
+import { wrapX } from './geography.js';
 
 export const ECOLOGY = Object.freeze({ radius: 15, weedMinLife: 72 * 3600000, weedLifeRange: 48 * 3600000, looseLife: 75000, sedimentGrace: 48 * 3600000 });
 const hash = text => { let n = 2166136261; for (const c of text) n = Math.imul(n ^ c.codePointAt(0), 16777619); return n >>> 0; };
@@ -8,7 +8,7 @@ export function validEcology(state, now = Date.now() + 60000) { return state ===
 export function mergeEcology(a, b) { if (!a) return b; if (!b) return a; return { version: 1, activated: Math.min(a.activated, b.activated), legacy: a.legacy || b.legacy, hour: Math.max(a.hour, b.hour) }; }
 export function densityField(world, scenery = world.sceneryMap(), occupiedByFish) {
   const width = 1000, floors = Array.from({ length: width }, (_, x) => world.floorAt(x)), height = Math.max(...floors), stride = width + 1;
-  const occupied = new Uint8Array(width * height), used = new Uint32Array(stride * (height + 1)), wet = new Uint32Array(used.length);
+  const occupied = new Uint8Array(width * height), pressure = new Int32Array(stride * (height + 1)), wet = new Uint32Array(pressure.length);
   const mark = (x, y) => { if (Number.isInteger(y) && y >= 0 && y < height) occupied[y * width + wrapX(x)] = 1; };
   for (const { scene, cell } of scenery.values()) mark(scene.x + cell.x, scene.y + cell.y);
   for (const c of occupiedByFish ? world.charValues('food', 'seaweed') : world.charValues()) {
@@ -24,19 +24,45 @@ export function densityField(world, scenery = world.sceneryMap(), occupiedByFish
       if (y < floors[x]) { rowWet++; if (occupied[cell] || occupiedByFish?.[cell]) rowUsed++; }
       const index = (y + 1) * stride + x + 1;
       wet[index] = wet[index - stride] + rowWet;
-      used[index] = used[index - stride] + rowUsed;
+      // Nonnegative pressure means at least 40% of the water is occupied.
+      pressure[index] = pressure[index - stride] + rowUsed * 5 - rowWet * 2;
     }
   }
   const rectangle = (table, left, right, top, bottom) => table[(bottom + 1) * stride + right + 1] - table[top * stride + right + 1] - table[(bottom + 1) * stride + left] + table[top * stride + left];
-  const cache = new Map();
-  return (cx, cy) => {
-    const x = wrapX(Math.round(cx)), y = Math.round(cy), key = worldKey(x, y); if (cache.has(key)) return cache.get(key);
-    const left = x - ECOLOGY.radius, right = x + ECOLOGY.radius, top = Math.max(0, y - ECOLOGY.radius), bottom = Math.min(height - 1, y + ECOLOGY.radius);
-    if (top > bottom) return 1;
-    const ranges = left < 0 ? [[0, right], [width + left, width - 1]] : right >= width ? [[left, width - 1], [0, right - width]] : [[left, right]];
-    let totalWet = 0, totalUsed = 0; for (const [a, b] of ranges) { totalWet += rectangle(wet, a, b, top, bottom); totalUsed += rectangle(used, a, b, top, bottom); }
-    const result = totalWet ? totalUsed / totalWet : 1; cache.set(key, result); return result;
+  function windowArea(table, x, y) {
+    const r = ECOLOGY.radius, left = x - r, right = x + r;
+    const top = Math.max(0, y - r), bottom = Math.min(height - 1, y + r);
+    if (top > bottom) return 0;
+    if (left < 0) return rectangle(table, width + left, width - 1, top, bottom) + rectangle(table, 0, right, top, bottom);
+    if (right >= width) return rectangle(table, left, width - 1, top, bottom) + rectangle(table, 0, right - width, top, bottom);
+    return rectangle(table, left, right, top, bottom);
+  }
+  const density = (cx, cy) => {
+    const x = wrapX(Math.round(cx)), y = Math.round(cy);
+    const water = windowArea(wet, x, y);
+    const used = (windowArea(pressure, x, y) + 2 * water) / 5;
+    return water ? used / water : 1;
   };
+  // Each row prefix counts centers that permit breeding. One range check
+  // covers all possible contact midpoints on that row of a fish's body.
+  const openRows = [];
+  density.crowdedRegion = (minX, minY, maxX, maxY) => {
+    if (minY < 0 || maxY >= height) return false;
+    const left = wrapX(minX), right = left + maxX - minX;
+    for (let y = minY; y <= maxY; y++) {
+      let row = openRows[y];
+      if (!row) {
+        row = openRows[y] = new Uint16Array(stride);
+        for (let x = 0; x < width; x++) {
+          row[x + 1] = row[x] + Number(windowArea(pressure, x, y) < 0);
+        }
+      }
+      if (right < width ? row[right + 1] !== row[left] :
+          row[width] !== row[left] || row[right - width + 1] !== 0) return false;
+    }
+    return true;
+  };
+  return density;
 }
 export const contactTime = density => density >= .4 ? Infinity : density >= .2 ? 20000 : 5000;
 export const growthChance = density => density >= .4 ? 0 : density >= .2 ? .005 : .01;

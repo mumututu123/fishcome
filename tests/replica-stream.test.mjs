@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { changesSince, fitsLegacyEnvelope, PAGE_UNITS, replicaPages, ReplicaReader, ReplicaTransfers } from '../www/replica-stream.js';
+import { decodeReplicaRowDelta, encodeReplicaRowDelta, replicaRowBase } from '../www/replica-row-delta.js';
 import { mergeBreeding } from '../www/breeding.js';
+import { ArchiveStore } from '../www/archive.js';
+import { applyInputRows, simulationApplied } from '../www/simulation-changes.js';
 import { ReplicaRecovery, ReplicaSwims, WorldBroadcast } from '../www/world-broadcast.js';
 import { CONFIG, World } from './empty-world.mjs';
 
@@ -163,6 +166,56 @@ test('合流按鱼元归属清理空造景，同位置的两份造景各自保�
   assert.deepEqual(world.sceneCells(samePosition).map(cell => cell.id), [samePosition + ':0', samePosition + ':1']);
 });
 
+test('连续合流跳过未变的鱼元归属，仍与完整合流同样处理进食、掉落、归档和前台编辑', () => {
+  const at = Date.now() - 10000, full = new World(at), live = new World(at, full.id);
+  const fish = crypto.randomUUID(), cell = { x: 0, y: 0, ch: 'o', color: '#88aacc' };
+  for (const world of [full, live]) {
+    assert(world.apply({ id: fish, actor: fish, kind: 'fish', t: at, x: 40, y: 20, cost: 2, gender: 'male',
+      cells: [cell, { ...cell, x: 1, ch: '鱼' }] }).ok);
+    world.attachArchives(new ArchiveStore());
+  }
+  const loose = { ...cell, id: 'loose', kind: 'food', entity: '', born: at, created: at, path: [] };
+  let tick = at, scans = 0;
+  const charValues = live.charValues.bind(live);
+  live.charValues = (...kinds) => { if (!kinds.length) scans++; return charValues(...kinds); };
+  const merge = (chars = {}, fishes = {}, scenes = {}) => {
+    const delta = { protocol: 1, roots: { ...full.data.roots }, tick: tick += 500, ops: {}, scenes, chars, fishes };
+    const previous = scans;
+    full.merge(delta);
+    live.merge(delta, {}, 'replica');
+    assert.deepEqual(live.serialize(), full.serialize());
+    return scans - previous;
+  };
+  assert.equal(merge({ loose }), 1);
+  assert.equal(merge({ loose: { ...loose, y: 1, moveAt: tick + 500 } }), 0);
+  const scene = { id: 'deposit', x: 20, y: 10, posAt: tick };
+  const grain = { ...loose, id: 'one', kind: 'scene', entity: scene.id, path: [{ id: 'settle', reason: 'expire', t: tick }] };
+  const burn = id => ({ ...grain, id, kind: 'burn', entity: '', path: [...grain.path, { id: 'remove', reason: 'delete', t: tick }] });
+  assert.equal(merge({ one: grain, two: { ...grain, id: 'two' } }, {}, { deposit: scene }), 0);
+  assert.equal(merge({ one: burn('one') }), 0);
+  assert(live.data.scenes.deposit);
+  assert.equal(merge({ two: burn('two') }), 0);
+  assert.equal(live.data.scenes.deposit, undefined);
+  const meal = { ...loose, kind: 'fish', entity: fish, x: 2, path: [{ id: 'eat', reason: 'eat', target: fish, t: tick }] };
+  merge({ loose: meal });
+  assert.equal(live.data.fishes[fish].lastFed, meal.path[0].t);
+  const archivedMealAt = tick + 100;
+  for (const world of [full, live]) {
+    world.archives.summary.lastMeals.set(fish, archivedMealAt);
+    world.archives.revision = 1;
+  }
+  merge();
+  assert.equal(live.data.fishes[fish].lastFed, archivedMealAt);
+  for (const world of [full, live]) {
+    applyInputRows(world, [['chars', 'loose', { ...loose }]]);
+    delete world.data.chars[fish + ':0'];
+    simulationApplied(world, { tables: { chars: { set: [], remove: [fish + ':0'] } }, values: {} });
+  }
+  merge();
+  assert.equal(live.data.fishes[fish], undefined);
+  assert.equal(live.data.chars[fish + ':1'].kind, 'food');
+});
+
 test('日常广播只读取变化行，签名时的新变化进入下一包，未知前台编辑只重建一次', async () => {
   const world = new World(100), data = world.data;
   data.fishes = { fish: { x: 1 }, resting: { x: 2 } };
@@ -201,6 +254,30 @@ test('日常广播只读取变化行，签名时的新变化进入下一包，�
 });
 
 const dir = (index, ids) => { const directions = []; directions[index] = ids; return directions; };
+
+test('广播等待发送期间，鱼的父辈、普通鱼和关系记录各自保留捕获时的值', async () => {
+  const world = new World(100), data = world.data;
+  data.fishes = { plain: { x: 1, facing: 1 }, child: { x: 2, parents: ['p', 'q'] } };
+  data.life.bonds = { 'p|q': { a: 'p', b: 'q', seconds: 1 }, old: { details: [1] } };
+  let notify, release;
+  const channel = new WorldBroadcast(callback => { notify = callback; });
+  const network = { live: () => [1], broadcast: (_, body) => body };
+  await channel.send(network, data, 100);
+  data.tick = 600;
+  data.fishes.plain.x = 4;
+  data.fishes.child.x = 5;
+  notify(world, { values: { tick: 600 }, tables: { fishes: { set: Object.entries(data.fishes), remove: [] } } });
+  const expectedFish = structuredClone(data.fishes), expectedLife = structuredClone(data.life);
+  const sending = channel.send({ ...network, broadcast: (_, body) => new Promise(resolve => { release = () => resolve(body); }) }, data, 600);
+  data.fishes.child.parents.push('r');
+  data.fishes.plain.x++;
+  data.life.bonds['p|q'].seconds++;
+  data.life.bonds.old.details.push(2);
+  release();
+  const { world: sent } = await sending;
+  assert.deepEqual(sent.fishes, expectedFish);
+  assert.deepEqual(sent.life, expectedLife);
+});
 
 test('连续步以增量中的鱼行序号携带泳姿，繁忙时合并状态并省略缺步泳姿', async () => {
   const channel = new WorldBroadcast(), world = new World(100), data = world.data;
@@ -356,6 +433,81 @@ test('定期全量接替积压增量，回执丢失会释放连接并由新连�
   await ack(fresh, sent[2]); await flush();
   assert.equal(sender.live.size, 0);
   assert.equal(new ReplicaReader().append(sent[2].text, true).world.fishes.current.x, 6);
+});
+
+test('实时更新的末页比中间页更早验签时仍应用完整版本并确认', async t => {
+  const received = [], receipts = [];
+  const peer = { node: 'source', replicaLive: true };
+  const replica = new ReplicaTransfers({
+    onMessage(message) { received.push(message.body); },
+    directControl(_, kind, body) { receipts.push({ kind, body }); }
+  });
+  t.after(() => replica.stop());
+  const world = { tick: 500, chars: { large: { text: '鱼'.repeat(PAGE_UNITS * 20) } } };
+  const pages = [...replicaPages({ delta: true, world })];
+  const id = crypto.randomUUID();
+  const deliver = index => replica.receive({ kind: 'replicaPage', from: peer.node, actor: 'actor',
+    body: { kind: 'live', id, index, ...pages[index] } }, peer);
+  await deliver(0);
+  await deliver(pages.length - 1);
+  assert.deepEqual(received, []);
+  for (let index = 1; index < pages.length - 1; index++) await deliver(index);
+  assert.deepEqual(received, [{ delta: true, world }]);
+  assert.deepEqual(receipts, [{ kind: 'replicaReceipt', body: { id, index: pages.length - 1, next: pages.length } }]);
+});
+
+test('紧凑更新重建字段和鱼行顺序，切主或缺步原样发送', () => {
+  const before = { tick: 500, fishes: { a: { id: 'a', actor: 'one', x: 1, parents: ['p'] }, b: { id: 'b', x: 4 } },
+    chars: { x: { id: 'x', state: 'food' } }, travel: { a: { since: 500, days: { today: 2 } } },
+    life: { at: 500, bonds: { 'a|b': { at: 500, seconds: 2 }, 'a|c': { at: 500, seconds: 4 } }, stories: { s: { kind: 'a' } } } };
+  const body = { delta: true, swims: [[0]], world: { tick: 1000, fishes: { b: { id: 'b', x: 5 },
+    a: { id: 'a', actor: 'one', x: 2, parents: ['p'] }, born: { id: 'born', x: 1 } },
+    chars: { x: { state: 'burn', id: 'x' } }, travel: { a: { since: 500, days: { today: 3 } } },
+    life: { at: 1000, bonds: { 'a|c': { at: 1000, seconds: 5 } }, stories: {} } } };
+  const base = replicaRowBase(crypto.randomUUID(), before);
+  const compact = encodeReplicaRowDelta(body, base);
+  assert.equal(compact.rowBase, base.id);
+  assert.deepEqual(compact.world.fishes[0], [1, 2, 5]);
+  assert.deepEqual(compact.world.chars[0], ['x', body.world.chars.x]);
+  const reader = new ReplicaReader();
+  let received;
+  for (const page of replicaPages(compact)) received = reader.append(page.text, page.last);
+  assert.equal(JSON.stringify(decodeReplicaRowDelta(received, base)), JSON.stringify(body));
+  assert.equal(decodeReplicaRowDelta(received, null), null);
+  const skipped = { ...body, world: { ...body.world, tick: 1500 } };
+  assert.equal(encodeReplicaRowDelta(skipped, base), skipped);
+  const takeover = { ...body, delta: false };
+  assert.equal(encodeReplicaRowDelta(takeover, base), takeover);
+});
+
+test('一端遗失基准时仅原格式确认本轮，下一轮继续使用紧凑更新', async t => {
+  const peer = { node: 'follower', replicaLive: true, replicaRows: true, confirmedReplica: 'joined' };
+  const via = { node: 'leader', replicaLive: true, replicaRows: true };
+  const received = [], packets = [], errors = [];
+  const sender = new ReplicaTransfers({
+    directControl(_, kind, body) {
+      packets.push(JSON.parse(body.text.split('\n')[0])[1]);
+      return receiver.receive({ kind, body, from: via.node, actor: 'publisher' }, via);
+    },
+    close(_, error) { errors.push(error); }
+  });
+  const receiver = new ReplicaTransfers({
+    onMessage(message) { received.push(message.body.world); },
+    directControl(_, kind, body) { return sender.receive({ kind, body, from: peer.node }, peer); }
+  });
+  t.after(() => { sender.stop(); receiver.stop(); });
+  const publish = async tick => {
+    sender.publishLive({ delta: true, world: { tick, fishes: { a: { id: 'a', x: tick / 500 } } } }, [peer]);
+    for (let i = 0; i < 100 && sender.live.size; i++) await new Promise(resolve => setImmediate(resolve));
+    assert.equal(sender.live.size, 0);
+  };
+  await publish(500);
+  receiver.rowsReceived.delete(via);
+  await publish(1000);
+  await publish(1500);
+  assert.deepEqual(received.map(world => [world.tick, world.fishes.a.x]), [[500, 1], [1000, 2], [1500, 3]]);
+  assert.deepEqual(packets.map(packet => !!packet.rowBase), [false, true, false, true]);
+  assert.deepEqual(errors, []);
 });
 
 test('已确认直连持续发差量，归档删除后回收比较基线，旧网状成员仍定期补齐', async () => {

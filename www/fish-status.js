@@ -2,8 +2,10 @@ export const DAY = 24 * 60 * 60 * 1000;
 export const MEAL_INTERVAL = 60 * 60 * 1000;
 // Creation/birth sets lastFed for hunger, but is not a meal.
 export function lastMealAt(fish, recorded) {
-  const known = [recorded, fish.lastMealAt, fish.lastFed > fish.created ? fish.lastFed : undefined].filter(Number.isFinite);
-  return known.length ? Math.max(...known) : undefined;
+  let latest = Number.isFinite(recorded) ? recorded : -Infinity;
+  if (Number.isFinite(fish.lastMealAt)) latest = Math.max(latest, fish.lastMealAt);
+  if (Number.isFinite(fish.lastFed) && fish.lastFed > fish.created) latest = Math.max(latest, fish.lastFed);
+  return latest === -Infinity ? undefined : latest;
 }
 export function feedingStatus(fish, now, recorded) {
   const last = lastMealAt(fish, recorded), nextMealAt = last === undefined ? undefined : last + MEAL_INTERVAL;

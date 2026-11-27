@@ -96,8 +96,12 @@ try {
       if (Object.is(a, b)) return;
       if (!a || !b || typeof a !== 'object' || typeof b !== 'object' || Array.isArray(a) !== Array.isArray(b)) mismatch(path);
       if (Array.isArray(a) && a.length !== b.length) mismatch(path);
-      const keys = Object.keys(a);
-      if (keys.length !== Object.keys(b).length) mismatch(path);
+      const keys = Object.keys(a), other = Object.keys(b);
+      if (keys.length !== other.length) mismatch(path);
+      const field = path.at(-1);
+      if (['chars', 'fishes', 'contacts', 'bonds', 'stories'].includes(field) || path.includes('bonds')) {
+        if (keys.some((key, i) => key !== other[i])) mismatch([...path, '顺序']);
+      }
       for (const key of keys) {
         path.push(key);
         if (!Object.hasOwn(b, key)) mismatch(path);

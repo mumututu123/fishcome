@@ -89,6 +89,18 @@ test('环形边界的遮挡、等距邻居和常去造景在完整模拟中保�
     ? Object.fromEntries(Object.keys(value).sort().map(key => [key, value[key]])) : value);
   assert.equal(createHash('sha256').update(state).digest('hex'), '122247f3e711c3b2cad080a2f05e1a606440380e020d22db56d3f55f3b22c18d');
 });
+test('距离与标识排序都相等时保留跨海界的分桶和桶内顺序', () => {
+  const w = world(), groups = new Map(), right = 'e\u0301', left = 'é', alsoLeft = 'é\u0001';
+  assert.equal(right.localeCompare(left), 0);
+  assert.equal(left.localeCompare(alsoLeft), 0);
+  for (const [id, x] of [['center', 0], [right, 1], [alsoLeft, 999], [left, 999]]) {
+    w.data.fishes[id] = { id, x, y: 20, facing: 1 };
+    groups.set(id, [{ x: 0, y: 0 }]);
+  }
+  const ctx = lifeContext(w, t, new Map(), groups);
+  assert.deepEqual(ctx.neighbors.get('center').map(p => p.id), [alsoLeft, left, right]);
+  assert.equal(ctx.crowdedNeighbor(ctx.points.get('center')).id, alsoLeft);
+});
 test('旧存档的分数坐标保留距离边界上的单向视线', () => {
   const w = world(), a = fish(w, 7, 20), b = crypto.randomUUID();
   assert(w.apply({ id: b, actor: 'bob', t, kind: 'fish', x: 20, y: 9, cells: [cell(0, 0), cell(0, 1)], cost: 2 }).ok);
@@ -216,4 +228,39 @@ test('无效时间、关系、来源和浮游凭据被拒绝，合法自然记�
   const w = world(), a = fish(w), b = fish(w, 25, 20, 'bob'); track(w, 45); assert(validateLife(w.data.life, source(w)));
   for (const mutate of [l => l.at = Infinity, l => l.bonds[pairKey(a, b)].seconds = -1, l => l.bonds[pairKey(a, b)].run = 999, l => l.stories[Object.keys(l.stories)[0]].fish = 'forged', l => l.bloomThrough.nope = 1]) { const bad = clone(w.data.life); mutate(bad); assert(!validateLife(bad, source(w))); const snapshot = w.serialize(); snapshot.life = bad; assert.throws(() => w.merge(snapshot), /鱼生记录/); }
   const at = weatherTime(w, 'plankton'); spawnPlankton(w, at); const c = Object.values(w.data.chars).find(c => c.plankton); assert(validPlankton(c, w.data.roots)); c.color = '#ffffff'; assert(!validPlankton(c, w.data.roots));
+});
+
+test('密集鱼群混有自然出生鱼时，关系上限和同一秒的熟鱼故事保留原有顺序', () => {
+  const start = Date.UTC(2025, 5, 15, 12, 17);
+  const actual = new World(start, 'mixed-school', { populate: false });
+  const ids = Array.from({ length: 105 }, (_, i) => i % 19 === 0 ? 'born:breed:older:' + i
+    : '00000000-0000-4000-8000-' + String(i).padStart(12, '0')).reverse();
+  for (const [i, id] of ids.entries()) {
+    actual.data.fishes[id] = { id, x: 997 + i % 5, y: 20 + i % 3, facing: 1 };
+    actual.data.chars[id] = { id, entity: id, kind: 'fish', x: 0, y: 0, path: [] };
+  }
+  for (let i = 0; i < ids.length; i++) for (let j = i + 1; j < ids.length; j++) {
+    if ((i + j) % 7) continue;
+    const [a, b] = [ids[i], ids[j]].sort(), key = a + '|' + b;
+    actual.data.life.bonds[key] = { a, b, seconds: 44, at: start, lastNear: start, run: 9 };
+    if ((i + j) % 3 === 0) recordStory(actual, 'friend', a, start - i, { other: b });
+  }
+  for (let i = 0; i < LIFE.storyLimit; i++) recordStory(actual, 'meal', 'older-' + i, start - i);
+  const expected = new World(start, 'mixed-school', { populate: false });
+  expected.data = actual.serialize();
+  const now = start + 1000, c = context(actual, now), bonds = expected.data.life.bonds, seen = new Set();
+  for (const [id, others] of c.neighbors) for (const q of others) {
+    const [a, b] = [id, q.id].sort(), key = a + '|' + b;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const old = bonds[key];
+    if (old) recordStory(expected, 'friend', a, now, { other: b });
+    bonds[key] = { a, b, seconds: (old?.seconds || 0) + 1, at: now, lastNear: now, run: old ? old.run + 1 : 0 };
+  }
+  const keys = Object.keys(bonds).sort((a, b) => a.localeCompare(b)).slice(0, LIFE.bondLimit);
+  updateLife(actual, now, c);
+  assert.deepEqual(Object.keys(actual.data.life.bonds), keys);
+  assert.deepEqual(actual.data.life.bonds, Object.fromEntries(keys.map(key => [key, bonds[key]])));
+  assert.deepEqual(Object.keys(actual.data.life.stories), Object.keys(expected.data.life.stories));
+  assert.deepEqual(actual.data.life.stories, expected.data.life.stories);
 });

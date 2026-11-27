@@ -67,12 +67,12 @@ test('全员离线与中途重开不补事件；没有熟鱼或成熟海草的�
 
 test('会议短暂停留，游行尝试同步转向；分散、饥饿、繁殖和食物仍按生态规则处理', () => {
   const w = make(), fishes = populated(w), meeting = startEvent(w, 'meeting'); assert(meeting);
-  assert.deepEqual(eventMotion(w.data, fishes[0], meeting.started + 1000, context(w, meeting.started + 1000)), { dx: 0, dy: 0 });
-  w.data.fishes[fishes[1]].x = 700; assert.equal(eventMotion(w.data, fishes[0], meeting.started + 1000, context(w, meeting.started + 1000)), null); w.data.fishes[fishes[1]].x = 373;
+  assert.deepEqual(eventMotion(fishes[0], meeting.started + 1000, context(w, meeting.started + 1000)), { dx: 0, dy: 0 });
+  w.data.fishes[fishes[1]].x = 700; assert.equal(eventMotion(fishes[0], meeting.started + 1000, context(w, meeting.started + 1000)), null); w.data.fishes[fishes[1]].x = 373;
   const parade = startEvent(w, 'parade'); assert(parade);
-  assert.equal(eventMotion(w.data, fishes[0], parade.started + 1000, context(w, parade.started + 1000)).dx, parade.direction);
-  assert.equal(eventMotion(w.data, fishes[0], parade.started + 7000, context(w, parade.started + 7000)).dx, -parade.direction);
-  assert.equal(eventMotion(w.data, fishes[0], parade.started + 13000, context(w, parade.started + 13000)), null);
+  assert.equal(eventMotion(fishes[0], parade.started + 1000, context(w, parade.started + 1000)).dx, parade.direction);
+  assert.equal(eventMotion(fishes[0], parade.started + 7000, context(w, parade.started + 7000)).dx, -parade.direction);
+  assert.equal(eventMotion(fishes[0], parade.started + 13000, context(w, parade.started + 13000)), null);
   w.data.fishes[fishes[0]].lastFed = parade.started - 86400000;
   const hungryMotion = idleMotion(w, w.data.fishes[fishes[0]], parade.started + 1000, context(w, parade.started + 1000)), remembered = w.data.life.events;
   w.data.life.events = {}; assert.deepEqual(idleMotion(w, w.data.fishes[fishes[0]], parade.started + 1000, context(w, parade.started + 1000)), hungryMotion); w.data.life.events = remembered;

@@ -161,17 +161,28 @@ export function updateContacts(world, now, groups, scenery, captured = capturedF
   world.data.contacts ||= {}; world.data.breeding ||= {};
   const taken = new Set(activeRecords(world.data).flatMap(record => [record.male, record.female]));
   const males = [], females = new Set(), pairs = new Map();
+  let density, ambiguousIds = false;
   for (const id of groups.keys()) {
     const fish = world.data.fishes[id];
     if (!fish || taken.has(id) || captured.has(id)) continue;
-    const gender = fishOrigin(world.data, id)?.gender;
+    if (typeof id !== 'string' || id.includes('|')) ambiguousIds = true;
+    const op = world.data.ops[id], gender = op?.kind === 'fish' ? op.gender : fishOrigin(world.data, id)?.gender;
     if (gender === 'male') males.push(fish);
     if (gender === 'female') females.add(id);
   }
   if (males.length && females.size) occupancy ||= world.movementGrid(groups);
   if (females.size) for (const fish of males) {
     const id = fish.id;
-    for (const cell of groups.get(id)) {
+    const cells = groups.get(id);
+    const hull = density && occupancy.integerCells && !ambiguousIds && occupancy.layout?.hull(cells);
+    if (hull?.namedCells) {
+      const b = hull.bounds;
+      const left = fish.x + fish.facing * (fish.facing === 1 ? b.minX : b.maxX);
+      // For integer cells the rounded midpoint lies on the cell or one step right/down.
+      if ((b.width + 1) * (b.height + 1) <= cells.length * NEIGHBORS.length &&
+          density.crowdedRegion(left, fish.y + b.minY, left + b.width, fish.y + b.maxY + 1)) continue;
+    }
+    for (const cell of cells) {
       const p = cellPosition(fish, cell);
       for (const [dx, dy] of NEIGHBORS) {
         const x = p.x + dx, y = p.y + dy, occupants = occupancy.get(x, y);
@@ -179,6 +190,7 @@ export function updateContacts(world, now, groups, scenery, captured = capturedF
         const cellId = typeof cell.id === 'string' ? cell.id : null;
         for (const other of occupants) {
           if (!females.has(other)) continue;
+          if (world.ambient && !density) density = densityField(world, scenery, occupancy.integerCells ? occupancy.cells : undefined);
           const pairKey = `${id}|${other}`, pair = pairs.get(pairKey);
           if (!pair) pairs.set(pairKey, { male: id, female: other, firstMaleId: cellId });
           else if (pair.male !== id || pair.female !== other) pairs.set(pairKey, { male: id, female: other, firstMaleId: null });
@@ -187,7 +199,7 @@ export function updateContacts(world, now, groups, scenery, captured = capturedF
       }
     }
   }
-  const contacts = {}, density = world.ambient && pairs.size ? densityField(world, scenery, occupancy.integerCells ? occupancy.cells : undefined) : null;
+  const contacts = {};
   for (const [key, { male, female, firstMaleId }] of [...pairs].sort(([a], [b]) => a.localeCompare(b))) {
     if (taken.has(male) || taken.has(female)) continue;
     const father = world.data.fishes[male], mother = world.data.fishes[female], fc = groups.get(male), mc = groups.get(female);
@@ -205,18 +217,38 @@ export function updateContacts(world, now, groups, scenery, captured = capturedF
   world.data.contacts = Object.fromEntries(Object.entries(contacts).filter(([, pair]) => !taken.has(pair.male) && !taken.has(pair.female)));
   world.data.contactAt = now;
 }
-export function motionUnits(world, groups) {
+export function motionOrder(world, groups, layout = world.bodyLayout(groups)) {
+  const active = activeRecords(world.data);
+  if (!active.length) return layout.ordered;
   const result = [], paired = new Set();
-  for (const record of activeRecords(world.data).sort((a, b) => a.id.localeCompare(b.id))) {
+  for (const record of active.sort((a, b) => a.id.localeCompare(b.id))) {
     const members = [world.data.fishes[record.male], world.data.fishes[record.female]];
     if (members.some(fish => !fish)) continue;
     const placed = members.flatMap(fish => (groups.get(fish.id) || []).map(cell => { const p = cellPosition(fish, cell); return { ...cell, x: nearX(p.x, members[0].x), y: p.y }; })), b = bounds(placed);
     const fish = { id: record.id, x: b.minX, y: b.minY, facing: 1, created: record.started, ...record.motion };
-    result.push({ id: record.id, fish, cells: placed.map(cell => ({ ...cell, x: cell.x - b.minX, y: cell.y - b.minY })), members, offsets: members.map(member => ({ x: nearX(member.x, members[0].x) - b.minX, y: member.y - b.minY, facing: member.facing })), record });
+    const cells = placed.map(cell => ({ ...cell, x: cell.x - b.minX, y: cell.y - b.minY }));
+    const offsets = members.map(member => ({ x: nearX(member.x, members[0].x) - b.minX, y: member.y - b.minY, facing: member.facing }));
+    result.push([record.id, cells, { id: record.id, fish, cells, members, offsets, record }]);
     for (const member of members) paired.add(member.id);
   }
-  for (const [id, cells] of groups) if (!paired.has(id) && world.data.fishes[id]) result.push({ id, cells, fish: world.data.fishes[id], members: [world.data.fishes[id]] });
-  return result;
+  const units = [];
+  let index = 0;
+  for (const entry of layout.ordered) {
+    const [id] = entry;
+    if (paired.has(id)) continue;
+    while (index < result.length && result[index][0].localeCompare(id) <= 0) units.push(result[index++]);
+    units.push(entry);
+  }
+  while (index < result.length) units.push(result[index++]);
+  return units;
+}
+export function motionUnits(world, groups) {
+  const units = [], fishes = world.data.fishes;
+  for (const [id, cells, pair] of motionOrder(world, groups)) {
+    if (pair) units.push(pair);
+    else if (fishes[id]) units.push({ id, cells, fish: fishes[id], members: [fishes[id]] });
+  }
+  return units;
 }
 export function commitUnit(unit, now) {
   if (unit.record) {

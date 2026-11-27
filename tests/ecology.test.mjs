@@ -102,3 +102,34 @@ test('人工字符、主动改字后的沉积与聊天记忆不会风化，风�
   w.data.ecology.hour = hour - 1; updateEcology(w, now, transition); assert.equal(c.kind, 'scene'); assert.equal(memory.kind, 'scene'); assert.equal(w.sceneCells(created).length, 2); assert.equal(w.wallet('maker'), 18);
 });
 test('生态时钟合流取稳定起点和最新小时，非法时间拒绝', () => { const a = newEcology(now, true), b = newEcology(now + HOUR); assert.deepEqual(mergeEcology(a, b), mergeEcology(b, a)); assert(validEcology(a)); assert(!validEcology({ ...a, activated: Infinity })); });
+
+test('鱼体横跨接缝、海面或密度分界时，整片繁殖区域与逐点密度相同', () => {
+  const w = sea();
+  fill(w, 0, 9, 420);
+  const density = densityField(w);
+  let crowded = 0, open = 0;
+  for (const left of [-17, -4, 0, 5, 990, 998, 1010]) for (const top of [0, 1, 8, 20]) {
+    for (const width of [1, 3, 8]) {
+      const right = left + width, bottom = top + 3;
+      let allCrowded = true;
+      for (let x = left; x <= right; x++) for (let y = top; y <= bottom; y++) {
+        if (Number.isFinite(contactTime(density(x, y)))) allCrowded = false;
+      }
+      assert.equal(density.crowdedRegion(left, top, right, bottom), allCrowded);
+      if (allCrowded) crowded++; else open++;
+    }
+  }
+  assert(crowded && open);
+});
+
+test('旧鱼体重复编号仍按原来的首个鱼元寻找接触点', () => {
+  const w = sea();
+  fish(w, 'male', 60); fish(w, 'female', 63);
+  const male = fish(w, 'male', 20), female = fish(w, 'female', 23);
+  const cells = w.fishCells(male);
+  cells[0].id = cells[2].id;
+  fill(w, 22, 20, 420);
+  assert.equal(contactTime(densityField(w)(23, 20)), Infinity);
+  updateContacts(w, now, w.fishGroups(), w.sceneryMap());
+  assert.deepEqual(w.data.contacts[male + '|' + female], { male, female, since: now, lastAt: now });
+});

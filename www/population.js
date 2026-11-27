@@ -62,7 +62,7 @@ function checkIllness(world, now) {
   if (slot <= state.illnessSlot || !world.ambient) return;
   state.illnessSlot = slot;
   // Never backfill infections for unattended/offline hours.
-  const fishes = Object.values(world.data.fishes);
+  const fishes = world.fishValues();
   if (fishes.length < POPULATION.threshold) return;
   const active = fishes.filter(f => illnessOf(world.data, f.id)).length;
   const quota = Math.max(0, Math.ceil(fishes.length * POPULATION.sickRatio) - active);
@@ -82,14 +82,14 @@ function lineClear(world, a, b, scenery) {
   return true;
 }
 function updatePredators(world, now, dt, transition) {
-  const state = world.data.population, count = Object.keys(world.data.fishes).length;
+  const state = world.data.population, fishes = world.fishValues(), count = fishes.length;
   const wanted = Math.min(POPULATION.predators, Math.max(0, Math.ceil((count - POPULATION.predatorThreshold) / 100)));
   for (const id of Object.keys(state.predators)) if (+id >= wanted) delete state.predators[id];
   if (!wanted && !Object.keys(state.predators).length) return;
   const groups = world.fishGroups();
   const scenery = populationScenery(world.data, world.sceneryMap(false), { predators: false });
-  const occupants = world.fishMap(groups);
-  const fits = p => predatorCells(p).every(c => world.waterAt(c.x, c.y) && !scenery.has(key(c.x, c.y)) && !occupants.has(key(c.x, c.y)));
+  const occupants = world.movementGrid(groups);
+  const fits = p => predatorCells(p).every(c => world.waterAt(c.x, c.y) && !scenery.has(key(c.x, c.y)) && !occupants.get(c.x, c.y));
   for (let i = 0; i < wanted; i++) if (!state.predators[i]) {
     for (let attempt = 0; attempt < 32; attempt++) {
       const x = hash(`predator:${world.id}:${i}:${attempt}`) % 1000;
@@ -104,7 +104,7 @@ function updatePredators(world, now, dt, transition) {
     const mouth = predatorCells(p)[0], ready = now - p.lastBite >= POPULATION.biteCooldown && now - state.huntAt >= POPULATION.huntCooldown;
     const targets = [];
     if (ready) {
-      prey ??= Object.values(world.data.fishes).filter(f => now - f.created >= POPULATION.juvenile && (groups.get(f.id)?.length || Infinity) <= POPULATION.preySize);
+      prey ??= fishes.filter(f => now - f.created >= POPULATION.juvenile && (groups.get(f.id)?.length || Infinity) <= POPULATION.preySize);
       for (const f of prey) {
         if (!world.data.fishes[f.id]) continue;
         for (const cell of groups.get(f.id) || []) {
@@ -121,7 +121,7 @@ function updatePredators(world, now, dt, transition) {
       const m = predatorCells(p)[0], dx = Math.abs(deltaX(target.x, m.x)), dy = Math.abs(target.y - m.y);
       if (dx + dy !== 1) return false; // No attacks across diagonal corners or scenery.
       const f = target.fish;
-      for (const c of groups.get(f.id) || []) { const at = cellPosition(f, c); occupants.delete(key(at.x, at.y)); }
+      for (const c of groups.get(f.id) || []) { const at = cellPosition(f, c); occupants.clear(at.x, at.y); }
       killFish(world, f.id, now, 'predator', transition, groups); p.lastBite = state.huntAt = now; target = null; return true;
     };
     if (bite()) continue;
@@ -130,7 +130,7 @@ function updatePredators(world, now, dt, transition) {
     if (dx && dx !== p.facing) {
       // Mirror about the body midpoint, checking every swept grid cell.
       const next = { ...p, x: wrapX(p.x - 3 * p.facing), facing: -p.facing };
-      const swept = predatorCells(p).every(c => Array.from({ length: 7 }, (_, i) => p.x - 3 + i).every(x => world.waterAt(x, c.y) && !scenery.has(key(x, c.y)) && !occupants.has(key(x, c.y))));
+      const swept = predatorCells(p).every(c => Array.from({ length: 7 }, (_, i) => p.x - 3 + i).every(x => world.waterAt(x, c.y) && !scenery.has(key(x, c.y)) && !occupants.get(x, c.y)));
       if (swept && free(next)) { p.x = next.x; p.facing = next.facing; }
     }
     p.cx = dx ? Math.min(1, p.cx + dt) : 0; p.cy = dy ? Math.min(1, p.cy + dt * .6) : 0;

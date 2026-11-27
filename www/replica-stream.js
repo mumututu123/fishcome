@@ -1,5 +1,6 @@
 import { worldTables } from './simulation-changes.js';
 import { DAY, shanghaiDay } from './fish-status.js';
+import { decodeReplicaRowDelta, encodeReplicaRowDelta, replicaRowBase } from './replica-row-delta.js';
 
 // One record per line lets the receiver assemble tables without retaining the wire text.
 // A record may span several signed pages, including in the middle of a surrogate pair.
@@ -154,6 +155,8 @@ export class ReplicaTransfers {
     this.incoming = new Map();
     this.completed = new Map();
     this.live = new Map();
+    this.rowsSent = new WeakMap();
+    this.rowsReceived = new WeakMap();
   }
   publishLive(body, peers) {
     for (const peer of peers) {
@@ -172,21 +175,31 @@ export class ReplicaTransfers {
   async sendLive(peer, lane) {
     try {
       while (lane.pending) {
-        const body = lane.pending, id = crypto.randomUUID();
+        const body = lane.pending;
         lane.pending = null;
-        let index = 0;
-        for (const page of replicaPages(body)) {
-          const packet = { id, kind: 'live', index: index++, ...page };
-          if (!page.last) { await this.network.directControl(peer, 'replicaPage', packet); continue; }
-          const applied = new Promise((resolve, reject) => { lane.receipt = { id, index: packet.index, resolve, reject }; });
-          const timeout = setTimeout(() => lane.receipt?.reject(new Error('伙伴应用世界增量超时')), body.delta ? ACK_MS : RESUME_MS);
-          try {
-            const [, next] = await Promise.all([this.network.directControl(peer, 'replicaPage', packet), applied]);
-            if (next !== index) throw new Error('伙伴拒绝世界增量');
-          } finally { clearTimeout(timeout); lane.receipt = null; }
-        }
+        const encoded = peer.replicaRows ? encodeReplicaRowDelta(body, this.rowsSent.get(peer)) : body;
+        let id = await this.sendLivePacket(peer, lane, encoded);
+        if (!id && encoded !== body) id = await this.sendLivePacket(peer, lane, body);
+        if (!id) throw new Error('伙伴拒绝世界增量');
+        if (peer.replicaRows) this.rowsSent.set(peer, replicaRowBase(id, body.world));
       }
     } finally { if (this.live.get(peer) === lane) this.live.delete(peer); }
+  }
+  async sendLivePacket(peer, lane, body) {
+    const id = crypto.randomUUID();
+    let index = 0;
+    for (const page of replicaPages(body)) {
+      const packet = { id, kind: 'live', index: index++, ...page };
+      if (!page.last) { await this.network.directControl(peer, 'replicaPage', packet); continue; }
+      const applied = new Promise((resolve, reject) => { lane.receipt = { id, index: packet.index, resolve, reject }; });
+      const timeout = setTimeout(() => lane.receipt?.reject(new Error('伙伴应用世界增量超时')), body.delta ? ACK_MS : RESUME_MS);
+      try {
+        const [, next] = await Promise.all([this.network.directControl(peer, 'replicaPage', packet), applied]);
+        if (next === -2 && body.rowBase) return null;
+        if (next !== index) throw new Error('伙伴拒绝世界增量');
+        return id;
+      } finally { clearTimeout(timeout); lane.receipt = null; }
+    }
   }
   discardPendingLive() {
     for (const [peer, lane] of this.live) {
@@ -272,11 +285,13 @@ export class ReplicaTransfers {
     let state = this.incoming.get(key);
     if (!state) {
       if (direct && index > 0) { await acknowledge(0); return false; }
-      if (this.incoming.size >= 16 || index > 16) throw new Error('世界分块接收队列已满');
+      if (this.incoming.size >= 16 || !live && index > 16) throw new Error('世界分块接收队列已满');
       state = { kind, actor: message.actor, next: 0, pending: new Map(), reader: new ReplicaReader() };
       this.incoming.set(key, state);
     }
-    if (state.kind !== kind || state.actor !== message.actor || index > state.next + 16 ||
+    // A live edge has one update in flight, but decompressing and verifying
+    // its pages can finish out of order. The shared byte budget below still applies.
+    if (state.kind !== kind || state.actor !== message.actor || !live && index > state.next + 16 ||
         state.endIndex !== undefined && (index > state.endIndex || last && index !== state.endIndex)) throw new Error('世界分块版本不一致');
     if (last) state.endIndex = index;
     if (index < state.next || state.pending.has(index)) {
@@ -292,17 +307,24 @@ export class ReplicaTransfers {
       while (state.pending.has(state.next)) {
         const page = state.pending.get(state.next);
         state.pending.delete(state.next++);
-        const body = state.reader.append(page.text, page.last);
+        let body = state.reader.append(page.text, page.last);
         if (!body) continue;
         if (state.pending.size) throw new Error('世界分块结束位置无效');
         if (kind === 'catchup' && body.base !== peer.confirmedReplica) throw new Error('分块变更引用了未确认的世界版本');
-        state.applying = this.network.onMessage({ id, kind: kind === 'catchup' ? 'merge' : live ? 'world' : kind, actor: message.actor, from: message.from, key: message.key, body }, peer);
-        await state.applying;
+        if (Object.hasOwn(body, 'rowBase')) {
+          if (!live || !peer.replicaRows) throw new Error('伙伴未确认实时变更格式');
+          body = decodeReplicaRowDelta(body, this.rowsReceived.get(peer));
+        }
+        if (body) {
+          state.applying = this.network.onMessage({ id, kind: kind === 'catchup' ? 'merge' : live ? 'world' : kind, actor: message.actor, from: message.from, key: message.key, body }, peer);
+          await state.applying;
+          if (live && peer.replicaRows) this.rowsReceived.set(peer, replicaRowBase(id, body.world));
+        }
         if (kind === 'hello') { peer.confirmedReplica = id; this.resumeLive(peer); }
         clearTimeout(state.timer); this.incoming.delete(key);
         const timer = setTimeout(() => this.completed.delete(key), RESUME_MS);
         this.completed.set(key, { next: state.next, timer });
-        if (live) await this.network.directControl(peer, 'replicaReceipt', { id, index: state.endIndex, next: state.next });
+        if (live) await this.network.directControl(peer, 'replicaReceipt', { id, index: state.endIndex, next: body ? state.next : -2 });
         break;
       }
       await acknowledge(state.next);

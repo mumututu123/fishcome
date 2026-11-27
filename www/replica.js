@@ -1,4 +1,4 @@
-import { CONFIG, chooseClaim, hash, validGlyph, validateOperation } from './engine.js';
+import { CONFIG, chooseClaim, hash, replicaSourceRows, validGlyph, validateOperation } from './engine.js';
 import { verifyEnvelope } from './storage.js';
 import { verifyReferral } from './referral.js';
 import { CHAT_FLOOR, validChatMessage, chatGlyphs, chatColor, chatCellId } from './chat.js';
@@ -16,6 +16,7 @@ import { ARCHIVE_FIELDS, assembleFragments, decodeArchive, mergeArchiveRecord, v
 import { buildOriginSources, inspectFishOrigin } from './diagnostics.js';
 
 const opBody = op => { const { proof, ...body } = op; return body; };
+
 export async function verifyChats(messages = {}, store, current = {}, roots) {
   for (const [id, message] of Object.entries(messages)) {
     if (!validChatMessage(message) || id !== message.id) throw new Error('聊天记录无效');
@@ -47,12 +48,14 @@ export async function verifyReplica(data, extra = {}, store, { current = {}, con
   if (data.seaweedHour !== undefined && (!Number.isInteger(data.seaweedHour) || data.seaweedHour < 0 || data.seaweedHour > Math.floor((Date.now() + 60000) / HOUR))) throw new Error('海草生长时钟无效');
   if (data.bubbleMinute !== undefined && (!Number.isInteger(data.bubbleMinute) || data.bubbleMinute < 0 || data.bubbleMinute > Math.floor((Date.now() + 60000) / MINUTE))) throw new Error('气泡生成时钟无效');
   if (data.bubbles !== undefined && (!data.bubbles || typeof data.bubbles !== 'object' || Array.isArray(data.bubbles) || Object.keys(data.bubbles).length > 200000)) throw new Error('气泡记录无效');
-  const sources = buildOriginSources(data, extra, current);
-  if (!validPopulation(data.population, { ...sources, fishes: { ...current.fishes, ...extra.fishes, ...data.fishes } }) || !validRocks(data.rocks, sources)) throw new Error('生态控制记录无效');
+  const chats = Object.keys(data.chats || {}).length > 0, chatSources = Object.keys(data.chatSources || {}).length > 0;
+  const chars = chats || chatSources ? undefined : replicaSourceRows(data.chars, current.chars, extra.chars);
+  const sources = buildOriginSources(data, extra, current, chars);
+  if (!validPopulation(data.population, { ...sources, fishes: replicaSourceRows(data.fishes, extra.fishes, current.fishes) }) || !validRocks(data.rocks, sources)) throw new Error('生态控制记录无效');
   // Check branch-local structure here; reconcile the source's final history during merge.
   for (const [id, bubble] of Object.entries(data.bubbles || {})) if (id !== bubble.id || !validBubble(bubble, sources.chars, false) || bubble.born > Date.now() + 60000) throw new Error('气泡缺少合法海草来源');
-  await verifyChats(data.chats, store, current, sources.roots);
-  await verifyChats(data.chatSources, store, { ...current, chats: { ...current.chats, ...data.chats } });
+  if (chats) await verifyChats(data.chats, store, current, sources.roots);
+  if (chatSources) await verifyChats(data.chatSources, store, { ...current, chats: { ...current.chats, ...data.chats } });
   if (!validateLife(data.life, sources)) throw new Error('鱼生记录无效');
   if (!validLegends(data.legends, sources)) throw new Error('稀有异象记录无效');
   if (data.breeding !== undefined && (!data.breeding || typeof data.breeding !== 'object' || Array.isArray(data.breeding) || Object.keys(data.breeding).length > 500000)) throw new Error('繁殖记录无效');

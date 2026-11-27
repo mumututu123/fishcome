@@ -1,7 +1,7 @@
 import { CONFIG } from './engine.js';
 import { fishOrigin, writeBreedingRecord } from './breeding.js';
 import { simulationWillApply, simulationApplied, subscribeSimulationChanges, worldRevision, worldTables } from './simulation-changes.js';
-import { expandSimulationPatch } from './simulation-delta.js';
+import { expandSimulationPatch, rowId } from './simulation-delta.js';
 export { subscribeSimulationChanges } from './simulation-changes.js';
 
 function* initialRows(world) {
@@ -34,8 +34,8 @@ function* initialRows(world) {
   for (const id of summary.grassMeals) yield ['@grassMeals', id, true];
 }
 
-function applyResult(world, { patch: delta, foodRevision }) {
-  const patch = expandSimulationPatch(world.data, delta);
+function applyResult(world, { patch: delta, foodRevision }, knownFish) {
+  const patch = expandSimulationPatch(world.data, delta, knownFish);
   simulationWillApply(world, patch);
   for (const [field, changes] of Object.entries(patch.tables)) {
     const table = world.data[field] ||= {};
@@ -69,6 +69,7 @@ export class SimulationClient {
     this.worker?.terminate();
     this.worker = null;
     this.owner = null;
+    this.knownFish = null;
     this.failure = null;
     const pending = this.pending;
     this.pending = null;
@@ -102,6 +103,7 @@ export class SimulationClient {
   async open(world, valid) {
     this.close();
     const worker = this.worker = this.makeWorker();
+    this.knownFish = Object.keys(world.data.fishes);
     this.names = new Map();
     this.foods = new Map();
     this.archiveChanges = [];
@@ -160,7 +162,7 @@ export class SimulationClient {
     const result = await this.request(message);
     if (!result || !valid()) { this.close(); return null; }
     if (!this.foods.size) {
-      applyResult(world, result);
+      applyResult(world, result, this.knownFish);
       return result;
     }
     // A food arrived during this step. Restore the last committed records on
@@ -172,7 +174,8 @@ export class SimulationClient {
       return null;
     }
     let rows = [];
-    for (const [field, changes] of Object.entries(tables)) for (const [id] of changes.set) {
+    for (const [field, changes] of Object.entries(tables)) for (const row of changes.set) {
+      const id = rowId(row, this.knownFish);
       rows.push([field, id, world.data[field][id]]);
       if (rows.length < 256) continue;
       await this.request({ kind: 'restore', rows });

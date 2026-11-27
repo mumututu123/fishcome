@@ -80,3 +80,60 @@ test('后台按种类读取鱼元保留字符表顺序，变种类、删行和�
   assert.deepEqual(ids('food'), ['final']);
   assert.deepEqual(ids(), ['final']);
 });
+
+test('后台生态索引读取当前鱼体和餐史，换主人、修改旧餐、回滚后与重新索引相同', () => {
+  const { worker, send } = startWorker([food('first', 10), food('second', 20)]);
+  const world = worker.world, cells = world.data.chars;
+  const check = () => assert.deepEqual(world.ecologyCharacters(), World.prototype.ecologyCharacters.call(world));
+  check();
+  cells.first.kind = 'fish';
+  cells.first.entity = 'adult';
+  cells.first.path.push({ reason: 'eat', t: start, target: 'adult' });
+  check();
+  cells.first.wild = {};
+  check();
+  cells.first.path[0].target = 'earlier';
+  check();
+  cells.first.entity = 'offspring';
+  check();
+  send({ kind: 'restore', rows: [['chars', 'first', undefined]] });
+  check();
+});
+
+test('后台复用上一轮占位时仍采纳旧姿态恢复、鱼元位移和重叠鱼的顺序', () => {
+  const { worker, send } = startWorker(['a','b'].map((id, i) => ({ ...food(id, i), kind: 'fish', entity: id })));
+  const { world } = worker;
+  function pose(id, x) { return { id, x, y: 10, facing: 1 }; }
+  send({ kind: 'restore', rows: [['fishes', 'a', pose('a', 4)], ['fishes','b',pose('b', 9)]] });
+  const grid = () => world.movementGrid(world.fishGroups());
+  assert.deepEqual([...grid().get(4, 10)], ['a']);
+  send({ kind: 'restore', rows: [['fishes','a',pose('a', 10)]] });
+  assert.equal(grid().get(4, 10), undefined);
+  assert.deepEqual([...grid().get(10, 10)], ['a', 'b']);
+  world.data.chars.a.x = -2;
+  assert.deepEqual([...grid().get(10, 10)], ['b']);
+  assert.deepEqual([...grid().get(8, 10)], ['a']);
+});
+
+test('后台复用鱼群资料时仍补回回滚的行程、旧餐和新归档的进食时间', () => {
+  const { worker, send } = startWorker([food('cell', 5)]);
+  const w = worker.world, cell = w.data.chars.cell;
+  const fish = { id: 'fish', created: start, x: 5, y: 8, facing: 1, lastFed: start };
+  send({ kind: 'restore', rows: [['fishes', 'fish', fish]] });
+  const sync = now => {
+    w.initializeTracking(now);
+    w.applyMealClaims(w.ecologyCharacters().latestMeals);
+  };
+  sync(start);
+  assert.equal(w.data.travel.fish.since, start);
+  delete w.data.travel.fish;
+  cell.path.push({ reason: 'eat', t: start + 10, target: 'fish' });
+  sync(start + 100);
+  assert.equal(w.data.travel.fish.since, start + 100);
+  assert.equal(w.data.fishes.fish.lastMealAt, start + 10);
+  w.data.fishes.fish.lastFed = start + 300;
+  sync(start + 300);
+  assert.equal(w.data.fishes.fish.lastMealAt, start + 300);
+  send({ kind: 'step', base: start, names: [], foods: [], archives: [{ removed: {}, meals: [['fish', start + 400, false]] }] });
+  assert.equal(w.data.fishes.fish.lastMealAt, start + 400);
+});

@@ -4,6 +4,7 @@ import { CONFIG, World, chooseClaim } from '../www/engine.js';
 import { ARCHIVE_FIELDS, ArchiveStore, encodeArchive, prepareCompaction } from '../www/archive.js';
 import { SimulationClient, subscribeSimulationChanges } from '../www/simulation-client.js';
 import { WorkerSimulation } from '../www/simulation-worker.js';
+import { expandSimulationPatch } from '../www/simulation-delta.js';
 import { applyInputRows, setParticipantName, subscribeBeforeSimulationPatch, worldEdited } from '../www/simulation-changes.js';
 import { CONTACT_TIME, updateContacts } from '../www/breeding.js';
 
@@ -49,6 +50,32 @@ function localWorker(beforeReceive = () => {}, simulation = new WorkerSimulation
     }
   };
 }
+
+test('半秒结算把接触顺序完整交给页面，包括仍保留的旧配对', async () => {
+  const world = new World(start, root, { populate: false, ambient: false });
+  for (let i = 0; i < 4; i++) {
+    const id = `00000000-0000-4000-8000-00000000000${i}`;
+    const cells = [0, 1, 2].map(x => ({ x, y: 0, ch: 'Q', color: '#acaabc' }));
+    assert(world.apply({ id, kind: 'fish', gender: i % 2 ? 'female' : 'male', actor: id, nick: '鱼',
+      t: start, cost: 3, x: 20 + 20 * Math.floor(i / 2) + 3 * (i % 2), y: 20, cells }).ok);
+  }
+  updateContacts(world, start, world.fishGroups(), world.sceneryMap());
+  const expected = Object.keys(world.data.contacts);
+  assert.equal(expected.length, 2);
+  world.data.contacts = Object.fromEntries(Object.entries(world.data.contacts).reverse());
+  const worker = new WorkerSimulation(), client = new SimulationClient(() => localWorker(undefined, worker));
+  try {
+    // Use the normal contact decision while keeping the four bodies in place.
+    await client.open(world, () => true);
+    worker.world.step = now => {
+      updateContacts(worker.world, now, worker.world.fishGroups(), worker.world.sceneryMap());
+      worker.world.data.tick = now;
+    };
+    await client.advance(world, start + CONFIG.step);
+    assert.deepEqual(Object.keys(world.data.contacts), expected);
+    assert.deepEqual(world.data.contacts, worker.world.data.contacts);
+  } finally { client.close(); }
+});
 
 test('追赶中在第一步交接真实归档，保留鱼的最后一餐并清除线程里的旧热行', async () => {
   const world = new World(start, root), store = new ArchiveStore(), worker = new WorkerSimulation();
@@ -232,15 +259,20 @@ test('后台只发送变化的鱼记录与当日行程，订阅者收到完整�
       assert.equal(before.at(-1).patch, after.at(-1));
       for (const [id, fish] of after.at(-1).tables.fishes.set) assert.deepEqual(fish, world.data.fishes[id]);
     }
-    for (const change of sent) for (const [, fields] of change.tables.fishes.set) {
+    for (const change of sent) for (const row of change.tables.fishes.set) {
+      if (!Array.isArray(row)) { assert(change.tables.fishes.motion instanceof Float64Array); continue; }
+      const [, fields] = row;
       assert.equal(Object.hasOwn(fields, 'actor'), false);
       assert.equal(Object.hasOwn(fields, 'id'), false);
     }
     const travel = sent.flatMap(change => change.tables.travel?.set || []);
     assert(travel.length > 0);
     for (const [, fields, , days] of travel) {
-      assert.equal(Object.hasOwn(fields, 'since'), false);
-      assert.equal(Object.hasOwn(days[0], '2025-06-14'), false);
+      if (typeof fields === 'string') assert.equal(fields, '2025-06-15');
+      else {
+        assert.equal(Object.hasOwn(fields, 'since'), false);
+        assert.equal(Object.hasOwn(days[0], '2025-06-14'), false);
+      }
     }
     const life = sent.find(change => change.life?.bonds);
     assert(life);
@@ -375,4 +407,29 @@ test('线程故障保留已完成步骤并暂停，协调者重新接管后可�
     assert.equal(world.data.tick, start + CONFIG.step);
     assert.equal(starts, 2);
   } finally { client.close(); }
+});
+
+test('后台关系逐项修改、删除再加入和回滚都保留原始字段与顺序', () => {
+  const world = new World(start, root, { populate: false }), worker = new WorkerSimulation();
+  const bond = (a, b) => ({ a, b, seconds: 10, at: start, lastNear: start, run: 3 });
+  const first = bond('a', 'b'), second = bond('c', 'd');
+  world.data.life.bonds = { 'a|b': first, 'c|d': second };
+  worker.receive({ kind: 'open', values: world.serialize(), tables: [], ambient: false });
+  worker.receive({ kind: 'ready' });
+  const table = worker.world.data.life.bonds;
+  table['c|d'].seconds++;
+  delete table['a|b'];
+  table['a|b'] = { ...first, run: 4 };
+  delete table['c|d'].run;
+  const patch = worker.tracker.changes(), updated = expandSimulationPatch(world.data, patch).values.life;
+  assert.deepEqual(Object.keys(updated.bonds), ['c|d', 'a|b']);
+  assert.deepEqual(updated.bonds['c|d'], { a: 'c', b: 'd', seconds: 11, at: start, lastNear: start });
+  assert.deepEqual(updated.bonds['a|b'], { ...first, run: 4 });
+  worker.world.data.life.bonds = { 'a|b': { ...updated.bonds['a|b'], seconds: 30, legacy: true }, 'c|d': updated.bonds['c|d'] };
+  worker.world.data.life.bonds['a|b'] = { ...worker.world.data.life.bonds['a|b'], run: 15 };
+  const again = expandSimulationPatch({ life: updated }, worker.tracker.changes()).values.life;
+  assert.deepEqual(Object.keys(again.bonds), ['a|b', 'c|d']);
+  assert.deepEqual(again.bonds['a|b'], { ...first, seconds: 30, run: 15, legacy: true });
+  worker.receive({ kind: 'restore', rows: [], previous: { life: structuredClone(world.data.life) }, foodRevision: 0 });
+  assert.deepEqual(worker.world.bondEntries(), Object.entries(world.data.life.bonds));
 });
