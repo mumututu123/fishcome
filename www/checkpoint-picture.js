@@ -1,6 +1,7 @@
 import { CONFIG, sceneryCount } from './engine.js';
 
 const character = cell => cell && cell.kind !== 'burn' ? 1 : 0;
+const liveMetadata = world => ({ id: world.id, roots: world.roots, participants: Object.keys(world.data.participants).length || 1, counts: world.counts() });
 
 class PictureState {
   constructor(world) {
@@ -57,6 +58,7 @@ class PictureState {
     if (tables.participants) this.participants = undefined;
   }
   metadata() {
+    if (this.recount) return liveMetadata(this.world);
     const data = this.world.data;
     if (data.tick >= this.nextExpiry) {
       this.nextExpiry = Infinity;
@@ -85,12 +87,23 @@ export class CheckpointPictures {
   reuse(picture) {
     if (typeof picture.image === 'string' && /^data:image\/(webp|png);base64,/.test(picture.image)) this.latest = picture;
   }
+  hasRecent(world = this.getWorld()) {
+    return Array.isArray(this.latest?.roots) && this.latest.roots.some(root => Object.hasOwn(world.data.roots, root));
+  }
+  recent() {
+    const world = this.getWorld();
+    if (this.hasRecent(world)) return { ...this.latest, ...liveMetadata(world) };
+  }
   beforePatch(world, patch) {
     if (this.state?.world === world) this.state.beforePatch(patch.tables);
   }
   changed(world, patch, source) {
     if (this.state?.world !== world) return;
-    if (!patch) { this.state = null; return; }
+    if (!patch) {
+      if (source === 'replica') this.state.recount = true;
+      else this.state = null;
+      return;
+    }
     const tables = patch.tables;
     this.state.applied(tables);
     if (source === 'input' && (tables.chars || tables.fishes || tables.scenes || tables.roots)) this.state.edit++;
@@ -110,7 +123,7 @@ export class CheckpointPictures {
     for (;;) {
       if (!this.task) {
         const world = this.getWorld();
-        if (this.state?.world !== world) this.state = new PictureState(world);
+        if (this.state?.world !== world || this.state.recount) this.state = new PictureState(world);
         const promise = this.generate(this.state, force).finally(() => { this.task = null; });
         this.task = { force, promise };
       }

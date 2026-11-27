@@ -35,6 +35,21 @@ function particle(w, e, index, x, y, at = e.at + POPULATION.warning) {
   e.particles[id] = { id, x, y, born: at, rise: 0, drift: 0, cx: 0, cy: 0, settled: true }; return e.particles[id];
 }
 
+test('同一批鱼同时饥饿或补结算多小时疾病时共用鱼体索引', () => {
+  const w = world(), body = [glyph(0, 0), glyph(1, 0), glyph(2, 0), glyph(3, 0), glyph(4, 0)];
+  const hungry = fish(w, 50, 20, body), sick = fish(w, 70, 20, body);
+  w.ambient = false;
+  w.data.fishes[hungry].hungerAt = now;
+  w.data.population.illnesses[sick] = { at: now - 2 * HOUR, nextLossAt: now - HOUR, curedAt: 0 };
+  w.fishCells = () => assert.fail('批量结算应按鱼编号获取鱼体，逐条重扫了整片海');
+  w.step(now + 500);
+  const groups = w.fishGroups();
+  assert.equal(groups.get(sick).length, 3);
+  assert(groups.get(hungry).length >= 2 && groups.get(hungry).length < body.length);
+  const losses = Object.values(w.data.chars).flatMap(cell => cell.path).filter(event => event.reason === 'ecoDissolve');
+  assert.deepEqual(losses.map(event => event.t).sort((a, b) => a - b), [now - HOUR, now]);
+});
+
 test('低于阈值不患病；500条每小时最多20%，不重复抽签且保护新鱼', () => {
   const low = world(299); advance(low, now + HOUR); assert.equal(Object.keys(low.data.population.illnesses).length, 0);
   const w = world(500); advance(w, now + HOUR); assert.equal(Object.keys(w.data.population.illnesses).length, 100);

@@ -579,7 +579,15 @@ export class World {
         if (food.ghost) { const s = legendSchedule(this.data.roots, food.ghost.seed, food.ghost.slot); recordStory(this, 'shipMeal', id, now, { legendary: s.id, legendSeed: s.seed, legendSlot: s.slot }); }
       }
     }
-    for (const id of groups.keys()) { const f = this.data.fishes[id]; if (f && now >= f.hungerAt) { this.starve(id, f.hungerAt); bodyChanged = true; } }
+    let hungryBodies = bodyChanged ? undefined : groups;
+    for (const id of groups.keys()) {
+      const f = this.data.fishes[id];
+      if (f && now >= f.hungerAt) {
+        hungryBodies ??= this.fishGroups();
+        this.starve(id, f.hungerAt, null, { cells: hungryBodies.get(id) });
+        bodyChanged = true;
+      }
+    }
     normalizeBreeding(this, now);
     updateContacts(this, now, bodyChanged ? this.fishGroups() : groups, scenery, captured, bodyChanged ? undefined : fishOccupancy);
     if (swims && bodyChanged) swims.length = 0;
@@ -590,11 +598,18 @@ export class World {
     for (const c of cells) { const a = cellPosition(f, c), z = cellPosition(next, c); for (let x = Math.min(a.x, z.x); x <= Math.max(a.x, z.x); x++) if (!this.waterAt(x, a.y) || scenery.has(key(x, a.y)) || foreignOwner(ownersAt(occupants, x, a.y), f.id, pair)) return false; }
     if (!this.canOccupy(next, cells, scenery, occupants)) return false; f.x = next.x; f.facing = next.facing; return true;
   }
-  starve(id, at, selectedId = null, { illness = false } = {}) {
-    const f = this.data.fishes[id], cells = this.fishCells(id); if (!f || cells.length < 2) return;
+  starve(id, at, selectedId = null, { illness = false, cells = this.fishCells(id) } = {}) {
+    const f = this.data.fishes[id]; if (!f || cells.length < 2) return;
     const candidates = illness ? cells.filter(c => components(cells.filter(other => other !== c)).length === 1) : [];
     const rim = candidates.length ? candidates : exteriorContour(cells);
-    const removed = rim.find(c => c.id === selectedId) || [...rim].sort((a, b) => hash(`${id}:${at}:${a.id}`) - hash(`${id}:${at}:${b.id}`) || a.id.localeCompare(b.id))[0];
+    let removed = rim.find(c => c.id === selectedId);
+    if (!removed) {
+      let best = Infinity;
+      for (const cell of rim) {
+        const score = hash(`${id}:${at}:${cell.id}`);
+        if (score < best || score === best && cell.id.localeCompare(removed.id) < 0) { removed = cell; best = score; }
+      }
+    }
     const event = `${illness ? 'illness' : 'hunger'}:${id}:${at}`, loss = { id: event, t: at, reason: illness ? 'ecoDissolve' : 'starve', ...(illness ? { fish: id, cause: 'depression' } : {}) };
     if (illness) { const pair = this.breedingState(id); if (pair) cancelBreeding(this.data, pair, at, 'illness'); }
     transition(removed, { kind: 'burn', entity: '' }, loss);
@@ -604,17 +619,20 @@ export class World {
     if (!kept.size) { delete this.data.fishes[id]; recordStory(this, 'depart', id, at); } else if (!illness) f.hungerAt = at + CONFIG.hunger;
     this.foodRevision++; this.dirty = true;
   }
-  merge(other, archived = {}) {
-    worldEdited(this);
+  merge(other, archived = {}, origin) {
+    worldEdited(this, origin);
     if (!other || other.protocol !== 1 || !other.chars || !other.fishes || !other.scenes || !other.ops) throw new Error('世界协议不兼容');
     if (other.terrain && !validTerrain(other.terrain, other.roots)) throw new Error('固定海底地形被修改或无效');
     for (const [root, at] of Object.entries(other.roots || {})) if (this.data.roots[root] !== undefined && this.data.roots[root] !== at) throw new Error('世界起源时间不能修改');
     const initial = initialSources({ ...this.data.roots, ...other.roots });
     if (!validEcology(other.ecology, Math.max(Date.now() + 60000, other.tick))) throw new Error('生态更替时钟无效');
-    const populationSources = { roots: { ...this.data.roots, ...other.roots }, fishes: { ...this.data.fishes, ...other.fishes }, ops: { ...archived.ops, ...this.data.ops, ...other.ops }, breeding: { ...archived.breeding, ...this.data.breeding, ...other.breeding } };
-    if (!validPopulation(other.population, populationSources, Math.max(Date.now() + 60000, other.tick)) || !validRocks(other.rocks, populationSources, Math.max(Date.now() + 60000, other.tick))) throw new Error('生态控制记录无效');
-    if (!validateLife(other.life, { roots: { ...this.data.roots, ...other.roots }, ops: { ...archived.ops, ...this.data.ops, ...other.ops }, breeding: { ...archived.breeding, ...this.data.breeding, ...other.breeding }, chars: { ...archived.chars, ...this.data.chars, ...other.chars } }, Math.max(Date.now() + 60000, this.data.tick, other.tick))) throw new Error('鱼生记录无效');
-    if (!validLegends(other.legends, { roots: { ...this.data.roots, ...other.roots }, ops: { ...archived.ops, ...this.data.ops, ...other.ops }, breeding: { ...archived.breeding, ...this.data.breeding, ...other.breeding } }, Math.max(Date.now() + 60000, this.data.tick, other.tick))) throw new Error('稀有异象记录无效');
+    const sources = { roots: { ...this.data.roots, ...other.roots }, fishes: { ...this.data.fishes, ...other.fishes }, ops: { ...archived.ops, ...this.data.ops, ...other.ops }, breeding: { ...archived.breeding, ...this.data.breeding, ...other.breeding } };
+    if (!validPopulation(other.population, sources, Math.max(Date.now() + 60000, other.tick)) || !validRocks(other.rocks, sources, Math.max(Date.now() + 60000, other.tick))) throw new Error('生态控制记录无效');
+    const latest = Math.max(Date.now() + 60000, this.data.tick, other.tick);
+    sources.chars = Object.keys(other.chars).length || Object.keys(archived.chars || {}).length
+      ? { ...archived.chars, ...this.data.chars, ...other.chars } : this.data.chars;
+    if (!validateLife(other.life, sources, latest)) throw new Error('鱼生记录无效');
+    if (!validLegends(other.legends, sources, latest)) throw new Error('稀有异象记录无效');
     for (const op of Object.values(other.ops)) if (op.genesis !== undefined && !validInitialOp(op, initial)) throw new Error('初始鱼记录被修改或无效');
     this.data.terrain = clone(chooseTerrain(terrainOf(this.data), terrainOf(other)));
     Object.assign(this.data.roots, other.roots);
@@ -662,8 +680,9 @@ export class World {
       const obj = type === 'fishes' ? canonicalBirthFish(incoming, birthOf(id)) : incoming, old = this.data[type][id];
       if (!old || (obj.posAt || 0) > (old.posAt || 0) || ((obj.posAt || 0) === (old.posAt || 0) && JSON.stringify(obj).localeCompare(JSON.stringify(old)) > 0)) this.data[type][id] = clone(obj);
     }
-    const dependencies = archiveDependencies({ ...this.data, ops: { ...archived.ops, ...this.data.ops }, breeding: { ...archived.breeding, ...this.data.breeding } });
+    let dependencies;
     for (const field of ['ops', 'breeding']) for (const [id, record] of Object.entries(archived[field] || {})) {
+      dependencies ??= archiveDependencies({ ...this.data, ops: { ...archived.ops, ...this.data.ops }, breeding: { ...archived.breeding, ...this.data.breeding } });
       const current = this.data[field][id], keep = dependencies[field].has(id);
       if (keep && !current) {
         const next = clone(record);
@@ -675,10 +694,14 @@ export class World {
     this.data.population = mergePopulation(this.data.population, other.population, Math.max(this.data.tick, other.tick));
     this.data.rocks = mergeRocks(this.data.rocks, other.rocks);
     settleLegendary(this, Math.max(this.data.tick, other.tick), transition);
-    normalizeBirthCells(this); const groups = this.fishGroups();
+    const cells = this.charValues(), groups = new Map();
+    normalizeBirthCells(this, cells);
     const latestFeed = new Map(this.archives?.summary.lastMeals || []), occupiedScenes = new Set();
-    for (const c of Object.values(this.data.chars)) {
+    let chatGlyphCount = 0;
+    for (const c of cells) {
+      if (c.kind === 'fish') groupFishCell(groups, c);
       if (c.kind === 'scene') occupiedScenes.add(c.entity);
+      if (c.chat) chatGlyphCount++;
       for (const r of c.path) if (r.reason === 'eat') latestFeed.set(r.target, Math.max(latestFeed.get(r.target) || 0, r.t));
     }
     for (const id of Object.keys(this.data.fishes)) {
@@ -698,12 +721,12 @@ export class World {
     if (localChatSources.size) {
       occupiedChatFloor = false;
       for (const [id, c] of Object.entries(this.data.chars)) {
-        if (localChatSources.has(c.chat)) delete this.data.chars[id];
+        if (localChatSources.has(c.chat)) { delete this.data.chars[id]; if (c.chat) chatGlyphCount--; }
         else if (c.kind === 'scene' && c.entity === CHAT_FLOOR) occupiedChatFloor = true;
       }
     }
     if (!occupiedChatFloor) delete this.data.scenes[CHAT_FLOOR];
-    this.data.pendingChatGlyphs = Math.max(0, Object.values(this.data.chatSources).reduce((sum, message) => sum + chatGlyphs(message.body.text).length, 0) - Object.values(this.data.chars).filter(c => c.chat).length);
+    this.data.pendingChatGlyphs = Math.max(0, Object.values(this.data.chatSources).reduce((sum, message) => sum + chatGlyphs(message.body.text).length, 0) - chatGlyphCount);
     this.data.tick = Math.max(this.data.tick, other.tick);
     this.data.ecology = mergeEcology(this.data.ecology, other.ecology);
     this.data.archives = mergeArchiveState(this.data.archives, other.archives);

@@ -313,8 +313,8 @@ export function repairLocalBirthTimes(data, archived = {}) {
   return changed ? { ...data, fishes, chars } : data;
 }
 
-export function normalizeBirthCells(world) {
-  for (const cell of Object.values(world.data.chars)) {
+export function normalizeBirthCells(world, cells = Object.values(world.data.chars)) {
+  for (const cell of cells) {
     const event = cell.path?.at(-1); if (cell.kind !== 'fish' || event?.reason !== 'birth') continue;
     const record = world.data.breeding?.[event.birth], inherited = record?.baby?.cells.find(item => item.id === cell.id);
     if (record?.status === 'born' && inherited && cell.entity === record.baby.id) Object.assign(cell, { x: inherited.x, y: inherited.y, ch: inherited.after });
