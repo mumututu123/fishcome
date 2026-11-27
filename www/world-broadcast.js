@@ -160,6 +160,52 @@ export class ReplicaSwims {
   }
 }
 
+const inventoryFields = { roots: 'rootCount', ops: 'opCount', chats: 'chatCount', chatSources: 'chatSourceCount' };
+
+function knownCount(rows, keys, archived) {
+  if (!archived?.size) return keys.length;
+  let count = keys.length + archived.size;
+  if (keys.length < archived.size) {
+    for (const id of keys) if (archived.has(id)) count--;
+  } else {
+    for (const id of archived.keys()) if (Object.hasOwn(rows, id)) count--;
+  }
+  return count;
+}
+
+// Heartbeats repair missing history. A row can move from the live table into
+// an archive at different times on each peer. It is still the same record.
+export class ReplicaInventory {
+  previousCounts = new WeakMap();
+
+  heartbeat(data, store) {
+    const counts = {}, body = { settledRecords: {} };
+    const previous = this.previousCounts.get(data);
+    for (const [field, name] of Object.entries(inventoryFields)) {
+      const rows = data[field], keys = Object.keys(rows);
+      body[name] = keys.length;
+      counts[field] = knownCount(rows, keys, store.ids[field]);
+      // A newly created row may still be travelling on the ordinary stream.
+      // Advertise the count that survived a full heartbeat before requesting repair.
+      body.settledRecords[field] = previous ? Math.min(previous[field], counts[field]) : 0;
+    }
+    this.previousCounts.set(data, counts);
+    return body;
+  }
+
+  missing(body, data, store) {
+    if (!body.settledRecords) {
+      return Object.entries(inventoryFields).some(([field, name]) => body[name] > 0 && body[name] > Object.keys(data[field]).length);
+    }
+    return Object.keys(inventoryFields).some(field => {
+      const count = body.settledRecords[field];
+      if (!(count > 0)) return false;
+      const rows = data[field], keys = Object.keys(rows);
+      return count > keys.length && count > knownCount(rows, keys, store.ids[field]);
+    });
+  }
+}
+
 export class ReplicaRecovery {
   missed = new Map();
 

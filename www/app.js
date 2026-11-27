@@ -5,7 +5,7 @@ import { atCheckpointBoundary, get, getMany, readCheckpointVersion, sameStoredCh
 import { beforeCheckpointPatch, noteCheckpointChanges, noteCheckpointMerge } from './checkpoint-pages.js';
 import { CheckpointPictures } from './checkpoint-picture.js';
 import { Network } from './network.js';
-import { ReplicaRecovery, ReplicaSwims, WorldBroadcast } from './world-broadcast.js';
+import { ReplicaInventory, ReplicaRecovery, ReplicaSwims, WorldBroadcast } from './world-broadcast.js';
 import { DiagnosticLog, inspectFishOrigins, repairFishOriginIssues, diagnosticSummary } from './diagnostics.js';
 import { loadReplicaArchives, verifyChats, verifyReplica } from './replica.js';
 import { Renderer } from './renderer.js';
@@ -55,6 +55,7 @@ let lastHello = new Set(), lastMeter = Date.now(), lastSave = 0, lastPictureTime
 const worldBroadcast = new WorldBroadcast(subscribeSimulationChanges);
 const replicaSwims = new ReplicaSwims();
 const replicaRecovery = new ReplicaRecovery();
+const replicaInventory = new ReplicaInventory();
 subscribeSimulationChanges((target, patch) => {
   if (target === world && started && !updateFrozen && !replacingCheckpoint && Number.isFinite(patch?.values?.tick)) {
     broadcastWorld(patch.swims);
@@ -386,7 +387,15 @@ async function onMessage(message, peer) {
     await completeReferral(peer, message.actor);
     status = ''; update();
   } else if (message.kind === 'beat') {
-    if (body.member?.id === message.from && body.member.actor === message.actor) { const direct = network.live().find(p => p.node === message.from); members.set(message.from, { ...body.member, direct: !!direct, url: await normalizeInvite(direct?.url || body.member.url), at: Date.now() }); remember(body.member.url); rememberAuthor(message.actor, body.member.nick); if (Date.now() - lastRepair > 5000 && (body.rootCount > world.roots.length || body.opCount > Object.keys(world.data.ops).length || body.chatCount > Object.keys(world.data.chats).length || body.chatSourceCount > Object.keys(world.data.chatSources).length)) { lastRepair = Date.now(); network.broadcast('replicaRequest', { to: message.from }).catch(() => {}); } }
+    if (body.member?.id === message.from && body.member.actor === message.actor) {
+      const direct = network.live().find(p => p.node === message.from);
+      members.set(message.from, { ...body.member, direct: !!direct, url: await normalizeInvite(direct?.url || body.member.url), at: Date.now() });
+      remember(body.member.url); rememberAuthor(message.actor, body.member.nick);
+      if (Date.now() - lastRepair > 5000 && replicaInventory.missing(body, world.data, archiveStore)) {
+        lastRepair = Date.now();
+        network.broadcast('replicaRequest', { to: message.from }).catch(() => {});
+      }
+    }
   } else if (message.kind === 'merge') {
     await mergeReplica(body.world, peer, 'merge'); geometryRepair = true; reconcileHistory(); syncIncomeSerial(); update();
     if (!body.base && body.repairFor === network.node && typeof body.request === 'string') replicaRecovery.covered(message, body.request);
@@ -945,7 +954,10 @@ async function tick() {
   if (replacingCheckpoint) return;
   if (!updateFrozen && identity.remainder >= 3600) { identity.remainder -= 3600; identity.serial = (identity.serial || 0) + 1; await submit({ kind: 'earn', cost: 0, serial: identity.serial }); }
   members.set(network.node, member());
-  if (now - selfBeat >= 3000 && network.live().length) { selfBeat = now; network.broadcast('beat', { member: member(), rootCount: world.roots.length, opCount: Object.keys(world.data.ops).length, chatCount: Object.keys(world.data.chats).length, chatSourceCount: Object.keys(world.data.chatSources).length }).catch(() => {}); }
+  if (now - selfBeat >= 3000 && network.live().length) {
+    selfBeat = now;
+    network.broadcast('beat', { member: member(), ...replicaInventory.heartbeat(world.data, archiveStore) }).catch(() => {});
+  }
   const currentLeader = leader(); if (currentLeader !== lastLeader) { simulation.close(); lastLeader = currentLeader; worldBroadcast.reset(); replicaSwims.reset(); renderer.presentSwims(world); if (amLeader()) { geometryRepair = true; world.data.tick = Math.max(world.data.tick, now - 2000); for (const envelope of [...inbox.values()].sort((a, b) => a.body.t - b.body.t || a.body.id.localeCompare(b.body.id))) { if (!world.data.ops[envelope.body.id]) { const result = world.apply({ ...clone(envelope.body), proof: clone(envelope) }); if (!result.ok) rejectOperation(envelope.body.id); network.broadcast('ack', { id: envelope.body.id, result }).catch(() => {}); } } for (const id of pending.keys()) if (world.data.ops[id]) pending.delete(id); } }
   if (amLeader() && fishRepairWaiting && now - lastSave > 5000) geometryRepair = true;
   if (amLeader() && !updateFrozen && !replacingCheckpoint) {

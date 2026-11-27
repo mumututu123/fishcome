@@ -81,7 +81,7 @@ ReplicaTransfers.prototype.receive = async function (message, peer) {
 };
 `;
 const instrument = `
-const testData = { frames: [], steps: [], stepRequests: [], applied: [], sends: [], receives: [], merges: [], worldMerges: [], saves: [], liveBytes: [] };
+const testData = { frames: [], steps: [], stepRequests: [], applied: [], sends: [], receives: [], merges: [], worldMerges: [], repairs: [], saves: [], liveBytes: [] };
 const stepRequests = new WeakMap();
 const originalRequest = SimulationClient.prototype.request;
 SimulationClient.prototype.request = function (message) {
@@ -131,6 +131,7 @@ mergeReplica = async (...args) => {
 };
 const originalBroadcast = Network.prototype.broadcast;
 Network.prototype.broadcast = async function (kind, body, ...args) {
+  if (kind === 'replicaRequest') testData.repairs.push({ at: Date.now(), correlated: !!body.request });
   if (kind !== 'world') return originalBroadcast.call(this, kind, body, ...args);
   const at = Date.now();
   if (window.denseDropNext && body.delta) {
@@ -547,6 +548,9 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
     .map(field => [field, stats(received.flatMap(row => row.rows ? [row.rows[field]] : []))]));
   const report = JSON.stringify({ count, realBackup: Boolean(backup), browserVersion, cold, joinedMs: joined - joining, settledMs: recent - joining, steadyMs: ended - recent,
     saved, liveWire, ...(switched ? { switched } : {}),
+    repairs: pages.map(page => ({ leader: page.node === page.leader,
+      requested: page.repairs.filter(sampled).map(row => ({ afterMs: row.at - recent, correlated: row.correlated })),
+      incoming: page.receives.filter(row => row.kind === 'merge' && sampled(row)).map(row => ({ afterMs: row.startAt - recent, ms: row.ms })) })),
     archiveRounds: rounds.map(({ at, tick, deliveredAt }) => ({ afterMs: at - recent, tick, deliveredAfterMs: deliveredAt - recent })), archiveError,
     leaderProgress, followerProgress, stepComplete, replicaRows,
     requestGaps: stats(requests.slice(1).map((row, index) => row.startAt - requests[index].startAt)),

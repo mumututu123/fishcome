@@ -5,7 +5,30 @@ import { decodeReplicaRowDelta, encodeReplicaRowDelta, replicaRowBase } from '..
 import { mergeBreeding } from '../www/breeding.js';
 import { ArchiveStore } from '../www/archive.js';
 import { applyInputRows, simulationApplied } from '../www/simulation-changes.js';
-import { ReplicaRecovery, ReplicaSwims, WorldBroadcast } from '../www/world-broadcast.js';
+import { ReplicaInventory, ReplicaRecovery, ReplicaSwims, WorldBroadcast } from '../www/world-broadcast.js';
+
+test('心跳按已知记录并集修复，允许在途记录先到达，搬入归档不会触发全海重传', () => {
+  const records = () => ({ roots: { sea: 1 }, ops: { fish: 1, feed: 1 }, chats: {}, chatSources: {} });
+  const archives = () => ({ ids: { ops: new Map(), chats: new Map(), chatSources: new Map() } });
+  const sender = new ReplicaInventory(), receiver = new ReplicaInventory();
+  const left = records(), right = records(), a = archives(), b = archives();
+  sender.heartbeat(left, a);
+  b.ids.ops.set('feed', 'pack');
+  delete right.ops.feed;
+  a.ids.ops.set('fish', 'pack');
+  left.ops.create = 1;
+  const inFlight = sender.heartbeat(left, a);
+  assert.equal(inFlight.opCount, 3);
+  assert.equal(inFlight.settledRecords.ops, 2);
+  assert.equal(receiver.missing(inFlight, right, b), false);
+  const settled = sender.heartbeat(left, a);
+  assert.equal(receiver.missing(settled, right, b), true);
+  b.ids.ops.set('create', 'new');
+  assert.equal(receiver.missing(settled, right, b), false);
+  assert.equal(receiver.missing({ opCount: 2 }, right, b), true);
+  assert.equal(receiver.missing({}, right, b), false);
+  assert.equal(sender.heartbeat(records(), a).settledRecords.ops, 0);
+});
 import { CONFIG, World } from './empty-world.mjs';
 
 test('分块保留标量、空表、跨块的字符、长记录及签名内的键顺序', async () => {
