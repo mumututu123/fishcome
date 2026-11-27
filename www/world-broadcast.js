@@ -20,19 +20,19 @@ function packet(data, rows, breeding) {
 
 function fullRows(data) { return Object.fromEntries(rowFields.map(field => [field, data[field] || {}])); }
 
-function baseline(world, breeding, at) {
-  return { initial: fullRows(world), updates: Object.fromEntries(rowFields.map(field => [field, new Map()])), breeding, fullAt: at, tick: world.tick };
+function baseline(world, at) {
+  return { rows: Object.fromEntries(rowFields.map(field => [field, new Map(Object.entries(world[field] || {}))])), fullAt: at, tick: world.tick };
 }
 
 function changedRows(data, base, pending) {
   const rows = {};
   const sameRow = replicaRowEquality(data.tick);
   for (const field of rowFields) {
-    const table = data[field] || {}, initial = base.initial[field], updates = base.updates[field];
+    const table = data[field] || {}, last = base.rows[field];
     const changed = rows[field] = {};
     const check = id => {
-      if (!Object.hasOwn(table, id)) { updates.set(id, undefined); return; }
-      const sent = updates.has(id) ? updates.get(id) : initial[id];
+      if (!Object.hasOwn(table, id)) { last.delete(id); return; }
+      const sent = last.get(id);
       const value = table[id];
       if (sent === undefined ? value !== undefined : !sameRow(field, sent, value)) changed[id] = value;
     };
@@ -42,8 +42,7 @@ function changedRows(data, base, pending) {
       // Foreground edits and merges can modify records in place. Reconcile with
       // the last sent values once, then return to tracking known worker writes.
       for (const id in table) if (Object.hasOwn(table, id)) check(id);
-      for (const id in initial) if (!Object.hasOwn(table, id)) updates.set(id, undefined);
-      for (const id of updates.keys()) if (!Object.hasOwn(table, id)) updates.set(id, undefined);
+      for (const id of last.keys()) if (!Object.hasOwn(table, id)) last.delete(id);
     }
   }
   return rows;
@@ -129,6 +128,37 @@ export class ReplicaSwims {
   }
 }
 
+export class ReplicaRecovery {
+  missed = new Map();
+
+  clear() { this.missed.clear(); }
+
+  ignore({ from, actor, body }) {
+    const tick = body?.world?.tick;
+    if (!Number.isFinite(tick)) return;
+    const previous = this.missed.get(from);
+    if (previous?.actor === actor) {
+      previous.tick = Math.max(previous.tick, tick);
+      previous.revision++;
+    } else this.missed.set(from, { actor, tick, revision: 1 });
+  }
+
+  request({ from, actor }, now = Date.now()) {
+    const missed = this.missed.get(from);
+    if (!missed || missed.actor !== actor || missed.request && now - missed.request.at < 5000) return;
+    const request = missed.request = { id: crypto.randomUUID(), at: now, revision: missed.revision };
+    return { to: from, request: request.id };
+  }
+
+  covered({ from, actor, body }, response) {
+    const missed = this.missed.get(from), tick = body?.world?.tick;
+    if (!missed || missed.actor !== actor || !Number.isFinite(tick) || tick < missed.tick) return;
+    if (response ? missed.request?.id === response && missed.request.revision === missed.revision : tick > missed.tick) {
+      this.missed.delete(from);
+    }
+  }
+}
+
 export class WorldBroadcast {
   constructor(subscribe) {
     this.observesChanges = !!subscribe;
@@ -148,7 +178,12 @@ export class WorldBroadcast {
   }
 
   reset() {
-    if (this.source) stopBreedingBroadcast(this.trackedBreeding);
+    if (this.source) {
+      stopBreedingBroadcast(this.trackedBreeding);
+      this.needsFull = true;
+    }
+    this.network?.clearPendingWorld?.();
+    this.network = null;
     this.source = null;
     this.previous = null;
     this.pending = null;
@@ -164,25 +199,27 @@ export class WorldBroadcast {
   }
 
   async captureJoined(data, capture) {
-    if (this.previous || this.busy) return capture();
+    if (this.previous || this.busy || this.needsFull) return capture();
     const generation = this.generation;
     this.takeChanges(data);
     breedingForBroadcast(data.breeding, true);
     this.busy = true;
     try {
       const snapshot = await capture();
-      if (generation === this.generation) this.previous = baseline(snapshot, data.breeding, Date.now());
+      if (generation === this.generation) this.previous = baseline(snapshot, Date.now());
       return snapshot;
     } finally { this.busy = false; }
   }
 
   async send(network, data, now = Date.now(), captureFull, directions) {
     if (!network.live().length) { if (this.source) this.reset(); return; }
-    if ((network.replicaPeers && !network.replicaPeers().length) || this.busy) return;
+    const peers = network.worldReplicaPeers?.() ?? network.replicaPeers?.();
+    if (peers?.length === 0 || this.busy) return;
     this.busy = true;
     try {
       if (this.source && (this.source !== data || this.trackedBreeding !== data.breeding)) this.reset();
-      const previous = this.previous && now - this.previous.fullAt <= 30000 ? this.previous : null;
+      this.network = network;
+      const previous = this.previous && (now - this.previous.fullAt <= 30000 || network.periodicWorldRequired?.() === false) ? this.previous : null;
       const pending = this.takeChanges(data);
       const generation = this.generation, breeding = breedingForBroadcast(data.breeding, !previous);
       let world, swims;
@@ -190,18 +227,19 @@ export class WorldBroadcast {
         world = structuredClone(packet(data, changedRows(data, previous, pending), breeding));
         if (world.tick === previous.tick + CONFIG.step) swims = encodeSwims(world.fishes, directions);
         previous.tick = world.tick;
-        // The baseline shares immutable rows with the last captured version.
-        // Keep later writes separate while joins still read that version.
+        // Retain only the latest detached value for each live row. Ongoing
+        // joins keep their own immutable snapshot of the world.
         for (const field of rowFields) {
-          const rows = world[field], updates = previous.updates[field];
-          for (const id in rows) if (Object.hasOwn(rows, id)) updates.set(id, rows[id]);
+          const rows = world[field], last = previous.rows[field];
+          for (const id in rows) if (Object.hasOwn(rows, id)) last.set(id, rows[id]);
         }
       } else {
         const source = captureFull ? await captureFull() : data;
         if (generation !== this.generation) return;
         const full = packet(source, fullRows(source), source.breeding);
         world = captureFull ? full : structuredClone(full);
-        this.previous = baseline(world, data.breeding, now);
+        this.previous = baseline(world, now);
+        this.needsFull = false;
       }
       return await network.broadcast('world', { delta: !!previous, ...(swims ? { swims } : {}), world }, { capturedWorld: true });
     } catch (error) {

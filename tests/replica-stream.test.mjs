@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { changesSince, fitsLegacyEnvelope, PAGE_UNITS, replicaPages, ReplicaReader, ReplicaTransfers } from '../www/replica-stream.js';
 import { mergeBreeding } from '../www/breeding.js';
-import { ReplicaSwims, WorldBroadcast } from '../www/world-broadcast.js';
+import { ReplicaRecovery, ReplicaSwims, WorldBroadcast } from '../www/world-broadcast.js';
 import { CONFIG, World } from './empty-world.mjs';
 
 test('分块保留标量、空表、跨块的字符、长记录及签名内的键顺序', async () => {
@@ -268,4 +268,146 @@ test('只播放同一来源相邻确认步的泳姿，跨缝可游动，转向�
   assert.equal(apply(message(4100, { a: fish('a', 7, 1, 4100) }, dir(5, [0, 0]), 'new leader', 'new actor')).directions, undefined);
   assert.equal(apply(message(4600, { a: fish('a', 8, 1, 4600) }, dir(5, [0]), 'new leader', 'new actor', {})), undefined);
   assert.equal(animation.latest, null);
+});
+
+test('等各伙伴应用回执后才继续发送，慢伙伴合并积压行而不阻塞其他伙伴', async t => {
+  const received = { slow: [], fast: [] }, forwarded = [], errors = [];
+  const peers = ['slow', 'fast'].map(node => ({ node, confirmedReplica: 'joined' }));
+  let releaseSlow;
+  const hold = new Promise(resolve => { releaseSlow = resolve; });
+  const receivers = new Map();
+  const sender = new ReplicaTransfers({
+    directControl(peer, kind, body) {
+      const { replica, via } = receivers.get(peer.node);
+      return Promise.resolve().then(() => {
+        replica.receive({ kind, from: 'source', actor: 'actor', body }, via).then(relay => forwarded.push(relay), error => errors.push(error));
+      });
+    },
+    close: (_, error) => errors.push(error)
+  });
+  t.after(() => { releaseSlow(); sender.stop(); for (const { replica } of receivers.values()) replica.stop(); });
+  for (const peer of peers) receivers.set(peer.node, {
+    via: { node: 'source', replicaLive: true },
+    replica: new ReplicaTransfers({
+      onMessage(message) {
+        assert.equal(message.kind, 'world');
+        received[peer.node].push(message.body);
+        if (peer.node === 'slow' && message.body.world.tick === 1) return hold;
+      },
+      directControl(_, kind, body) { return sender.receive({ kind, from: peer.node, body }, peer); }
+    })
+  });
+  const wait = async check => {
+    for (let i = 0; i < 100 && !check(); i++) await new Promise(resolve => setImmediate(resolve));
+    assert(check());
+  };
+  sender.publishLive({ delta: true, world: { tick: 1, fishes: { a: { x: 1 } } } }, peers);
+  await wait(() => received.slow.length === 1 && received.fast.length === 1);
+  assert.equal(receivers.get('slow').replica.incoming.size, 1);
+  await wait(() => !sender.live.has(peers[1]));
+  sender.publishLive({ delta: true, swims: [null, [0]], world: { tick: 2, chars: { c: { x: 7 } }, fishes: { a: { x: 2 } }, contacts: { aged: {} } } }, peers);
+  await wait(() => received.fast.length === 2 && !sender.live.has(peers[1]));
+  sender.publishLive({ delta: true, swims: [null, [0]], world: { tick: 3, breeding: { finished: { status: 'born' } }, fishes: { b: { x: 3 } }, contacts: {} } }, peers);
+  await wait(() => received.fast.length === 3 && !sender.live.has(peers[1]));
+  assert.deepEqual(received.fast.map(body => body.world.tick), [1, 2, 3]);
+  assert.equal(received.slow.length, 1);
+  assert.equal(receivers.get('slow').replica.incoming.size, 1);
+  releaseSlow();
+  await wait(() => !sender.live.size);
+  assert.deepEqual(received.slow.map(body => body.world.tick), [1, 3]);
+  assert.deepEqual(received.slow[1], { delta: true, world: { tick: 3, breeding: { finished: { status: 'born' } },
+    fishes: { a: { x: 2 }, b: { x: 3 } }, contacts: {}, chars: { c: { x: 7 } } } });
+  assert.deepEqual(errors, []);
+  assert(forwarded.length && forwarded.every(value => value === false));
+});
+
+test('定期全量接替积压增量，回执丢失会释放连接并由新连接的完整状态恢复', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const sent = [], closed = [];
+  const older = { node: 'peer', confirmedReplica: 'joined' }, fresh = { node: 'peer', confirmedReplica: 'joined' };
+  const sender = new ReplicaTransfers({
+    directControl(peer, kind, body) { sent.push({ peer, kind, ...body }); },
+    close(peer, error) { closed.push([peer, error.message]); sender.close(peer, error); }
+  });
+  t.after(() => sender.stop());
+  const flush = () => new Promise(resolve => setImmediate(resolve));
+  const ack = (peer, packet) => sender.receive({
+    kind: 'replicaReceipt', from: peer.node, body: { id: packet.id, index: packet.index, next: packet.index + 1 }
+  }, peer);
+  sender.publishLive({ delta: true, world: { tick: 1, fishes: {} } }, [older]);
+  sender.publishLive({ delta: true, world: { tick: 2, fishes: { old: { x: 2 } } } }, [older]);
+  sender.publishLive({ delta: false, world: { tick: 3, fishes: { current: { x: 3 } } } }, [older]);
+  sender.publishLive({ delta: true, world: { tick: 4, fishes: { current: { x: 4 } } } }, [older]);
+  assert.equal(sent.length, 1);
+  await ack(older, sent[0]); await flush();
+  assert.equal(sent.length, 2);
+  assert.deepEqual(new ReplicaReader().append(sent[1].text, true), {
+    delta: false, world: { tick: 4, fishes: { current: { x: 4 } } }
+  });
+  sender.publishLive({ delta: true, world: { tick: 5, fishes: { current: { x: 5 } } } }, [older]);
+  t.mock.timers.tick(120000); await flush();
+  assert.deepEqual(closed, [[older, '伙伴应用世界增量超时']]);
+  assert.equal(sent.length, 2);
+  assert.equal(sender.live.size, 0);
+
+  sender.publishLive({ delta: false, world: { tick: 6, fishes: { current: { x: 6 } } } }, [fresh]);
+  await ack(older, sent[1]); await flush();
+  assert(sender.live.has(fresh));
+  await ack(fresh, sent[2]); await flush();
+  assert.equal(sender.live.size, 0);
+  assert.equal(new ReplicaReader().append(sent[2].text, true).world.fishes.current.x, 6);
+});
+
+test('已确认直连持续发差量，归档删除后回收比较基线，旧网状成员仍定期补齐', async () => {
+  let notify, legacy = false;
+  const channel = new WorldBroadcast(callback => { notify = callback; });
+  const world = new World(100), data = world.data;
+  const record = { id: 'cold', kind: 'fish' };
+  const network = { live: () => [1], periodicWorldRequired: () => legacy, broadcast: (_, body) => body };
+  data.ops.cold = record;
+  assert.equal((await channel.send(network, data, 100)).delta, false);
+  assert(channel.previous.rows.ops.has('cold'));
+  delete data.ops.cold;
+  notify(world, { values: {}, tables: { ops: { set: [], remove: ['cold'] } } });
+  const afterArchive = await channel.send(network, data, 31000);
+  assert.equal(afterArchive.delta, true);
+  assert.deepEqual(afterArchive.world.ops, {});
+  assert(!channel.previous.rows.ops.has('cold'));
+
+  data.ops.cold = record;
+  notify(world, { values: {}, tables: { ops: { set: [['cold', record]], remove: [] } } });
+  assert.deepEqual((await channel.send(network, data, 32000)).world.ops, { cold: record });
+  legacy = true;
+  const repair = await channel.send(network, data, 33000);
+  assert.equal(repair.delta, false);
+  assert.deepEqual(repair.world.ops, { cold: record });
+});
+
+test('选主期间跳过的更新只向原发布者补齐，较早的全量及其他发布者不清除等待', () => {
+  const recovery = new ReplicaRecovery();
+  const packet = (from, actor, tick) => ({ from, actor, body: { world: { tick } } });
+  const source = tick => packet('original-publisher', 'original-actor', tick);
+  recovery.ignore(source(100));
+  assert.equal(recovery.request(packet('other', 'other-actor', 200), 1000), undefined);
+  const first = recovery.request(source(200), 1000);
+  assert.equal(first.to, 'original-publisher');
+  assert.match(first.request, /^[0-9a-f-]{36}$/i);
+  assert.equal(recovery.request(source(200), 2000), undefined);
+
+  recovery.covered(packet('other', 'other-actor', 900), first.request);
+  recovery.covered(packet('original-publisher', 'other-actor', 900), first.request);
+  recovery.covered(source(99), first.request);
+  recovery.ignore(source(100));
+  recovery.covered(source(250), first.request);
+  const latest = recovery.request(source(300), 6000);
+  assert.equal(latest.to, 'original-publisher');
+  assert.notEqual(latest.request, first.request);
+  recovery.covered(source(300), latest.request);
+  assert.equal(recovery.request(source(400), 12000), undefined);
+
+  recovery.ignore(source(500));
+  recovery.covered(source(500));
+  assert.equal(recovery.request(source(600), 13000).to, 'original-publisher');
+  recovery.covered(source(550));
+  assert.equal(recovery.request(source(600), 19000), undefined);
 });

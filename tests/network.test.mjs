@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Network } from '../www/network.js';
+import { ReplicaReader, replicaPages } from '../www/replica-stream.js';
+import { WorldBroadcast } from '../www/world-broadcast.js';
 
 class PeerConnection {
   connectionState = 'new';
@@ -80,6 +82,81 @@ test('旧伙伴接收已截取的世界时复用快照，并在签名前固定�
   const hello = await pending;
   assert.equal(hello.body.world, world);
   assert.equal(hello.body.cards[0].status, 'ended');
+});
+
+test('支持应用回执的伙伴拥有独立发送通道，旧版和网状中继继续收到原分块', async () => {
+  const network = new Network({ actor: 'a'.repeat(64) });
+  const modern = { node: 'modern', replicaPages: true, replicaLive: true };
+  const older = { node: 'older', replicaPages: true };
+  const paths = [], relays = [];
+  let peers = [modern, older], release;
+  network.replicaPeers = () => peers;
+  network.replicas.publishLive = (body, recipients) => paths.push([body.world.tick, recipients]);
+  network.broadcastReplica = (_, body, options, recipients) => {
+    relays.push([body, recipients]);
+    if (body.world.tick === 1) return new Promise(resolve => { release = resolve; });
+  };
+  const body = (tick, fishes) => ({ delta: true, world: { tick, fishes } });
+  await network.broadcast('world', body(1, { x: { x: 1 } }));
+  await network.broadcast('world', body(2, { y: { x: 2 } }));
+  await network.broadcast('world', body(3, { z: { x: 3 } }));
+  assert.deepEqual(paths, [[1, [modern]], [2, [modern]], [3, [modern]]]);
+  assert.deepEqual(relays, [[body(1, { x: { x: 1 } }), [older]]]);
+  release(); await flush();
+  assert.deepEqual(relays[1], [body(3, { y: { x: 2 }, z: { x: 3 } }), [older]]);
+
+  peers = [modern]; network.worldMembers.set('indirect', Date.now());
+  await network.broadcast('world', body(4, {}));
+  await flush();
+  assert.deepEqual(paths.at(-1), [4, [modern]]);
+  assert.deepEqual(relays.at(-1), [body(4, {}), [modern]]);
+});
+
+test('加入者在补发截取和双向握手之间锁住差量，已加入伙伴继续接收', async t => {
+  const host = new Network({ actor: 'a'.repeat(64) }, {}, () => {}), channel = new WorldBroadcast();
+  const ready = { node: 'ready', replicaPages: true, replicaLive: true, sentHello: true, confirmedReplica: 'ready' };
+  const joining = { node: 'joining', replicaPages: true, replicaLive: true };
+  host.live = () => [ready, joining];
+  t.after(() => host.replicas.stop());
+  const original = { tick: 1, roots: {}, breeding: {}, fishes: {} };
+  const unroll = (peer, packet) => host.replicas.receive({ from: peer.node, kind: 'replicaReceipt', body: {
+    id: packet.id, index: packet.index, next: packet.index + 1
+  } }, peer);
+  const packets = { ready: [], joining: [] };
+  host.directControl = async (peer, kind, packet) => {
+    if (kind !== 'replicaPage') return;
+    packets[peer.node].push(new ReplicaReader().append(packet.text, packet.last));
+    await unroll(peer, packet);
+  };
+  let releaseHello, releaseCut, releaseCatchup, catchup;
+  host.replicas.hello = (_, body, kind) => new Promise(resolve => {
+    if (!kind) releaseHello = () => resolve({ world: body.world, version: 'base' });
+    else { catchup = body.world; releaseCatchup = resolve; }
+  });
+  await channel.send(host, original, 100);
+  const joined = host.direct(joining, 'hello', { world: structuredClone(original) }, () => {
+    const cut = structuredClone(original);
+    return new Promise(resolve => { releaseCut = () => resolve(cut); });
+  });
+  original.fishes.before = { x: 2 }; original.tick++;
+  await channel.send(host, original, 200);
+  releaseHello(); await until(() => releaseCut);
+  original.fishes.after = { x: 3 }; original.tick++;
+  await channel.send(host, original, 300);
+  assert.deepEqual(packets.joining, []);
+  await until(() => packets.ready.length === 3);
+  assert.deepEqual(packets.ready.map(p => Object.keys(p.world.fishes)), [[], ['before'], ['after']]);
+  releaseCut(); await until(() => releaseCatchup);
+  assert.deepEqual(catchup.fishes, { before: { x: 2 } });
+  releaseCatchup(); await joined;
+  assert.deepEqual(packets.joining, []);
+
+  const [otherHello] = replicaPages({ world: { tick: 1 } });
+  await host.replicas.receive({ from: joining.node, kind: 'replicaPage', body: {
+    kind: 'hello', id: crypto.randomUUID(), index: 0, ...otherHello
+  } }, joining);
+  await until(() => packets.joining.length === 1);
+  assert.deepEqual(packets.joining[0].world.fishes, { after: { x: 3 } });
 });
 
 test('自动连接尚在握手时手动连接复用同一次尝试，等直连成功才返回', async t => {

@@ -7,8 +7,10 @@ const www = path.resolve(__dirname, '../www');
 const fishMode = process.argv[2] === '--fish';
 const count = Number((fishMode ? process.argv[3] : process.argv[2]) || (fishMode ? 5000 : 100000));
 const rounds = Number(process.argv[4] || 7);
+const applyDelay = Number(process.env.TIDE_TEST_APPLY_DELAY || 0);
 assert(Number.isSafeInteger(count) && count > 0 && (!fishMode || count <= 5500));
 assert(Number.isSafeInteger(rounds) && rounds > 0);
+assert(Number.isSafeInteger(applyDelay) && applyDelay >= 0);
 const server = http.createServer((req, res) => {
   if (req.url === '/') return res.setHeader('content-type', 'text/html').end('<!doctype html><title>联机容量验证</title>');
   const file = req.url === '/capacity-fish.mjs' ? path.join(__dirname, 'capacity-fish.mjs')
@@ -65,28 +67,30 @@ async function setup(page, rows, nick) {
   }, { rows, nick });
 }
 
-async function connect(left, right, from, to) {
-  const { offer, id } = await left.evaluate(async remote => {
+async function connect(left, right, from, to, live = false) {
+  const { offer, id } = await left.evaluate(async ({ remote, live }) => {
     const p = window.peer = net.make(crypto.randomUUID(), location.origin, remote);
     p.replicaPages = true;
+    p.replicaLive = live;
     net.attach(p, p.pc.createDataChannel('tide'));
     await p.pc.setLocalDescription(await p.pc.createOffer()); await net.ice(p.pc);
     return { offer: p.pc.localDescription.toJSON(), id: p.id };
-  }, to);
-  const answer = await right.evaluate(async ({ offer, id, remote }) => {
+  }, { remote: to, live });
+  const answer = await right.evaluate(async ({ offer, id, remote, live }) => {
     const p = window.peer = net.make(id, location.origin, remote);
     p.replicaPages = true;
+    p.replicaLive = live;
     await p.pc.setRemoteDescription(offer);
     await p.pc.setLocalDescription(await p.pc.createAnswer()); await net.ice(p.pc);
     return p.pc.localDescription.toJSON();
-  }, { offer, id, remote: from });
+  }, { offer, id, remote: from, live });
   await left.evaluate(answer => peer.pc.setRemoteDescription(answer), answer);
   await Promise.all([left, right].map(p => p.waitForFunction(() => peer.dc?.readyState === 'open')));
 }
 
 async function setupFish(page, fishCount) {
   await page.goto('http://127.0.0.1:' + server.address().port);
-  return page.evaluate(async fishCount => {
+  return page.evaluate(async ({ fishCount, applyDelay }) => {
     const { World, CONFIG } = await import('/engine.js');
     const { Network } = await import('/network.js');
     const { verifyReplica } = await import('/replica.js');
@@ -114,6 +118,7 @@ async function setupFish(page, fishCount) {
     };
     const net = window.net = new Network(identity, {}, async message => {
       if (!['hello', 'merge', 'world'].includes(message.kind)) return;
+      if (message.kind === 'world' && applyDelay) await new Promise(resolve => setTimeout(resolve, applyDelay));
       const data = message.body.world, started = clock();
       await verifyReplica(data, {}, undefined, { current: world.data });
       const verified = clock();
@@ -141,9 +146,9 @@ async function setupFish(page, fishCount) {
       let sending;
       const unsubscribe = subscribeSimulationChanges((target, patch) => {
         if (target !== world || !Number.isFinite(patch?.values?.tick)) return;
-        const started = clock(), bytes = net.stats.sent;
+        const started = clock();
         sending = channel.send(net, world.data, Date.now(), undefined, patch.swims).then(() => ({
-          started, sendMs: clock() - started, wireBytes: net.stats.sent - bytes
+          started, queueMs: clock() - started
         }));
       });
       try {
@@ -163,7 +168,7 @@ async function setupFish(page, fishCount) {
       } finally { unsubscribe(); simulation.close(); }
     };
     return net.node;
-  }, fishCount);
+  }, { fishCount, applyDelay });
 }
 
 async function fishReplica(left, right) {
@@ -172,23 +177,28 @@ async function fishReplica(left, right) {
   left.on('worker', () => workers++);
   for (const page of [left, right]) page.on('pageerror', error => errors.push(error.message));
   const [from, to] = await Promise.all([setupFish(left, count), setupFish(right, 0)]);
-  await connect(left, right, from, to);
+  await connect(left, right, from, to, true);
   await Promise.all([left, right].map(page => page.evaluate(() => joinReplica())));
   const initial = await right.evaluate(() => ({ fish: Object.keys(world.data.fishes).length, cells: Object.keys(world.data.chars).length }));
   assert.deepEqual(initial, { fish: count, cells: count * 9 });
+  const sentBefore = await left.evaluate(() => net.stats.sent);
   const { sent, poses } = await left.evaluate(rounds => sendSteps(rounds), rounds);
-  await right.waitForFunction(n => arrivals.length >= n || rejected.length, rounds);
+  await right.waitForFunction(tick => arrivals.at(-1)?.tick === tick || rejected.length > 0, sent.at(-1).tick);
   const received = await right.evaluate(() => ({ arrivals, poses: poses(), rejected, rejects: net.stats.rejected }));
   assert.deepEqual(received.rejected, []);
   assert.equal(received.rejects, 0);
   assert.deepEqual(errors, []);
   assert.equal(workers, 1);
-  assert.deepEqual(received.arrivals.map(packet => packet.tick), sent.map(packet => packet.tick));
-  const deliveries = sent.map(({ samples, started, ...packet }, i) => {
-    const arrival = received.arrivals[i];
+  const appliedTicks = received.arrivals.map(packet => packet.tick), sentTicks = sent.map(packet => packet.tick);
+  assert.equal(appliedTicks.at(-1), sentTicks.at(-1));
+  assert.deepEqual(appliedTicks, sentTicks.filter(tick => appliedTicks.includes(tick)));
+  if (!applyDelay) assert.deepEqual(appliedTicks, sentTicks);
+  const byTick = new Map(sent.map(packet => [packet.tick, packet]));
+  const deliveries = received.arrivals.map(arrival => {
+    const { samples, started, ...packet } = byTick.get(arrival.tick);
     assert.equal(arrival.delta, true, '应保留已加入后的日常增量');
     assert.equal(arrival.appliedTick, packet.tick);
-    assert(arrival.rows > 0 && packet.wireBytes > 0);
+    assert(arrival.rows > 0);
     assert.deepEqual(arrival.samples, samples);
     return { ...packet, sendOffsetMs: started - sent[0].started, rows: arrival.rows,
       animated: arrival.animated, deliveryMs: arrival.merged - started,
@@ -196,9 +206,10 @@ async function fishReplica(left, right) {
   });
   assert.equal(received.poses.length, count);
   for (let i = 0; i < poses.length; i++) assert.deepEqual(received.poses[i], poses[i], poses[i][0]);
-  const wireBytes = deliveries.reduce((sum, packet) => sum + packet.wireBytes, 0);
-  console.log(JSON.stringify({ browser: browser.version(), initial, rounds, workers, rejected: received.rejects,
-    missing: sent.length - received.arrivals.length, comparedFinalPoses: poses.length,
+  const wireBytes = await left.evaluate(() => net.stats.sent) - sentBefore;
+  assert(wireBytes > 0);
+  console.log(JSON.stringify({ browser: browser.version(), initial, rounds, workers, applyDelay, rejected: received.rejects,
+    appliedPackets: received.arrivals.length, coalescedSteps: sent.length - received.arrivals.length, comparedFinalPoses: poses.length,
     wireBytesPerSecond: wireBytes / (rounds * .5), deliveries }, null, 2));
 }
 
