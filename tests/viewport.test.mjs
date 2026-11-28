@@ -37,8 +37,8 @@ test('页面写入完整运动记录，视窗只处理改变占格的鱼，旧�
     frame.commit(fishes);
     viewport.update(patch.tables);
     assert.equal(frame.pairs, undefined);
-    assert.equal(viewport.owners.fish.get('a').x, 5);
-    assert.equal(viewport.owners.fish.get('b').x, x);
+    assert.equal(fishes.a.x, 5);
+    assert.equal(fishes.b.x, x);
     return patch.tables.fishes;
   }
   const first = commit(500, 33);
@@ -353,9 +353,7 @@ test('追随端提交合流后，鱼体换主人、食物沉积和跨接缝镜�
   runtime.draw(world);
   assert.deepEqual(runtime.hit(71, 51), { kind: 'fish', id: 'g' });
 
-  const movedOwners = [];
-  const moveOwner = index.moveOwner.bind(index);
-  index.moveOwner = (group, pose) => { movedOwners.push(pose?.id); moveOwner(group, pose); };
+  const before = index.query(997, 1002, 0, 31);
   const nextTick = tick + 500;
   const next = { ...incoming, tick: nextTick, chars: {}, scenes: {},
     fishes: Object.fromEntries(Object.entries(world.data.fishes).map(([id, fish]) => [id, { ...fish, posAt: nextTick, cx: 0.25 }])) };
@@ -363,10 +361,10 @@ test('追随端提交合流后，鱼体换主人、食物沉积和跨接缝镜�
   // left its anchor. Hit-testing and drawing still use the latest fish rows.
   const steady = world.merge(next, {}, 'replica', true);
   runtime.applyMerge(world, index, steady);
-  assert.deepEqual(movedOwners, []);
+  assert.equal(index.query(997, 1002, 0, 31), before);
   const cross = { ...next, tick: nextTick + 500, fishes: { g: { ...next.fishes.g, x: 35, posAt: nextTick + 500 } } };
   runtime.applyMerge(world, index, world.merge(cross, {}, 'replica', true));
-  assert.deepEqual(movedOwners, ['g']);
+  assert(index.query(35, 35, 0, 31).some(cell => cell.entity === 'g'));
   const rebuilt = new ViewportCells(world.data);
   for (const x of [0, 33, 997]) assert.deepEqual(rows(index.query(x, x + 5, 0, 31)), rows(rebuilt.query(x, x + 5, 0, 31)));
   runtime.camera.x = 35;

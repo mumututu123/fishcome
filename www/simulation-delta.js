@@ -136,15 +136,15 @@ class CommittedRows {
     return this.offsets?.[i] ? poseRecord(before, this.motion, this.offsets[i] - 1, this.tick)
       : { ...before, days: { ...before.days, [this.day]: this.distances[i] } };
   }
-  forEachPose(visit) {
-    for (let i = 0; i < this.length; i++) {
-      const offset = this.offsets?.[i];
-      if (offset) visit(this.idAt(i), this.motion[offset - 1], this.motion[offset], this.motion[offset + 1]);
-      else {
-        const { x, y, facing } = this.recordAt(i);
-        visit(this.idAt(i), x, y, facing);
-      }
-    }
+  readPose(i, coordinates) {
+    const record = this.records[i];
+    if (record) return record;
+    const offset = this.offsets?.[i];
+    if (!offset) return this.recordAt(i);
+    coordinates.x = this.motion[offset - 1];
+    coordinates.y = this.motion[offset];
+    coordinates.facing = this.motion[offset + 1];
+    return coordinates;
   }
   commit(table) {
     const slots = SimulationRows.for(table, this.knownFish);
