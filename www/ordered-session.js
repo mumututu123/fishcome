@@ -163,7 +163,7 @@ export class OrderedSession {
 
   valid(s) {
     return this.current === s && this.io.peer() === s.peer && this.io.world() === s.world &&
-      this.io.leader() === s.leader && this.io.store() === s.store && (s.snapshot && !s.steps ||
+      this.io.leader() === s.leader && this.io.store() === s.store && ((s.snapshot || s.reserved) && !s.steps ||
       s.store.revision === s.revision && s.world.data.archives?.at === s.archiveAt);
   }
   send(s, message) {
@@ -202,7 +202,7 @@ export class OrderedSession {
   }
   archiveChanging(reason) {
     const s = this.current;
-    if (s?.snapshot && !s.steps) this.changed(s.world);
+    if ((s?.snapshot || s?.reserved) && !s.steps) this.changed(s.world);
     else this.stop(reason);
   }
   committed(s) {
@@ -220,6 +220,12 @@ export class OrderedSession {
   async probe() {
     const peer = this.io.peer(), now = performance.now();
     const prior = this.current;
+    if (prior?.reserved && prior.owner && this.valid(prior)) {
+      if (prior.world.data.tick < prior.base) return;
+      if (prior.world.data.tick > prior.base) { this.stop('权威步没有连续到达预约基准'); return; }
+      prior.waiting = false;
+      return this.openCheckpoint(prior);
+    }
     if (prior?.nextCut && prior.owner && this.valid(prior) && prior.world.data.tick > prior.base) {
       prior.joined?.(false);
       const s = this.begin(peer, crypto.randomUUID(), prior.world.data.tick);
@@ -230,15 +236,17 @@ export class OrderedSession {
     if (this.current || !peer || !this.io.isLeader() || now < (this.retryAt || 0) ||
         Date.now() - this.io.world().data.tick > CONFIG.step) return;
     const world = this.io.world(), leader = this.io.leader();
-    const possible = this.candidate;
-    if (!possible?.acknowledged || possible.peer !== peer || possible.world !== world || possible.leader !== leader || now - possible.askedAt > 1000) {
-      if (possible?.peer === peer && !possible.acknowledged && now - possible.askedAt < CONFIG.step / 2) return;
-      const id = crypto.randomUUID();
-      this.candidate = { peer, world, leader, id, askedAt: now };
+    let possible = this.candidate;
+    if (!possible || possible.peer !== peer || possible.world !== world || possible.leader !== leader) {
+      possible = this.candidate = { peer, world, leader, id: crypto.randomUUID() };
       prepareCheckpointPages(world).catch(() => {});
+    }
+    if (!possible.acknowledged) {
+      if (now - possible.askedAt < CONFIG.step) return;
+      possible.askedAt = now;
       // An unanswered enquiry never reserves an ecology tick. The existing
       // authority keeps publishing while the other tab finishes its hello.
-      await this.io.send(peer, { action: 'available?', id, leader });
+      await this.io.send(peer, { action: 'available?', id: possible.id, leader });
       return;
     }
     this.candidate = undefined;
@@ -259,6 +267,11 @@ export class OrderedSession {
   }
   capture(s) {
     if (s.snapshot) return;
+    if (s.reserved) {
+      s.revision = s.store.revision;
+      s.archiveAt = s.world.data.archives?.at;
+      s.reserved = false;
+    }
     s.snapshot = captureOrderedWorld(s.world, s.store);
     const data = s.snapshot.world.data;
     s.journal = new AdmissionJournal(data, capturedOrderedRows(data, 'chars'), capturedOrderedRows(data, 'ops'));
@@ -284,6 +297,7 @@ export class OrderedSession {
   }
   async afterReplica() {
     const s = this.current;
+    if (s?.reserved && !s.owner && !s.snapshot && s.world.data.tick === s.base && this.valid(s)) this.capture(s);
     if (s?.followAnchor && !s.owner && !s.steps) {
       if (s.journal.broken) return this.send(s, { action: 'pastJoined', base: s.base, proof: s.proof, follow: false });
       return this.offerTip(s);
@@ -460,16 +474,34 @@ export class OrderedSession {
     if (b.action === 'available') {
       const c = this.candidate;
       if (s || !c || !this.io.isLeader() || peer !== c.peer || b.id !== c.id || b.leader !== c.leader ||
-          c.world !== this.io.world() || c.leader !== this.io.leader() || performance.now() - c.askedAt > CONFIG.step) return;
+          c.world !== this.io.world() || c.leader !== this.io.leader()) return;
       // The next ordinary committed tick invokes probe at its publication
       // boundary. Signing a cut here would spend the first tick's remaining
       // budget on a reply that can arrive anywhere inside that tick.
       c.acknowledged = true;
       return;
     }
+    if (b.action === 'reserve') {
+      const missed = this.missedOpening, world = this.io.world();
+      if (!missed || this.io.isLeader() || missed.peer !== peer || missed.world !== world || missed.leader !== this.io.leader() ||
+          b.replaces !== missed.epoch || typeof b.epoch !== 'string' || b.epoch.length !== 36 || !Number.isSafeInteger(b.base) ||
+          b.base < world.data.tick || b.base > world.data.tick + CONFIG.step * 4 || (b.base - world.data.tick) % CONFIG.step !== 0 ||
+          s?.steps || s && s.epoch !== missed.epoch && (!missed.previous || s.checkedProof !== missed.previous)) return;
+      this.missedOpening = undefined;
+      s?.joined?.(false);
+      s = this.begin(peer, b.epoch, b.base);
+      s.priorProof = missed.previous;
+      s.reserved = s.waiting = true;
+      return this.afterReplica();
+    }
     if (b.action === 'open' || b.action === 'opening') {
       const observed = s?.peer === peer && s.epoch === b.epoch && s.base === b.base && s.snapshot;
       if (b.previous !== undefined && (!s || !this.valid(s) || b.previous !== (s.epoch === b.epoch ? s.priorProof : s.checkedProof))) return;
+      if (b.action === 'opening' && !observed && !this.io.isLeader() && b.base < this.io.world().data.tick && Number.isSafeInteger(b.base) &&
+          typeof b.epoch === 'string' && b.epoch.length === 36 && (!s || !s.steps && (s.epoch === b.epoch || b.previous && b.previous === s.checkedProof))) {
+        this.missedOpening = { peer, world: this.io.world(), leader: this.io.leader(), epoch: b.epoch, previous: b.previous };
+        return this.io.send(peer, { action: 'missedOpening', epoch: b.epoch, base: b.base });
+      }
       if (this.io.isLeader() || typeof b.epoch !== 'string' || b.epoch.length !== 36 || !Number.isSafeInteger(b.base) ||
           !observed && b.base < this.io.world().data.tick || b.base > this.io.world().data.tick + CONFIG.step * 2 ||
           (b.action === 'open' ? !/^[0-9a-f]{64}$/.test(b.proof) || !/^[0-9a-f]{64}$/.test(b.exceptBonds)
@@ -493,6 +525,15 @@ export class OrderedSession {
     if (!s || s.peer !== peer || b.epoch !== s.epoch) return;
     if (b.action === 'stop') { this.stop('伙伴已切回世界同步', false, true); return; }
     if (!this.valid(s)) { this.stop('共同结算的连接或归档已更换'); return; }
+    if (b.action === 'missedOpening' && s.owner && !s.steps && b.base === s.base) {
+      const prior = s;
+      prior.joined?.(false);
+      s = this.begin(peer, crypto.randomUUID(), s.world.data.tick + CONFIG.step * 2);
+      s.priorProof = prior.priorProof;
+      s.orderFields = prior.orderFields;
+      s.waiting = s.reserved = true;
+      return this.send(s, { action: 'reserve', replaces: prior.epoch, base: s.base });
+    }
     if (b.action === 'history' && s.owner && !s.steps && !s.reconciling && b.base === s.base) {
       if (!s.cut?.exceptBonds || b.exceptBonds !== s.cut.exceptBonds || !b.bonds) {
         const different = Object.keys(s.cut?.tableProofs || {}).filter(name => /^[0-9a-f]{64}$/.test(b.tableProofs?.[name]) && b.tableProofs[name] !== s.cut.tableProofs[name]);

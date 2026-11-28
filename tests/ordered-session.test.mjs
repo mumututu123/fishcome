@@ -305,6 +305,37 @@ test('缺少起始步的接收端能释放旧会话，成员更换后没有旧�
   assert.equal(a.session.valid(past), false);
 });
 
+test('开启通知到达时已经错过旧步，双方提前预约同一自然步，证明再迟到仍可接管', async () => {
+  const now = Date.now(), { sides: [a,b], drain } = pair(now), early = [], reserved = [];
+  const delayProof = queue => msg => {
+    if (msg.action !== 'opening' && msg.action !== 'open') return;
+    queue.push(msg); return true;
+  };
+  await a.session.probe();
+  await drain(delayProof(early));
+  publishOrdinary(a,b,now + 500);
+  for (const msg of early.reverse()) await b.session.receive(b.peer,msg);
+  await drain();
+  for (const side of [a,b]) {
+    assert.equal(side.session.current.reserved, true);
+    assert.equal(side.session.current.base, now + 1500);
+  }
+  for (const tick of [now + 1000, now + 1500, now + 2000]) {
+    for (const side of [a,b]) assert.equal(side.session.run(tick), false);
+    publishOrdinary(a,b,tick);
+    await a.session.probe();
+    await b.session.afterReplica();
+    await drain(delayProof(reserved));
+  }
+  assert.equal(reserved.length, 2);
+  for (const msg of reserved.reverse()) await b.session.receive(b.peer,msg);
+  await drain();
+  for (const side of [a,b]) assert.equal(side.session.run(now + 2500), true);
+  await drain();
+  assert.deepEqual(a.calls,[now + 2500]);
+  assert.deepEqual(a.calls,b.calls);
+});
+
 for (const conflict of [false, true]) test('慢入场遇到真实签名归档和名册换序后，' + (conflict ? '不同的本地归档索引阻止接管' : '归档已落盘的同一世界继续接管'), async () => {
   const now = Date.now(), { sides: [a,b], drain } = pair(now);
   const signed = await earn(a.world, 9);
@@ -476,8 +507,11 @@ test('对方尚未完成首次加入时询问不占用时钟，迟到的回执�
   assert.ok(old); assert.equal(a.session.current, undefined);
   assert.equal(a.session.run(now + 500), false);
   a.session.candidate.askedAt = performance.now() - 1100;
+  await a.session.probe();
+  await drain(message => message.action === 'available');
   await a.session.receive(a.peer,old);
   assert.equal(a.session.current,undefined);
+  assert.equal(a.session.candidate.acknowledged,true);
   await a.session.probe(); await drain();
   assert.ok(a.session.current.steps); assert.ok(b.session.current.steps);
 });
