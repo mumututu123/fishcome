@@ -623,9 +623,19 @@ export class World {
         if (!this.data.scenes[id]) this.data.scenes[id] = { id, actor: c.payer, nick: this.data.participants[c.payer] || '自然沉积', x: c.x, y: c.y, posAt: now, poseId: id };
         const s = this.data.scenes[id], px = c.x, py = c.y; transition(c, { kind: 'scene', entity: id, x: deltaX(c.x, s.x), y: c.y - s.y }, { id: `settle:${c.id}:${c.path.length}`, t: c.born + CONFIG.foodLife, reason: 'expire' }); this.dirty = true; scenery.set(key(px, py), { scene: s, cell: c }); continue;
       }
-      c.fall = blocked || eatContact || fishOccupancy.get(c.x, c.y + 1) || (foodCount.get(key(c.x, c.y + 1)) > 0) ? 0 : (c.fall || 0) + dt * CONFIG.depth / 300;
-      while (c.fall >= 1 && c.y + 1 < this.floorAt(c.x) && !scenery.has(key(c.x, c.y + 1)) && !fishOccupancy.get(c.x, c.y + 1) && !(foodCount.get(key(c.x, c.y + 1)) > 0)) { const old = key(c.x, c.y); foodCount.set(old, Math.max(0, foodCount.get(old) - 1)); c.y++; c.fall--; foodCount.set(key(c.x, c.y), (foodCount.get(key(c.x, c.y)) || 0) + 1); }
-      c.moveAt = now;
+      let y = c.y;
+      let fall = blocked || eatContact || fishOccupancy.get(c.x, y + 1) || foodCount.get(key(c.x, y + 1)) > 0
+        ? 0 : (c.fall || 0) + dt * CONFIG.depth / 300;
+      const floor = this.floorAt(c.x);
+      while (fall >= 1 && y + 1 < floor && !scenery.has(key(c.x, y + 1)) &&
+          !fishOccupancy.get(c.x, y + 1) && !(foodCount.get(key(c.x, y + 1)) > 0)) {
+        const old = key(c.x, y);
+        foodCount.set(old, Math.max(0, foodCount.get(old) - 1));
+        y++; fall--;
+        const next = key(c.x, y);
+        foodCount.set(next, (foodCount.get(next) || 0) + 1);
+      }
+      this.setFoodMotion(c, y, fall, now);
     }
     const edible = [...foods.filter(c => c.kind === 'food' && now - c.born < CONFIG.foodLife), ...seaweed].sort((a, b) => (a.born ?? a.created) - (b.born ?? b.created) || a.id.localeCompare(b.id)), foodPositions = new Set([...foods.filter(c => c.kind === 'food'), ...edible].map(c => key(c.x, c.y)));
     const turningObstacles = new Map(scenery); for (const cell of edible) if (cell.kind === 'seaweed') turningObstacles.set(key(cell.x, cell.y), {});
@@ -671,6 +681,11 @@ export class World {
       const stable = changedBodies.size ? ids.filter(id => !changedBodies.has(id)) : ids;
       if (stable.length) swims[direction] = stable;
     });
+  }
+  setFoodMotion(cell, y, fall, now) {
+    cell.fall = fall;
+    if (cell.y !== y) cell.y = y;
+    cell.moveAt = now;
   }
   turn(f, cells, scenery = this.sceneryMap(), occupants = this.fishOccupants(), b = bounds(cells), hull) {
     const next = { id: f.id, x: f.x + f.facing * (b.minX + b.maxX), y: f.y, facing: -f.facing };

@@ -11,6 +11,10 @@ import { advanceBond, encodeBondIntervals } from './bond-interval.js';
 import { digestJsonText, jsonDigest } from './step-digest.js';
 
 const motionEdit = { properties: motionFields };
+const fallFields = ['fall', 'y', 'moveAt'];
+const foodEdits = Array.from({ length: 8 }, (_, bits) => ({
+  properties: fallFields.filter((_, bit) => bits & (1 << bit))
+}));
 
 // Only a user operation, a verified replica or archiving writes these fields.
 // Natural simulation and geometry repair use them as lookup tables.
@@ -225,6 +229,10 @@ function trackWorld() {
       if (!changed.has(id)) changed.set(id, { properties: new Set() });
       let edit = changed.get(id);
       if (!edit) return;
+      if (typeof edit === 'number') {
+        edit = { properties: new Set(foodEdits[edit].properties) };
+        changed.set(id, edit);
+      }
       if (edit === motionEdit || typeof edit === 'string') {
         edit = edit === motionEdit ? { properties: new Set(motionFields) } : { properties: new Set(), days: new Set([edit]) };
         changed.set(id, edit);
@@ -417,6 +425,17 @@ function trackWorld() {
     poseRevision++;
     return raw(fish);
   }
+  function setFoodMotion(cell, y, fall, now) {
+    const row = raw(cell);
+    let bits = 0;
+    if (row.fall !== fall || !Object.hasOwn(row, 'fall')) { row.fall = fall; bits |= 1; }
+    if (row.y !== y) { row.y = y; bits |= 2; }
+    if (row.moveAt !== now || !Object.hasOwn(row, 'moveAt')) { row.moveAt = now; bits |= 4; }
+    if (!bits) return;
+    const edits = tableChanges('chars'), id = row[observation].location.id, old = edits.get(id);
+    if (old === undefined || typeof old === 'number') edits.set(id, (old || 0) | bits);
+    else if (old) for (const key of foodEdits[bits].properties) old.properties.add(key);
+  }
   // Ordinary fish publish their motion directly in the wire format. Later
   // feeding, death or repairs can still supersede that row in the same step.
   let swimming;
@@ -513,6 +532,7 @@ function trackWorld() {
     // Swimming owns these six scalar fields until the ordered movement pass
     // completes. Other writes to the same fish still join the ordinary edit.
     movingFish,
+    setFoodMotion,
     swimOrdinal: id => knownFish.get(id),
     beginSwimBatch,
     completeSwimBatch,
@@ -565,7 +585,7 @@ function trackWorld() {
             motion[offset++] = row.facing;
             motion[offset++] = row.cx;
             motion[offset++] = row.cy;
-          } else set.push(encodeRow(id, row, edit));
+          } else set.push(encodeRow(id, row, typeof edit === 'number' ? foodEdits[edit] : edit));
         }
         if (motion && offset * 2 < motion.length) motion = motion.slice(0, offset);
         patch.tables[field] = { set, remove };
@@ -706,6 +726,7 @@ export class WorkerSimulation {
       this.world.poseEdits = this.tracker.poseEdits;
       this.world.clearPoseEdits = this.tracker.clearPoseEdits;
       this.world.movingFish = this.tracker.movingFish;
+      this.world.setFoodMotion = this.tracker.setFoodMotion;
       this.world.swimOrdinal = this.tracker.swimOrdinal;
       this.world.beginSwimBatch = this.tracker.beginSwimBatch;
       this.world.completeSwimBatch = this.tracker.completeSwimBatch;
