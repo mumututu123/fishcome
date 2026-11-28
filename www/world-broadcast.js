@@ -276,8 +276,23 @@ function knownCount(rows, keys, archived) {
 // an archive at different times on each peer. It is still the same record.
 export class ReplicaInventory {
   previousCounts = new WeakMap();
+  publications = new WeakMap();
 
-  heartbeat(data, store) {
+  heartbeat(data, store, publishing = false) {
+    const cut = publishing && this.publications.get(data);
+    if (cut) return cut.body;
+    return this.count(data, store);
+  }
+
+  atPublication(data, store, now) {
+    const last = this.publications.get(data);
+    if (last && now >= last.at && now - last.at < 3000) return;
+    const body = { ...this.count(data, store), inventoryOnWorld: true };
+    this.publications.set(data, { at: now, body });
+    return body.settledRecords;
+  }
+
+  count(data, store) {
     const counts = {}, body = { settledRecords: {} };
     const previous = this.previousCounts.get(data);
     for (const [field, name] of Object.entries(inventoryFields)) {
@@ -413,7 +428,7 @@ export class WorldBroadcast {
     } finally { this.busy = false; }
   }
 
-  async send(network, data, now = Date.now(), captureFull, directions) {
+  async send(network, data, now = Date.now(), captureFull, directions, readInventory) {
     if (!network.live().length) { if (this.source) this.reset(); return; }
     const peers = network.worldReplicaPeers?.() ?? network.replicaPeers?.();
     if (peers?.length === 0 || this.busy) return;
@@ -460,7 +475,9 @@ export class WorldBroadcast {
         this.previous = baseline(world, now);
         this.needsFull = false;
       }
-      const body = { delta: !!previous, ...(previous && { fromTick }), ...(swims ? { swims } : {}), world };
+      const settledRecords = previous && readInventory?.();
+      const body = { delta: !!previous, ...(previous && { fromTick }), ...(swims ? { swims } : {}),
+        ...(settledRecords && { settledRecords }), world };
       network.stageWorld?.(body, peers);
       return await network.broadcast('world', body, { capturedWorld: true });
     } catch (error) {

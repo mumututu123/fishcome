@@ -394,9 +394,10 @@ async function onMessage(message, peer) {
       const direct = network.live().find(p => p.node === message.from);
       members.set(message.from, { ...body.member, direct: !!direct, url: await normalizeInvite(direct?.url || body.member.url), at: Date.now() });
       remember(body.member.url); rememberAuthor(message.actor, body.member.nick);
-      if (Date.now() - lastRepair > 5000 && replicaInventory.missing(body, world.data, archiveStore)) {
-        lastRepair = Date.now();
-        network.broadcast('replicaRequest', { to: message.from }).catch(() => {});
+      // The ordered world stream checks these counts after the matching data commits.
+      // Legacy and indirect peers still audit history through their heartbeat.
+      if (!(body.inventoryOnWorld === true && direct?.replicaLive && direct.confirmedReplica && message.from === leader())) {
+        checkReplicaInventory(body, message.from, false);
       }
     }
   } else if (message.kind === 'merge') {
@@ -419,6 +420,9 @@ async function onMessage(message, peer) {
     try {
       const changed = await mergeReplica(body.world, peer, body.delta ? 'world-delta' : 'world-full', message);
       if (changed) update();
+      if (changed !== undefined && body.settledRecords && peer?.replicaLive && peer.node === message.from && message.from === leader()) {
+        checkReplicaInventory(body, message.from, true);
+      }
       return changed !== undefined;
     }
     catch (error) {
@@ -490,8 +494,16 @@ async function networkChange(error) {
 async function probeGone(id, url) { if (!id || id === network.node || !members.has(id)) return; try { url = await normalizeInvite(url); const s = await network.local('probe', { url }); if (!(s.clients || []).some(c => c.id === id)) { members.delete(id); await network.broadcast('lost', { id, url }); update(); } } catch { /* Membership lease expires if the publishing computer is unreachable. */ } }
 async function broadcastWorld(directions) {
   if (!amLeader()) return;
-  try { await worldBroadcast.send(network, world.data, Date.now(), captureReplica, directions); }
+  const now = Date.now();
+  try { await worldBroadcast.send(network, world.data, now, captureReplica, directions,
+    () => replicaInventory.atPublication(world.data, archiveStore, now)); }
   catch (error) { status = error.message; }
+}
+function checkReplicaInventory(body, from, ordered) {
+  const now = Date.now();
+  if (now - lastRepair <= 5000 || !replicaInventory.missing(body, world.data, archiveStore)) return;
+  lastRepair = now;
+  network.broadcast('replicaRequest', { to: from, ...(ordered && { request: crypto.randomUUID() }) }).catch(() => {});
 }
 async function applyAtBoundary(message, requiresLeader) {
   const target = world, store = archiveStore;
@@ -1000,7 +1012,7 @@ async function maintainWorld() {
   if (replacingCheckpoint) return;
   if (now - selfBeat >= 3000 && network.live().length) {
     selfBeat = now;
-    network.broadcast('beat', { member: member(), ...replicaInventory.heartbeat(world.data, archiveStore) }).catch(() => {});
+    network.broadcast('beat', { member: member(), ...replicaInventory.heartbeat(world.data, archiveStore, amLeader()) }).catch(() => {});
   }
   if (!activeSavePromise && now - lastSave > 5000) { lastSave = now; save().catch(reportSaveError); }
   if (amLeader() && now - lastPictureTime > 30000) { lastPictureTime = now; takePicture().catch(() => {}); }

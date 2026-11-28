@@ -33,6 +33,28 @@ test('心跳按已知记录并集修复，允许在途记录先到达，搬入�
 });
 import { CONFIG, World } from './empty-world.mjs';
 
+test('直连库存只随已发布的世界增加，同一步归档仍能发现真正缺少的记录', () => {
+  const sender = new ReplicaInventory(), receiver = new ReplicaInventory();
+  const store = () => ({ ids: { ops: new Map(), chats: new Map(), chatSources: new Map() } });
+  const left = { tick: 500, roots: { sea: 0 }, ops: { a: {} }, chats: {}, chatSources: {} };
+  const right = structuredClone(left), a = store(), b = store();
+  sender.atPublication(left, a, 0);
+  sender.atPublication(left, a, 3000);
+  left.ops.earned = {};
+  const before = sender.heartbeat(left, a, true);
+  assert.equal(before.inventoryOnWorld, true);
+  assert.equal(before.opCount, 1);
+  assert.equal(sender.heartbeat(left, a, true), before);
+  a.ids.ops.set('earned', 'archive');
+  delete left.ops.earned;
+  sender.atPublication(left, a, 6000);
+  const settledRecords = sender.atPublication(left, a, 9000);
+  assert.equal(left.tick, right.tick);
+  assert.equal(receiver.missing({ settledRecords }, right, b), true);
+  b.ids.ops.set('earned', 'archive');
+  assert.equal(receiver.missing({ settledRecords }, right, b), false);
+});
+
 test('分块保留标量、空表、跨块的字符、长记录及签名内的键顺序', async () => {
   const body = { delta: false, world: {
     tick: 12, roots: {}, notices: [], chats: {

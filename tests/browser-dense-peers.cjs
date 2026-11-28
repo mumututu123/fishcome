@@ -700,6 +700,9 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
   assert.deepEqual(errors, []);
   assert.equal(stepStages.requestToAuthority.missing, 0, '完成的生态请求缺少权威状态写入时间');
   assert(!archiveError && rounds.every(round => sampled(round) && round.deliveredAt <= ended), archiveError || '至少一轮归档未在采样期间传递');
+  if (archiveRounds && !values.drop && !values['forget-live-base'] && !values['plain-live']) {
+    assert(!pages.some(page => page.repairs.some(sampled)), '完整存档直连归档时误报缺少记录，触发了补拉');
+  }
   if (values['refresh-budget']) assert(confirmed.missing === 0 && confirmed.over20 === 0 &&
     stepComplete.n >= 9 && stepComplete.n === stepComplete.requested && stepComplete.over20 === 0 &&
     requests.slice(1).every((row, i) => row.tick - requests[i].tick === 500) && summaries.every(page => page.draw.over20 === 0 &&
