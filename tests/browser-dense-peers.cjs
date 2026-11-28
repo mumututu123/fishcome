@@ -78,8 +78,8 @@ ReplicaTransfers.prototype.sendLivePacket = async function (peer, lane, body) {
 };
 const receivePage = ReplicaTransfers.prototype.receive;
 ReplicaTransfers.prototype.receive = async function (message, peer) {
-  if (window.denseForgetArmed && message.body.kind === 'live' && message.body.index === 0 &&
-      message.body.text.split('\\n', 1)[0].includes('"rowBase":')) {
+  if (window.denseForgetArmed && (message.kind === 'replicaFrame' && message.body.rowBase ||
+      message.body.kind === 'live' && message.body.index === 0 && message.body.text.split('\\n', 1)[0].includes('"rowBase":'))) {
     this.rowsReceived.delete(peer);
     window.denseForgetArmed = false;
   }
@@ -193,6 +193,12 @@ Network.prototype.encode = async function (message) {
     testData.liveBytes.push({ at: Date.now(), bytes: encoded.byteLength + Math.ceil(encoded.byteLength / 16000) * 44 });
   }
   return encoded;
+};
+const originalEncodeLiveFrame = Network.prototype.encodeLiveFrame;
+Network.prototype.encodeLiveFrame = async function (id, body) {
+  const wire = await originalEncodeLiveFrame.call(this, id, body);
+  if (wire) testData.liveBytes.push({ at: Date.now(), bytes: wire.length + Math.ceil(wire.length / 16000) * 44 });
+  return wire;
 };
 const originalSave = save;
 save = async (...args) => {

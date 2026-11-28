@@ -853,11 +853,12 @@ test('游动顺序与收包顺序不同，亲鱼、进食与旧字段例外仍�
   const sink = { live: () => [1], broadcast: (_, body) => body };
   const ids = ['z', 'a', 'b'];
   for (const id of ids) data.fishes[id] = { id, x: 1, y: 4, facing: 1, cx: 0, cy: 0, posAt: data.tick };
+  data.fishes.a.cx = 0.9;
   let previous = await sender.send(sink, data, 100), base = replicaRowBase(crypto.randomUUID(), previous.world, true);
   const first = previous.world.fishes.z;
   for (let step = 1; step <= 2; step++) {
     const tick = data.tick += CONFIG.step;
-    const a = data.fishes.a = { ...data.fishes.a, x: step + 1, posAt: tick };
+    const a = data.fishes.a = { ...data.fishes.a, x: step + 1, cx: 1e-18, posAt: tick };
     const b = data.fishes.b = { ...data.fishes.b, x: step + 2, posAt: tick };
     const z = data.fishes.z = { ...data.fishes.z, x: step + 3, posAt: tick, lastFed: 600, cx: 0 };
     let raw;
@@ -878,6 +879,14 @@ test('游动顺序与收包顺序不同，亲鱼、进食与旧字段例外仍�
     assert.deepEqual(decoded.world.fishes, data.fishes);
     const packed = encodeReplicaRowDelta(next, base, true, true);
     assert.deepEqual(decodeReplicaRowDelta(packed, base, true, true), decoded);
+    const transitions = encodeReplicaRowDelta(next, base, true, true, true, true);
+    assert.equal(typeof transitions.world.fishes.moves, 'string');
+    if (step === 1) assert.deepEqual(transitions.world.fishes.literals, [1e-18]);
+    assert.deepEqual(decodeReplicaRowDelta(transitions, base, true, true, true, true), decoded);
+    assert.throws(() => decodeReplicaRowDelta(transitions, base, true, true));
+    const corrupt = structuredClone(transitions);
+    corrupt.world.fishes.increments = [];
+    assert.throws(() => decodeReplicaRowDelta(corrupt, base, true, true, true, true));
     assert.deepEqual(Object.keys(decoded.world.fishes), ids);
     if (step === 2) assert.equal(Object.hasOwn(previous.world.fishes.z, 'cx'), false);
     base = replicaRowBase(crypto.randomUUID(), next.world, true, base);
