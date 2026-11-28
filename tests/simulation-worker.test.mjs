@@ -183,6 +183,31 @@ test('靠前两条鱼元被移除导致各页整体移位，逐页验证真实�
   } finally { client.close(); }
 });
 
+test('已预装的鱼元继续上报真实下落，未知历史字段参与页面证明', async () => {
+  const worlds = [new World(start,root,{populate:false,ambient:false}),new World(start,root,{populate:false,ambient:false})];
+  const id = crypto.randomUUID();
+  const food = { id,kind:'food',actor:'visitor',nick:'甲',x:5,y:0,ch:'鱼',color:'#ace123',t:start,cost:1 };
+  for (const world of worlds) {
+    world.attachArchives(new ArchiveStore());
+    assert.equal(world.apply(food).ok,true);
+    world.data.chars[id].legacy = { ['旧\n栏']: ['$', '"', null, true] };
+  }
+  const clients = worlds.map(()=>new SimulationClient(()=>localWorker()));
+  try {
+    await clients[0].checkRetained(worlds[0]);
+    const cut = await orderedCheckpoint(worlds[0],worlds[0].archives);
+    for (let i=1;i<=4;i++) {
+      const outputs = await Promise.all(clients.map(async (client,n) => {
+        const world = worlds[n], handle = await client.prepareAgreed(world,()=>true,n===0 && i===1 ? cut.characterPages : undefined);
+        return client.advanceAgreed(world,start+i*CONFIG.step,()=>true,handle);
+      }));
+      assert.equal(outputs[0].changesDigest,outputs[1].changesDigest);
+      assert.equal(JSON.stringify(worlds[0].data),JSON.stringify(worlds[1].data));
+    }
+    assert.ok(worlds[0].data.chars[id].y + worlds[0].data.chars[id].fall > 0);
+  } finally { for (const client of clients) client.close(); }
+});
+
 test('确认输入只装载基准，到点双方各提交一个相同的生态步，过期约定无法再用', async () => {
   const makeWorld = () => new World(start, root, { populate: false, ambient: false });
   const worlds = [makeWorld(), makeWorld()];

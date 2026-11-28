@@ -5,9 +5,8 @@ async function digestBytes(bytes) {
   return Array.from(new Uint8Array(hash), byte => byte.toString(16).padStart(2, '0')).join('');
 }
 
-export function jsonDigest(value) {
-  return digestBytes(encoder.encode(JSON.stringify(value)));
-}
+export function digestJsonText(json) { return digestBytes(encoder.encode(json)); }
+export function jsonDigest(value) { return digestJsonText(JSON.stringify(value)); }
 
 export async function stepDigest(value) {
   const binary = [];

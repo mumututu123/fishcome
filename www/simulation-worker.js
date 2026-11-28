@@ -8,7 +8,7 @@ import { shanghaiDay } from './fish-status.js';
 import { worldTables } from './simulation-changes.js';
 import { encodeFields, motionFields } from './simulation-delta.js';
 import { advanceBond, encodeBondIntervals } from './bond-interval.js';
-import { jsonDigest } from './step-digest.js';
+import { digestJsonText, jsonDigest } from './step-digest.js';
 
 const motionEdit = { properties: motionFields };
 
@@ -19,10 +19,8 @@ const inputFields = new Set(['ops', 'terrain', 'roots', 'participants', 'archive
 // Track writes on the worker's private copy. Reads of old records do not put
 // them in a message. Collections can be replaced by the simulation as a whole
 // (notably contacts), in which case additions and removals must both be sent.
-function trackWorld(source) {
-  const knownFish = new Map(Object.keys(source.fishes).map((id, index) => [id, index]));
-  const fishIds = Array.from(knownFish.keys());
-  const daysByOrdinal = new Array(knownFish.size);
+function trackWorld() {
+  let source, knownFish, fishIds, daysByOrdinal;
   // These are the worker's private, mutable records. Keeping the observation
   // with its record avoids growing a world-sized hash table on a step.
   const observation = Symbol('simulation observation');
@@ -475,7 +473,16 @@ function trackWorld(source) {
     values.clear(); rows.clear(); lifeFields.clear(); bondRows.clear(); previousBonds = activeBonds = undefined; orderedBonds = false;
   }
   return {
-    data: watch(source, { root: true }),
+    attach(data) {
+      source = data;
+      fishIds = Object.keys(source.fishes);
+      knownFish = new Map(fishIds.map((id,index) => [id,index]));
+      daysByOrdinal = new Array(fishIds.length);
+      return watch(source, { root: true });
+    },
+    // These detached records can acquire observers before a tick is selected.
+    // Their writes use the roster and world installed at admission.
+    observeCharacter: (id, record) => watch(record, { field: 'chars', id }),
     // Callers enumerate this read-only list. Its rows still carry tracked writes.
     charValues,
     copyCharacter: id => plain(source.chars[id]),
@@ -584,24 +591,25 @@ function trackWorld(source) {
 }
 
 export class WorkerSimulation {
+  characterPageHash(rows) { return digestJsonText('[' + rows.map(row => row.json).join(',') + ']'); }
   async installCharacters(table, order, hashes) {
     const pages = this.characterPages;
     this.characterPages = undefined;
+    const byId = this.characterRows;
+    this.characterRows = undefined;
     const missing = [], checks = [];
-    let byId;
     for (const [index, page] of order.entries()) {
       if (typeof page === 'number') {
-        for (const [id, record] of pages[page]) table[id] = record;
+        for (const row of pages[page]) table[row.id] = row.record;
         continue;
       }
       // Removing an early row shifts all following page boundaries. Preserve
       // the checkpoint's order and check its actual page bytes again using
       // old rows by ID before asking the UI for replacement records.
-      byId ??= new Map(pages.flat());
-      const candidate = page.map(id => [id, byId.get(id)]);
-      for (const [id, record] of candidate) table[id] = record;
-      if (candidate.some(([,record]) => record === undefined)) missing.push(index);
-      else checks.push(jsonDigest(candidate).then(hash => { if (hash !== hashes[index]) missing.push(index); }));
+      const candidate = page.map(id => byId.get(id));
+      for (let i = 0; i < page.length; i++) table[page[i]] = candidate[i]?.record;
+      if (candidate.some(row => !row)) missing.push(index);
+      else checks.push(this.characterPageHash(candidate).then(hash => { if (hash !== hashes[index]) missing.push(index); }));
     }
     await Promise.all(checks);
     return missing.sort((a,b) => a - b);
@@ -617,11 +625,18 @@ export class WorkerSimulation {
     if (message.kind === 'characterWitness') {
       const ids = Object.keys(this.world.data.chars);
       this.characterPages = [];
+      this.characterRows = new Map();
+      this.preparedTracker = trackWorld();
       for (let start = 0; start < ids.length; start += 128) {
-        this.characterPages.push(ids.slice(start, start + 128).map(id => [id,
-          message.cold ? this.world.data.chars[id] : this.tracker.copyCharacter(id)]));
+        this.characterPages.push(ids.slice(start, start + 128).map(id => {
+          const record = message.cold ? this.world.data.chars[id] : this.tracker.copyCharacter(id);
+          const json = JSON.stringify([id, record]);
+          const row = { id, json, record: this.preparedTracker.observeCharacter(id, record) };
+          this.characterRows.set(id, row);
+          return row;
+        }));
       }
-      return Promise.all(this.characterPages.map(jsonDigest));
+      return Promise.all(this.characterPages.map(page => this.characterPageHash(page)));
     }
     if (message.kind === 'open') {
       this.world = new World(message.values.tick, 'worker', { populate: false, ambient: message.ambient });
@@ -636,6 +651,8 @@ export class WorkerSimulation {
       this.archive = { summary: { catalog, lastMeals: new Map(), grassMeals: new Set() } };
       if (message.characters) return this.installCharacters(this.world.data.chars, message.characters, message.hashes);
       this.characterPages = undefined;
+      this.characterRows = undefined;
+      this.preparedTracker = undefined;
     } else if (message.kind === 'rows') {
       for (const [field, id, value, origin] of message.rows) {
         if (field === '@lastMeals') this.archive.summary.lastMeals.set(id, value);
@@ -645,8 +662,9 @@ export class WorkerSimulation {
       }
     } else if (message.kind === 'ready') {
       this.world.attachArchives(this.archive);
-      this.tracker = trackWorld(this.world.data);
-      this.world.data = this.tracker.data;
+      this.tracker = this.preparedTracker || trackWorld();
+      this.preparedTracker = undefined;
+      this.world.data = this.tracker.attach(this.world.data);
       this.world.charValues = this.tracker.charValues;
       this.world.readBonds = this.tracker.readBonds;
       this.world.readStories = this.tracker.readStories;
