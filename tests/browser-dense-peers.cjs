@@ -263,6 +263,7 @@ window.denseSurvey = () => ({ ...testData, node: network?.node, leader: network 
   tick: world.data.tick, step: CONFIG.step, fish: Object.keys(world.data.fishes).length, rejected: network?.stats.rejected,
   phases: window.densePhases, longTasks: window.denseLongTasks, replicaFailures: window.denseReplicaFailures,
   liveTransfers: window.denseLiveTransfers,
+  orderedHistory: diagnostics.list().filter(log => log.source === 'ordered-steps').slice(-24),
   logs: diagnostics.list().filter(log => log.level === 'warn' || log.level === 'error').slice(-10) });
 window.denseJoinSettled = () => {
   if (!network?.replicaPeers().length) return false;
@@ -280,15 +281,21 @@ window.denseArchiveRound = async (serial, dropStep) => {
   const t = Date.now() - 8 * ARCHIVE.period;
   const op = { id: identity.actor + ':hour:' + serial, actor: identity.actor, nick: identity.nick,
     roots: world.roots, kind: 'earn', t, cost: 0, serial };
-  const proof = await network.makeEnvelope('op', op);
   if (dropStep) await new Promise(resolve => { window.denseDropped = resolve; window.denseDropNext = true; });
-  const result = await simulation.atStepBoundary(() => world.apply({ ...op, proof }));
-  if (!result?.ok || result.duplicate) throw new Error('未写入本轮待归档的签名操作');
+  if (world.data.ops[op.id] || archiveStore.ids.ops.has(op.id)) throw new Error('本轮操作应为全新的签名收入');
+  const submittedAt = Date.now();
+  await submit(op);
+  const limit = performance.now() + 12000;
+  while (!world.data.ops[op.id] && !archiveStore.ids.ops.has(op.id)) {
+    if (performance.now() >= limit) throw new Error('正式操作入口未确认本轮待归档的签名收入');
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  const acceptedTick = world.data.tick;
   archiveCheckAt = 0;
   await archiveWorld();
   const id = archiveStore.ids.ops.get(op.id);
   if (!id || world.data.ops[op.id] || !world.data.archives.chunks[id]) throw new Error('签名操作未移入新归档');
-  return { id, at: Date.now(), tick: world.data.tick };
+  return { id, at: Date.now(), tick: world.data.tick, submittedAt, acceptedTick };
 };
 window.denseHasArchive = id => Boolean(world.data.archives.chunks[id] && archiveStore.manifests[id]);
 window.denseForgetLiveBase = () => { window.denseForgetArmed = true; return true; };
@@ -693,7 +700,7 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
       visible: stats(frames.map(event => event.visible)), noFish, rejected: page.rejected, saves: stats(page.saves.filter(sampled).map(event => event.ms)),
       phases: Object.fromEntries(Object.entries(phases).map(([name, rows]) => [name, { sync: stats(rows.map(row => row.sync)), total: stats(rows.map(row => row.total)) }])),
       longestTasks: page.longTasks.filter(sampled).sort((a, b) => b.ms - a.ms).slice(0, 8),
-      failed: page.receives.filter(event => event.failed), replicaFailures: page.replicaFailures, logs: page.logs };
+      failed: page.receives.filter(event => event.failed), replicaFailures: page.replicaFailures, logs: page.logs, orderedHistory: page.orderedHistory };
   });
   const offsets = traces && summaries.flatMap(page => page.traceClockOffsets ?? []);
   const traceClockSkewMs = offsets?.length === 4 ? Math.max(...offsets) - Math.min(...offsets) : undefined;
@@ -726,7 +733,8 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
     repairs: pages.map(page => ({ leader: page.node === page.leader,
       requested: page.repairs.filter(sampled).map(row => ({ afterMs: row.at - recent, correlated: row.correlated })),
       incoming: page.receives.filter(row => row.kind === 'merge' && sampled(row)).map(row => ({ afterMs: row.startAt - recent, ms: row.ms })) })),
-    archiveRounds: rounds.map(({ at, tick, deliveredAt }) => ({ afterMs: at - recent, tick, deliveredAfterMs: deliveredAt - recent })), archiveError,
+    archiveRounds: rounds.map(({ at, tick, deliveredAt, submittedAt, acceptedTick }) => ({
+      afterMs: at - recent, tick, submittedAfterMs: submittedAt - recent, acceptedTick, deliveredAfterMs: deliveredAt - recent })), archiveError,
     leaderProgress, followerProgress, stepComplete, stepStages, bothDisplays: confirmed, schedule, slowestStep: committed.reduce((slowest, row) =>
       !slowest || row.ms > slowest.ms ? row : slowest, null), stepSamples: requests, replicaRows,
     requestGaps: stats(requests.slice(1).map((row, index) => row.startAt - requests[index].startAt)),
@@ -768,7 +776,8 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
   assert(summaries.every(page => page.frames.n >= 20 && page.noFish === 0 && page.rejected === 0), '画面中断或接收拒绝');
   assert.deepEqual(errors, []);
   assert.equal(stepStages.requestToAuthority.missing, 0, '完成的生态请求缺少权威状态写入时间');
-  assert(!archiveError && rounds.every(round => sampled(round) && round.deliveredAt <= ended), archiveError || '至少一轮归档未在采样期间传递');
+  assert(!archiveError && rounds.length === archiveRounds && rounds.every(round => sampled(round) && round.deliveredAt <= ended),
+    archiveError || '至少一轮归档未在采样期间传递');
   if (archiveRounds && !values.drop && !values['forget-live-base'] && !values['plain-live']) {
     assert(!pages.some(page => page.repairs.some(sampled)), '完整存档直连归档时误报缺少记录，触发了补拉');
   }

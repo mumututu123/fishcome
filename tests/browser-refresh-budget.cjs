@@ -3,6 +3,7 @@ const { writeFile } = require('node:fs/promises');
 
 function recordDraw(renderer, frames, page, trace) {
   const draw = renderer.draw.bind(renderer);
+  const glyphIds = new Map();
   renderer.draw = (...args) => {
     const sequence = frames.length;
     const prefix = `tide.refresh.${page}.${sequence}`;
@@ -22,7 +23,12 @@ function recordDraw(renderer, frames, page, trace) {
     if (trace) for (let i = 0; i < cells.length; i += step) {
       const x = cells[i], y = cells[i + 1], size = renderer.paintedSize;
       if (x + size / 2 < 0 || y + size / 2 < 0 || x + size / 2 >= renderer.width || y + size / 2 >= renderer.height) continue;
-      poses.push(cells[i + 2].id, x, y);
+      const glyph = cells[i + 2].id;
+      let ordinal = glyphIds.get(glyph);
+      if (ordinal === undefined) { ordinal = glyphIds.size; glyphIds.set(glyph, ordinal); }
+      // Keep exact coordinates and stable identity in a packed numeric array.
+      // Retaining glyph strings beside boxed doubles on every frame perturbs GC.
+      poses.push(ordinal, x, y);
     }
     frames.push({ sequence, at: performance.timeOrigin + start, draw: drawMs,
       ...(trace && { beforeMark: performance.timeOrigin + beforeMark, afterMark: performance.timeOrigin + afterMark }),
