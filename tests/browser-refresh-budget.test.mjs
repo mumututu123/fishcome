@@ -11,6 +11,17 @@ test('连续多轮的图层跟踪可跨块读取，保留原始帧编号并拒�
   await assert.rejects(readGraphicsEvents([source.slice(0, -2)]), /截断/);
 });
 
+test('只采入场时仍按相同步号核对双方实际提交，并保留未提交和旧通道', () => {
+  const requests = [500, 1000, 1500].map(tick => ({ tick, agreed: true, committed: true }));
+  const peers = [{ tick: 500, agreed: true, committed: true }, { tick: 1000, agreed: true, committed: false }];
+  matchStepStarts(requests, peers);
+  assert.equal(requests[0].peerSteps[0].committed, true);
+  assert.equal(requests[1].peerSteps[0].committed, false);
+  assert.equal(requests[2].peerSteps, undefined);
+  assert.equal(requests[0].peerSteps[0].startFromHost, undefined);
+  assert.equal(requests[0].traceAt, undefined);
+});
+
 test('独立画布必须找到同一子图层与实际合成器呈现', () => {
   const worker = (name, ts) => ({ name, ts, pid: 1, tid: 2, tts: ts, args: { data: { callTime: ts } } });
   const viz = (name, ts, fields = {}) => ({ name, ts, pid: 3, tid: 4, ...fields });

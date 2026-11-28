@@ -838,7 +838,7 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
         .map(event => [Number(event.name.slice(prefix.length)), event.args.data.callTime]));
     };
     matchStepStarts(requests, follower.stepRequests, stamps(coordinator), stamps(follower));
-  }
+  } else matchStepStarts(requests, follower.stepRequests);
   const completed = requests.filter(row => row.committed).map(row => row.ms);
   const over20 = completed.filter(ms => ms > 20).length;
   const stepComplete = { ...stats(completed), requested: requests.length, aborted: requests.filter(row => row.committed === false).length,

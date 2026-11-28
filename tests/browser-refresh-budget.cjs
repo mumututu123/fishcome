@@ -269,7 +269,7 @@ function scheduledSteps(requests, phase, step, start, end) {
   return { expected, unrequested, unpresented };
 }
 
-function matchStepStarts(requests, peers, hostMarks, peerMarks) {
+function matchStepStarts(requests, peers, hostMarks = new Map(), peerMarks = new Map()) {
   const byTick = new Map();
   for (const row of peers) {
     if (!byTick.has(row.tick)) byTick.set(row.tick, []);
@@ -285,7 +285,8 @@ function matchStepStarts(requests, peers, hostMarks, peerMarks) {
       (!request.agreed || others.some(row => row.agreed && row.committed))
       ? Math.min(host, ...stamps) : undefined;
     if (others.length) request.peerSteps = others.map((row, i) => ({
-      agreed: row.agreed, committed: row.committed, startFromHost: (stamps[i] - host) / 1000, compute: row.ms,
+      agreed: row.agreed, committed: row.committed, compute: row.ms,
+      startFromHost: Number.isFinite(stamps[i]) && Number.isFinite(host) ? (stamps[i] - host) / 1000 : undefined,
       rule: row.rule, toWorker: row.toWorker, inWorker: row.inWorker, fromWorker: row.fromWorker, authority: row.authority
     }));
   }
