@@ -122,8 +122,8 @@ function readPresentations(events, page, start, end) {
   }));
   // Both independent browser processes run on the same machine. Check the
   // mapping from trace ticks to the page clock before comparing their events.
-  clockOffsets.sort((a, b) => a - b);
-  return { drawn, rows, moving, longestGaps, clockOffsetMs: clockOffsets[Math.floor(clockOffsets.length / 2)] };
+  return { drawn, rows, moving, longestGaps,
+    clockOffsets: clockOffsets.length ? [Math.min(...clockOffsets), Math.max(...clockOffsets)] : undefined };
 }
 
 function distribution(values) {

@@ -145,7 +145,7 @@ SimulationClient.prototype.compute = async function (target, message, ownsWorld)
 };
 const originalOnMessage = onMessage;
 onMessage = async (message, peer) => {
-  const at = Date.now(), start = performance.now();
+  const start = performance.now(), at = performance.timeOrigin + start;
   const before = world.data.tick;
   let failed = false;
   try { return await originalOnMessage(message, peer); }
@@ -153,8 +153,9 @@ onMessage = async (message, peer) => {
   finally {
     if (['hello', 'merge', 'world', 'archiveChunk'].includes(message.kind)) testData.receives.push({ kind: message.kind,
       tick: message.body.world?.tick, delta: message.body.delta, before, after: world.data.tick,
-      ...(message.kind === 'world' && message.body.delta && { rows: Object.fromEntries(['fishes', 'chars', 'breeding', 'contacts', 'travel', 'ops', 'scenes'].map(field => [field, Object.keys(message.body.world[field] || {}).length])) }),
-      startAt: at, at: Date.now(), ms: performance.now() - start, failed });
+      bundled: message.body.archivePacks ? Object.keys(message.body.archivePacks) : undefined,
+      ...(${!values['step-boundaries-only']} && message.kind === 'world' && message.body.delta && { rows: Object.fromEntries(['fishes', 'chars', 'breeding', 'contacts', 'travel', 'ops', 'scenes'].map(field => [field, Object.keys(message.body.world[field] || {}).length])) }),
+      startAt: at, at: performance.timeOrigin + performance.now(), ms: performance.now() - start, failed });
   }
 };
 const originalMergeReplica = mergeReplica;
@@ -170,7 +171,7 @@ let lastWorldSent = -Infinity, suppressedTick, dropsRemaining = ${dropSteps};
 Network.prototype.broadcast = async function (kind, body, ...args) {
   if (kind === 'replicaRequest') testData.repairs.push({ at: Date.now(), correlated: !!body.request });
   if (kind !== 'world') return originalBroadcast.call(this, kind, body, ...args);
-  const at = Date.now();
+  const at = performance.timeOrigin + performance.now();
   if (window.denseDropNext && body.delta && body.world.tick > lastWorldSent && body.world.tick !== suppressedTick) {
     window.denseDropNext = --dropsRemaining > 0;
     suppressedTick = body.world.tick;
@@ -226,16 +227,16 @@ for (const [object, method, name] of [
         : method === 'broadcast' && args[0] === 'world' ? args[1].world.tick : undefined;
       return window.denseObserve(name, original, this, args, tick);
     }
-    const archiveCount = Object.keys(this.data.archives?.chunks || {}).length;
+    const archiveCount = ${!values['step-boundaries-only']} && Object.keys(this.data.archives?.chunks || {}).length;
     const start = performance.now(), at = performance.timeOrigin + start;
     const result = window.denseObserve(name, original, this, args), ms = performance.now() - start;
     const [incoming, archived, origin] = args;
-    testData.worldMerges.push({ at, ms, before: previous, after: this.data.tick, incomingTick: incoming.tick,
+    if (${!values['step-boundaries-only']}) testData.worldMerges.push({ at, ms, before: previous, after: this.data.tick, incomingTick: incoming.tick,
       replicaDelta: origin === 'replica', newArchives: Object.keys(this.data.archives?.chunks || {}).length - archiveCount,
       incomingChars: Object.keys(incoming.chars).length, incomingOps: Object.keys(incoming.ops).length,
       incomingScenes: Object.keys(incoming.scenes).length, incomingBreeding: Object.keys(incoming.breeding || {}).length,
       archiveChars: Object.keys(archived?.chars || {}).length, archiveOps: Object.keys(archived?.ops || {}).length });
-    if (previous && !amLeader() && this.data.tick > previous) testData.applied.push({ tick: this.data.tick, at: Date.now() });
+    if (previous && !amLeader() && this.data.tick > previous) testData.applied.push({ tick: this.data.tick, at: performance.timeOrigin + performance.now() });
     return result;
   };
 }
@@ -599,7 +600,7 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
   const leaderSteps = coordinator.steps.filter(sampled);
   const received = follower.receives.filter(event => event.kind === 'world' && sampled(event) && !event.failed && event.after > event.before);
   const sentAt = new Map();
-  for (const send of coordinator.sends) if (!send.dropped && !sentAt.has(send.tick)) sentAt.set(send.tick, send.at);
+  for (const send of coordinator.sends) if (!send.dropped && send.at < (sentAt.get(send.tick) ?? Infinity)) sentAt.set(send.tick, send.at);
   const elapsedAfterSend = (event, timestamp) => timestamp - sentAt.get(event.tick);
   const matchedLatency = ms => Number.isFinite(ms) && ms >= 0;
   const transport = received.map(event => elapsedAfterSend(event, event.at)).filter(matchedLatency);
@@ -621,6 +622,15 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
     pending: requests.filter(row => row.committed === undefined).length,
     over20, over20Pct: completed.length && Math.round(over20 / completed.length * 10000) / 100 };
   const committed = requests.filter(row => row.committed);
+  const receivedByTick = new Map(follower.receives.filter(row => row.kind === 'world' && !row.failed && row.before < row.tick && row.after >= row.tick)
+    .map(row => [row.tick, row]));
+  const appliedByTick = new Map(follower.applied.map(row => [row.tick, row.at]));
+  for (const request of committed) {
+    const message = receivedByTick.get(request.tick);
+    const elapsed = at => Number.isFinite(at) ? Math.round((at - request.startAt) * 1000) / 1000 : undefined;
+    request.delivery = { published: elapsed(sentAt.get(request.tick)), received: elapsed(message?.startAt),
+      applied: elapsed(appliedByTick.get(request.tick)), finished: elapsed(message?.at) };
+  }
   const authority = committed.map(row => row.authority).filter(Number.isFinite);
   const stepStages = {
     toWorker: stats(committed.map(row => row.toWorker).filter(Number.isFinite)),
@@ -642,14 +652,15 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
     for (const row of page.phases.filter(sampled)) (phases[row.phase] ||= []).push(row);
     const presentations = traces && readPresentations(traces[i].traceEvents, page, recent, ended);
     return { leader: page.node === page.leader, fish: page.fish, simulationFailure: page.simulationFailure,
-      traceClockOffset: presentations?.clockOffsetMs,
+      traceClockOffsets: presentations?.clockOffsets,
       ...frameSummary(page, presentations, recent, ended, coordinator.steps, requests),
       visible: stats(frames.map(event => event.visible)), noFish, rejected: page.rejected, saves: stats(page.saves.filter(sampled).map(event => event.ms)),
       phases: Object.fromEntries(Object.entries(phases).map(([name, rows]) => [name, { sync: stats(rows.map(row => row.sync)), total: stats(rows.map(row => row.total)) }])),
       longestTasks: page.longTasks.filter(sampled).sort((a, b) => b.ms - a.ms).slice(0, 8),
       failed: page.receives.filter(event => event.failed), replicaFailures: page.replicaFailures, logs: page.logs };
   });
-  const traceClockSkewMs = traces && Math.abs(summaries[0].traceClockOffset - summaries[1].traceClockOffset);
+  const offsets = traces && summaries.flatMap(page => page.traceClockOffsets ?? []);
+  const traceClockSkewMs = offsets?.length === 4 ? Math.max(...offsets) - Math.min(...offsets) : undefined;
   const confirmed = traces && bothDisplays(requests);
   const schedule = traces && scheduledSteps(requests, clockPhase, step, recent, ended);
   const dropped = coordinator.sends.filter(event => event.dropped && sampled(event));
@@ -671,7 +682,10 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
   const replicaRows = Object.fromEntries(['fishes', 'chars', 'breeding', 'contacts', 'travel', 'ops', 'scenes']
     .map(field => [field, stats(received.flatMap(row => row.rows ? [row.rows[field]] : []))]));
   const report = JSON.stringify({ count, realBackup: Boolean(backup), browserVersion, cold, joinedMs: joined - joining, settledMs: recent - joining, steadyMs: ended - recent,
-    saved, liveWire, browserProcesses: browsers.length, traceClockSkewMs, ...(switched ? { switched } : {}),
+    saved, liveWire, browserProcesses: browsers.length, traceClockSkewMs,
+    bundledArchives: new Set(follower.receives.filter(sampled).flatMap(row => row.bundled || [])).size,
+    separateArchiveMessages: follower.receives.filter(row => sampled(row) && row.kind === 'archiveChunk').length,
+    ...(switched ? { switched } : {}),
     repairs: pages.map(page => ({ leader: page.node === page.leader,
       requested: page.repairs.filter(sampled).map(row => ({ afterMs: row.at - recent, correlated: row.correlated })),
       incoming: page.receives.filter(row => row.kind === 'merge' && sampled(row)).map(row => ({ afterMs: row.startAt - recent, ms: row.ms })) })),
