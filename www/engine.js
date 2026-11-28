@@ -595,6 +595,8 @@ export class World {
     const foods = looseFood.filter(c => c.kind === 'food').sort((a, b) => a.born - b.born || a.id.localeCompare(b.id));
     const foodCount = new Map(); for (const c of foods) foodCount.set(key(c.x, c.y), (foodCount.get(key(c.x, c.y)) || 0) + 1);
     const contact = food => {
+      const neighbors = fishOccupancy.foodContacts(food, scenery, canEat);
+      if (neighbors) return neighbors;
       const at = key(food.x, food.y);
       if (scenery.has(at)) return [];
       const ids = new Set();

@@ -67,6 +67,32 @@ export class MovementGrid {
     if (slot <= 0) return slot && this.overlaps.get(k) || undefined;
     return this.singles[slot] ??= new Set([this.owners[slot]]);
   }
+  foodContacts(food, scenery, canEat) {
+    const { x, y } = food;
+    if (!this.integerCells || this.overlapped || this.unsafeHorizontal || !Number.isInteger(x) ||
+        !Number.isInteger(y) || x < 0 || x >= WORLD_WIDTH || y <= 0 || y >= occupancyRows - 1) return;
+    if (scenery.has(worldKey(x, y))) return [];
+    const center = this.cells[y * WORLD_WIDTH + x], slots = [], eligible = [];
+    // Preserve the first occurrence even if that cell's diagonal is blocked.
+    // A second cell of the same body can still have a clear edge to the food.
+    for (let dx = -1; dx <= 1; dx++) {
+      const column = dx < 0 && !x ? WORLD_WIDTH - 1 : dx > 0 && x === WORLD_WIDTH - 1 ? 0 : x + dx;
+      for (let dy = -1; dy <= 1; dy++) {
+        if (!dx && !dy) continue;
+        const owner = this.cells[(y + dy) * WORLD_WIDTH + column];
+        if (!owner || owner === center) continue;
+        let index = slots.indexOf(owner);
+        if (index < 0) { index = slots.length; slots.push(owner); }
+        if (!dx || !dy || !scenery.has(worldKey(column, y)) && !scenery.has(worldKey(x, y + dy))) eligible[index] = true;
+      }
+    }
+    const found = [];
+    for (let i = 0; i < slots.length; i++) {
+      const id = this.owners[slots[i]];
+      if (eligible[i] && canEat(id)) found.push(id);
+    }
+    return found;
+  }
   clear(x, y) {
     const k = this.index(x, y);
     if (typeof k !== 'number') { this.fractional.delete(k); return; }
