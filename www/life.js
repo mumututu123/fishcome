@@ -55,33 +55,25 @@ export function recordStory(world, kind, fish, at, extra = {}) {
 }
 export function withStoryBatch(world, work) {
   if (world.activeStoryWriter) return work(world.activeStoryWriter);
-  let life;
-  let stories, storyOrder, storyCount, orderChanged = false;
-  const compareStories = (a, b) => stories[b].at - stories[a].at || a.localeCompare(b);
+  let life, stories, storyCount;
+  function retainStories() {
+    if (storyCount <= LIFE.storyLimit) return;
+    stories = trim(stories, LIFE.storyLimit);
+    storyCount = LIFE.storyLimit;
+  }
   function record(_, kind, fish, at, extra = {}) {
     if (!stories) {
-      life ??= state(world, at);
+      life = state(world, at);
       stories = { ...(world.readStories?.() ?? life.stories) };
       storyCount = Object.keys(stories).length;
     }
-    const story = makeStory(kind, fish, at, extra), id = story.id, old = stories[id];
-    if (old) {
-      stories[id] = choose(old, story);
-      if (old.at !== stories[id].at) orderChanged = true;
-    } else { stories[id] = story; storyCount++; }
-    if (storyCount <= LIFE.storyLimit) return;
-    if (!storyOrder) storyOrder = Object.keys(stories).sort(compareStories);
-    else if (orderChanged) { if (!old) storyOrder.push(id); storyOrder.sort(compareStories); }
-    else if (!old) {
-      let low = 0, high = storyOrder.length;
-      while (low < high) {
-        const mid = (low + high) >>> 1;
-        if (compareStories(id, storyOrder[mid]) < 0) high = mid; else low = mid + 1;
-      }
-      storyOrder.splice(low, 0, id);
-    }
-    while (storyOrder.length > LIFE.storyLimit) delete stories[storyOrder.pop()];
-    storyCount = storyOrder.length; orderChanged = false;
+    const story = makeStory(kind, fish, at, extra), id = story.id;
+    // Distinct additions commute with keeping the first 512 ranked stories.
+    // A repeated ID must first see whether its previous story survived.
+    if (stories[id]) retainStories();
+    if (stories[id]) stories[id] = choose(stories[id], story);
+    else { stories[id] = story; storyCount++; }
+    if (storyCount >= 2 * LIFE.storyLimit) retainStories();
   }
   world.activeStoryWriter = record;
   try {
@@ -89,7 +81,8 @@ export function withStoryBatch(world, work) {
   } finally {
     world.activeStoryWriter = undefined;
     if (stories) {
-      life.stories = storyOrder ? Object.fromEntries(storyOrder.map(id => [id, stories[id]])) : stories;
+      retainStories();
+      life.stories = stories;
       world.dirty = true;
     }
   }

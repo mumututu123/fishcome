@@ -3,9 +3,23 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { World, CONFIG, clone, hash } from '../www/engine.js';
 import { restoreCheckpoint } from '../www/lifecycle.js';
-import { LIFE, personality, personalityText, weatherAt, lifeContext, updateLife, idleMotion, fishLifeText, recordStory, mergeLife, newLife, validateLife, spawnPlankton, planktonSource, validPlankton, freshPlankton, pairKey, storiesFor, storyText, returnStory } from '../www/life.js';
+import { LIFE, personality, personalityText, weatherAt, lifeContext, updateLife, idleMotion, fishLifeText, recordStory, withStoryBatch, mergeLife, newLife, validateLife, spawnPlankton, planktonSource, validPlankton, freshPlankton, pairKey, storiesFor, storyText, returnStory } from '../www/life.js';
 import { fishCatalog } from '../www/fish-profile.js';
 const t = Math.floor((Date.now() - 3600000) / 180000) * 180000 + 80000;
+
+test('一批故事中再次遇到已裁掉或保留的同一条，与逐条裁剪顺序一致', () => {
+  const a = { data: { life: newLife(t) } }, b = { data: { life: newLife(t) } };
+  const write = (id, at) => { recordStory(a, 'meal', id, at); recordStory(b, 'meal', id, at); };
+  withStoryBatch(b, () => {
+    for (let i = 0; i <= LIFE.storyLimit; i++) write(String(i), t + i);
+    write('0', t + 2000);
+    write('1', t);
+    write('7', t + 2000);
+    write('7', t);
+    write('new', t);
+  });
+  assert.deepEqual(Object.entries(b.data.life.stories), Object.entries(a.data.life.stories));
+});
 
 test('密集鱼群只保留规定数量的关系，已熟悉的鱼即使最终被裁掉也能留下故事', () => {
   const at = Date.UTC(2025, 5, 15, 12, 17);
