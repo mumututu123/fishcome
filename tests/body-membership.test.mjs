@@ -103,7 +103,7 @@ test('局部食物筛选覆盖跨海界鱼眼、深浅水、药物选择和旧�
       reference.data.chars[key] = { id: key, kind: 'food', entity: '', ch, x: (x + offset + 1000) % 1000, y, born: now, moveAt: now, fall: 0, path: [] };
     }
     const worker = open(reference), world = worker.world, grid = world.movementGrid(world.fishGroups());
-    const marked = grid.visibleFoodOwners(world.charValues('food'), CONFIG.sightShallow);
+    const marked = grid.ownersNear(world.charValues('food'), CONFIG.sightShallow);
     if (fractional) assert.equal(marked, undefined);
     else { assert.equal(marked[grid.slot(id)], 1); assert.equal(marked[grid.slot(distant)], 0); }
     for (let i = 0; i < 4; i++) {

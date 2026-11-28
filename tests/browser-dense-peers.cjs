@@ -15,7 +15,8 @@ const { positionals, values } = parseArgs({ allowPositionals: true, options: {
   'full-updates': { type: 'string' }, drop: { type: 'boolean' }, 'drop-steps': { type: 'string' }, help: { type: 'boolean' },
   backup: { type: 'string' }, trace: { type: 'string' }, report: { type: 'string' }, 'refresh-budget': { type: 'boolean' },
   'archive-rounds': { type: 'string', default: '0' }, 'plain-live': { type: 'string' },
-  'forget-live-base': { type: 'boolean' }, 'switch-leader': { type: 'boolean' }, 'rebuild-viewport': { type: 'boolean' }
+  'forget-live-base': { type: 'boolean' }, 'switch-leader': { type: 'boolean' }, 'rebuild-viewport': { type: 'boolean' },
+  'step-boundaries-only': { type: 'boolean' }
 } });
 if (values.help) {
   console.log('用法：node tests/browser-dense-peers.cjs [鱼数] [--seconds=35] [--full-updates=0|1] [--drop] [--profile=跟随端.cpuprofile]');
@@ -26,6 +27,7 @@ if (values.help) {
   console.log('--archive-rounds=3 在观测期间连续生成并同步 3 个新归档包（需 --backup）。');
   console.log('--plain-live=A|B|both 模拟不支持紧凑发送的端；--forget-live-base 模拟跟随端遗失上一版本；--switch-leader 在观测后切换协调端。');
   console.log('--rebuild-viewport 用接收端旧的整表画面索引方式对照。');
+  console.log('--step-boundaries-only 关闭各阶段的细分计时，保留请求、提交和呈现时间，用于对照观测开销。');
   process.exit(0);
 }
 const backup = values.backup && JSON.parse(readFileSync(values.backup, 'utf8'));
@@ -49,8 +51,15 @@ assert(!values.source || launchers.every(Boolean), '--source 需要相同规则�
 const { chromium } = require(process.env.TIDE_TEST_MODULES ? path.join(process.env.TIDE_TEST_MODULES, 'playwright') : 'playwright');
 const www = values.source ? path.resolve(values.source, 'www') : path.resolve(__dirname, '../www');
 const browsers = [], children = [], observed = [], errors = [];
-const phaseModules = { '/archive.js': 'compactKnown', '/replica.js': 'verifyReplica', '/storage.js': 'putMany',
-  '/simulation-delta.js': 'expandSimulationPatch', '/checkpoint-pages.js': 'noteCheckpointChanges' };
+const phaseModules = {
+  '/archive.js': { compactKnown: '' },
+  '/replica.js': { verifyReplica: 'args[3]?.context' },
+  '/storage.js': { putMany: '' },
+  '/simulation-delta.js': { expandSimulationPatch: 'args[1].values.tick' },
+  '/checkpoint-pages.js': { beforeCheckpointPatch: 'args[1].values.tick', noteCheckpointChanges: 'args[1]?.values.tick' },
+  '/world-broadcast.js': { captureStep: 'args[0].tick' },
+  '/replica-row-delta.js': { encodeReplicaRowDelta: 'args[0].world.tick' }
+};
 const observeCommit = `
 const reportApplied = simulationApplied;
 simulationApplied = (world, patch) => {
@@ -84,27 +93,39 @@ ReplicaTransfers.prototype.receive = async function (message, peer) {
   }
 };
 `;
+const observeFirstReplicaPage = `
+const measuredPages = replicaPages;
+replicaPages = function* (body, frame) {
+  const pages = measuredPages(body, frame);
+  const first = window.denseObserve('replicaFirstPage', pages.next, pages, [], body.world.tick);
+  if (!first.done) yield first.value;
+  yield* pages;
+};
+`;
 const instrument = `
 const testData = { frames: [], steps: [], stepRequests: [], applied: [], sends: [], receives: [], merges: [], worldMerges: [], repairs: [], saves: [], liveBytes: [] };
 const stepRequests = new WeakMap();
 const originalRequest = SimulationClient.prototype.request;
 SimulationClient.prototype.request = function (message) {
-  if (message.kind === 'step') {
-    const sequence = testData.stepRequests.length;
-    if (${Boolean(values.trace)}) {
-      const name = 'tide.request.' + window.densePage + '.' + sequence;
-      performance.mark(name);
-      performance.clearMarks(name);
-    }
-    const start = performance.now(), row = { sequence, startAt: performance.timeOrigin + start, tick: message.base + CONFIG.step };
-    stepRequests.set(message, { row, start });
-    testData.stepRequests.push(row);
+  if (message.kind !== 'step') return originalRequest.call(this, message);
+  const sequence = testData.stepRequests.length;
+  if (${Boolean(values.trace)}) {
+    const name = 'tide.request.' + window.densePage + '.' + sequence;
+    performance.mark(name);
+    performance.clearMarks(name);
   }
+  const start = performance.now(), row = { sequence, startAt: performance.timeOrigin + start, tick: message.base + CONFIG.step };
+  stepRequests.set(message, { row, start });
+  testData.stepRequests.push(row);
   const reply = originalRequest.call(this, message);
-  if (message.kind === 'step') reply.then(result => {
-    if (result?.ruleTime !== undefined) window.densePhases.push({ phase: 'worker.rules',
-      at: Date.now(), total: result.ruleTime, sync: result.ruleTime });
-  }, () => {});
+  const resolve = this.pending.resolve;
+  this.pending.resolve = result => {
+    row.reply = performance.now() - start;
+    row.rule = result?.ruleTime;
+    if (row.rule !== undefined) window.densePhases.push({ phase: 'worker.rules', context: row.tick,
+      at: row.startAt + row.reply, total: row.rule, sync: row.rule });
+    resolve(result);
+  };
   return reply;
 };
 const originalCompute = SimulationClient.prototype.compute;
@@ -175,6 +196,8 @@ save = async (...args) => {
 };
 window.denseCommitted = (target, patch, at) => {
   if (target !== world || !Number.isFinite(patch?.values.tick)) return;
+  const request = testData.stepRequests.at(-1);
+  if (request?.tick === patch.values.tick && request.authority === undefined) request.authority = at - request.startAt;
   (amLeader() ? testData.steps : testData.applied).push({ tick: patch.values.tick, at });
 };
 for (const [object, method, name] of [
@@ -186,7 +209,11 @@ for (const [object, method, name] of [
   if (typeof original !== 'function') continue;
   object[method] = function (...args) {
     const previous = method === 'merge' && this === world && this.data.tick;
-    if (!previous) return window.denseObserve(name, original, this, args);
+    if (!previous) {
+      const tick = method === 'worldChanged' ? args[1]?.values.tick : method === 'send' ? args[1].tick
+        : method === 'broadcast' && args[0] === 'world' ? args[1].world.tick : undefined;
+      return window.denseObserve(name, original, this, args, tick);
+    }
     const archiveCount = Object.keys(this.data.archives?.chunks || {}).length;
     const start = performance.now(), at = performance.timeOrigin + start;
     const result = window.denseObserve(name, original, this, args), ms = performance.now() - start;
@@ -282,7 +309,7 @@ async function withLaunchers(run) {
 }
 async function openPage(browser, origin, options, assets) {
   const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
-  await context.addInitScript(label => {
+  await context.addInitScript(({ label, stepBoundariesOnly }) => {
     window.densePage = label;
     window.densePhases = []; window.denseLongTasks = []; window.denseReplicaFailures = []; window.denseLiveTransfers = [];
     const longTasks = new PerformanceObserver(list => {
@@ -290,13 +317,14 @@ async function openPage(browser, origin, options, assets) {
     });
     longTasks.observe({ type: 'longtask', buffered: true });
     window.denseObserve = (phase, action, receiver, args, context) => {
+      if (stepBoundariesOnly) return Reflect.apply(action, receiver, args);
       const start = performance.now(), at = performance.timeOrigin + start;
       const result = Reflect.apply(action, receiver, args), sync = performance.now() - start;
       const done = () => { window.densePhases.push({ phase, context, at, sync, total: performance.now() - start }); };
       if (result instanceof Promise) result.then(done, done); else done();
       return result;
     };
-  }, options);
+  }, { label: options, stepBoundariesOnly: values['step-boundaries-only'] });
   await context.route(`${origin}/**`, async route => {
     const { pathname } = new URL(route.request().url());
     if (pathname === '/fixture') return route.fulfill({ contentType: 'text/html', body: '<title>密集海验收</title>' });
@@ -306,7 +334,8 @@ async function openPage(browser, origin, options, assets) {
     if (!file.startsWith(assets + path.sep)) return route.fulfill({ status: 404 });
     try {
       if (pathname === '/app.js') return route.fulfill({ contentType: 'text/javascript', body: readFileSync(file, 'utf8') + instrument });
-      if (pathname === '/replica-stream.js') return route.fulfill({ contentType: 'text/javascript', body: readFileSync(file, 'utf8') + observeReplicaPages });
+      if (pathname === '/replica-stream.js') return route.fulfill({ contentType: 'text/javascript',
+        body: readFileSync(file, 'utf8') + observeReplicaPages + (values['step-boundaries-only'] ? '' : observeFirstReplicaPage) });
       if (pathname === '/simulation-changes.js') return route.fulfill({ contentType: 'text/javascript', body: readFileSync(file, 'utf8') + observeCommit });
       if (pathname === '/simulation-worker.js') return route.fulfill({
         contentType: 'text/javascript', body: readFileSync(file, 'utf8') + `
@@ -327,10 +356,11 @@ WorkerSimulation.prototype.receive = function (message) {
         const source = readFileSync(file, 'utf8').replace('const replicaRowsVersion = 1;', 'const replicaRowsVersion = 0;');
         return route.fulfill({ contentType: 'text/javascript', body: source });
       }
-      if (Object.hasOwn(phaseModules, pathname)) {
-        const name = phaseModules[pathname];
-        const context = name === 'verifyReplica' ? ', args[3]?.context' : '';
-        const observe = `\nif (globalThis.denseObserve) { const original = ${name}; ${name} = (...args) => globalThis.denseObserve('${name}', original, undefined, args${context}); }`;
+      if (!values['step-boundaries-only'] && Object.hasOwn(phaseModules, pathname)) {
+        const observe = Object.entries(phaseModules[pathname]).map(([name, context]) => {
+          const argument = context ? ', ' + context : '';
+          return `\nif (globalThis.denseObserve) { const original = ${name}; ${name} = (...args) => globalThis.denseObserve('${name}', original, undefined, args${argument}); }`;
+        }).join('');
         return route.fulfill({ contentType: 'text/javascript', body: readFileSync(file, 'utf8') + observe });
       }
       return await route.fulfill({ path: file });
@@ -559,6 +589,19 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
   const stepComplete = { ...stats(completed), requested: requests.length, aborted: requests.filter(row => row.committed === false).length,
     pending: requests.filter(row => row.committed === undefined).length,
     over20, over20Pct: completed.length && Math.round(over20 / completed.length * 10000) / 100 };
+  const committed = requests.filter(row => row.committed);
+  const authority = committed.map(row => row.authority).filter(Number.isFinite);
+  const stepStages = {
+    requestToReply: stats(committed.map(row => row.reply)),
+    replyToAuthority: stats(committed.map(row => row.authority - row.reply)),
+    requestToAuthority: { ...stats(authority), over20: authority.filter(ms => ms > 20).length, missing: committed.length - authority.length },
+    authorityToNotificationsDone: stats(committed.map(row => row.ms - row.authority))
+  };
+  const stepsByTick = new Map(requests.map(request => [request.tick, request]));
+  for (const phase of coordinator.phases.filter(sampled)) {
+    const request = stepsByTick.get(phase.context);
+    if (request && phase.at >= request.startAt && !Object.hasOwn(request.phases ??= {}, phase.phase)) request.phases[phase.phase] = phase.sync;
+  }
   const summaries = pages.map(page => {
     const frames = page.frames.filter(sampled), noFish = frames.filter(frame => !frame.visible).length;
     const phases = {};
@@ -593,7 +636,7 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
       requested: page.repairs.filter(sampled).map(row => ({ afterMs: row.at - recent, correlated: row.correlated })),
       incoming: page.receives.filter(row => row.kind === 'merge' && sampled(row)).map(row => ({ afterMs: row.startAt - recent, ms: row.ms })) })),
     archiveRounds: rounds.map(({ at, tick, deliveredAt }) => ({ afterMs: at - recent, tick, deliveredAfterMs: deliveredAt - recent })), archiveError,
-    leaderProgress, followerProgress, stepComplete, replicaRows,
+    leaderProgress, followerProgress, stepComplete, stepStages, stepSamples: requests, replicaRows,
     requestGaps: stats(requests.slice(1).map((row, index) => row.startAt - requests[index].startAt)),
     stepGaps: stats(leaderSteps.slice(1).map((step, index) => step.at - leaderSteps[index].at)),
     tickGaps: [...new Set(leaderSteps.slice(1).map((step, index) => step.tick - leaderSteps[index].tick))],
@@ -631,6 +674,7 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
   assert(pages.every(page => page.peers === 1), '两端在观测结束时仍应直连');
   assert(summaries.every(page => page.frames.n >= 20 && page.noFish === 0 && page.rejected === 0), '画面中断或接收拒绝');
   assert.deepEqual(errors, []);
+  assert.equal(stepStages.requestToAuthority.missing, 0, '完成的生态请求缺少权威状态写入时间');
   assert(!archiveError && rounds.every(round => sampled(round) && round.deliveredAt <= ended), archiveError || '至少一轮归档未在采样期间传递');
   if (values['refresh-budget']) assert(stepComplete.n >= 9 && stepComplete.over20 === 0 && summaries.every(page => page.draw.over20 === 0 &&
     [page.presented, page.visibleMotion].every(row => row.over20 === 0 && row.n >= 20 && row.startCovered && row.endCovered) &&

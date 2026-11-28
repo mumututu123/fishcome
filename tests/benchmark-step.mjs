@@ -9,12 +9,13 @@ import { parseArgs } from 'node:util';
 const { values } = parseArgs({ options: {
   checkpoint: { type: 'string' }, source: { type: 'string' }, reference: { type: 'string' }, fish: { type: 'string' },
   'resume-at': { type: 'string' },
-  budget: { type: 'string' }, samples: { type: 'boolean' }, pace: { type: 'boolean' },
+  budget: { type: 'string' }, samples: { type: 'boolean' }, pace: { type: 'boolean' }, 'delivery-control': { type: 'boolean' },
   steps: { type: 'string', default: '24' }, warmup: { type: 'string', default: '6' }, help: { type: 'boolean' }
 } });
 if (values.help) {
   console.log('用法：node tests/benchmark-step.mjs [--steps=24] [--warmup=6] [--fish=5000 | --checkpoint=备份.json] [--source=被测工作区] [--reference=原版工作区] [--budget=20] [--samples] [--pace]');
   console.log('--resume-at=含时区的时间 从备份恢复到指定时刻，保留离线期间到期的自然事件；默认按备份本身的时刻复播。');
+  console.log('--delivery-control 增跑空消息和预计算整步的独立交付对照。20 毫秒验收仍按正常生态步计时。');
   process.exit(0);
 }
 const steps = Number(values.steps), warmup = Number(values.warmup), fish = Number(values.fish ?? 5000);
@@ -64,7 +65,7 @@ try {
   page.on('worker', () => workers++);
   page.on('pageerror', error => errors.push(error.message));
   await page.goto(`http://127.0.0.1:${server.address().port}/`);
-  const report = await page.evaluate(async ({ checkpoint, fish, steps, warmup, budget, separateReference, samples, pace }) => {
+  const report = await page.evaluate(async ({ checkpoint, fish, steps, warmup, budget, separateReference, samples, pace, deliveryControl }) => {
     const { World, CONFIG } = await import('/engine.js');
     const { SimulationClient, subscribeSimulationChanges } = await import('/simulation-client.js');
     const { ArchiveStore } = await import('/archive.js');
@@ -160,6 +161,33 @@ try {
       }
     } finally { simulation.close(); }
 
+    let deliveryControlMs;
+    if (deliveryControl) {
+      const control = copyWorld(), client = new SimulationClient(() => new Worker('/measured-worker.mjs', { type: 'module' }));
+      const ping = [], compute = [], deliver = [];
+      try {
+        await client.open(control, () => true);
+        const first = performance.now();
+        for (let i = 1; i <= warmup + steps; i++) {
+          const due = first + (i - 1) * CONFIG.step, tick = start + i * CONFIG.step;
+          if (pace && due > performance.now()) await new Promise(resolve => setTimeout(resolve, due - performance.now()));
+          const at = performance.now();
+          const reply = await client.request({ kind: 'delivery-ping' });
+          const pingMs = performance.now() - at;
+          if (reply.tick !== control.data.tick) throw new Error('空消息返回的世界步不符');
+          const prepared = await client.request({ kind: 'prepare-delivery', base: control.data.tick });
+          const ready = performance.now();
+          await client.advance(control, tick);
+          const delivered = performance.now() - ready;
+          if (control.data.tick !== tick) throw new Error('预计算对照没有交付当前步');
+          if (i > warmup) { ping.push(pingMs); compute.push(prepared.elapsed); deliver.push(delivered); }
+        }
+        compare(committed.data, control.data, ['预计算对照的最终世界']);
+        compare(committed.foodRevision, control.foodRevision, ['预计算对照的进食版本']);
+        deliveryControlMs = { emptyRoundTrip: stats(ping), prepareFullStep: stats(compute), deliverPreparedStep: stats(deliver) };
+      } finally { client.close(); }
+    }
+
     // Run the full reference replay separately so its snapshots, allocations and
     // deep comparisons cannot stall a timed callback on the UI thread.
     const replay = copyWorld(), verified = new SimulationClient();
@@ -191,11 +219,11 @@ try {
           total: rounded(wall), ...Object.fromEntries(Object.entries(phases).map(([phase, times]) => [phase, rounded(times[i])]))
         })) } : {}),
         budgetMs: budget, ecologyMs: stats(ecologies), workerSubmitMs: stats(roundTrips),
-        phaseMs: Object.fromEntries(Object.entries(phases).map(([phase, times]) => [phase, stats(times)])) };
+        phaseMs: Object.fromEntries(Object.entries(phases).map(([phase, times]) => [phase, stats(times)])), deliveryControlMs };
     } finally { unsubscribe(); verified.close(); }
-  }, { checkpoint, fish, steps, warmup, budget, separateReference: !!values.reference, samples: values.samples, pace: !!values.pace });
+  }, { checkpoint, fish, steps, warmup, budget, separateReference: !!values.reference, samples: values.samples, pace: !!values.pace, deliveryControl: values['delivery-control'] });
   assert.deepEqual(errors, []);
-  assert.equal(workers, 2, '计时、状态复核各自运行一个独立的后台线程');
+  assert.equal(workers, values['delivery-control'] ? 3 : 2, '计时、交付对照和状态复核应使用各自的后台线程');
   console.log(JSON.stringify({ browser: browser.version(), sample: checkpoint ? 'checkpoint' : 'generated', ...report }, null, 2));
   if (values.budget !== undefined) assert.equal(report.workerSubmitMs.overBudget, 0, '有完整生态步超过指定耗时');
 } finally {
