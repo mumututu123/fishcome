@@ -28,7 +28,18 @@ function trackWorld(source) {
   const observation = Symbol('simulation observation');
   const values = new Set(), rows = new Map(), lifeFields = new Set(), bondRows = new Map();
   const populationFields = new Set(), patients = new Set();
-  const illnessSchedule = { due: -Infinity };
+  const illnessSchedule = {
+    due: -Infinity,
+    records: () => raw(source.population.illnesses),
+    admit(table, id, patient) {
+      // Reintroducing a patient deleted earlier in this step also changes
+      // the dictionary order. A full replacement preserves that ordering.
+      if (patients.has(id) && !Object.hasOwn(table, id)) populationFields.add('illnesses');
+      patients.add(id);
+      table[id] = patient;
+      this.due = Math.min(this.due, patient.nextLossAt);
+    }
+  };
   const raw = object => object?.[observation]?.target ?? object;
   const bondTimes = new WeakMap();
   let characters, ecology, membership, meals, previousBonds, activeBonds, publishedBonds, orderedBonds = false;
@@ -130,6 +141,7 @@ function trackWorld(source) {
     if (field === 'life') {
       if (part === undefined) return { field, part: key };
       if (part === 'bonds' && bond === undefined) return { ...location, bond: key };
+      if (part === 'stories' && id === undefined) return { ...location, id: key };
     }
     return location;
   }
@@ -236,7 +248,7 @@ function trackWorld(source) {
       if (raw(target[key]) === raw(value) && Object.hasOwn(target, key)) return true;
       const parent = target[observation].location;
       mark(target, parent, key, value);
-      target[key] = value && typeof value === 'object' && !isPatientTable(parent) ? watch(value, child(parent, key)) : value;
+      target[key] = value && typeof value === 'object' && !deferredRows(parent) ? watch(value, child(parent, key)) : value;
       return true;
     },
     deleteProperty(target, key) {
@@ -245,8 +257,8 @@ function trackWorld(source) {
       return delete target[key];
     }
   };
-  function isPatientTable(location) {
-    return location.field === 'population' && location.part === 'illnesses' && location.id === undefined;
+  function deferredRows({ field, part, id }) {
+    return id === undefined && (field === 'population' && part === 'illnesses' || field === 'life' && part === 'stories');
   }
   function watch(object, location) {
     if (!object || typeof object !== 'object' || inputFields.has(location.field)) return object;
@@ -257,7 +269,7 @@ function trackWorld(source) {
     if (existing) return existing.proxy;
     const bondTable = location.field === 'life' && location.part === 'bonds' && location.bond === undefined;
     const contactTable = location.field === 'contacts' && location.table;
-    const lazy = bondTable || contactTable || isPatientTable(location);
+    const lazy = bondTable || contactTable || deferredRows(location);
     const proxy = new Proxy(object, lazy ? {
       ...writes,
       get(table, key, receiver) {

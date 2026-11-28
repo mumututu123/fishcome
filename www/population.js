@@ -68,7 +68,7 @@ function checkIllness(world, now) {
   // Never backfill infections for unattended/offline hours.
   const fishes = world.fishValues();
   if (fishes.length < POPULATION.threshold) return;
-  const illnesses = state.illnesses, patients = Object.values(illnesses);
+  const illnesses = world.illnessSchedule?.records() ?? state.illnesses, patients = Object.values(illnesses);
   let active = 0;
   // Settlement has already removed every patient whose fish left the sea.
   for (const patient of patients) if (!patient.curedAt) active++;
@@ -83,7 +83,9 @@ function checkIllness(world, now) {
   ranked.sort((a, b) => a.rank - b.rank || a.id.localeCompare(b.id));
   for (let i = 0; i < quota && i < ranked.length; i++) {
     const { id } = ranked[i];
-    illnesses[id] = { at: now, nextLossAt: now + POPULATION.dissolveEvery, curedAt: 0 };
+    const patient = { at: now, nextLossAt: now + POPULATION.dissolveEvery, curedAt: 0 };
+    if (world.illnessSchedule) world.illnessSchedule.admit(illnesses, id, patient);
+    else illnesses[id] = patient;
     recordStory(world, 'depressed', id, now, { visit: now });
   }
 }
