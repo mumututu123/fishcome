@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { ARCHIVE, ArchiveStore, archiveChunks, archivePlan } from '../www/archive.js';
 import { World } from '../www/engine.js';
+import { mergeBonds } from '../www/life.js';
 import { actorId, signer } from '../www/storage.js';
 import { prepareOrderedArchive } from '../www/ordered-archive.js';
 import { OrderedSession } from '../www/ordered-session.js';
@@ -31,6 +32,7 @@ function pair(now) {
       stopped: (_, reason) => stops.push(reason), inputsCommitted: async () => {}, archiveConfirmed() {},
       prepareArchive: (_, boundary) => prepareOrderedArchive(world, store, boundary, id => packs[id], async () => {}),
       archiveBoundary: (_, commit) => commit(), prepare: async () => ({}),
+      bondHistory: (_, bonds) => mergeBonds(world.data.life.bonds, bonds),
       install: (_, changes, valid, wrap) => { if (valid()) wrap(() => Object.assign(world.data, changes)); },
       advance: async (_, tick) => { calls.push(tick); world.data.tick = tick; return { tick, changesDigest: await stepDigest({ tick }) }; }
     });
@@ -134,4 +136,19 @@ test('缺少起始步的接收端能释放旧会话，成员更换后没有旧�
   assert.equal(a.session.run(now + 500), false);
   assert.equal(a.session.current, null); assert.deepEqual(a.calls, []);
   assert.equal(a.session.valid(past), false);
+});
+test('同一步归并离线期间不同的伙伴成员与累计相处，随后共同执行', async () => {
+  const now = Date.now(), { sides: [a,b], drain } = pair(now);
+  const bond = (first, second, seconds) => ({ a: first, b: second, seconds, at: now, lastNear: now, run: 1 });
+  a.world.data.life.bonds = { 'a|b': bond('a','b',3) };
+  b.world.data.life.bonds = { 'a|b': bond('a','b',8), 'a|c': bond('a','c',5) };
+  await a.session.probe(); await drain();
+  for (const side of [a,b]) {
+    assert.deepEqual(side.stops, []);
+    assert.equal(side.world.data.life.bonds['a|b'].seconds,8);
+    assert.equal(side.world.data.life.bonds['a|c'].seconds,5);
+    assert.equal(side.session.run(now+500),true);
+  }
+  await drain();
+  assert.equal(a.session.current.steps.proof,b.session.current.steps.proof);
 });

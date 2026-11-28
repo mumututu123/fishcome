@@ -138,7 +138,7 @@ const ordered = new OrderedSession({
     const sources = { ops: { ...prior.ops, ...s.world.data.ops }, breeding: { ...prior.breeding, ...s.world.data.breeding }, roots: s.world.data.roots };
     if (!validateLife(life, sources)) throw new Error('伙伴历史缺少有效来源');
     const records = mergeBonds(s.world.data.life.bonds, bonds);
-    return JSON.stringify(records) === JSON.stringify(s.world.data.life.bonds) ? undefined : records;
+    return JSON.stringify(records) === JSON.stringify(s.world.data.life.bonds) ? s.world.data.life.bonds : records;
   },
   install: (target, changes, valid, apply) => atCheckpointBoundary(target.data, () => {
     if (valid()) apply(() => { worldEdited(target); Object.assign(target.data, changes); target.dirty = true; });
@@ -168,7 +168,7 @@ const ordered = new OrderedSession({
   stopped(session, reason) {
     diagnostics.record('info', 'ordered-steps', reason);
     if (session.executed && amLeader()) worldBroadcast.reset();
-    if (session.steps && amLeader()) resumeOrderedInputs().catch(error => diagnostics.record('warn', 'ordered-steps', error.message));
+    if (amLeader()) resumeOrderedInputs().catch(error => diagnostics.record('warn', 'ordered-steps', error.message));
   }
 });
 subscribeSimulationChanges((target, patch) => ordered.changed(target, patch));
@@ -264,7 +264,7 @@ async function archiveWorld(now = Date.now()) {
     if (!canArchive()) return;
     if (chunks.length) await putMany(chunks.map(chunk => ['archive:' + chunk.manifest.id, chunk.encoded]), { generation: await saveGeneration });
     if (!canArchive()) return;
-    if (session?.steps && ordered.current === session) {
+    if (session && await ordered.whenJoined(session)) {
       const boundary = { version: 1, at: now, chunks: Object.fromEntries(chunks.map(({ manifest }) => [manifest.id, manifest])) };
       if (await ordered.proposeArchive(boundary)) return;
       if (!canArchive()) return;
@@ -513,7 +513,7 @@ async function onMessage(message, peer) {
     if (rejectedOps.has(body.id)) return;
     if (body.kind === 'referral' && !await verifyReferral(body)) return;
     inbox.set(body.id, clone(message));
-    if (amLeader() && !ordered.current?.steps) {
+    if (amLeader() && !ordered.current) {
       const result = await applyAtBoundary(message, true);
       if (!result) return;
       if (result.ok) await save({ reusePicture: true }); else rejectOperation(body.id);
@@ -599,7 +599,7 @@ async function submit(payload) {
     const message = await network.broadcast('op', op);
     if (rejectedOps.has(op.id)) { pending.delete(op.id); update(); return; }
     inbox.set(op.id, clone(message));
-    const result = amLeader() && !ordered.current?.steps && await applyAtBoundary(message, true);
+    const result = amLeader() && !ordered.current && await applyAtBoundary(message, true);
     if (result) {
       pending.delete(op.id);
       if (!result.ok) { rejectOperation(op.id); toast(result.error); }

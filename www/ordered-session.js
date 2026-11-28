@@ -9,15 +9,68 @@ export function checkpointOrder(data) {
   return Object.fromEntries(orderedTables.filter(name => tableAt(data, name)).map(name => [name, Object.keys(tableAt(data, name))]));
 }
 
+// State that determines traversal order is part of the commitment. Hash small
+// numbered pages in order so encoding a real sea can yield to the renderer.
+async function checkpointProof(world, store, data, valid) {
+  let yieldAt = performance.now() + 2;
+  async function table(rows) {
+    const keys = Object.keys(rows), pages = [];
+    for (let at = 0; at < keys.length; at += 128) {
+      if (!valid()) return;
+      if (performance.now() >= yieldAt) {
+        if (globalThis.scheduler?.yield) await scheduler.yield();
+        else if (globalThis.setImmediate) await new Promise(resolve => setImmediate(resolve));
+        else await new Promise(resolve => setTimeout(resolve, 0));
+        yieldAt = performance.now() + 2;
+      }
+      const page = keys.slice(at, at + 128).map(id => [id, rows[id]]);
+      pages.push(stepDigest(page));
+    }
+    return Promise.all(pages);
+  }
+  const fields = [];
+  let bondEntry;
+  for (const name of Object.keys(data)) {
+    if (!valid()) return;
+    const field = data[name];
+    if (name === 'life' && field) {
+      const parts = [];
+      for (const [key, value] of Object.entries(field)) parts.push([key, value && typeof value === 'object' && !Array.isArray(value)
+        ? ['pages', await table(value)] : ['value', value]]);
+      bondEntry = parts.find(part => part[0] === 'bonds');
+      fields.push([name, 'life', parts]);
+    } else if (field && typeof field === 'object' && !Array.isArray(field)) fields.push([name, 'pages', await table(field)]);
+    else fields.push([name, 'value', field]);
+  }
+  if (!valid()) return {};
+  const commonArchives = await stepDigest([world.ambient, Object.keys(store.manifests).sort(), store.summary, store.overrides]);
+  const whole = () => stepDigest([fields, commonArchives]);
+  const proof = await whole();
+  if (!bondEntry) return { proof };
+  const before = bondEntry[1];
+  bondEntry[1] = null;
+  const exceptBonds = await whole();
+  bondEntry[1] = before;
+  async function withBonds(bonds) {
+    bondEntry[1] = ['pages', await table(bonds)];
+    return valid() ? whole() : undefined;
+  }
+  return { proof, exceptBonds, withBonds };
+}
+
 // Merging can preserve every record but reorder a dictionary. The leader's
 // order matters to subsequent simulation and conflict ties. Only rearrange
 // local rows, and only install them after the complete checkpoint hash agrees.
-export async function orderedCheckpoint(world, store, orders) {
+export async function orderedCheckpoint(world, store, orders, valid = () => true) {
   const changes = {}, data = { ...world.data };
   if (orders) {
     for (const [name, keys] of Object.entries(orders)) {
       if (!orderedTables.includes(name)) throw new Error('共同检查点包含未知表');
       const table = tableAt(data, name), local = Object.keys(table || {});
+      // Separate legitimate histories can retain a different set of pairs.
+      // Preserve our full local table until the ordinary history join verifies.
+      if (name === 'life.bonds' && table && Array.isArray(keys) &&
+          (keys.length !== local.length || keys.some(id => !Object.hasOwn(table, id)))) continue;
       if (!table || !Array.isArray(keys) || keys.length !== local.length) throw new Error('共同检查点的数据不齐');
       if (keys.every((key, i) => key === local[i])) continue;
       const aligned = {};
@@ -31,8 +84,7 @@ export async function orderedCheckpoint(world, store, orders) {
       } else data[name] = changes[name] = aligned;
     }
   }
-  const proof = await stepDigest([data, world.ambient, Object.keys(store.manifests).sort(), store.summary, store.overrides]);
-  return { proof, changes };
+  return { ...await checkpointProof(world, store, data, valid), changes };
 }
 
 export class OrderedSession {
@@ -51,6 +103,7 @@ export class OrderedSession {
     const s = this.current;
     if (!s) return;
     this.current = null;
+    s.joined?.(false);
     s.steps?.close();
     s.archive?.plan?.close();
     s.archive?.done?.(false);
@@ -76,7 +129,9 @@ export class OrderedSession {
     this.retryAt = now + 3000;
     const world = this.io.world(), s = this.begin(peer, crypto.randomUUID(), world.data.tick);
     const order = checkpointOrder(world.data);
-    const { proof } = await orderedCheckpoint(world, s.store);
+    await this.send(s, { action: 'opening', base: s.base, order });
+    s.cut = await orderedCheckpoint(world, s.store, undefined, () => this.valid(s));
+    const { proof } = s.cut;
     if (!this.valid(s) || world.data.tick !== s.base) return;
     s.proof = proof;
     await this.send(s, { action: 'open', base: s.base, proof, order });
@@ -86,26 +141,42 @@ export class OrderedSession {
     if (!s?.waiting || s.checking || s.world.data.tick < s.base) return;
     if (!this.valid(s) || s.world.data.tick !== s.base) { this.stop('已错过共同检查点'); return; }
     s.checking = true;
-    const { proof, changes } = await orderedCheckpoint(s.world, s.store, s.order);
+    s.cut = await orderedCheckpoint(s.world, s.store, s.order, () => this.valid(s));
+    await this.finishCheckpoint(s);
+  }
+  async finishCheckpoint(s) {
+    if (!this.valid(s) || !s.cut?.proof || !s.proof || s.joining) return;
+    s.joining = true;
+    const { proof, changes } = s.cut;
     if (!this.valid(s)) return;
     if (proof !== s.proof) {
-      await this.send(s, { action: 'history', base: s.base, bonds: s.world.data.life.bonds });
-      if (this.current === s) this.stop('两端已验证的世界内容不同', false);
+      s.reconciling = true;
+      await this.send(s, { action: 'history', base: s.base, exceptBonds: s.cut.exceptBonds, bonds: s.world.data.life.bonds });
       return;
     }
     if (Object.keys(changes).length) {
-      await this.io.install(s.world, changes, () => this.valid(s), action => {
-        s.applying = true;
-        try { action(); } finally { s.applying = false; }
-      });
+      await this.installChecked(s, changes);
     }
     if (!this.valid(s)) return;
     s.waiting = false;
     this.start(s);
     await this.send(s, { action: 'joined', base: s.base, proof });
   }
+  installChecked(s, changes) {
+    return this.io.install(s.world, changes, () => this.valid(s), action => {
+      s.applying = true;
+      try { action(); } finally { s.applying = false; }
+    });
+  }
+  whenJoined(s) {
+    if (!this.valid(s)) return Promise.resolve(false);
+    if (s.steps) return Promise.resolve(true);
+    return s.onJoin ??= new Promise(resolve => { s.joined = resolve; });
+  }
   start(s) {
+    s.joined?.(true);
     this.io.beginExecution?.(s.world);
+    s.cut = undefined;
     s.steps = new OrderedSteps({ epoch: s.epoch, tick: s.base, proof: s.proof, leader: s.owner,
       send: body => this.send(s, body), validOp: async op => {
         if (!await this.io.validOp(s.world, op)) return false;
@@ -147,23 +218,43 @@ export class OrderedSession {
   async receive(peer, b) {
     if (!b || typeof b !== 'object' || this.io.peer() !== peer) return;
     let s = this.current;
-    if (b.action === 'open') {
-      if (this.io.isLeader() || s || typeof b.epoch !== 'string' || b.epoch.length !== 36 || !Number.isSafeInteger(b.base) ||
+    if (b.action === 'open' || b.action === 'opening') {
+      if (this.io.isLeader() || typeof b.epoch !== 'string' || b.epoch.length !== 36 || !Number.isSafeInteger(b.base) ||
           b.base < this.io.world().data.tick || b.base > this.io.world().data.tick + CONFIG.step * 2 ||
-          !/^[0-9a-f]{64}$/.test(b.proof) || !b.order || typeof b.order !== 'object') return;
-      s = this.begin(peer, b.epoch, b.base);
-      Object.assign(s, { waiting: true, proof: b.proof, order: b.order });
-      return this.afterReplica();
+          b.action === 'open' && !/^[0-9a-f]{64}$/.test(b.proof) || !b.order || typeof b.order !== 'object') return;
+      if (s && (s.peer !== peer || s.epoch !== b.epoch || s.base !== b.base || !s.waiting)) return;
+      if (!s) {
+        s = this.begin(peer, b.epoch, b.base);
+        Object.assign(s, { waiting: true, order: b.order });
+      }
+      if (b.action === 'open') s.proof = b.proof;
+      return s.cut ? this.finishCheckpoint(s) : this.afterReplica();
     }
     if (!s || s.peer !== peer || b.epoch !== s.epoch) return;
     if (b.action === 'stop') { this.stop('伙伴已切回世界同步', false); return; }
     if (!this.valid(s)) { this.stop('共同结算的连接或归档已更换'); return; }
-    if (b.action === 'history' && s.owner && !s.steps && b.base === s.base) {
-      const history = await this.io.bondHistory?.(s, b.bonds);
+    if (b.action === 'history' && s.owner && !s.steps && !s.reconciling && b.base === s.base) {
+      if (!s.cut?.exceptBonds || b.exceptBonds !== s.cut.exceptBonds) { this.stop('两端已验证的世界内容不同'); return; }
+      s.reconciling = true;
+      const bonds = await this.io.bondHistory(s, b.bonds);
       if (!this.valid(s)) return;
-      this.stop('双方重新合并已验证的伙伴历史', false);
-      if (history) await this.io.install(s.world, { life: { ...s.world.data.life, bonds: history } },
-        () => this.io.world() === s.world && s.world.data.tick === s.base && s.store.revision === s.revision && this.io.isLeader(), f => f());
+      const proof = await s.cut.withBonds(bonds);
+      if (!proof || !this.valid(s)) return;
+      if (bonds !== s.world.data.life.bonds) await this.installChecked(s, { life: { ...s.world.data.life, bonds } });
+      s.proof = proof;
+      await this.send(s, { action: 'historyCut', base: s.base, proof, bonds });
+      return;
+    }
+    if (b.action === 'historyCut' && !s.owner && s.reconciling && !s.steps && b.base === s.base && /^[0-9a-f]{64}$/.test(b.proof)) {
+      const bonds = await this.io.bondHistory(s, b.bonds);
+      if (!this.valid(s)) return;
+      const proof = await s.cut.withBonds(bonds);
+      if (!this.valid(s)) return;
+      if (proof !== b.proof) { this.stop('伙伴历史归并结果不同'); return; }
+      s.cut.changes.life = { ...(s.cut.changes.life || s.world.data.life), bonds };
+      s.cut.proof = s.proof = proof;
+      s.joining = false;
+      await this.finishCheckpoint(s);
       return;
     }
     if (b.action === 'joined' && s.owner && !s.steps && b.base === s.base && b.proof === s.proof) {
