@@ -18,13 +18,19 @@ test('真实合流只提醒一次，同一身份刷新两次后仍能双向同�
   const browser = await chromium.launch();
   t.after(() => browser.close());
   const errors = [];
+  async function ready(page) {
+    await page.waitForFunction(() => window.tide).catch(async error => {
+      const message = await page.locator('#networkStatus').textContent();
+      throw new Error(`世界未就绪：${message}；页面异常：${errors.join('、')}`, { cause: error });
+    });
+  }
   async function open(url, nick) {
     const page = await browser.newPage();
     page.on('pageerror', error => errors.push(error.message));
     await page.goto(url);
     await page.locator('#nickInput').fill(nick);
     await page.locator('#welcomeForm .primary').click();
-    await page.waitForFunction(() => window.tide);
+    await ready(page);
     return page;
   }
 
@@ -57,7 +63,7 @@ test('真实合流只提醒一次，同一身份刷新两次后仍能双向同�
   for (let i = 0; i < 2; i++) {
     const priorNode = await b.evaluate(() => tide.network.node);
     await b.reload();
-    await b.waitForFunction(() => window.tide);
+    await ready(b);
     assert.deepEqual(await state(b), expected, '刷新后应从本地存档恢复已合流的世界');
     const currentNode = await b.evaluate(() => tide.network.node);
     assert.notEqual(currentNode, priorNode);

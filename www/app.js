@@ -24,7 +24,7 @@ import { memoryForCell, ancestralGlyph, ancestralText } from './easter-eggs.js';
 import { activeEvent, eventSchedule, eventTitle, eventPosition, eventLetter, radioTranscript, eventNarration } from './random-events.js';
 import { activeLegend, legendSchedule, legendTitle, legendPosition, capturedFish } from './legends.js';
 import { POPULATION, illnessOf } from './population.js';
-import { ARCHIVE, ARCHIVE_FIELDS, ArchiveStore, archivePlanAsync, reachesArchiveThreshold, archiveChunks, emptyArchiveState, mergeArchiveState, prepareCompaction, compactKnown } from './archive.js';
+import { ARCHIVE, ARCHIVE_FIELDS, ArchiveStore, archivePlanAsync, reachesArchiveThreshold, archiveChunks, emptyArchiveState, mergeArchiveState, prepareCompaction, compactKnown, observeArchiveDependencies } from './archive.js';
 import { WORLD_RULES, rulesCompatible } from './rules.js';
 import { assetPlatformLabel, classifyPeerCompatibility, detectUpdateSource, formatUpdateBytes, normalizeAssetSuffix, pickHigherVersionPeers } from './update.js';
 const $ = id => document.getElementById(id);
@@ -171,13 +171,14 @@ async function archiveWorld(now = Date.now()) {
   archiveCheckAt = now; archiveScanning = true;
   const target = world, store = archiveStore;
   const initialRevision = store.revision;
+  const dependencies = observeArchiveDependencies(target);
   let committed = false;
   const isCurrent = () => target === world && store === archiveStore;
   const canArchive = () => isCurrent() && !updateFrozen && !replacingCheckpoint && amLeader();
   try {
     const pressure = await reachesArchiveThreshold(target.data);
     if (now - (target.data.archives?.at || 0) < ARCHIVE.period && !pressure) return;
-    const plan = await archivePlanAsync(target.data, now, { pressure });
+    const plan = await archivePlanAsync(target.data, now, { pressure, dependencies: dependencies.read });
     if (!canArchive()) return;
     const hasNewRecords = Object.values(plan).some(table => Object.keys(table).length);
     const mealTargets = new Set();
@@ -191,7 +192,7 @@ async function archiveWorld(now = Date.now()) {
       target.data.archives ||= emptyArchiveState();
       for (const { manifest } of chunks) target.data.archives.chunks[manifest.id] = manifest;
     }
-    const compact = await prepareCompaction(target, store);
+    const compact = await prepareCompaction(target, store, dependencies.read);
     const changed = await simulation.archiveAtStepBoundary(target, () => {
       if (!isCurrent() || (!hasNewRecords && !canArchive())) return;
       const removed = compact();
@@ -207,7 +208,7 @@ async function archiveWorld(now = Date.now()) {
   } catch (error) {
     if (!committed && isCurrent() && store.revision !== initialRevision) worldEdited(target);
     status = '记忆整理稍后重试：' + error.message;
-  } finally { archiveBusy = false; archiveScanning = false; }
+  } finally { dependencies.close(); archiveBusy = false; archiveScanning = false; }
 }
 async function requestHistory(peer) { const ids = (historyQueues.get(peer.id) || []).filter(id => !histories[id]); historyQueues.set(peer.id, ids); if (ids.length) await network.direct(peer, 'historyRequest', { ids: ids.slice(0, 32) }); else historyQueues.delete(peer.id); }
 // Never relax network validation; only local checkpoints and explicit backup

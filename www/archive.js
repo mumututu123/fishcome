@@ -1,6 +1,6 @@
 import { chooseReferral } from './referral.js';
 import { mergeTravel } from './fish-status.js';
-import { simulationWillApply, simulationApplied } from './simulation-changes.js';
+import { simulationWillApply, simulationApplied, subscribeSimulationChanges } from './simulation-changes.js';
 
 export const ARCHIVE = Object.freeze({ age: 7 * 86400000, period: 86400000, threshold: 8 * 1024 * 1024, chunkSize: 256 * 1024, maxChunk: 1024 * 1024, fragmentSize: 384 * 1024, maxRecord: 32 * 1024 * 1024 });
 const compactableFields = ['ops', 'chars', 'breeding', 'travel', 'chats'];
@@ -43,7 +43,14 @@ export function archiveDependencies(data) {
   for (const op of Object.values(data.ops)) if (op.kind === 'sceneEdit' && data.chars[op.cell]?.kind !== 'burn') keep.ops.add(op.id);
   return keep;
 }
-function* archiveCandidates(data, now, pressure) {
+// Planning, comparison with durable rows and removal may see the same live
+// world. Share its dependencies only for the lifetime of this archive.
+export function observeArchiveDependencies(world) {
+  let retained;
+  const close = subscribeSimulationChanges(target => { if (target === world) retained = undefined; });
+  return { read: () => retained ??= archiveDependencies(world.data), close };
+}
+function* archiveCandidates(data, now, pressure, dependencies = archiveDependencies) {
   const cutoff = now - (pressure ? ARCHIVE.period : ARCHIVE.age);
   const records = Object.fromEntries(ARCHIVE_FIELDS.map(field => [field, {}]));
   let keep, scanned = 0;
@@ -54,7 +61,7 @@ function* archiveCandidates(data, now, pressure) {
       if (!record || field === 'chars' && record.kind !== 'burn' || field === 'travel' && data.fishes[id] || field === 'breeding' && record.status === 'active') continue;
       const at = field === 'ops' ? record.t : field === 'chars' ? Math.max(record.created || 0, record.moveAt || 0, ...record.path.map(e => e.t || 0)) : field === 'chats' ? record.body.t : field === 'breeding' ? record.at : Math.max(record.since || 0, ...Object.keys(record.days || {}).map(day => Date.parse(day + 'T23:59:59+08:00')));
       if (at > cutoff) continue;
-      keep ??= archiveDependencies(data);
+      keep ??= dependencies(data);
       if (!keep[field].has(id)) records[field][id] = record;
     }
   }
@@ -76,8 +83,8 @@ async function runInSlices(iterator) {
     start = performance.now();
   }
 }
-export function archivePlanAsync(data, now, { pressure = false } = {}) {
-  return runInSlices(archiveCandidates(data, now, pressure));
+export function archivePlanAsync(data, now, { pressure = false, dependencies } = {}) {
+  return runInSlices(archiveCandidates(data, now, pressure, dependencies));
 }
 // Measure the same uncompressed JSON bytes as the archive threshold, stopping
 // as soon as the answer is known instead of allocating a whole-world string.
@@ -323,7 +330,7 @@ export class ArchiveStore {
     return result;
   }
 }
-export async function prepareCompaction(world, store) {
+export async function prepareCompaction(world, store, dependencies = archiveDependencies) {
   const { data } = world, revision = store.revision, candidates = [];
   let keep;
   for (const field of compactableFields) {
@@ -335,7 +342,7 @@ export async function prepareCompaction(world, store) {
     const ids = index.size <= 1024 ? index.keys() : Object.keys(live);
     for (const id of ids) {
       if (!Object.hasOwn(live, id) || !index.has(id) || field === 'chars' && live[id]?.kind !== 'burn') continue;
-      keep ??= archiveDependencies(data);
+      keep ??= dependencies(data);
       if (keep[field].has(id)) continue;
       const archived = await store.get(field, id);
       if (archived) candidates.push([field, id, archived]);
@@ -343,7 +350,7 @@ export async function prepareCompaction(world, store) {
   }
   return () => {
     if (!candidates.length || revision !== store.revision) return;
-    const current = archiveDependencies(world.data);
+    const current = dependencies(world.data);
     const removed = {};
     for (const [field, id, record] of candidates) {
       if (current[field].has(id) || !same(world.data[field]?.[id], record)) continue;

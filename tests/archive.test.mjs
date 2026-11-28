@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { World, chooseClaim, clone } from '../www/engine.js';
-import { ARCHIVE, ARCHIVE_FIELDS, ArchiveStore, archivePlan, archivePlanAsync, reachesArchiveThreshold, archiveChunks, encodeArchive, decodeArchive, assembleFragments, emptyArchiveState, mergeArchiveState, compactKnown } from '../www/archive.js';
+import { ARCHIVE, ARCHIVE_FIELDS, ArchiveStore, archivePlan, archivePlanAsync, reachesArchiveThreshold, archiveChunks, encodeArchive, decodeArchive, assembleFragments, emptyArchiveState, mergeArchiveState, compactKnown, prepareCompaction, observeArchiveDependencies } from '../www/archive.js';
+import { applyInputRows } from '../www/simulation-changes.js';
 import { newLife } from '../www/life.js';
 import { fishCatalog } from '../www/fish-profile.js';
 import { signer, actorId, verifyEnvelope } from '../www/storage.js';
@@ -26,6 +27,27 @@ test('分批检查归档大小保留 UTF-8 字节阈值和原有归档选择', a
   assert.deepEqual(await archivePlanAsync(w.data, now, { pressure: true }), archivePlan(w.data, now, { pressure: true }));
 });
 const blank = () => Object.fromEntries(ARCHIVE_FIELDS.map(f => [f, {}]));
+
+test('同一轮归档复用依赖检查，提交前新出现的引用保留在线记录', async () => {
+  const world = new World(old, undefined, { populate: false }), store = new ArchiveStore();
+  const records = blank(), id = 'older-glyph';
+  records.chars[id] = world.data.chars[id] = { id, kind: 'burn', created: old, path: [] };
+  await store.ingest(await encodeArchive(records, world.data.roots), chooseClaim);
+  let traversals = 0;
+  world.data.chars = new Proxy(world.data.chars, { ownKeys(table) { traversals++; return Reflect.ownKeys(table); } });
+  const dependencies = observeArchiveDependencies(world);
+  try {
+    const plan = await archivePlanAsync(world.data, now, { dependencies: dependencies.read });
+    assert.deepEqual(plan.chars[id], records.chars[id]);
+    const planned = traversals;
+    const compact = await prepareCompaction(world, store, dependencies.read);
+    assert.equal(traversals, planned);
+    applyInputRows(world, [['bubbles', 'new-bubble', { source: id }]]);
+    compact();
+    assert(traversals > planned);
+    assert.equal(world.data.chars[id], records.chars[id]);
+  } finally { dependencies.close(); }
+});
 
 test('并发吸收同一归档只更新一次余额、归档版本和起源索引', async () => {
   const store = new ArchiveStore();
