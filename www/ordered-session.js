@@ -278,8 +278,11 @@ export class OrderedSession {
       const c = this.candidate;
       if (s || !c || !this.io.isLeader() || peer !== c.peer || b.id !== c.id || b.leader !== c.leader ||
           c.world !== this.io.world() || c.leader !== this.io.leader() || performance.now() - c.askedAt > CONFIG.step) return;
+      // The next ordinary committed tick invokes probe at its publication
+      // boundary. Signing a cut here would spend the first tick's remaining
+      // budget on a reply that can arrive anywhere inside that tick.
       c.acknowledged = true;
-      return this.probe();
+      return;
     }
     if (b.action === 'open' || b.action === 'opening') {
       if (this.io.isLeader() || typeof b.epoch !== 'string' || b.epoch.length !== 36 || !Number.isSafeInteger(b.base) ||

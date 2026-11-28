@@ -41,7 +41,13 @@ function pair(now) {
   }
   async function drain(drop) {
     for (let i = 0; i < 200; i++) {
-      while (wires.length) { const [to, message] = wires.shift(); if (!drop?.(message)) await sides[to].session.receive(sides[to].peer, message); }
+      while (wires.length) {
+        const [to, message] = wires.shift();
+        if (drop?.(message)) continue;
+        await sides[to].session.receive(sides[to].peer, message);
+        // The normal world publication calls probe immediately after committing.
+        if (message.action === 'available') await sides[to].session.probe();
+      }
       if (!sides.some(s => s.session.current?.running)) return;
       await new Promise(resolve => setTimeout(resolve, 1));
     }
@@ -202,6 +208,24 @@ test('对方尚未完成首次加入时询问不占用时钟，迟到的回执�
   assert.equal(a.session.current,undefined);
   await a.session.probe(); await drain();
   assert.ok(a.session.current.steps); assert.ok(b.session.current.steps);
+});
+test('有效回复落在旧步中间时仍照常发布，下一次提交才选定新检查点', async () => {
+  const now = Date.now(), { sides: [a,b], drain } = pair(now);
+  await a.session.probe();
+  let reply;
+  await drain(message => { if (message.action === 'available') { reply = message; return true; } });
+  await a.session.receive(a.peer, reply);
+  assert.equal(a.session.current, undefined);
+  assert.equal(a.session.run(now + 500), false);
+  a.world.data.tick = b.world.data.tick = now + 500;
+  await a.session.probe();
+  await drain();
+  for (const side of [a,b]) {
+    assert.equal(side.session.current.base,now + 500);
+    assert.equal(side.session.run(now + 1000),true);
+  }
+  await drain();
+  assert.deepEqual(a.calls,b.calls);
 });
 test('共同模式首步等待或取消时原广播仍发增量，实际提交后才重建发送基准', async () => {
   const now = Date.now(), { sides: [a,b], drain } = pair(now);
