@@ -1,12 +1,29 @@
 import { WORLD_WIDTH, MAX_FLOOR } from './geography.js';
 
 export class BodyLayout {
-  constructor(groups) {
+  constructor(groups, hulls = new WeakMap()) {
     this.groups = groups;
-    this.hulls = new WeakMap();
+    this.hulls = hulls;
   }
   get ordered() {
     return this.byId ??= [...this.groups].sort(([a], [b]) => a.localeCompare(b));
+  }
+  updated(groups, changed) {
+    const layout = new BodyLayout(groups, this.hulls);
+    layout.school = this.school;
+    if (!changed || !this.byId || [...changed].some(id => groups.has(id) && !this.groups.has(id))) return layout;
+    // A locale may collate two different legacy names equally. Their tie order
+    // follows the first glyph in the table and must be sorted again after edits.
+    this.distinctOrder ??= this.byId.every(([id], i) => !i || this.byId[i - 1][0].localeCompare(id) !== 0);
+    if (this.distinctOrder) {
+      layout.distinctOrder = true;
+      layout.byId = [];
+      for (const row of this.byId) {
+        if (!changed.has(row[0])) layout.byId.push(row);
+        else if (groups.has(row[0])) layout.byId.push([row[0], groups.get(row[0])]);
+      }
+    }
+    return layout;
   }
   hull(cells) {
     let shape = this.hulls.get(cells);

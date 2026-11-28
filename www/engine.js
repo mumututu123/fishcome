@@ -157,7 +157,7 @@ function planFreeSwimming(grid, singles, now) {
   plan.last = now;
 }
 function chooseDirection(world, id, fish, cells, pair, center, now, ambient, bins, canEat) {
-  const found = bins.size && (pair ? pair.members.some(member => canEat(member.id)) : canEat(id)) ? new Map() : null;
+  const found = bins?.size && (pair ? pair.members.some(member => canEat(member.id)) : canEat(id)) ? new Map() : null;
   if (found) for (const eye of cells) if (EYES.has(eye.ch)) {
     const p = cellPosition(fish, eye), r = sightRadius(p.y), binWidth = CONFIG.width / 10;
     for (let bx = Math.floor((p.x - r) / 10); bx <= Math.floor((p.x + r) / 10); bx++) for (let by = Math.floor((p.y - r) / 10); by <= Math.floor((p.y + r) / 10); by++) {
@@ -432,7 +432,15 @@ export class World {
   movementGrid(groups) {
     const cached = this.movingPopulation;
     if (cached && cached.groups === groups && cached.version === this.poseRevision()) return cached.grid;
-    const grid = new MovementGrid(this.bodyLayout(groups));
+    const layout = this.bodyLayout(groups);
+    if (cached && this.poseEdits) {
+      const bodies = this.bodyEdits(cached.groups, groups), poses = this.poseEdits();
+      if (bodies && poses && cached.grid.reconcile(this, layout, bodies, poses)) {
+        this.retainMovementGrid(groups, cached.grid);
+        return cached.grid;
+      }
+    }
+    const grid = new MovementGrid(layout);
     for (const [id, body] of groups) if (this.data.fishes[id]) grid.update(this.data.fishes[id], body);
     this.retainMovementGrid(groups, grid);
     return grid;
@@ -440,6 +448,7 @@ export class World {
   retainMovementGrid(groups, grid) {
     if (!this.poseRevision) return;
     // Overlapping owners must be enumerated in body-table order at every new step.
+    this.clearPoseEdits?.();
     this.movingPopulation = grid.overlapped ? null : { groups, grid, version: this.poseRevision() };
   }
   canOccupy(f, cells, scenery = this.sceneryMap(), occupants = this.fishOccupants(), blocked, hull) {
@@ -653,7 +662,8 @@ export class World {
     const avoidancePhase = Math.floor(now / 12000);
     let travelDay, starvationDue = false;
     const singles = fishOccupancy.swimmers(this, CONFIG.speed);
-    const freeIntents = !bins.size && ambient && this.stableFishRoster;
+    const freeIntents = ambient && this.stableFishRoster;
+    const nearFood = freeIntents && bins.size && fishOccupancy.visibleFoodOwners(edible, Math.max(CONFIG.sightShallow, CONFIG.sightDeep));
     if (freeIntents) planFreeSwimming(fishOccupancy, singles, now);
     for (const [id, cells, pair, swimmer] of motionOrder(this, groups, layout, singles)) {
       let f = pair ? pair.fish : swimmer?.fish ?? fishes[id];
@@ -672,8 +682,9 @@ export class World {
       let hull = swimmer ? swimmer.hull : layout.hull(cells);
       if (!Number.isSafeInteger(f.x) || !Number.isSafeInteger(f.y) || Math.abs(f.facing) !== 1 || Math.abs(f.x) > WORLD_WIDTH * 2) hull = null;
       const center = hull?.bounds || bounds(cells);
-      const intended = freeIntents && swimmer?.intended ||
-        chooseDirection(this, id, f, cells, pair, center, now, ambient, bins, canEat);
+      const visibleBins = bins.size && (!nearFood || swimmer?.slot === undefined || nearFood[swimmer.slot]) ? bins : null;
+      const intended = !visibleBins && freeIntents && swimmer?.intended ||
+        chooseDirection(this, id, f, cells, pair, center, now, ambient, visibleBins, canEat);
       let dx = intended.dx, dy = intended.dy;
       const beforeX = f.x, beforeY = f.y, beforeFacing = f.facing;
       if (pair) for (const member of pair.members) fishOccupancy.update(member, groups.get(member.id) || [], true);

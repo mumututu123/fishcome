@@ -27,11 +27,16 @@ export class MovementGrid {
     if (!roster) return this.layout.ordered;
     if (this.roster !== roster) {
       this.roster = roster;
+      const entries = this.swimmerBodies ??= new WeakMap();
       this.swimmersById = this.layout.ordered.map(([id, cells]) => {
+        const fish = world.readFish(id), cached = entries.get(cells);
+        if (cached && cached[0] === id && cached[3].fish === fish) return cached;
         const hull = this.layout.hull(cells);
-        return [id, cells, null, { fish: world.readFish(id), ordinal: world.swimOrdinal?.(id), hull, slot: this.slots.get(id),
+        const entry = [id, cells, null, { fish, ordinal: world.swimOrdinal?.(id), hull, slot: this.slots.get(id),
           speedX: hull && speed * hull.bounds.width / cells.length, speedY: hull && speed * hull.bounds.height / cells.length,
           intended: undefined }];
+        entries.set(cells, entry);
+        return entry;
       });
     }
     return this.swimmersById;
@@ -92,7 +97,65 @@ export class MovementGrid {
       this.overlaps.set(k, new Set([this.owners[current], id]));
     }
   }
-  add(x, y, id) { this.setCell(x, y, id, this.slot(id), false); }
+  add(x, y, id) {
+    const slot = this.slot(id);
+    this.setCell(x, y, id, slot, false);
+    (this.additions ??= []).push([x, y, id, slot]);
+  }
+  reconcile(world, layout, bodies, poses) {
+    if (this.overlapped || !this.integerCells) return false;
+    const changed = new Set([...bodies, ...poses.keys()]);
+    for (const id of changed) {
+      const oldBody = this.layout.groups.get(id);
+      if (oldBody && !this.layout.hull(oldBody)) return false;
+    }
+    for (const [x, y, id, slot] of this.additions || []) this.setCell(x, y, id, slot, true);
+    this.additions = undefined;
+    for (const id of changed) {
+      const old = this.layout.groups.get(id), previous = poses.has(id) ? poses.get(id) : world.readFish(id);
+      if (!old || !previous) continue;
+      const { xy } = this.layout.hull(old), slot = this.slots.get(id);
+      for (let i = 0; i < xy.length; i += 2) {
+        this.setCell(previous.x + previous.facing * xy[i], previous.y + xy[i + 1], id, slot, true);
+      }
+    }
+    // Movement order and the adjacent-pair search use the same current body collection.
+    if (this.layout !== layout) this.roster = undefined;
+    this.layout = layout;
+    for (const id of changed) {
+      const fish = world.readFish(id), body = layout.groups.get(id);
+      if (fish && body) this.update(fish, body);
+    }
+    return !this.overlapped;
+  }
+  visibleFoodOwners(foods, radius) {
+    // The eyes are a subset of occupied body cells. Select every owner with
+    // any cell in range before the ordered pass starts moving its first fish.
+    if (this.overlapped || this.fractional.size) return;
+    const size = 10, columns = WORLD_WIDTH / size, rows = Math.ceil(occupancyRows / size);
+    const sectors = new Uint8Array(rows * columns), nearby = new Uint8Array(this.owners.length);
+    for (const food of foods) {
+      if (!Number.isSafeInteger(food.x) || !Number.isSafeInteger(food.y) || Math.abs(food.x) > 2 * WORLD_WIDTH) return;
+      const x = wrapX(food.x), top = Math.max(0, Math.floor((food.y - radius) / size));
+      const bottom = Math.min(rows - 1, Math.floor((food.y + radius) / size));
+      for (let y = top; y <= bottom; y++) {
+        for (let bx = Math.floor((x - radius) / size); bx <= Math.floor((x + radius) / size); bx++) {
+          const column = (bx + columns) % columns, sector = y * columns + column;
+          if (sectors[sector]) continue;
+          sectors[sector] = 1;
+          const endY = Math.min((y + 1) * size, occupancyRows);
+          for (let cy = y * size; cy < endY; cy++) {
+            const start = cy * WORLD_WIDTH + column * size;
+            for (let i = start; i < start + size; i++) {
+              const slot = this.cells[i];
+              if (slot) nearby[slot] = 1;
+            }
+          }
+        }
+      }
+    }
+    return nearby;
+  }
   prepareMovement(data, scenery, foods, weeds) {
     const depths = terrainOf(data).depths;
     if (this.depths !== depths) {

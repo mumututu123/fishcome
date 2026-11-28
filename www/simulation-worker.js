@@ -1,3 +1,4 @@
+import { BodyMembership } from './body-membership.js';
 import { BodyLayout } from './motion-hull.js';
 import { World, CONFIG, indexEcologyCharacters } from './engine.js';
 import { shanghaiDay } from './fish-status.js';
@@ -20,11 +21,12 @@ function trackWorld(source) {
   const values = new Set(), rows = new Map(), lifeFields = new Set(), bondRows = new Map();
   const raw = object => originals.get(object) || object;
   const bondTimes = new WeakMap();
-  let characters, ecology, bodies, meals, previousBonds, activeBonds, publishedBonds, orderedBonds = false;
+  let characters, ecology, membership, meals, previousBonds, activeBonds, publishedBonds, orderedBonds = false;
   let fishRoster, previousStories, poseRevision = 0, originRevision = 0;
   const characterViews = new Map();
   const activeKinds = ['food', 'seaweed', 'scene'];
   const activeKey = JSON.stringify(activeKinds);
+  let poses = new Map();
   const allCharacters = () => characters ??= Object.values(raw(source.chars));
   function charValues(...kinds) {
     if (kinds[0] === undefined) return allCharacters();
@@ -32,6 +34,11 @@ function trackWorld(source) {
     if (cached) return cached.cells;
     // Settling changes the food and scenery lists together. Rebuild them from
     // their shared membership, without revisiting every glyph of every fish.
+    if (key === activeKey && membership) {
+      const cells = membership.activeCells();
+      characterViews.set(key, { kinds, cells });
+      return cells;
+    }
     const source = key !== activeKey && kinds.every(kind => activeKinds.includes(kind))
       ? charValues(...activeKinds) : allCharacters();
     const cells = source.filter(cell => kinds.includes(cell.kind));
@@ -48,19 +55,20 @@ function trackWorld(source) {
     if (!ecology) {
       // Food settling into scenery keeps the same position in this combined
       // view. It changes neither the shape of a swimmer nor a previous meal.
-      const cells = bodies && meals ? charValues('food', 'seaweed', 'scene') : allCharacters();
-      ecology = indexEcologyCharacters(cells, bodies, meals);
-      bodies = ecology.groups;
+      membership ??= new BodyMembership(raw(source.chars), activeKinds);
+      membership.flush();
+      const cells = meals ? charValues(...activeKinds) : allCharacters();
+      ecology = indexEcologyCharacters(cells, membership.groups, meals);
       const { pastMeals, pastGrass, latestMeals } = ecology;
       meals = { pastMeals, pastGrass, latestMeals };
     }
     return ecology;
   }
   function mealPath(path) { return path?.some(event => event?.reason === 'eat'); }
-  function noteCharacterChange(target, parent, key, value) {
+  function noteCharacterChange(target, parent, key, value, deleting) {
     if (parent.table) {
       const previous = target[key];
-      if (previous?.kind === 'fish' || value?.kind === 'fish') bodies = undefined;
+      membership?.mark(key, true, deleting);
       if (mealPath(previous?.path) || mealPath(value?.path)) meals = undefined;
       characters = ecology = undefined;
       invalidateCharacterViews(previous?.kind, value?.kind);
@@ -70,16 +78,25 @@ function trackWorld(source) {
       // A path edit can replace an event, edit its payload, or truncate its array.
       const changesMeal = Array.isArray(target) ? key === 'length' || target[key]?.reason === 'eat' || value?.reason === 'eat'
         : target.reason === 'eat' || key === 'reason' && value === 'eat';
-      if (changesMeal) meals = ecology = undefined;
+      if (meals && Array.isArray(target) && target === raw(source.chars[parent.id]?.path) && key === String(target.length) && value?.reason === 'eat') {
+        const { target: diner, t } = value;
+        meals.pastMeals.add(diner);
+        if (source.chars[parent.id]?.wild) meals.pastGrass.add(diner);
+        if (Number.isFinite(t) && t > (meals.latestMeals.get(diner) ?? -Infinity)) {
+          meals = { ...meals, latestMeals: new Map(meals.latestMeals).set(diner, t) };
+          ecology = undefined;
+        }
+      } else if (changesMeal) meals = ecology = undefined;
       return;
     }
     if (parent.property !== undefined) return;
     if (key === 'kind') {
-      if (target.kind === 'fish' || value === 'fish') bodies = undefined;
+      membership?.mark(parent.id);
       if (target === raw(source.chars[parent.id])) invalidateCharacterViews(target.kind, value, true);
       ecology = undefined;
     } else if (target.kind === 'fish' && (key === 'entity' || key === 'x' || key === 'y' || key === 'id')) {
-      bodies = ecology = undefined;
+      membership?.mark(parent.id);
+      ecology = undefined;
     } else if (key === 'path' && (mealPath(target.path) || mealPath(value)) || key === 'wild' && mealPath(target.path)) {
       meals = ecology = undefined;
     }
@@ -141,12 +158,19 @@ function trackWorld(source) {
     if (parent.root && (key === 'fishes' || key === 'travel') ||
         field === 'fishes' && (parent.table || !property && (key === 'id' || key === 'created' || key === 'lastFed' || key === 'lastMealAt')) ||
         field === 'travel' && parent.table && !value) fishRoster = undefined;
-    if (parent.root && key === 'fishes' || field === 'fishes' && (parent.table || !property && (key === 'x' || key === 'y' || key === 'facing'))) poseRevision++;
+    if (parent.root && key === 'fishes') {
+      poseRevision++;
+      poses = undefined;
+    } else if (field === 'fishes' && (parent.table || !property && (key === 'x' || key === 'y' || key === 'facing'))) {
+      poseRevision++;
+      const fish = parent.table ? target[key] : target, moved = parent.table ? key : id;
+      if (poses && !poses.has(moved)) poses.set(moved, fish && { x: fish.x, y: fish.y, facing: fish.facing });
+    }
     if (parent.root && key === 'chars') {
-      ecology = bodies = meals = undefined;
+      ecology = membership = meals = undefined;
       characters = undefined;
       characterViews.clear();
-    } else if (field === 'chars') noteCharacterChange(target, parent, key, value);
+    } else if (field === 'chars') noteCharacterChange(target, parent, key, value, deleting);
     if (parent.root) {
       // The contact clock replaces the entire ordered table, including rows
       // that kept their value but moved after another pair joined or left.
@@ -374,6 +398,9 @@ function trackWorld(source) {
       activeBonds = { table, keys, at, base };
     },
     ecologyCharacters,
+    bodyEdits: (before, after) => membership?.edits(before, after),
+    poseEdits: () => poses,
+    clearPoseEdits: () => { if (poses) poses.clear(); else poses = new Map(); },
     poseRevision: () => poseRevision,
     readFish: id => raw(source.fishes[id]),
     readContacts: () => raw(source.contacts),
@@ -489,7 +516,14 @@ export class WorkerSimulation {
       this.world.readFish = this.tracker.readFish;
       this.world.readContacts = this.tracker.readContacts;
       let layout;
-      this.world.bodyLayout = groups => layout?.groups === groups ? layout : (layout = new BodyLayout(groups));
+      this.world.bodyLayout = groups => {
+        if (layout?.groups !== groups) layout = layout
+          ? layout.updated(groups, this.tracker.bodyEdits(layout.groups, groups)) : new BodyLayout(groups);
+        return layout;
+      };
+      this.world.bodyEdits = this.tracker.bodyEdits;
+      this.world.poseEdits = this.tracker.poseEdits;
+      this.world.clearPoseEdits = this.tracker.clearPoseEdits;
       this.world.movingFish = this.tracker.movingFish;
       this.world.swimOrdinal = this.tracker.swimOrdinal;
       this.world.journalSwim = this.tracker.journalSwim;

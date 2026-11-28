@@ -155,9 +155,12 @@ function updateVolcano(world, now, dt, transition, resume = false) {
     }
   }
   const e = state.eruption; if (!e) return;
-  const groups = world.fishGroups(), scenery = world.sceneryMap(), occupancy = world.fishOccupants(groups);
-  const hit = c => { for (const id of occupancy.get(key(c.x, c.y)) || []) if (world.data.fishes[id]) killFish(world, id, now, 'magma', transition, groups); };
-  if (!resume && now >= e.nextAt && e.emitted < POPULATION.magmaLimit && now - e.at <= POPULATION.warning + POPULATION.emission * POPULATION.magmaLimit + 2000) {
+  const emitting = !resume && now >= e.nextAt && e.emitted < POPULATION.magmaLimit &&
+    now - e.at <= POPULATION.warning + POPULATION.emission * POPULATION.magmaLimit + 2000;
+  if (!emitting && !Object.keys(e.particles).length) return;
+  const groups = world.fishGroups(), scenery = world.sceneryMap(), occupancy = world.movementGrid(groups);
+  const hit = c => { for (const id of occupancy.get(c.x, c.y) || []) if (world.data.fishes[id]) killFish(world, id, now, 'magma', transition, groups); };
+  if (emitting) {
     const index = e.emitted++, r = hash(`${e.id}:${index}`), x = wrapX(e.x + r % 5 - 2), y = world.floorAt(x) - 1;
     e.nextAt = now + POPULATION.emission;
     if (!scenery.has(key(x, y))) { const id = `${e.id}:${index}`; e.particles[id] = { id, x, y, born: now, rise: 8 + r % 8, drift: r % 3 - 1, cx: 0, cy: 0, settled: false }; }
@@ -183,7 +186,7 @@ function updateVolcano(world, now, dt, transition, resume = false) {
     // Rock is always supported on the seabed/scenery, never suspended in water.
     let y = c.y;
     while (world.waterAt(c.x, y + 1) && !scenery.has(key(c.x, y + 1))) y++;
-    if (Object.keys(world.data.rocks).length < POPULATION.rockLimit && y >= 60 && !scenery.has(key(c.x, y)) && !occupancy.has(key(c.x, y))) {
+    if (Object.keys(world.data.rocks).length < POPULATION.rockLimit && y >= 60 && !scenery.has(key(c.x, y)) && !occupancy.get(c.x, y)) {
       world.data.rocks[id] = { id, seed: e.seed, slot: e.slot, index: +id.split(':').at(-1), x: c.x, y, at: c.born + POPULATION.cooling };
       populationScenery({ rocks: { [id]: world.data.rocks[id] } }, scenery, { predators: false });
     } else if (Object.keys(world.data.rocks).length < POPULATION.rockLimit && y >= 60 && !scenery.has(key(c.x, y))) {

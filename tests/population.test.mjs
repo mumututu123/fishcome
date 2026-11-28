@@ -99,6 +99,16 @@ test('食肉鱼真实嘴部接触才捕食，30分钟个体冷却和10分钟全�
   advance(w, now + 3000); assert(w.data.fishes[blocked]); assert.equal(p.x, 500);
   assert(predatorCells(p).every(c => !w.fishMap().has(key(c.x, c.y))));
 });
+test('火山预警和冷却后保留的喷发记录无需读取鱼体或造景', () => {
+  const w = world(1), e = erupt(w);
+  w.ambient = false;
+  w.fishGroups = w.sceneryMap = () => assert.fail('没有岩浆需要定位时不应扫描海洋');
+  advance(w, e.nextAt - 1);
+  e.emitted = POPULATION.magmaLimit;
+  advance(w, e.at + POPULATION.cooling + HOUR);
+  assert.equal(w.data.population.eruption.id, e.id);
+});
+
 test('火山预警、发射上升、回落与32字上限；间隔至少6小时，离线不补喷', () => {
   const w = world(), e = erupt(w), start = e.at;
   advance(w, start + POPULATION.warning - 500); assert.equal(e.emitted, 0);

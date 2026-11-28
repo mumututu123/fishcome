@@ -91,21 +91,28 @@ function indexPoints(points) {
 }
 function schoolGeometry(world, layout, roster) {
   const points = new Map(), centers = [], ordered = [], ranks = new Map();
-  let maxRadius = 0, rank = 0;
+  const previous = layout.school, centerByBody = previous?.centerByBody ?? new WeakMap();
+  let subset = !!previous?.orderedPairs, maxRadius = 0, rank = 0;
   for (const [id, cells] of layout.groups) {
     const fish = world.readFish(id);
     if (!fish || !cells.length) continue;
-    const box = layout.hull(cells)?.bounds ?? bounds(cells);
-    const halfWidth = (box.maxX - box.minX) / 2, halfHeight = (box.maxY - box.minY) / 2;
-    maxRadius = Math.max(maxRadius, halfWidth, halfHeight);
-    const point = { id, x: 0, y: 0, halfWidth, halfHeight };
+    let center = centerByBody.get(cells);
+    if (!center || center.fish !== fish) {
+      const box = layout.hull(cells)?.bounds ?? bounds(cells);
+      const point = { id, x: 0, y: 0, halfWidth: (box.maxX - box.minX) / 2, halfHeight: (box.maxY - box.minY) / 2 };
+      center = { fish, point, localX: (box.minX + box.maxX) / 2, localY: (box.minY + box.maxY) / 2 };
+      centerByBody.set(cells, center);
+    }
+    if (subset && !previous.points.has(id)) subset = false;
+    const { point } = center;
+    maxRadius = Math.max(maxRadius, point.halfWidth, point.halfHeight);
     points.set(id, point);
-    centers.push({ fish, point, localX: (box.minX + box.maxX) / 2, localY: (box.minY + box.maxY) / 2 });
+    centers.push(center);
   }
   for (const [id] of layout.ordered) {
     const point = points.get(id);
     if (!point) continue;
-    if (ordered.length && ordered.at(-1).id.localeCompare(id)) rank++;
+    if (ordered.length && (subset || ordered.at(-1).id.localeCompare(id))) rank++;
     ranks.set(point, rank);
     point.slot = ordered.length;
     ordered.push(point);
@@ -113,16 +120,16 @@ function schoolGeometry(world, layout, roster) {
   // Check that each leading ID owns a disjoint range in the actual locale's
   // pair-key ordering. Legacy names with overlapping ranges use the bounded sort.
   const first = ordered[0]?.id, last = ordered.at(-1)?.id;
-  const orderedPairs = rank + 1 === ordered.length && ordered.every((p, i) =>
+  const orderedPairs = subset && ordered.length > 0 || rank + 1 === ordered.length && ordered.every((p, i) =>
     /^[a-z0-9:-]+$/.test(p.id) && (!i || (ordered[i - 1].id + '|' + last).localeCompare(p.id + '|' + first) < 0));
-  return { roster, points, centers, ordered, ranks, orderedPairs, maxRadius };
+  return { groups: layout.groups, roster, points, centers, centerByBody, ordered, ranks, orderedPairs, maxRadius };
 }
 
 export function lifeContext(world, now, scenery, groups, sharedLayout) {
   const layout = sharedLayout || world.bodyLayout(groups), roster = world.fishValues();
   // Only the simulation loop lends its workspace to the next tick. Public
   // contexts requested by tools and the renderer retain their own positions.
-  const geometry = sharedLayout?.school?.roster === roster ? sharedLayout.school : schoolGeometry(world, layout, roster);
+  const geometry = sharedLayout?.school?.groups === groups && sharedLayout.school.roster === roster ? sharedLayout.school : schoolGeometry(world, layout, roster);
   if (sharedLayout) sharedLayout.school = geometry;
   const { points, ordered, maxRadius } = geometry;
   const sortedNeighbors = new Map(), scenes = new Map();

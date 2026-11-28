@@ -171,7 +171,8 @@ test('过期食物沉积保留活鱼的占位和餐史，真实进食单独更�
   c.path.length = 0;
   assert.equal(w.ecologyCharacters().latestMeals.size, 0);
   c.kind = 'fish'; c.entity = 'adult';
-  assert.notEqual(w.movementGrid(w.fishGroups()), grid);
+  assert.equal(w.movementGrid(w.fishGroups()), grid);
+  assert.deepEqual([...grid.get(15, 10)], ['adult']);
   assert.deepEqual(w.ecologyCharacters(), World.prototype.ecologyCharacters.call(w));
 });
 

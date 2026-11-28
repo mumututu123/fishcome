@@ -5,7 +5,7 @@ export const EVENTS = Object.freeze({ period: 360000, opening: 2000, limit: 32, 
 export const EVENT_KINDS = Object.freeze(['whale', 'hiccup', 'bottle', 'meeting', 'blossom', 'meteor', 'radio', 'parade']);
 const DURATIONS = { whale: 32000, hiccup: 22000, bottle: 60000, meeting: 18000, blossom: 32000, meteor: 16000, radio: 30000, parade: 18000 };
 const TITLES = { whale: '深海巨影', hiccup: '海洋打了个嗝', bottle: '漂流瓶路过', meeting: '鱼群临时开会', blossom: '海底开花', meteor: '流星掉进海里', radio: '海洋电台', parade: '倒着游的游行' };
-const hash = text => { let n = 2166136261; for (const ch of text) n = Math.imul(n ^ ch.codePointAt(0), 16777619); return n >>> 0; };
+const hash = (text, n = 2166136261) => { for (const ch of text) n = Math.imul(n ^ ch.codePointAt(0), 16777619); return n >>> 0; };
 const distance = (a, b) => Math.max(Math.abs(deltaX(a.x, b.x)), Math.abs(a.y - b.y));
 const seedOf = data => data.terrain?.seed || Object.keys(data.roots).sort()[0];
 export const eventTitle = kind => TITLES[kind] || '';
@@ -47,11 +47,16 @@ export function eventNarration(kind) {
   return { whale: '看见深处一道巨大的影子，安静地游了过去', hiccup: '听见海打了个嗝：今天的海，好像吃得很饱', bottle: '看见一封信随着水流，去往下一片水域', meeting: '参加了一次临时会议，讨论了一会儿，似乎没有结论', blossom: '看见海草开了花，像亮起一盏小灯', meteor: '看见一颗星星，游得比自己还快', radio: '听见海底电台断断续续地向发呆的鱼问好', parade: '和熟鱼一起转了个头：刚才的方向不算' }[kind] || '';
 }
 export function planEvent(world, schedule, now, context, bondFor = key => world.data.life?.bonds[key]) {
-  const points = [...context.points.values()].sort((a, b) => hash(`${schedule.id}:${a.id}`) - hash(`${schedule.id}:${b.id}`) || a.id.localeCompare(b.id));
+  const prefix = hash(schedule.id + ':');
+  const ranked = candidates => candidates.map(item => ({ item, rank: hash(item.id, prefix) }))
+    .sort((a, b) => a.rank - b.rank || a.item.id.localeCompare(b.item.id)).map(entry => entry.item);
   const healthy = p => !world.breedingState(p.id) && now - world.data.fishes[p.id].lastFed < 86400000;
+  const needsGroup = schedule.kind === 'meeting' || schedule.kind === 'parade';
+  const all = [...context.points.values()];
+  const points = ranked(needsGroup ? all.filter(healthy) : all);
   let focus = points[0], fishes = [], plants = [];
-  if (['meeting', 'parade'].includes(schedule.kind)) {
-    for (const point of points.filter(healthy)) {
+  if (needsGroup) {
+    for (const point of points) {
       const companions = (context.neighbors.get(point.id) || []).filter(q => healthy(q) && bondFor([point.id, q.id].sort().join('|'))?.seconds >= 45);
       const group = [point.id];
       for (const companion of companions) if (group.length < 4 && group.every(id => (context.neighbors.get(companion.id) || []).some(q => q.id === id))) group.push(companion.id);
@@ -60,8 +65,7 @@ export function planEvent(world, schedule, now, context, bondFor = key => world.
     if (!fishes.length) return null;
   }
   if (['hiccup', 'blossom'].includes(schedule.kind)) {
-    const weeds = world.charValues('seaweed').filter(c => schedule.kind !== 'blossom' || now - c.created >= 3600000);
-    weeds.sort((a, b) => hash(`${schedule.id}:${a.id}`) - hash(`${schedule.id}:${b.id}`) || a.id.localeCompare(b.id));
+    const weeds = ranked(world.charValues('seaweed').filter(c => schedule.kind !== 'blossom' || now - c.created >= 3600000));
     if (!weeds.length) return null;
     focus = weeds[0]; plants = weeds.filter(c => distance(c, focus) <= 8).slice(0, 7).map(c => c.id).sort();
   }

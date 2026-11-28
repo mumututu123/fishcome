@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { World, clone } from '../www/engine.js';
+import { World, clone, hash } from '../www/engine.js';
 import { EVENTS, EVENT_KINDS, eventSchedule, eventPosition, activeEvent, planEvent, updateEvents, validEvent, eventMotion, eventLetter, radioLines, radioTranscript } from '../www/random-events.js';
 import { eventGlyphs } from '../www/random-event-visuals.js';
 import { lifeContext, recordStory, pairKey, mergeLife, validateLife, storyText, idleMotion } from '../www/life.js';
@@ -22,6 +22,17 @@ function schedule(w, kind, rare) { let slot = Math.floor(w.data.tick / EVENTS.pe
 const context = (w, at) => lifeContext(w, at, w.sceneryMap(), w.fishGroups());
 function startEvent(w, kind) { const s = schedule(w, kind); w.data.tick = s.started; updateEvents(w, s.started, context(w, s.started), true, recordStory); return activeEvent(w.data, s.started); }
 const sources = w => ({ roots: w.data.roots, ops: w.data.ops, breeding: w.data.breeding, chars: w.data.chars });
+
+test('事件按相同抽签值选择鱼，给每个候选只计算一次抽签值', () => {
+  const w = make(), points = new Map();
+  const ids = Array.from({ length: 512 }, (_, i) => '鱼🐟-' + i);
+  let reads = 0;
+  for (const id of ids) points.set(id, { get id() { reads++; return id; }, x: 50, y: 5 });
+  const s = schedule(w, 'bottle');
+  const expected = ids.slice().sort((a, b) => hash(s.id + ':' + a) - hash(s.id + ':' + b) || a.localeCompare(b));
+  assert.deepEqual(planEvent(w, s, s.started, { points }).fishes, expected.slice(0, 4));
+  assert(reads <= 2 * ids.length, '仅排序预先算好的抽签值，勿在每次比较时重新读取候选编号');
+});
 
 test('整片海稳定抽签，八类与稀有变体均可出现，事件间有安静间隔', () => {
   const roots = { sea: 0 }, counts = new Map(), rare = new Set(); let occurred = 0;
