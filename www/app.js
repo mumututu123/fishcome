@@ -62,7 +62,7 @@ subscribeSimulationChanges((target, patch) => {
   if (target === world && started && !updateFrozen && !replacingCheckpoint && Number.isFinite(patch?.values?.tick)) {
     if (!ordered.current?.running) {
       broadcastWorld(patch.swims);
-      if (amLeader()) queueMicrotask(() => ordered.probe().catch(stopOrdered));
+      if (amLeader()) queueMicrotask(() => runOrdered(() => ordered.probe()));
     }
   }
 });
@@ -111,7 +111,7 @@ function orderedPeer() {
   const peers = network.live(), people = active();
   if (peers.length !== 1 || people.length !== 2 || network.hasRelayedWorldPeer(peers)) return;
   const peer = peers[0], other = members.get(peer.node);
-  if (other?.orderedSteps === 1 && other.build === meta.version && peer.replicaLive && peer.sentHello && peer.confirmedReplica &&
+  if (other?.orderedSteps === 1 && other.build === meta.version && peer.replicaLive && peer.sentHello && peer.confirmedReplica && other.peers <= 1 &&
       !peer.replicaCatchingUp && (!amLeader() || !geometryRepair && !world.data.pendingChatGlyphs)) return peer;
 }
 function orderedInputs(limit = 64) {
@@ -162,7 +162,7 @@ const ordered = new OrderedSession({
   archiveConfirmed: () => { renderChat(); save({ reusePicture: true }).catch(error => diagnostics.record('warn', 'archive', error.message)); },
   // Both workers start with the same row roster and compact patch reference.
   // An existing leader worker may still contain private pre-join indexes.
-  beginExecution: () => simulation.close(),
+  beginExecution: () => { worldBroadcast.reset(); simulation.close(); },
   prepare: (target, valid) => simulation.prepareAgreed(target, valid),
   advance: (target, nextTick, valid, handle) => simulation.advanceAgreed(target, nextTick, valid, handle),
   stopped(session, reason) {
@@ -172,7 +172,13 @@ const ordered = new OrderedSession({
   }
 });
 subscribeSimulationChanges((target, patch) => ordered.changed(target, patch));
-function stopOrdered(error) { ordered.stop(error.message); }
+function runOrdered(action) {
+  const task = action(), session = ordered.current;
+  return task.catch(error => {
+    if (ordered.current === session) ordered.stop(error.message);
+    diagnostics.record('warn', 'ordered-steps', error.message);
+  });
+}
 function pendingCost() {
   let total = 0;
   for (const [id, operation] of pending) if (!world.data.ops[id] && !archiveStore.ids.ops.has(id)) total += operation.cost || 0;
@@ -436,8 +442,7 @@ async function onMessage(message, peer) {
   const body = message.body;
   if (message.kind === 'orderedStep') {
     if (peer.node !== message.from || members.get(message.from)?.actor !== message.actor) return;
-    try { await ordered.receive(peer, body); }
-    catch (error) { stopOrdered(error); throw error; }
+    await runOrdered(() => ordered.receive(peer, body));
     return;
   }
   if (message.kind === 'hello') {
@@ -489,7 +494,7 @@ async function onMessage(message, peer) {
     }
     try {
       const changed = await mergeReplica(body.world, peer, body.delta ? 'world-delta' : 'world-full', message);
-      if (changed !== undefined) ordered.afterReplica().catch(stopOrdered);
+      if (changed !== undefined) runOrdered(() => ordered.afterReplica());
       if (changed) update();
       if (changed !== undefined && body.settledRecords && peer?.replicaLive && peer.node === message.from && message.from === leader()) {
         checkReplicaInventory(body, message.from, true);

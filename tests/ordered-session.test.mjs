@@ -36,9 +36,9 @@ function pair(now) {
     });
     sides.push({ world, peer, store, inputs, applied, session, calls, stops });
   }
-  async function drain() {
+  async function drain(drop) {
     for (let i = 0; i < 200; i++) {
-      while (wires.length) { const [to, message] = wires.shift(); await sides[to].session.receive(sides[to].peer, message); }
+      while (wires.length) { const [to, message] = wires.shift(); if (!drop?.(message)) await sides[to].session.receive(sides[to].peer, message); }
       if (!sides.some(s => s.session.current?.running)) return;
       await new Promise(resolve => setTimeout(resolve, 1));
     }
@@ -99,4 +99,39 @@ test('一批两份签名依业务编号各取自己的归档凭据', async () =>
   a.inputs.push(first, second);
   await a.session.probe(); await drain();
   for (const side of [a,b]) assert.deepEqual(side.applied, [first.body.id, second.body.id]);
+});
+test('没有收到最后的输入签认时两端都不执行，收到旧连接的消息也不能重新启用', async () => {
+  const now = Date.now(), { sides: [a,b], drain } = pair(now);
+  let withheld;
+  await a.session.probe();
+  await drain(message => { if (message.action === 'seal') { withheld = message; return true; } });
+  assert.ok(withheld);
+  for (const side of [a,b]) {
+    side.session.current.began = performance.now() - 2500;
+    assert.equal(side.session.run(now + 500), false);
+    assert.deepEqual(side.calls, []);
+  }
+  await drain();
+  await b.session.receive(b.peer, withheld);
+  assert.equal(b.session.current, null);
+  a.session.retryAt = 0;
+  await a.session.probe(); await drain();
+  assert.notEqual(b.session.current.epoch, withheld.epoch);
+  await b.session.receive(b.peer, withheld);
+  assert.equal(b.session.run(now + 500), true);
+  assert.equal(a.session.run(now + 500), true);
+  await drain();
+  assert.deepEqual(a.calls, b.calls);
+});
+test('缺少起始步的接收端能释放旧会话，成员更换后没有旧步提交', async () => {
+  const now = Date.now(), { sides: [a,b], drain } = pair(now);
+  const old = b.session.begin(b.peer, crypto.randomUUID(), now + 500);
+  old.waiting = true; old.began = performance.now() - 2200;
+  assert.equal(b.session.run(now + 1000), false); assert.equal(b.session.current, null);
+  await a.session.probe(); await drain();
+  const past = a.session.current;
+  a.session.io.peer = () => ({});
+  assert.equal(a.session.run(now + 500), false);
+  assert.equal(a.session.current, null); assert.deepEqual(a.calls, []);
+  assert.equal(a.session.valid(past), false);
 });

@@ -158,7 +158,6 @@ export class OrderedSession {
     if (!s || s.peer !== peer || b.epoch !== s.epoch) return;
     if (b.action === 'stop') { this.stop('伙伴已切回世界同步', false); return; }
     if (!this.valid(s)) { this.stop('共同结算的连接或归档已更换'); return; }
-    if (b.action === 'stop') { this.stop('伙伴已结束本次共同结算', false); return; }
     if (b.action === 'history' && s.owner && !s.steps && b.base === s.base) {
       const history = await this.io.bondHistory?.(s, b.bonds);
       if (!this.valid(s)) return;
@@ -173,17 +172,18 @@ export class OrderedSession {
     }
     if (!s.steps) return;
     if (b.action === 'archive' && !s.owner && !s.archive) {
-      if (!b.boundary || !/^[0-9a-f]{64}$/.test(b.id) || await stepDigest(b.boundary) !== b.id || !this.valid(s)) return;
+      if (!b.boundary || !/^[0-9a-f]{64}$/.test(b.id) || await stepDigest(b.boundary) !== b.id || !this.valid(s) || s.archive) return;
       const ticket = s.archive = { boundary: b.boundary, id: b.id };
       await this.prepareArchive(s, ticket);
       if (ticket.plan) await this.send(s, { action: 'archiveReady', id: ticket.id });
       return;
     }
-    if (b.action === 'archiveReady' && s.owner && s.archive?.id === b.id) {
+    if (b.action === 'archiveReady' && s.owner && s.archive?.id && s.archive.id === b.id) {
       s.archive.remote = true;
       return;
     }
-    if (b.action === 'offer' && b.archive !== undefined && (!s.archive?.plan || b.archive !== s.archive.id)) {
+    if (b.action === 'offer' && !s.owner && !s.steps.next && b.base === s.steps.tick && b.previous === s.steps.proof &&
+        b.archive !== undefined && (!s.archive?.plan || b.archive !== s.archive.id)) {
       this.stop('共同归档尚未校验'); return;
     }
     if (b.action === 'finished') {
@@ -193,7 +193,7 @@ export class OrderedSession {
       return this.nextOffer(s);
     }
     if (b.action === 'prepared') {
-      if (s.steps.next?.digest === b.digest && b.base === s.steps.tick && typeof b.outcomes === 'string') {
+      if (s.steps.next?.digest && s.steps.next.digest === b.digest && b.base === s.steps.tick && /^[0-9a-f]{64}$/.test(b.outcomes)) {
         s.remoteReady = b.outcomes;
         this.ready(s);
       }
@@ -251,7 +251,10 @@ export class OrderedSession {
     if (!this.valid(s)) { this.stop('成员、权威或归档已更换'); return false; }
     if (s.running) return true;
     if (now < s.base + CONFIG.step) return false;
-    if (s.waiting && s.world.data.tick < s.base) return false;
+    if (s.waiting && s.world.data.tick < s.base) {
+      if (performance.now() - s.began >= 2000) this.stop('直连未送达已约定的起始步');
+      return false;
+    }
     if (!s.localReady || s.localReady !== s.remoteReady) {
       if (!s.executed && performance.now() - s.began < 2000) return true;
       this.stop('本步输入尚未得到双方确认'); return false;
