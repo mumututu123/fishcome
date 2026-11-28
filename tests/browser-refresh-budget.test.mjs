@@ -27,6 +27,9 @@ test('独立画布必须找到同一子图层与实际合成器呈现', () => {
   const events = decodeGraphicsTrace(raw), page = { page: 'A', frames: [{ at: 1, sequence: 0, owner: true, poses: [1, 20, 30] }] };
   assert.equal(readPresentations(events, page, 0, 15).rows[0].traceTs, 8000);
   assert.equal(readPresentations(events.slice(0, -1), page, 0, 15).rows.length, 0);
+  events[7].args = { status: 'canceled' };
+  assert.equal(readPresentations(events, page, 0, 15).rows.length, 0);
+  delete events[7].args;
   events[5].args.chrome_graphics_pipeline.aggregated_surface_frame_trace_ids.pop();
   assert.equal(readPresentations(events, page, 0, 15).rows.length, 0);
 });

@@ -66,7 +66,7 @@ function indexOffscreenPresentations(events) {
       if (e.ph === 'b') begin.set(id, begin.has(id) ? null : e);
       if (e.ph === 'e' && begin.has(id)) {
         const start = begin.get(id), key = thread(e);
-        if (start) {
+        if (start && e.args?.status !== 'canceled') {
           if (!presentations.has(key)) presentations.set(key, []);
           presentations.get(key).push({ ts: start.ts, presented: e.ts });
         }
