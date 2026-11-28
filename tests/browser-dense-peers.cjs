@@ -248,6 +248,11 @@ window.denseJoinSettled = () => {
   return full && Date.now() - full.at >= 800 && !network.replicas.outgoing.size &&
     [...network.replicas.incoming.values()].every(state => state.kind === 'world' || state.kind === 'live');
 };
+window.denseFrameSampleFish = () => {
+  if (testData.frames.at(-1)?.visible) return;
+  const id = Object.keys(world.data.fishes)[0];
+  if (id) moveCameraToFish(world.data.fishes[id], bounds(world.fishCells(id)));
+};
 window.denseArchiveRound = async (serial, dropStep) => {
   if (!amLeader()) throw new Error('归档轮次开始时协调端已切换');
   const t = Date.now() - 8 * ARCHIVE.period;
@@ -441,6 +446,10 @@ async function main([urlA, urlB], assets) {
   const began = Date.now();
   const cold = await Promise.all([[a, urlA], [b, urlB]].map(async ([page, url]) => {
     await page.goto(url + '/');
+    if (!backup && count < 200) {
+      await page.waitForFunction(() => window.tide);
+      await page.evaluate(() => denseFrameSampleFish());
+    }
     await page.waitForFunction(() => window.tide && denseSurvey().frames.some(frame => frame.visible > 0), null, { polling: 50, timeout: 60000 });
     return Date.now() - began;
   }));
