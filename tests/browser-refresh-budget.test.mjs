@@ -1,6 +1,15 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { readPresentations, frameSummary, bothDisplays, scheduledSteps } from './browser-refresh-budget.cjs';
+import { readPresentations, frameSummary, bothDisplays, scheduledSteps, matchStepStarts } from './browser-refresh-budget.cjs';
+
+test('双端本地结算从最先发起的请求计时，遗漏对方的时标或确认均不能通过', () => {
+  const requests = [500, 1000, 1500, 2000].map((tick, sequence) => ({ tick, sequence, agreed: sequence > 0 }));
+  const peers = [{ tick: 1000, sequence: 4, agreed: true, committed: true },
+    { tick: 2000, sequence: 5, agreed: true, committed: true }];
+  matchStepStarts(requests, peers, new Map([[0, 900], [1, 10000], [2, 20000], [3, 30000]]), new Map([[4, 6000]]));
+  assert.deepEqual(requests.map(r => r.traceAt), [900, 6000, undefined, undefined]);
+  assert.equal(requests[1].peerSteps[0].startFromHost, -4);
+});
 
 test('从实际呈现的同一鱼元坐标核实游动，切换可见鱼元不会伪造运动', () => {
   const frames = [

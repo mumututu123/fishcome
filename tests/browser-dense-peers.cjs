@@ -8,7 +8,7 @@ const path = require('node:path');
 const { setTimeout: pause } = require('node:timers/promises');
 const { parseArgs } = require('node:util');
 const { unpackZip, launcherName, withReleaseFixtures } = require('./release-fixtures.cjs');
-const { recordDraw, frameSummary, startTrace, readPresentations, bothDisplays, scheduledSteps } = require('./browser-refresh-budget.cjs');
+const { recordDraw, frameSummary, startTrace, readPresentations, bothDisplays, scheduledSteps, matchStepStarts } = require('./browser-refresh-budget.cjs');
 
 const { positionals, values } = parseArgs({ allowPositionals: true, options: {
   profile: { type: 'string' }, source: { type: 'string' }, seconds: { type: 'string', default: '10' },
@@ -16,7 +16,7 @@ const { positionals, values } = parseArgs({ allowPositionals: true, options: {
   backup: { type: 'string' }, trace: { type: 'string' }, report: { type: 'string' }, 'refresh-budget': { type: 'boolean' },
   'archive-rounds': { type: 'string', default: '0' }, 'plain-live': { type: 'string' },
   'forget-live-base': { type: 'boolean' }, 'switch-leader': { type: 'boolean' }, 'rebuild-viewport': { type: 'boolean' },
-  'step-boundaries-only': { type: 'boolean' }, 'world-start': { type: 'string' }
+  'step-boundaries-only': { type: 'boolean' }, 'world-start': { type: 'string' }, 'headless-shell': { type: 'boolean' }
 } });
 if (values.help) {
   console.log('用法：node tests/browser-dense-peers.cjs [鱼数] [--seconds=35] [--full-updates=0|1] [--drop] [--profile=跟随端.cpuprofile]');
@@ -29,6 +29,7 @@ if (values.help) {
   console.log('--rebuild-viewport 用接收端旧的整表画面索引方式对照。');
   console.log('--step-boundaries-only 关闭各阶段的细分计时，保留请求、提交和呈现时间，用于对照观测开销。');
   console.log('--world-start=含时区的日期 用同一存档复现指定的游戏时刻，浏览器动画、网络和性能计时照常运行。');
+  console.log('默认使用完整版 Chromium 的无界面模式；--headless-shell 用精简无界面浏览器复现软件合成对照。');
   process.exit(0);
 }
 const backup = values.backup && JSON.parse(readFileSync(values.backup, 'utf8'));
@@ -127,7 +128,8 @@ SimulationClient.prototype.request = function (message) {
     performance.mark(name);
     performance.clearMarks(name);
   }
-  const start = performance.now(), row = { sequence, startAt: performance.timeOrigin + start, tick: message.base + CONFIG.step };
+  const start = performance.now(), row = { sequence, startAt: performance.timeOrigin + start, tick: message.base + CONFIG.step,
+    ...(message.agreed && { agreed: true }) };
   stepRequests.set(message, { row, start });
   testData.stepRequests.push(row);
   const reply = originalRequest.call(this, message);
@@ -460,7 +462,16 @@ function assertProgress(result, elapsed, label) {
 }
 
 async function main([urlA, urlB], assets) {
-  for (const _ of [urlA, urlB]) browsers.push(await chromium.launch({ headless: true }));
+  for (const _ of [urlA, urlB]) browsers.push(await chromium.launch({
+    headless: true, ...(values['headless-shell'] ? {} : { channel: 'chromium' })
+  }));
+  const graphics = await Promise.all(browsers.map(async browser => {
+    const session = await browser.newBrowserCDPSession();
+    try {
+      const { gpu } = await session.send('SystemInfo.getInfo');
+      return { device: gpu.devices[0]?.deviceString, compositor: gpu.featureStatus.gpu_compositing, raster: gpu.featureStatus.rasterization };
+    } finally { await session.detach(); }
+  }));
   if (worldStart !== undefined) clockShift = worldStart - Date.now();
   const [a, b] = await Promise.all([openPage(browsers[0], urlA, 'A', assets), openPage(browsers[1], urlB, 'B', assets)]);
   const fixture = backup ? await seedBackup([a, b]) : await seedSynthetic(a, b);
@@ -490,7 +501,7 @@ async function main([urlA, urlB], assets) {
   const stopTrace = values.trace && await Promise.all(browsers.map(browser => startTrace(browser, values['step-boundaries-only'])));
   if (stopTrace) await pause(300);
   const recent = observationNow();
-  await survey({ a, b, fixture, cold, joining, joined, recent, stopTrace, browserVersion: browsers[0].version() });
+  await survey({ a, b, fixture, cold, joining, joined, recent, stopTrace, browserVersion: browsers[0].version(), graphics });
 }
 
 async function seedBackup(pages) {
@@ -565,7 +576,7 @@ async function seedSynthetic(a, b) {
   return { joinedFish: fixture.joinedFish, archiveIds: [fixture.archiveId] };
 }
 
-async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace, browserVersion }) {
+async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace, browserVersion, graphics }) {
   const { firstLeads, tick: clockPhase, step } = await a.evaluate(() => {
     const { node, leader, tick, step } = denseSurvey();
     return { firstLeads: node === leader, tick, step };
@@ -634,10 +645,12 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
   const requests = coordinator.stepRequests.filter(row => row.startAt >= recent && row.startAt < ended ||
     row.tick >= recent && row.tick < ended);
   if (traces) {
-    const prefix = 'tide.request.' + coordinator.page + '.';
-    const stamps = new Map(traces[pages.indexOf(coordinator)].traceEvents.filter(event => event.name.startsWith(prefix))
-      .map(event => [Number(event.name.slice(prefix.length)), event.args.data.callTime]));
-    for (const request of requests) request.traceAt = stamps.get(request.sequence);
+    const stamps = page => {
+      const prefix = 'tide.request.' + page.page + '.';
+      return new Map(traces[pages.indexOf(page)].traceEvents.filter(event => event.name.startsWith(prefix))
+        .map(event => [Number(event.name.slice(prefix.length)), event.args.data.callTime]));
+    };
+    matchStepStarts(requests, follower.stepRequests, stamps(coordinator), stamps(follower));
   }
   const completed = requests.filter(row => row.committed).map(row => row.ms);
   const over20 = completed.filter(ms => ms > 20).length;
@@ -705,7 +718,8 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
   const replicaRows = Object.fromEntries(['fishes', 'chars', 'breeding', 'contacts', 'travel', 'ops', 'scenes']
     .map(field => [field, stats(received.flatMap(row => row.rows ? [row.rows[field]] : []))]));
   const report = JSON.stringify({ count, realBackup: Boolean(backup), browserVersion, cold, joinedMs: joined - joining, settledMs: recent - joining, steadyMs: ended - recent,
-    saved, liveWire, browserProcesses: browsers.length, traceClockSkewMs, worldStart,
+    saved, liveWire, browserProcesses: browsers.length, graphics, traceClockSkewMs, worldStart,
+    agreedSteps: requests.filter(r => r.agreed && r.committed && r.peerSteps?.some(p => p.agreed && p.committed)).length,
     bundledArchives: new Set(follower.receives.filter(sampled).flatMap(row => row.bundled || [])).size,
     separateArchiveMessages: follower.receives.filter(row => sampled(row) && row.kind === 'archiveChunk').length,
     ...(switched ? { switched } : {}),

@@ -223,4 +223,25 @@ function scheduledSteps(requests, phase, step, start, end) {
   return { expected, unrequested, unpresented };
 }
 
-module.exports = { recordDraw, frameSummary, startTrace, readPresentations, bothDisplays, scheduledSteps };
+function matchStepStarts(requests, peers, hostMarks, peerMarks) {
+  const byTick = new Map();
+  for (const row of peers) {
+    if (!byTick.has(row.tick)) byTick.set(row.tick, []);
+    byTick.get(row.tick).push(row);
+  }
+  for (const request of requests) {
+    const host = hostMarks.get(request.sequence);
+    const others = byTick.get(request.tick) || [];
+    const stamps = others.map(row => peerMarks.get(row.sequence));
+    // A sealed tick belongs to both engines. Its clock starts at the first
+    // request, including earlier peer attempts. Missing evidence fails closed.
+    request.traceAt = Number.isFinite(host) && stamps.every(Number.isFinite) &&
+      (!request.agreed || others.some(row => row.agreed && row.committed))
+      ? Math.min(host, ...stamps) : undefined;
+    if (others.length) request.peerSteps = others.map((row, i) => ({
+      agreed: row.agreed, committed: row.committed, startFromHost: (stamps[i] - host) / 1000, compute: row.ms
+    }));
+  }
+}
+
+module.exports = { recordDraw, frameSummary, startTrace, readPresentations, bothDisplays, scheduledSteps, matchStepStarts };
