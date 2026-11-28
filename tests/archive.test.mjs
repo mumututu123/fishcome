@@ -37,16 +37,31 @@ test('同一轮归档复用依赖检查，提交前新出现的引用保留在�
   world.data.chars = new Proxy(world.data.chars, { ownKeys(table) { traversals++; return Reflect.ownKeys(table); } });
   const dependencies = observeArchiveDependencies(world);
   try {
-    const plan = await archivePlanAsync(world.data, now, { dependencies: dependencies.read });
+    const plan = await archivePlanAsync(world.data, now, { dependencies });
     assert.deepEqual(plan.chars[id], records.chars[id]);
     const planned = traversals;
-    const compact = await prepareCompaction(world, store, dependencies.read);
+    const compact = await prepareCompaction(world, store, dependencies);
     assert.equal(traversals, planned);
     applyInputRows(world, [['bubbles', 'new-bubble', { source: id }]]);
     compact();
     assert(traversals > planned);
     assert.equal(world.data.chars[id], records.chars[id]);
   } finally { dependencies.close(); }
+});
+
+test('跨批读取期间早已走过的字段发生变化，以最新海洋重新核对依赖', () => {
+  const w = new World(old, undefined, { populate: false });
+  for (let i = 0; i < 520; i++) w.data.chars[i] = { kind: 'burn' };
+  const observed = observeArchiveDependencies(w);
+  try {
+    const scan = observed.scan();
+    assert.equal(scan.next().done, false);
+    applyInputRows(w, [['bubbles', 'incoming', { source: 'retained' }]]);
+    let next;
+    do { next = scan.next(); } while (!next.done);
+    assert(next.value.chars.has('retained'));
+    assert.equal(observed.read(), next.value);
+  } finally { observed.close(); }
 });
 
 test('并发吸收同一归档只更新一次余额、归档版本和起源索引', async () => {

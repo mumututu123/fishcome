@@ -8,7 +8,7 @@ const path = require('node:path');
 const { setTimeout: pause } = require('node:timers/promises');
 const { parseArgs } = require('node:util');
 const { unpackZip, launcherName, withReleaseFixtures } = require('./release-fixtures.cjs');
-const { recordDraw, frameSummary, startTrace, readPresentations } = require('./browser-refresh-budget.cjs');
+const { recordDraw, frameSummary, startTrace, readPresentations, bothDisplays } = require('./browser-refresh-budget.cjs');
 
 const { positionals, values } = parseArgs({ allowPositionals: true, options: {
   profile: { type: 'string' }, source: { type: 'string' }, seconds: { type: 'string', default: '10' },
@@ -636,6 +636,7 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
       longestTasks: page.longTasks.filter(sampled).sort((a, b) => b.ms - a.ms).slice(0, 8),
       failed: page.receives.filter(event => event.failed), replicaFailures: page.replicaFailures, logs: page.logs };
   });
+  const confirmed = trace && bothDisplays(requests);
   const dropped = coordinator.sends.filter(event => event.dropped && sampled(event));
   const droppedTicks = new Set(dropped.map(event => event.tick));
   const resumedTick = dropped.at(-1)?.tick + 500;
@@ -658,7 +659,7 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
       requested: page.repairs.filter(sampled).map(row => ({ afterMs: row.at - recent, correlated: row.correlated })),
       incoming: page.receives.filter(row => row.kind === 'merge' && sampled(row)).map(row => ({ afterMs: row.startAt - recent, ms: row.ms })) })),
     archiveRounds: rounds.map(({ at, tick, deliveredAt }) => ({ afterMs: at - recent, tick, deliveredAfterMs: deliveredAt - recent })), archiveError,
-    leaderProgress, followerProgress, stepComplete, stepStages, slowestStep: committed.reduce((slowest, row) =>
+    leaderProgress, followerProgress, stepComplete, stepStages, bothDisplays: confirmed, slowestStep: committed.reduce((slowest, row) =>
       !slowest || row.ms > slowest.ms ? row : slowest, null), stepSamples: requests, replicaRows,
     requestGaps: stats(requests.slice(1).map((row, index) => row.startAt - requests[index].startAt)),
     stepGaps: stats(leaderSteps.slice(1).map((step, index) => step.at - leaderSteps[index].at)),
@@ -699,7 +700,8 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
   assert.deepEqual(errors, []);
   assert.equal(stepStages.requestToAuthority.missing, 0, '完成的生态请求缺少权威状态写入时间');
   assert(!archiveError && rounds.every(round => sampled(round) && round.deliveredAt <= ended), archiveError || '至少一轮归档未在采样期间传递');
-  if (values['refresh-budget']) assert(stepComplete.n >= 9 && stepComplete.n === stepComplete.requested && stepComplete.over20 === 0 &&
+  if (values['refresh-budget']) assert(confirmed.missing === 0 && confirmed.over20 === 0 &&
+    stepComplete.n >= 9 && stepComplete.n === stepComplete.requested && stepComplete.over20 === 0 &&
     requests.slice(1).every((row, i) => row.tick - requests[i].tick === 500) && summaries.every(page => page.draw.over20 === 0 &&
     [page.presented, page.visibleMotion].every(row => row.over20 === 0 && row.n >= 20 && row.startCovered && row.endCovered) &&
     page.requestToConfirmedFrame.over20 === 0 && page.requestToConfirmedFrame.requestsWithoutObservedFrame === 0),

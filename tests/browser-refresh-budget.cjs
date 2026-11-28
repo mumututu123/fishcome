@@ -82,7 +82,8 @@ function readPresentations(events, page, start, end) {
     const presented = presentation.get(mark.frame);
     if (!(presented >= mark.endTs)) continue;
     const at = frame.at + (presented - mark.ts) / 1000;
-    displayed.set(presented, { ...frame, at, traceTs: presented, drawToPresent: (presented - mark.endTs) / 1000 });
+    displayed.set(presented, { ...frame, at, traceTs: presented, drawStartTs: mark.ts, drawEndTs: mark.endTs,
+      drawToPresent: (presented - mark.endTs) / 1000 });
   }
   const rows = [...displayed.values()].sort((a, b) => a.at - b.at);
   const moving = [];
@@ -151,11 +152,19 @@ function frameSummary(page, presentations, start, end, authority = page.steps, r
   const firstMoving = new Map();
   for (const frame of presentations.moving) if (!firstMoving.has(frame.tick)) firstMoving.set(frame.tick, frame.at);
   const firstVisible = new Map();
-  for (const frame of presentations.rows) if (frame.poses?.length && !firstVisible.has(frame.tick)) firstVisible.set(frame.tick, frame.traceTs);
+  for (const frame of presentations.rows) if (frame.poses?.length && !firstVisible.has(frame.tick)) firstVisible.set(frame.tick, frame);
   const commits = authority.filter(inWindow);
   const visibleAfterCommit = commits.map(commit => firstMoving.get(commit.tick) - commit.at).filter(ms => Number.isFinite(ms) && ms >= 0);
-  const requestToConfirmed = requests.map(request => request.committed ? (firstVisible.get(request.tick) - request.traceAt) / 1000 : NaN)
-    .filter(ms => Number.isFinite(ms) && ms >= 0);
+  const requestToConfirmed = [];
+  const endName = page.node === page.leader ? 'host' : 'peer';
+  for (const request of requests) {
+    const frame = firstVisible.get(request.tick);
+    if (!request.committed || !frame || !Number.isFinite(request.traceAt) || frame.drawStartTs < request.traceAt) continue;
+    const elapsed = ts => (ts - request.traceAt) / 1000;
+    (request.display ??= {})[endName] = { drawStart: elapsed(frame.drawStartTs), drawEnd: elapsed(frame.drawEndTs),
+      presented: elapsed(frame.traceTs) };
+    requestToConfirmed.push(elapsed(frame.traceTs));
+  }
   return { ...result,
     drawCpu: distribution(presentations.drawn.filter(inWindow).map(frame => frame.drawCpu)),
     presented: cadence(presentations.rows, start, end),
@@ -169,4 +178,16 @@ function frameSummary(page, presentations, start, end, authority = page.steps, r
   };
 }
 
-module.exports = { recordDraw, frameSummary, startTrace, readPresentations };
+function bothDisplays(requests) {
+  const completed = [];
+  let slowest;
+  for (const { tick, display } of requests) {
+    if (!display?.host || !display.peer) continue;
+    const ms = Math.max(display.host.presented, display.peer.presented);
+    completed.push(ms);
+    if (!slowest || slowest.ms < ms) slowest = { tick, ms, ...display };
+  }
+  return { ...distribution(completed), requested: requests.length, missing: requests.length - completed.length, slowest };
+}
+
+module.exports = { recordDraw, frameSummary, startTrace, readPresentations, bothDisplays };

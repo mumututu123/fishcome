@@ -178,7 +178,7 @@ async function archiveWorld(now = Date.now()) {
   try {
     const pressure = await reachesArchiveThreshold(target.data);
     if (now - (target.data.archives?.at || 0) < ARCHIVE.period && !pressure) return;
-    const plan = await archivePlanAsync(target.data, now, { pressure, dependencies: dependencies.read });
+    const plan = await archivePlanAsync(target.data, now, { pressure, dependencies });
     if (!canArchive()) return;
     const hasNewRecords = Object.values(plan).some(table => Object.keys(table).length);
     const mealTargets = new Set();
@@ -192,7 +192,7 @@ async function archiveWorld(now = Date.now()) {
       target.data.archives ||= emptyArchiveState();
       for (const { manifest } of chunks) target.data.archives.chunks[manifest.id] = manifest;
     }
-    const compact = await prepareCompaction(target, store, dependencies.read);
+    const compact = await prepareCompaction(target, store, dependencies);
     const changed = await simulation.archiveAtStepBoundary(target, () => {
       if (!isCurrent() || (!hasNewRecords && !canArchive())) return;
       const removed = compact();
@@ -957,6 +957,7 @@ async function start() {
   syncUpdateStatus(); refreshPeerUpdates().catch(() => {});
   reconnect().catch(() => {}); update();
   startSimulationClock(() => world.data.tick, tick);
+  startSimulationClock(() => world.data.tick + CONFIG.step / 2, maintainWorld);
   setInterval(() => { network.presence(active().filter(m => m.id !== network.node).map(m => ({ id: m.id, url: m.url }))).catch(() => {}); if (network.connections.size < 6) { const candidate = active().filter(m => m.id !== network.node && !network.has(m.id)).sort((a, b) => hash(`${network.node}:${a.id}`) - hash(`${network.node}:${b.id}`))[0]; if (candidate) network.connect(candidate.url, candidate.id).catch(() => {}); } }, 6000);
   document.addEventListener('visibilitychange', async () => { if (!document.hidden) { lifeSince = identity.lifeSeenAt || Date.now(); returnVisit = Date.now() - lifeSince > 60000; lifeMessage = null; } await resumeAfterInactivity(); if (network.live().length) network.broadcast('beat', { member: member() }).catch(() => {}); save().catch(() => {}); });
   window.addEventListener('pagehide', () => { simulation.close(); const blob = new Blob([JSON.stringify({ node: network.node, token: meta.token })], { type: 'application/json' }); navigator.sendBeacon('/local/unregister', blob); if (updateFrozen || updateRestarting || replacingCheckpoint) return; save({ reusePicture: true }).catch(() => {}); });
@@ -972,10 +973,6 @@ async function tick() {
   if (replacingCheckpoint) return;
   if (!updateFrozen && identity.remainder >= 3600) { identity.remainder -= 3600; identity.serial = (identity.serial || 0) + 1; await submit({ kind: 'earn', cost: 0, serial: identity.serial }); }
   members.set(network.node, member());
-  if (now - selfBeat >= 3000 && network.live().length) {
-    selfBeat = now;
-    network.broadcast('beat', { member: member(), ...replicaInventory.heartbeat(world.data, archiveStore) }).catch(() => {});
-  }
   const currentLeader = leader(); if (currentLeader !== lastLeader) { simulation.close(); lastLeader = currentLeader; worldBroadcast.reset(); replicaSwims.reset(); renderer.presentSwims(world); if (amLeader()) { geometryRepair = true; world.data.tick = Math.max(world.data.tick, now - 2000); for (const envelope of [...inbox.values()].sort((a, b) => a.body.t - b.body.t || a.body.id.localeCompare(b.body.id))) { if (!world.data.ops[envelope.body.id]) { const result = world.apply({ ...clone(envelope.body), proof: clone(envelope) }); if (!result.ok) rejectOperation(envelope.body.id); network.broadcast('ack', { id: envelope.body.id, result }).catch(() => {}); } } for (const id of pending.keys()) if (world.data.ops[id]) pending.delete(id); } }
   if (amLeader() && fishRepairWaiting && now - lastSave > 5000) geometryRepair = true;
   if (amLeader() && !updateFrozen && !replacingCheckpoint) {
@@ -993,6 +990,18 @@ async function tick() {
         toast(status);
       });
   } else simulation.close();
+}
+// Start periodic storage, presence and HUD work between ecology deadlines.
+// Foreground edits, pagehide and explicit archive requests keep their own cuts.
+async function maintainWorld() {
+  if (replacingCheckpoint) return;
+  const now = Date.now();
+  await resumeAfterInactivity(now);
+  if (replacingCheckpoint) return;
+  if (now - selfBeat >= 3000 && network.live().length) {
+    selfBeat = now;
+    network.broadcast('beat', { member: member(), ...replicaInventory.heartbeat(world.data, archiveStore) }).catch(() => {});
+  }
   if (!activeSavePromise && now - lastSave > 5000) { lastSave = now; save().catch(reportSaveError); }
   if (amLeader() && now - lastPictureTime > 30000) { lastPictureTime = now; takePicture().catch(() => {}); }
   update();

@@ -8,22 +8,32 @@ export const ARCHIVE_FIELDS = [...compactableFields, 'chatSources', 'fishes', 's
 export const emptyArchiveState = (at = 0) => ({ version: 1, at, chunks: {} });
 const json = value => JSON.stringify(value);
 const same = (a, b) => json(a) === json(b);
-export function archiveDependencies(data) {
+function* scanArchiveDependencies(data) {
   const keep = Object.fromEntries(ARCHIVE_FIELDS.map(field => [field, new Set()]));
+  let visited = 0;
   const fish = id => { if (!id) return; if (id.startsWith('born:')) birth(id.slice(5)); else keep.ops.add(id); };
   const birth = id => { if (keep.breeding.has(id)) return; keep.breeding.add(id); const r = data.breeding?.[id]; if (r) { fish(r.male); fish(r.female); } };
-  for (const id of Object.keys(data.fishes)) { fish(id); keep.travel.add(id); }
+  for (const id of Object.keys(data.fishes)) {
+    fish(id); keep.travel.add(id);
+    if (++visited % 512 === 0) yield;
+  }
   for (const contact of Object.values(data.contacts || {})) { fish(contact.male); fish(contact.female); }
   for (const bubble of Object.values(data.bubbles || {})) keep.chars.add(bubble.source);
   for (const r of Object.values(data.breeding || {})) if (r.status === 'active') birth(r.id);
   for (const [id, scene] of Object.entries(data.scenes)) { keep.ops.add(id); if (scene.poseId) keep.ops.add(scene.poseId); }
-  for (const c of Object.values(data.chars)) if (c.kind !== 'burn') {
+  for (const id in data.chars) {
+    if (++visited % 512 === 0) yield;
+    const c = data.chars[id];
+    if (!Object.hasOwn(data.chars, id) || !c || c.kind === 'burn') continue;
     keep.chars.add(c.id); keep.ops.add(c.id.slice(0, 36));
     for (const event of c.path) { if (event.birth) birth(event.birth); if (event.reason === 'expire') keep.ops.add(event.id?.slice(0, 36)); }
     if (c.wild?.source.startsWith('cell:')) { const source = c.wild.source.slice(5), root = data.chars[source]; keep.chars.add(source); keep.ops.add(source.slice(0, 36)); if (root) keep.ops.add(root.entity); }
     if (c.chat) keep.chats.add(c.chat);
   }
-  for (const r of Object.values(data.life?.bonds || {})) { fish(r.a); fish(r.b); }
+  for (const r of Object.values(data.life?.bonds || {})) {
+    fish(r.a); fish(r.b);
+    if (++visited % 512 === 0) yield;
+  }
   for (const [id, r] of Object.entries(data.life?.places || {})) { fish(id); keep.ops.add(r.scene); }
   for (const [id, r] of Object.entries(data.life?.haunts || {})) { fish(id); keep.ops.add(r.scene); }
   for (const event of Object.values(data.life?.events || {})) {
@@ -43,14 +53,30 @@ export function archiveDependencies(data) {
   for (const op of Object.values(data.ops)) if (op.kind === 'sceneEdit' && data.chars[op.cell]?.kind !== 'burn') keep.ops.add(op.id);
   return keep;
 }
+function finish(iterator) {
+  let result;
+  do { result = iterator.next(); } while (!result.done);
+  return result.value;
+}
+export function archiveDependencies(data) { return finish(scanArchiveDependencies(data)); }
 // Planning, comparison with durable rows and removal may see the same live
 // world. Share its dependencies only for the lifetime of this archive.
 export function observeArchiveDependencies(world) {
-  let retained;
-  const close = subscribeSimulationChanges(target => { if (target === world) retained = undefined; });
-  return { read: () => retained ??= archiveDependencies(world.data), close };
+  let retained, revision = 0;
+  const close = subscribeSimulationChanges(target => {
+    if (target === world) { retained = undefined; revision++; }
+  });
+  const read = () => retained ??= archiveDependencies(world.data);
+  function* scan() {
+    if (retained) return retained;
+    const before = revision, keep = yield* scanArchiveDependencies(world.data);
+    // An edit during a yielded traversal invalidates its cut. The synchronous
+    // read also bounds completion when inputs keep arriving.
+    return before === revision ? retained = keep : read();
+  }
+  return { read, scan, close };
 }
-function* archiveCandidates(data, now, pressure, dependencies = archiveDependencies) {
+function* archiveCandidates(data, now, pressure, dependencies) {
   const cutoff = now - (pressure ? ARCHIVE.period : ARCHIVE.age);
   const records = Object.fromEntries(ARCHIVE_FIELDS.map(field => [field, {}]));
   let keep, scanned = 0;
@@ -61,17 +87,14 @@ function* archiveCandidates(data, now, pressure, dependencies = archiveDependenc
       if (!record || field === 'chars' && record.kind !== 'burn' || field === 'travel' && data.fishes[id] || field === 'breeding' && record.status === 'active') continue;
       const at = field === 'ops' ? record.t : field === 'chars' ? Math.max(record.created || 0, record.moveAt || 0, ...record.path.map(e => e.t || 0)) : field === 'chats' ? record.body.t : field === 'breeding' ? record.at : Math.max(record.since || 0, ...Object.keys(record.days || {}).map(day => Date.parse(day + 'T23:59:59+08:00')));
       if (at > cutoff) continue;
-      keep ??= dependencies(data);
+      keep ??= yield* (dependencies ? dependencies.scan() : scanArchiveDependencies(data));
       if (!keep[field].has(id)) records[field][id] = record;
     }
   }
   return records;
 }
 export function archivePlan(data, now, { pressure = false } = {}) {
-  const iterator = archiveCandidates(data, now, pressure);
-  let result;
-  do { result = iterator.next(); } while (!result.done);
-  return result.value;
+  return finish(archiveCandidates(data, now, pressure));
 }
 async function runInSlices(iterator) {
   let start = performance.now();
@@ -330,7 +353,7 @@ export class ArchiveStore {
     return result;
   }
 }
-export async function prepareCompaction(world, store, dependencies = archiveDependencies) {
+export async function prepareCompaction(world, store, dependencies) {
   const { data } = world, revision = store.revision, candidates = [];
   let keep;
   for (const field of compactableFields) {
@@ -342,7 +365,7 @@ export async function prepareCompaction(world, store, dependencies = archiveDepe
     const ids = index.size <= 1024 ? index.keys() : Object.keys(live);
     for (const id of ids) {
       if (!Object.hasOwn(live, id) || !index.has(id) || field === 'chars' && live[id]?.kind !== 'burn') continue;
-      keep ??= dependencies(data);
+      keep ??= await runInSlices(dependencies ? dependencies.scan() : scanArchiveDependencies(data));
       if (keep[field].has(id)) continue;
       const archived = await store.get(field, id);
       if (archived) candidates.push([field, id, archived]);
@@ -350,7 +373,7 @@ export async function prepareCompaction(world, store, dependencies = archiveDepe
   }
   return () => {
     if (!candidates.length || revision !== store.revision) return;
-    const current = dependencies(world.data);
+    const current = dependencies ? dependencies.read() : archiveDependencies(world.data);
     const removed = {};
     for (const [field, id, record] of candidates) {
       if (current[field].has(id) || !same(world.data[field]?.[id], record)) continue;
