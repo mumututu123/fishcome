@@ -637,7 +637,13 @@ export class World {
       }
       this.setFoodMotion(c, y, fall, now);
     }
-    const edible = [...foods.filter(c => c.kind === 'food' && now - c.born < CONFIG.foodLife), ...seaweed].sort((a, b) => (a.born ?? a.created) - (b.born ?? b.created) || a.id.localeCompare(b.id)), foodPositions = new Set([...foods.filter(c => c.kind === 'food'), ...edible].map(c => key(c.x, c.y)));
+    const edible = foods.filter(c => c.kind === 'food' && now - c.born < CONFIG.foodLife).concat(seaweed);
+    if (seaweed.length || edible.some(c => !Number.isFinite(c.born))) {
+      edible.sort((a, b) => (a.born ?? a.created) - (b.born ?? b.created) || a.id.localeCompare(b.id));
+    }
+    const foodPositions = new Set();
+    for (const c of foods) if (c.kind === 'food') foodPositions.add(key(c.x, c.y));
+    for (const c of seaweed) foodPositions.add(key(c.x, c.y));
     const turningObstacles = new Map(scenery); for (const cell of edible) if (cell.kind === 'seaweed') turningObstacles.set(key(cell.x, cell.y), {});
     const waitingToEat = new Set(); for (const food of edible) for (const id of contact(food)) waitingToEat.add(id);
     const foodsNear = foodSight(edible);
