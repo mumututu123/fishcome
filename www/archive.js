@@ -226,6 +226,18 @@ export function mergeArchiveRecord(field, old, record, chooseChar) {
 export class ArchiveStore {
   mealRevision = 0;
   constructor({ load } = {}) { this.load = load; this.packs = new Map(); this.manifests = {}; this.rootsByChunk = new Map(); this.ids = Object.fromEntries(ARCHIVE_FIELDS.map(f => [f, new Map()])); this.cache = new Map(); this.bigCache = new Map(); this.overrides = Object.fromEntries(ARCHIVE_FIELDS.map(f => [f, {}])); this.summary = { ops: {}, ledger: {}, serials: {}, catalog: {}, lastMeals: new Map(), grassMeals: new Set(), mealSources: new Map() }; }
+  // Cached records are immutable. Each index that ingest mutates belongs to
+  // the staged archive until the world confirms its new boundary.
+  prepareIndex() {
+    const next = Object.assign(new ArchiveStore({ load: this.load }), this);
+    for (const field of ['packs', 'cache', 'bigCache', 'rootsByChunk']) next[field] = new Map(this[field]);
+    next.manifests = { ...this.manifests };
+    next.ids = Object.fromEntries(ARCHIVE_FIELDS.map(f => [f, new Map(this.ids[f])]));
+    next.overrides = Object.fromEntries(ARCHIVE_FIELDS.map(f => [f, { ...this.overrides[f] }]));
+    next.summary = Object.fromEntries(Object.entries(this.summary).map(([field, values]) => [field,
+      values instanceof Map ? new Map(values) : values instanceof Set ? new Set(values) : { ...values }]));
+    return next;
+  }
   async ingest(chunk, chooseChar, mealTargets) {
     if (this.manifests[chunk.manifest.id]) return;
     const revision = this.revision;

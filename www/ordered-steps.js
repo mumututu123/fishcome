@@ -31,21 +31,21 @@ export class OrderedSteps {
       ids.add(op.body.id);
     }
   }
-  async offer(inputs) {
+  async offer(inputs, archive) {
     if (!this.leader || this.next || this.closed) return;
     const base = this.tick, previous = this.proof;
-    const slot = this.next = { tick: base + CONFIG.step, inputs };
+    const slot = this.next = { tick: base + CONFIG.step, inputs, archive };
     await this.verifyInputs(inputs);
-    slot.digest = await stepDigest([this.epoch, previous, slot.tick, inputs]);
-    if (this.next === slot && !this.closed) await this.send({ action: 'offer', epoch: this.epoch, base, previous, inputs });
+    slot.digest = await stepDigest([this.epoch, previous, slot.tick, inputs, archive ?? null]);
+    if (this.next === slot && !this.closed) await this.send({ action: 'offer', epoch: this.epoch, base, previous, inputs, archive });
   }
   async receive(body) {
     if (this.closed || body.epoch !== this.epoch || body.base !== this.tick || body.previous !== this.proof) return;
     if (body.action === 'offer' && !this.leader) {
       if (this.next) return;
-      const slot = this.next = { tick: this.tick + CONFIG.step, inputs: body.inputs };
+      const slot = this.next = { tick: this.tick + CONFIG.step, inputs: body.inputs, archive: body.archive };
       await this.verifyInputs(slot.inputs);
-      slot.digest = await stepDigest([this.epoch, this.proof, slot.tick, slot.inputs]);
+      slot.digest = await stepDigest([this.epoch, this.proof, slot.tick, slot.inputs, slot.archive ?? null]);
       if (this.next === slot && !this.closed) await this.reply('accept', slot);
     } else if (body.action === 'accept' && this.leader && this.next?.digest && this.next.digest === body.digest && !this.next.sealed) {
       const slot = this.next;

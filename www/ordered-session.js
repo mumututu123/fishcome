@@ -52,6 +52,8 @@ export class OrderedSession {
     if (!s) return;
     this.current = null;
     s.steps?.close();
+    s.archive?.plan?.close();
+    s.archive?.done?.(false);
     if (inform) this.io.send(s.peer, { action: 'stop', epoch: s.epoch }).catch(() => {});
     this.io.stopped(s, reason);
   }
@@ -105,6 +107,37 @@ export class OrderedSession {
         return this.valid(s);
       } });
   }
+  async proposeArchive(boundary) {
+    const s = this.current;
+    if (!s?.owner || !s.steps || s.archive || !this.valid(s)) return false;
+    const ticket = s.archive = { boundary };
+    const completion = new Promise(resolve => { ticket.done = resolve; });
+    try {
+      ticket.id = await stepDigest(boundary);
+      if (!this.valid(s)) return false;
+      await Promise.all([this.prepareArchive(s, ticket), this.send(s, { action: 'archive', boundary, id: ticket.id })]);
+      if (!this.valid(s)) return false;
+      return completion;
+    } catch (error) { if (this.current === s) this.stop(error.message); throw error; }
+  }
+  async prepareArchive(s, ticket) {
+    const plan = await this.io.prepareArchive(s, ticket.boundary);
+    if (!this.valid(s) || s.archive !== ticket) { plan.close(); return; }
+    ticket.plan = plan;
+  }
+  async offer(s) {
+    const archive = s.archive;
+    await s.steps.offer(this.io.inputs(), archive?.plan && archive.remote ? archive.id : undefined);
+  }
+  ready(s) {
+    if (!s.remoteReady || !s.localReady) return;
+    if (s.localReady !== s.remoteReady) { this.stop('本步操作或归档结果不同'); return; }
+    if (s.steps.next?.archive && s.archive?.committed) {
+      s.archive.done?.(true);
+      s.archive = undefined;
+      this.io.archiveConfirmed();
+    }
+  }
   async receive(peer, b) {
     if (!b || typeof b !== 'object' || this.io.peer() !== peer) return;
     let s = this.current;
@@ -122,9 +155,23 @@ export class OrderedSession {
     if (b.action === 'stop') { this.stop('伙伴已结束本次共同结算', false); return; }
     if (b.action === 'joined' && s.owner && !s.steps && b.base === s.base && b.proof === s.proof) {
       this.start(s);
-      return s.steps.offer(this.io.inputs());
+      return this.offer(s);
     }
     if (!s.steps) return;
+    if (b.action === 'archive' && !s.owner && !s.archive) {
+      if (!b.boundary || !/^[0-9a-f]{64}$/.test(b.id) || await stepDigest(b.boundary) !== b.id || !this.valid(s)) return;
+      const ticket = s.archive = { boundary: b.boundary, id: b.id };
+      await this.prepareArchive(s, ticket);
+      if (ticket.plan) await this.send(s, { action: 'archiveReady', id: ticket.id });
+      return;
+    }
+    if (b.action === 'archiveReady' && s.owner && s.archive?.id === b.id) {
+      s.archive.remote = true;
+      return;
+    }
+    if (b.action === 'offer' && b.archive !== undefined && (!s.archive?.plan || b.archive !== s.archive.id)) {
+      this.stop('共同归档尚未校验'); return;
+    }
     if (b.action === 'finished') {
       if (!s.owner || !Number.isSafeInteger(b.base) || !/^[0-9a-f]{64}$/.test(b.proof) ||
           (b.base !== s.steps.tick && b.base !== s.steps.next?.tick)) return;
@@ -134,7 +181,7 @@ export class OrderedSession {
     if (b.action === 'prepared') {
       if (s.steps.next?.digest === b.digest && b.base === s.steps.tick && typeof b.outcomes === 'string') {
         s.remoteReady = b.outcomes;
-        if (s.localReady && s.localReady !== s.remoteReady) this.stop('本步操作结果不同');
+        this.ready(s);
       }
       return;
     }
@@ -142,25 +189,47 @@ export class OrderedSession {
     const slot = s.steps.next;
     if (!this.valid(s) || !slot?.sealed || slot.preparing) return;
     slot.preparing = true;
+    if (slot.archive) {
+      const ticket = s.archive;
+      if (!ticket?.plan || ticket.id !== slot.archive) throw new Error('本步归档尚未准备完成');
+      await this.io.archiveBoundary(s.world, () => {
+        if (!this.valid(s)) return;
+        s.applying = true;
+        try {
+          slot.archiveChange = ticket.plan.commit();
+          ticket.committed = true;
+          s.revision = s.store.revision;
+          s.archiveAt = s.world.data.archives.at;
+          return slot.archiveChange;
+        } finally { ticket.plan.close(); s.applying = false; }
+      });
+      if (!this.valid(s) || !ticket.committed) return;
+    }
     s.applying = true;
     try {
       slot.outcomes = slot.inputs.map(op => this.io.apply(s.world, op, s.receipts.get(op.id), s.owner));
     } finally { s.applying = false; }
     s.receipts.clear();
+    if (slot.inputs.length) {
+      this.io.inputsCommitted(slot.inputs, slot.outcomes, s.owner).catch(error => {
+        if (this.current === s) this.stop(error.message);
+      });
+    }
     const handle = await this.io.prepare(s.world, () => this.valid(s));
     if (!this.valid(s) || !handle) return;
-    const outcomes = await stepDigest(slot.outcomes);
+    const outcomes = await stepDigest([slot.outcomes, slot.archiveChange ?? null]);
     if (!this.valid(s)) return;
     s.handle = handle;
     s.localReady = outcomes;
-    if (s.remoteReady && s.remoteReady !== outcomes) { this.stop('本步操作结果不同'); return; }
+    this.ready(s);
+    if (!this.valid(s)) return;
     await this.send(s, { action: 'prepared', base: s.steps.tick, digest: slot.digest, outcomes });
   }
   async nextOffer(s) {
     if (!s.owner || !this.valid(s) || !s.finished || s.finished.base !== s.steps.tick || s.steps.next) return;
     if (s.finished.proof !== s.steps.proof) { this.stop('上一步的实际结果不同'); return; }
     s.finished = null;
-    await s.steps.offer(this.io.inputs());
+    await this.offer(s);
   }
   run(now) {
     const s = this.current;

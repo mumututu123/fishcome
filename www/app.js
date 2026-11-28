@@ -6,6 +6,7 @@ import { beforeCheckpointPatch, noteCheckpointChanges, noteCheckpointMerge } fro
 import { CheckpointPictures } from './checkpoint-picture.js';
 import { Network } from './network.js';
 import { OrderedSession } from './ordered-session.js';
+import { prepareOrderedArchive } from './ordered-archive.js';
 import { ReplicaInventory, ReplicaRecovery, ReplicaSwims, WorldBroadcast } from './world-broadcast.js';
 import { DiagnosticLog, inspectFishOrigins, repairFishOriginIssues, diagnosticSummary } from './diagnostics.js';
 import { loadReplicaArchives, verifyChats, verifyLocalCheckpoint, verifyReplica } from './replica.js';
@@ -110,19 +111,19 @@ function orderedPeer() {
   const peers = network.live(), people = active();
   if (peers.length !== 1 || people.length !== 2 || network.hasRelayedWorldPeer(peers)) return;
   const peer = peers[0], other = members.get(peer.node);
-  if (other?.orderedSteps === 1 && other.build === meta.version && peer.sentHello && peer.confirmedReplica &&
+  if (other?.orderedSteps === 1 && other.build === meta.version && peer.replicaLive && peer.sentHello && peer.confirmedReplica &&
       !peer.replicaCatchingUp && (!amLeader() || !geometryRepair && !world.data.pendingChatGlyphs)) return peer;
 }
-function orderedInputs() {
-  return [...inbox.values()].filter(op => !rejectedOps.has(op.body.id) && !world.data.ops[op.body.id] && !archiveStore.ids.ops.has(op.body.id))
-    .sort((a, b) => a.body.t - b.body.t || a.body.id.localeCompare(b.body.id)).slice(0, 64);
+function orderedInputs(limit = 64) {
+  return [...inbox.values()].filter(op => !rejectedOps.has(op.body.id) && (op.body.kind === 'referral' || !world.data.ops[op.body.id] && !archiveStore.ids.ops.has(op.body.id)))
+    .sort((a, b) => a.body.t - b.body.t || a.body.id.localeCompare(b.body.id)).slice(0, limit);
 }
 async function resumeOrderedInputs() {
-  for (const op of orderedInputs()) {
+  for (const op of orderedInputs(Infinity)) {
     if (!amLeader() || ordered.current?.steps) return;
     const result = await applyAtBoundary(op, true);
     if (!result) return;
-    if (!result.ok) rejectOperation(op.body.id);
+    if (result.ok) await save({ reusePicture: true }); else rejectOperation(op.body.id);
     await network.broadcast('ack', { id: op.body.id, result });
   }
 }
@@ -134,14 +135,23 @@ const ordered = new OrderedSession({
   install: (target, changes, valid, apply) => atCheckpointBoundary(target.data, () => {
     if (valid()) apply(() => { worldEdited(target); Object.assign(target.data, changes); target.dirty = true; });
   }),
-  apply(target, op, archived, owner) {
+  apply(target, op, archived) {
     const result = target.apply({ ...clone(op.body), proof: clone(op) }, archived);
     inbox.delete(op.body.id);
     if (!result.ok) rejectOperation(op.body.id);
     if (pending.delete(op.body.id) && !result.ok) toast(result.error);
-    if (owner) network.broadcast('ack', { id: op.body.id, result }).catch(() => {});
     return result;
   },
+  async inputsCommitted(ops, outcomes, owner) {
+    if (outcomes.some(result => result.ok)) await save({ reusePicture: true });
+    if (owner && amLeader()) for (const [i, op] of ops.entries()) await network.broadcast('ack', { id: op.body.id, result: outcomes[i] });
+  },
+  prepareArchive: (s, boundary) => prepareOrderedArchive(s.world, s.store, boundary,
+    async id => await get('archive:' + id) || await requestArchive(id, s.peer),
+    async chunks => putMany(chunks.map(chunk => ['archive:' + chunk.manifest.id, chunk.encoded]), { generation: await saveGeneration }),
+    diagnostics),
+  archiveBoundary: (target, commit) => atCheckpointBoundary(target.data, () => simulation.archiveAtStepBoundary(target, commit)),
+  archiveConfirmed: () => { renderChat(); save({ reusePicture: true }).catch(error => diagnostics.record('warn', 'archive', error.message)); },
   prepare: (target, valid) => simulation.prepareAgreed(target, valid),
   advance: (target, nextTick, valid, handle) => simulation.advanceAgreed(target, nextTick, valid, handle),
   stopped(session, reason) {
@@ -232,14 +242,20 @@ async function archiveWorld(now = Date.now()) {
     const plan = await archivePlanAsync(target.data, now, { pressure, dependencies });
     if (!canArchive()) return;
     const hasNewRecords = Object.values(plan).some(table => Object.keys(table).length);
+    const session = ordered.current;
+    const chunks = hasNewRecords ? await archiveChunks(plan, target.data.roots) : [];
+    if (!canArchive()) return;
+    if (chunks.length) await putMany(chunks.map(chunk => ['archive:' + chunk.manifest.id, chunk.encoded]), { generation: await saveGeneration });
+    if (!canArchive()) return;
+    if (session?.steps && ordered.current === session) {
+      const boundary = { version: 1, at: now, chunks: Object.fromEntries(chunks.map(({ manifest }) => [manifest.id, manifest])) };
+      if (await ordered.proposeArchive(boundary)) return;
+      if (!canArchive()) return;
+    }
     const mealTargets = new Set();
     if (hasNewRecords) {
       ordered.stop('历史归档发生变化');
       archiveBusy = true;
-      const chunks = await archiveChunks(plan, target.data.roots);
-      if (!canArchive()) return;
-      await putMany(chunks.map(chunk => ['archive:' + chunk.manifest.id, chunk.encoded]), { generation: await saveGeneration });
-      if (!isCurrent()) return;
       for (const chunk of chunks) await store.ingest(chunk, chooseClaim, mealTargets);
       target.data.archives ||= emptyArchiveState();
       for (const { manifest } of chunks) target.data.archives.chunks[manifest.id] = manifest;
