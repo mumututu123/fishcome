@@ -41,6 +41,32 @@ function open(reference) {
   return worker;
 }
 
+test('进食、饥饿和疾病只撤销变形鱼的画面路径，其余鱼仍逐步游动', () => {
+  const now = Date.UTC(2026, 0, 1);
+  for (const cause of ['food', 'hunger', 'illness']) {
+    const reference = makeFishWorld(World, 20, 1000, { now, spacingX: 34 });
+    const [changed] = Object.keys(reference.data.fishes), fish = reference.data.fishes[changed];
+    if (cause === 'hunger') fish.hungerAt = now + CONFIG.step;
+    else if (cause === 'illness') reference.data.population.illnesses[changed] = { at: now, nextLossAt: now + CONFIG.step, curedAt: 0 };
+    else reference.data.chars.food = { id: 'food', kind: 'food', entity: '', ch: '饵', x: fish.x + 2, y: fish.y, born: now, fall: 0, path: [] };
+    const before = reference.serialize(), sim = open(reference), paths = [];
+    reference.step(now + CONFIG.step, paths);
+    const reply = sim.receive({ kind: 'step', base: now, names: [], foods: [] });
+    if (cause === 'food') assert.equal(reference.data.chars.food.entity, changed);
+    else assert.equal(reference.data.fishes[changed], undefined);
+    assert.deepEqual(reply.patch.swims, paths);
+    assert(paths.flat().length > 0 && !paths.flat().includes(changed));
+    paths.forEach((ids, d) => {
+      for (const id of ids) {
+        const old = before.fishes[id], next = reference.data.fishes[id];
+        assert.equal(next.facing, old.facing);
+        assert.equal(next.x, (old.x + d % 3 - 1 + CONFIG.width) % CONFIG.width);
+        assert.equal(next.y, old.y + Math.floor(d / 3) - 1);
+      }
+    });
+  }
+});
+
 test('真实退鱼和归入新鱼元时保留其余鱼形及网格，原占格清除且新增占格立即可见', () => {
   const now = Date.UTC(2026, 0, 1);
   const reference = makeFishWorld(World, 3, 1000, { now });

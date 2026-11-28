@@ -600,11 +600,18 @@ export class World {
   }
   step(now, swims) {
     this.initializeTracking(now);
-    processLegends(this, now, transition);
-    updatePopulation(this, now, transition);
-    finishBreeding(this, now, transition);
-    if (this.ambient) updateEcology(this, now, transition);
-    updateSeaweed(this, now, CONFIG, this.monument, hash, transition);
+    // Only an unchanged body can replay its confirmed path from the preceding frame.
+    const changedBodies = swims && capturedFishIds(this.data, this.data.tick), paths = [];
+    const changeCell = swims ? (cell, next, record) => {
+      if (cell.kind === 'fish') changedBodies.add(cell.entity);
+      if (next.kind === 'fish') changedBodies.add(next.entity);
+      transition(cell, next, record);
+    } : transition;
+    processLegends(this, now, changeCell);
+    updatePopulation(this, now, changeCell);
+    finishBreeding(this, now, changeCell);
+    if (this.ambient) updateEcology(this, now, changeCell);
+    updateSeaweed(this, now, CONFIG, this.monument, hash, changeCell);
     updateBubbles(this, now);
     if (this.ambient) spawnPlankton(this, now);
     const dt = Math.min(1, Math.max(0, (now - this.data.tick) / 1000)); this.data.tick = now;
@@ -750,7 +757,7 @@ export class World {
         f.x = wrapX(f.x); f.posAt = now;
         if (beforeX !== f.x || beforeY !== f.y || beforeFacing !== f.facing) {
           fishOccupancy.moveFish(f, cells, beforeX, beforeY, beforeFacing, hull, slot);
-          if (swims && beforeFacing === f.facing && (movedX || movedY)) (swims[(movedY + 1) * 3 + movedX + 1] ||= []).push(id);
+          if (swims && beforeFacing === f.facing && (movedX || movedY)) (paths[(movedY + 1) * 3 + movedX + 1] ||= []).push(id);
         }
       }
       if (ordinal !== undefined) this.journalSwim(ordinal, f);
@@ -764,7 +771,7 @@ export class World {
     }
     this.retainMovementGrid(groups, fishOccupancy);
     let bodyChanged = magmaVictims.size > 0;
-    for (const id of magmaVictims) killFish(this, id, now, 'magma', transition, groups);
+    for (const id of magmaVictims) killFish(this, id, now, 'magma', changeCell, groups);
     for (const food of edible) {
       if (!['food', 'seaweed'].includes(food.kind) || !this.waterAt(food.x, food.y) || fishOccupancy.get(food.x, food.y)) continue;
       const candidates = contact(food);
@@ -774,7 +781,7 @@ export class World {
         bodyChanged = true;
         const winner = candidates[0], grass = food.kind === 'seaweed';
         const previouslyAte = (grass ? pastGrass : pastMeals).has(winner) || (grass ? this.archives?.summary.grassMeals.has(winner) : this.archives?.summary.lastMeals.has(winner));
-        const id = winner, cs = groups.get(id), f = this.data.fishes[id]; fishOccupancy.add(food.x, food.y, id); transition(food, { kind: 'fish', entity: id, x: deltaX(food.x, f.x) * f.facing, y: food.y - f.y }, { id: `eat:${food.id}:${food.path.length}`, t: now, reason: 'eat', rank: cs.length }); cs.push(food); f.lastFed = now; f.hungerAt = now + CONFIG.hunger; this.foodRevision++; this.dirty = true;
+        const id = winner, cs = groups.get(id), f = this.data.fishes[id]; fishOccupancy.add(food.x, food.y, id); changeCell(food, { kind: 'fish', entity: id, x: deltaX(food.x, f.x) * f.facing, y: food.y - f.y }, { id: `eat:${food.id}:${food.path.length}`, t: now, reason: 'eat', rank: cs.length }); cs.push(food); f.lastFed = now; f.hungerAt = now + CONFIG.hunger; this.foodRevision++; this.dirty = true;
         if (!previouslyAte) recordStory(this, grass ? 'grass' : 'meal', id, now);
         f.lastMealAt = now; pastMeals.add(id); if (grass) pastGrass.add(id);
         cureFish(this, id, food, now);
@@ -786,13 +793,16 @@ export class World {
       const f = this.data.fishes[id];
       if (f && now >= f.hungerAt) {
         hungryBodies ??= this.fishGroups();
-        this.starve(id, f.hungerAt, null, { cells: hungryBodies.get(id) });
+        this.starve(id, f.hungerAt, null, { cells: hungryBodies.get(id), changeCell });
         bodyChanged = true;
       }
     }
     normalizeBreeding(this, now);
     updateContacts(this, now, bodyChanged ? this.fishGroups() : groups, scenery, captured, bodyChanged ? undefined : fishOccupancy);
-    if (swims && bodyChanged) swims.length = 0;
+    paths.forEach((ids, direction) => {
+      const stable = changedBodies.size ? ids.filter(id => !changedBodies.has(id)) : ids;
+      if (stable.length) swims[direction] = stable;
+    });
   }
   turn(f, cells, scenery = this.sceneryMap(), occupants = this.fishOccupants(), b = bounds(cells), hull) {
     const next = { id: f.id, x: f.x + f.facing * (b.minX + b.maxX), y: f.y, facing: -f.facing };
@@ -804,7 +814,7 @@ export class World {
     for (const c of cells) { const a = cellPosition(f, c), z = cellPosition(next, c); for (let x = Math.min(a.x, z.x); x <= Math.max(a.x, z.x); x++) if (!this.waterAt(x, a.y) || scenery.has(key(x, a.y)) || foreignOwner(ownersAt(occupants, x, a.y), f.id, pair)) return false; }
     if (!this.canOccupy(next, cells, scenery, occupants)) return false; f.x = next.x; f.facing = next.facing; return true;
   }
-  starve(id, at, selectedId = null, { illness = false, cells = this.fishCells(id) } = {}) {
+  starve(id, at, selectedId = null, { illness = false, cells = this.fishCells(id), changeCell = transition } = {}) {
     const f = this.data.fishes[id]; if (!f || cells.length < 2) return;
     const candidates = illness ? cells.filter(c => components(cells.filter(other => other !== c)).length === 1) : [];
     const rim = candidates.length ? candidates : exteriorContour(cells);
@@ -818,10 +828,10 @@ export class World {
     }
     const event = `${illness ? 'illness' : 'hunger'}:${id}:${at}`, loss = { id: event, t: at, reason: illness ? 'ecoDissolve' : 'starve', ...(illness ? { fish: id, cause: 'depression' } : {}) };
     if (illness) { const pair = this.breedingState(id); if (pair) cancelBreeding(this.data, pair, at, 'illness'); }
-    transition(removed, { kind: 'burn', entity: '' }, loss);
+    changeCell(removed, { kind: 'burn', entity: '' }, loss);
     const remaining = cells.filter(c => c !== removed), parts = components(remaining).sort((a, b) => b.length - a.length || hash(`${event}:${a.map(c => c.id).sort()[0]}`) - hash(`${event}:${b.map(c => c.id).sort()[0]}`));
     const kept = parts[0]?.length >= 2 ? new Set(parts[0].map(c => c.id)) : new Set();
-    for (const c of remaining) if (!kept.has(c.id)) { const p = cellPosition(f, c); transition(c, illness ? { kind: 'burn', entity: '' } : { kind: 'food', entity: '', x: wrapX(p.x), y: p.y, born: at, fall: 0 }, illness ? loss : { id: event, t: at, reason: 'shed' }); }
+    for (const c of remaining) if (!kept.has(c.id)) { const p = cellPosition(f, c); changeCell(c, illness ? { kind: 'burn', entity: '' } : { kind: 'food', entity: '', x: wrapX(p.x), y: p.y, born: at, fall: 0 }, illness ? loss : { id: event, t: at, reason: 'shed' }); }
     if (!kept.size) { delete this.data.fishes[id]; recordStory(this, 'depart', id, at); } else if (!illness) f.hungerAt = at + CONFIG.hunger;
     this.foodRevision++; this.dirty = true;
   }

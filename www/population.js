@@ -38,7 +38,7 @@ export function killFish(world, id, now, cause, transition, groups = world.fishG
   delete world.data.fishes[id]; delete world.data.population.illnesses[id];
   recordStory(world, 'depart', id, now, { cause }); world.foodRevision++; world.dirty = true;
 }
-function settleIllness(world, now) {
+function settleIllness(world, now, changeCell) {
   const state = world.data.population;
   let groups;
   for (const [id, r] of Object.entries(state.illnesses)) {
@@ -50,7 +50,7 @@ function settleIllness(world, now) {
         const at = r.nextLossAt;
         groups ??= world.fishGroups();
         const cells = (groups.get(id) || []).filter(cell => cell.kind === 'fish');
-        world.starve(id, at, null, { illness: true, cells });
+        world.starve(id, at, null, { illness: true, cells, changeCell });
         r.nextLossAt = at + POPULATION.dissolveEvery;
       }
       if (!world.data.fishes[id]) delete state.illnesses[id];
@@ -198,7 +198,7 @@ function updateVolcano(world, now, dt, transition, resume = false) {
 export function updatePopulation(world, now, transition, { resume = false } = {}) {
   world.data.population ||= newPopulation(now); world.data.rocks ||= {};
   const state = world.data.population, dt = Math.min(1, Math.max(0, (now - state.at) / 1000));
-  settleIllness(world, now);
+  settleIllness(world, now, transition);
   if (resume) {
     state.illnessSlot = Math.max(state.illnessSlot, Math.floor(now / POPULATION.check));
     state.volcanoSlot = Math.max(state.volcanoSlot, Math.floor(now / POPULATION.volcanoPeriod));

@@ -148,14 +148,21 @@ export function processLegends(world, now, transition) {
   }
   const events = Object.values(state.events).map(e => ({ e, s: legendSchedule(world.data.roots, e.seed, e.slot) })).filter(({ e, s }) => s && now >= e.at && state.at < s.ends).sort((a, b) => a.s.started - b.s.started || a.s.id.localeCompare(b.s.id));
   if (continuous && events.length) {
-    const { e, s } = events[0], scenery = world.sceneryMap(), fishMap = world.fishMap(), until = Math.min(now, s.ends - 1), hurt = new Map();
+    const { e, s } = events[0], until = Math.min(now, s.ends - 1), hurt = new Map();
+    let scenery, occupancy;
     const from = Math.max(e.at, state.at + 1), samples = [];
     for (let sample = from; sample <= until; sample += 100) samples.push(Math.round(sample));
     if (until >= from && samples.at(-1) !== Math.round(until)) samples.push(Math.round(until));
     for (const t of samples) {
       const age = t - s.started; if (age < LEGENDS.warning || s.kind === 'ship') continue;
+      scenery ??= world.sceneryMap();
       for (const cell of legendGeometry(world.data, e, t, scenery)) {
-        if (!['arm', 'beam'].includes(cell.role)) continue; const fish = fishMap.get(key(cell.x, cell.y)); if (!fish || !world.data.fishes[fish]) continue;
+        if (cell.role !== 'arm' && cell.role !== 'beam') continue;
+        occupancy ??= world.movementGrid(world.fishGroups());
+        // A legacy save can have overlapping fish. The last body in table order wins.
+        let fish;
+        for (const id of occupancy.get(cell.x, cell.y) || []) fish = id;
+        if (!fish || !world.data.fishes[fish]) continue;
         if (cell.role === 'arm' && !e.arms[cell.arm] && !capturedFish(world.data, fish, t) && !Object.values(e.arms).some(c => c.fish === fish)) {
           const f = world.data.fishes[fish]; e.arms[cell.arm] = { fish, at: t, x: cell.x, y: cell.y, pose: { x: f.x, y: f.y, facing: f.facing }, cells: world.fishCells(fish).map(c => c.id).sort() }; cancelPair(world, fish, t); story(world, 'captured', fish, t, s); world.dirty = true;
         }

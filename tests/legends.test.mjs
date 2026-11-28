@@ -13,6 +13,13 @@ function fixture(kind) {
   const w = new World(born, seed, { populate: false, ambient: false }); const e = { seed, slot: s.slot, at: started, arms: {}, minute: 0, drops: [] }; w.data.legends.events[s.id] = e; return { w, s, e };
 }
 const glyph = (x, y, ch = 'o') => ({ x, y, ch, color: '#88aacc' });
+test('幽灵船航行和传奇预警时无需定位全海的鱼或造景', () => {
+  for (const [kind, age] of [['ship', 180000], ['cthulhu', 500], ['godzilla', 500]]) {
+    const { w } = fixture(kind);
+    w.sceneryMap = w.fishGroups = w.fishMap = () => assert.fail('此时没有触手或光束需要定位');
+    at(w, started + age);
+  }
+});
 function fish(w, x, y, cells = [glyph(0, 0), glyph(1, 0)], actor = crypto.randomUUID()) { const id = crypto.randomUUID(); assert(w.apply({ id, actor, nick: '鱼', t: born, kind: 'fish', x: wrapX(x), y, cells, cost: cells.length }).ok); return id; }
 function at(w, time) { w.data.tick = w.data.legends.at = time - 500; w.resolveLegends(time); w.data.tick = time; }
 const sources = w => ({ roots: w.data.roots, ops: w.data.ops, breeding: w.data.breeding, chars: w.data.chars });

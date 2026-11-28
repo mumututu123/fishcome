@@ -163,6 +163,10 @@ try {
     // Run the full reference replay separately so its snapshots, allocations and
     // deep comparisons cannot stall a timed callback on the UI thread.
     const replay = copyWorld(), verified = new SimulationClient();
+    // Older rules can clear every visual path when just one body changes.
+    // Compare persisted state with the requested reference and display paths
+    // with the current public simulation, independent of the worker and UI.
+    const pathWorld = separateReference ? copyWorld() : ecology;
     let patches = 0, workerSwims;
     const unsubscribe = subscribeSimulationChanges((world, patch) => {
       if (world === replay && patch && Number.isFinite(patch.values.tick)) { patches++; workerSwims = patch.swims; }
@@ -171,8 +175,9 @@ try {
       if (!await verified.open(replay, () => true)) throw new Error('复核模拟未初始化');
       for (let i = 1; i <= warmup + steps; i++) {
         const now = start + i * CONFIG.step, swims = [], at = performance.now();
-        ecology.step(now, swims);
+        ecology.step(now, pathWorld === ecology ? swims : undefined);
         if (i > warmup) ecologies.push(performance.now() - at);
+        if (pathWorld !== ecology) pathWorld.step(now, swims);
         await verified.advance(replay, now);
         if (replay.data.tick !== now || patches !== i) throw new Error(`第 ${i} 步复核时没有提交`);
         compare(ecology.data, replay.data, [`第 ${i} 步`]);
@@ -180,6 +185,7 @@ try {
         compare(swims, workerSwims || [], [`第 ${i} 步`, 'swims']);
       }
       compare(committed.data, replay.data, ['计时与独立复核的最终世界']);
+      if (pathWorld !== ecology) compare(pathWorld.data, ecology.data, ['画面路径与原规则的最终世界']);
       return { initial, steps, warmup, paced: pace, ...(checkpoint?.resumeAt === undefined ? {} : { resumeAt: checkpoint.resumeAt }), checkedSteps: patches, stepIntervalMs: CONFIG.step, workerOpenMs: rounded(workerOpenMs),
         ...(samples ? { samples: roundTrips.map((wall, i) => ({
           total: rounded(wall), ...Object.fromEntries(Object.entries(phases).map(([phase, times]) => [phase, rounded(times[i])]))
