@@ -85,15 +85,16 @@ export async function verifyReplica(data, extra = {}, store, { current = {}, con
   for (const [id, record] of Object.entries(data.breeding || {})) if (record.id !== id || !validBreedingRecord(record, sources) || record.at > Date.now() + 60000) throw new Error('繁殖记录缺少合法来源');
   if (data.contacts !== undefined && (!data.contacts || typeof data.contacts !== 'object' || Array.isArray(data.contacts) || Object.keys(data.contacts).length > 500000 || !Number.isFinite(data.contactAt) || data.contactAt > Date.now() + 60000)) throw new Error('接触计时无效');
   for (const [id, contact] of Object.entries(data.contacts || {})) if (id !== `${contact.male}|${contact.female}` || fishOrigin(sources, contact.male)?.gender !== 'male' || fishOrigin(sources, contact.female)?.gender !== 'female' || !Number.isFinite(contact.since) || !Number.isFinite(contact.lastAt) || contact.since < 0 || contact.since > contact.lastAt || contact.lastAt > data.contactAt) throw new Error('接触计时缺少合法来源');
-  for (const [id, fish] of Object.entries(data.fishes)) {
-    const issue = inspectFishOrigin(id, fish, sources);
+  for (const id of Object.keys(data.fishes)) {
+    const issue = inspectFishOrigin(id, data.fishes[id], sources);
     if (!issue.ok) {
       diagnostics?.record('error', ctx, '鱼的创建者记录无效', { ...issue, dataOps: Object.keys(data.ops || {}).length, extraOps: Object.keys(extra.ops || {}).length, dataBreeding: Object.keys(data.breeding || {}).length, extraBreeding: Object.keys(extra.breeding || {}).length });
       throw new Error('鱼的创建者记录无效');
     }
   }
   if (data.travel !== undefined && (!data.travel || typeof data.travel !== 'object' || Array.isArray(data.travel))) throw new Error('鱼运动记录无效');
-  for (const [id, record] of Object.entries(data.travel || {})) {
+  for (const id of Object.keys(data.travel || {})) {
+    const record = data.travel[id];
     const source = fishOrigin(sources, id);
     if (!validTravel(record) || !source || record.since < source.created || record.since > Date.now() + 60000) {
       diagnostics?.record('error', ctx, '鱼运动记录缺少合法来源', { id, since: record?.since ?? null, sourceCreated: source?.created ?? null, hasSource: Boolean(source) });
