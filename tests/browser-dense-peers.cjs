@@ -197,7 +197,7 @@ Network.prototype.encode = async function (message) {
 const originalEncodeLiveFrame = Network.prototype.encodeLiveFrame;
 Network.prototype.encodeLiveFrame = async function (id, body) {
   const wire = await originalEncodeLiveFrame.call(this, id, body);
-  if (wire) testData.liveBytes.push({ at: Date.now(), bytes: wire.length + Math.ceil(wire.length / 16000) * 44 });
+  if (wire) testData.liveBytes.push({ at: Date.now(), directFrame: true, bytes: wire.length + Math.ceil(wire.length / 16000) * 44 });
   return wire;
 };
 const originalSave = save;
@@ -662,7 +662,8 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
     !actualSteps.some(event => droppedTicks.has(event.tick)) && actualSteps.some(event => event.tick > dropped.at(-1).tick);
   const fullUpdates = follower.receives.filter(event => event.kind === 'world' && sampled(event) && !event.delta && !event.failed).length;
   const transfers = coordinator.liveTransfers.filter(sampled);
-  const liveWire = { bytes: coordinator.liveBytes.filter(sampled).reduce((sum, row) => sum + row.bytes, 0),
+  const liveBytes = coordinator.liveBytes.filter(sampled);
+  const liveWire = { bytes: liveBytes.reduce((sum, row) => sum + row.bytes, 0), signedFrames: liveBytes.filter(row => row.directFrame).length,
     plain: transfers.filter(row => !row.compact).length, compact: transfers.filter(row => row.compact && !row.resent).length,
     compactAcrossSteps: transfers.filter(row => row.compact && !row.resent && row.tick - row.fromTick > 500).length,
     missingBase: transfers.filter(row => row.resent).length, elapsed: stats(transfers.map(row => row.ms)) };
