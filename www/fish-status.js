@@ -30,14 +30,54 @@ function validTravelDays(days) {
   }
   return true;
 }
+// A received day changes one value in a previously received journey. Both
+// snapshots may outlive their packet, including after a repair or reconnect.
+const journeySteps = new WeakMap(), sharedDays = new WeakMap();
+export function advanceJourney(previous, day, distance) {
+  const old = journeySteps.get(previous);
+  const next = { ...previous, days: { ...previous.days, [day]: distance } };
+  const valid = old ? (old.day === day || validMovementDay(day)) && Number.isFinite(distance) && distance >= 0 : validTravel(next);
+  if (!valid) throw new Error('鱼运动记录无效');
+  Object.freeze(next.days);
+  Object.freeze(next);
+  journeySteps.set(next, { token: {}, previous: old?.token, day });
+  return next;
+}
 export function validTravel(record) {
+  if (journeySteps.has(record)) return true;
   return record && Number.isFinite(record.since) && record.since >= 0 && record.days && typeof record.days === 'object' && !Array.isArray(record.days) && validTravelDays(record.days);
+}
+
+// Borrow the signed day table until a reader needs an independently writable
+// copy. A save, local swim or leader change can keep that copy across frames.
+function ownDays(value) {
+  sharedDays.delete(this);
+  Object.defineProperty(this, 'days', { value, configurable: true, writable: true, enumerable: true });
+  return value;
+}
+function readDays() { return ownDays.call(this, { ...sharedDays.get(this).days }); }
+const dailyTable = { configurable: true, enumerable: true, get: readDays, set: ownDays };
+function sharedJourney(since, right, step) {
+  const result = Object.defineProperty({ since }, 'days', dailyTable);
+  sharedDays.set(result, { token: step.token, days: right.days });
+  return result;
 }
 export function mergeTravel(left, right) {
   if (!validTravel(right)) throw new Error('鱼运动记录无效');
   if (!left) return structuredClone(right);
-  const days = { ...left.days }; for (const [day, distance] of Object.entries(right.days)) days[day] = Math.max(days[day] || 0, distance);
-  return { since: Math.min(left.since, right.since), days };
+  const since = Math.min(left.since, right.since), step = journeySteps.get(right);
+  let retained = sharedDays.get(left);
+  if (retained && Object.getOwnPropertyDescriptor(left, 'days')?.get !== readDays) retained = undefined;
+  if (retained && retained.token === step?.previous && (retained.days[step.day] || 0) <= right.days[step.day]) {
+    return sharedJourney(since, right, step);
+  }
+  const days = { ...(retained?.days ?? left.days) };
+  for (const [day, distance] of Object.entries(right.days)) days[day] = Math.max(days[day] || 0, distance);
+  if (step) {
+    const keys = Object.keys(days), incoming = Object.keys(right.days);
+    if (keys.length === incoming.length && keys.every((key, i) => key === incoming[i] && days[key] === right.days[key])) return sharedJourney(since, right, step);
+  }
+  return { since, days };
 }
 export function mealIndex(chars, now) {
   const fish = new Map(), seen = new Set();

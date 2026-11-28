@@ -109,7 +109,7 @@ export function enforceLegends(world, now, transition) {
     delete world.data.fishes[id]; recordStory(world, 'depart', id, death.at); world.dirty = true;
   }
 }
-function settleCaptures(world, now, transition) {
+function settleCaptures(world, now, transition, posed) {
   for (const e of Object.values(world.data.legends.events)) {
     const s = legendSchedule(world.data.roots, e.seed, e.slot); if (s?.kind !== 'cthulhu') continue;
     for (const [arm, c] of Object.entries(e.arms)) {
@@ -119,11 +119,12 @@ function settleCaptures(world, now, transition) {
         if (world.data.fishes[c.fish]) { delete world.data.fishes[c.fish]; story(world, 'cthulhuDepart', c.fish, s.ends, s); recordStory(world, 'depart', c.fish, s.ends); world.dirty = true; }
       } else if (world.data.fishes[c.fish]) {
         cancelPair(world, c.fish, now); const f = world.data.fishes[c.fish]; Object.assign(f, c.pose, { cx: 0, cy: 0, posAt: now });
+        posed?.add(c.fish);
       }
     }
   }
 }
-export function settleLegendary(world, now, transition) { settleCaptures(world, now, transition); enforceLegends(world, now, transition); }
+export function settleLegendary(world, now, transition, posed) { settleCaptures(world, now, transition, posed); enforceLegends(world, now, transition); }
 export function ghostRoll(seed, slot, minute) { return (hash(`maggot:${seed}:${slot}:${minute}`) >>> 8) % 100 === 0; }
 export function ghostIndex(seed, slot, minute, prior = []) { const order = modelCells('ship').sort((a, b) => hash(`plank:${seed}:${slot}:${a.index}`) - hash(`plank:${seed}:${slot}:${b.index}`) || a.index - b.index); return order[minute - 1]?.index ?? null; }
 export function ghostSource(roots, source) {

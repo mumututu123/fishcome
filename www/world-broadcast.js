@@ -1,6 +1,6 @@
 import { breedingForBroadcast, stopBreedingBroadcast } from './breeding.js';
 import { replicaRowEquality } from './replica-stream.js';
-import { committedStepFields, DailyDistance, FishPoseFrame, travelRow } from './replica-row-delta.js';
+import { committedStepFields, DailyDistance, FishPoseFrame, replicaFishIds, travelRow } from './replica-row-delta.js';
 import { BondFrame } from './bond-interval.js';
 import { applyStoryChanges } from './simulation-delta.js';
 import { CONFIG, detachReplicaRows } from './engine.js';
@@ -170,20 +170,17 @@ function reconcileFishRows(base) {
   base.poseFrame = null;
 }
 
-function encodeSwims(ids, directions) {
+function encodeSwims(indices, directions) {
   if (!directions?.length) return;
-  // Ordinals refer to the fish rows already present in the signed world.
-  const byFish = new Map(), result = [];
+  const moves = new Uint8Array(indices.size), result = [];
   for (let direction = 0; direction < 9; direction++) {
     if (direction === 4 || !directions[direction]) continue;
-    for (const id of directions[direction]) byFish.set(id, direction);
+    for (const id of directions[direction]) {
+      const index = indices.get(id);
+      if (index !== undefined) moves[index] = direction + 1;
+    }
   }
-  let index = 0;
-  for (const id of ids) {
-    const direction = byFish.get(id);
-    if (direction !== undefined) (result[direction] ||= []).push(index);
-    index++;
-  }
+  for (let i = 0; i < moves.length; i++) if (moves[i]) (result[moves[i] - 1] ||= []).push(i);
   if (result.length) return result;
 }
 
@@ -205,7 +202,7 @@ function incomingBodyChanges(data, incoming) {
 
 function decodeSwims(data, incoming, encoded) {
   if (!Array.isArray(encoded) || encoded.length > 9 || encoded[4] != null) return;
-  const ids = Object.keys(incoming.fishes), seen = new Set(), dirs = [], captured = capturedFishIds(data, data.tick);
+  const ids = replicaFishIds(incoming), seen = new Uint8Array(ids.length), dirs = [], captured = capturedFishIds(data, data.tick);
   const changedBodies = incomingBodyChanges(data, incoming);
   for (let direction = 0; direction < encoded.length; direction++) {
     const indices = encoded[direction];
@@ -213,8 +210,8 @@ function decodeSwims(data, incoming, encoded) {
     if (!Array.isArray(indices) || indices.length > ids.length) return;
     const dx = direction % 3 - 1, dy = Math.floor(direction / 3) - 1;
     for (const index of indices) {
-      if (!Number.isInteger(index) || index < 0 || index >= ids.length || seen.has(index)) return;
-      seen.add(index);
+      if (!Number.isInteger(index) || index < 0 || index >= ids.length || seen[index]) return;
+      seen[index] = 1;
       const id = ids[index], before = data.fishes[id], after = incoming.fishes[id];
       if (before && before.posAt === data.tick && after.posAt === incoming.tick && !captured.has(id) && !changedBodies.has(id) &&
           before.actor === after.actor && before.created === after.created && before.facing === after.facing &&
@@ -437,7 +434,10 @@ export class WorldBroadcast {
         if (!contiguous) reconcileFishRows(previous);
         world = contiguous ? captureStep(data, previous, step, breeding, pending) : captureDelta(packet(data, changedRows(data, previous, pending), breeding));
         const poses = committedStepFields.get(world)?.poses;
-        if (directions?.length && world.tick === previous.tick + CONFIG.step) swims = encodeSwims(poses ? poses.indices.keys() : Object.keys(world.fishes), directions);
+        if (directions?.length && world.tick === previous.tick + CONFIG.step) {
+          const indices = poses?.indices ?? new Map(Object.keys(world.fishes).map((id, i) => [id, i]));
+          swims = encodeSwims(indices, directions);
+        }
         previous.tick = world.tick;
         previous.life = world.life;
         previous.bondFrame = committedStepFields.get(world)?.bondFrame;

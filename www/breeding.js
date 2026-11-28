@@ -93,14 +93,19 @@ function settleRecord(data, record, status, now) {
 export function cancelBreeding(data, record, now, reason) {
   settleRecord(data, record, 'cancelled', now); record.reason = reason;
 }
-export function normalizeBreeding(world, now) {
+export function normalizeBreeding(world, now, posed) {
   world.data.breeding ||= {}; world.data.contacts ||= {};
   const taken = new Set();
   for (const record of activeRecords(world.data).sort((a, b) => a.started - b.started || a.id.localeCompare(b.id))) {
     if (!world.data.fishes[record.male] || !world.data.fishes[record.female]) { cancelBreeding(world.data, record, now, 'parent-gone'); continue; }
     if (taken.has(record.male) || taken.has(record.female)) { cancelBreeding(world.data, record, now, 'conflicting-pair'); continue; }
     taken.add(record.male); taken.add(record.female);
-    if (record.pose) { Object.assign(world.data.fishes[record.male], record.pose.male); Object.assign(world.data.fishes[record.female], record.pose.female); }
+    if (record.pose) {
+      Object.assign(world.data.fishes[record.male], record.pose.male);
+      Object.assign(world.data.fishes[record.female], record.pose.female);
+      posed?.add(record.male);
+      posed?.add(record.female);
+    }
   }
 }
 export function chooseOwner(record, fatherCount, motherCount, fatherRemaining, motherRemaining) {

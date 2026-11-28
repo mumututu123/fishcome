@@ -6,6 +6,7 @@ import { DiagnosticLog, inspectFishOrigins, repairFishOriginIssues, diagnosticSu
 
 import { ArchiveStore, ARCHIVE_FIELDS, encodeArchive, compactKnown } from '../www/archive.js';
 import { loadReplicaArchives, verifyReplica } from '../www/replica.js';
+import { worldEdited } from '../www/simulation-changes.js';
 import { Network } from '../www/network.js';
 import { actorId, signer, verifyEnvelope } from '../www/storage.js';
 
@@ -406,4 +407,26 @@ test('分支在不同位置完成同一次出生，增量只带胜出凭据也�
   for (const inherited of early.breeding[breedingId].baby.cells) {
     assert.equal(saved.chars[inherited.id].path.at(-1).x, inherited.x);
   }
+});
+
+test('鱼生验证只覆盖收到的消息和原有来源，等待期间更换世界、归档或创建凭据均重查', async () => {
+  const world = new World(Date.now() - 1000), data = world.serialize();
+  const [first, second] = Object.keys(world.data.fishes).sort();
+  const key = first + '|' + second, at = data.tick;
+  data.life.bonds[key] = { a: first, b: second, seconds: 1, at, lastNear: at, run: 0 };
+  data.ops = {}; data.fishes = {}; data.chars = {};
+  const archive = new ArchiveStore(), extra = {};
+  const receipt = await verifyReplica(data, extra, archive, { current: world.data, mergeCut: true });
+  const latest = Date.now() + 60000;
+  assert(receipt(world.data, data, extra, latest));
+  assert(!receipt(world.data, { ...data }, extra, latest));
+  assert(!receipt(world.data, data, {}, latest));
+  assert(!receipt({ ...world.data }, data, extra, latest));
+  assert(!receipt(world.data, data, extra, 0));
+  archive.revision = 1;
+  assert(!receipt(world.data, data, extra, latest));
+  const newer = await verifyReplica(data, extra, archive, { current: world.data, mergeCut: true });
+  worldEdited(world);
+  delete world.data.ops[first];
+  assert.throws(() => world.merge(data, extra, 'replica', true, newer), /鱼生记录无效/);
 });

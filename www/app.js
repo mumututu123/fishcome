@@ -238,16 +238,16 @@ function needsReplicaSave(incoming, current, store) {
 }
 async function mergeVerifiedWorld(data, peer, context, { local = false, worldMessage } = {}) {
   const target = world, store = archiveStore, revision = store.revision;
-  let incoming = data, archived;
+  const delta = context === 'world-delta';
+  let incoming = data, archived, checkedRules;
   await ensureArchives(data, peer, null, store, target.data, async (sources, current) => {
     archived = sources;
     const options = { context, current, diagnostics };
     if (local) incoming = await verifyLocalCheckpoint(data, sources, store, options);
-    else await verifyReplica(data, sources, store, options);
+    else checkedRules = await verifyReplica(data, sources, store, { ...options, mergeCut: delta && current === target.data });
   });
   // Overlapping archive rows have a canonical winner after ingestion.
   if (revision !== store.revision) archived = await store.dependencies(incoming, target.data);
-  const delta = context === 'world-delta';
   const commit = () => {
     if (target !== world || store !== archiveStore) throw new Error('运行世界已更换，请重新同步');
     if (worldMessage && (worldMessage.from !== leader() || replacingCheckpoint || updateRestarting)) {
@@ -259,7 +259,7 @@ async function mergeVerifiedWorld(data, peer, context, { local = false, worldMes
     const apply = () => {
       const index = delta && renderer.currentIndex(target);
       let changes;
-      try { changes = target.merge(incoming, archived, delta ? 'replica' : undefined, delta); }
+      try { changes = target.merge(incoming, archived, delta ? 'replica' : undefined, delta, checkedRules); }
       finally { if (delta) noteCheckpointMerge(target.data, changes, incoming, archived); }
       if (delta) pictures.merged(target, changes);
       if (index) renderer.applyMergedChars(target, index, changes?.chars);

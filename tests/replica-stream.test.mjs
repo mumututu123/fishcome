@@ -3,6 +3,7 @@ import test from 'node:test';
 import './browser-byte-arrays.mjs';
 import { changesSince, coalesceWorld, fitsLegacyEnvelope, PAGE_UNITS, replicaPages, ReplicaReader, ReplicaTransfers } from '../www/replica-stream.js';
 import { committedStepFields, decodeReplicaRowDelta, encodeReplicaRowDelta, replicaRowBase } from '../www/replica-row-delta.js';
+import { mergeTravel } from '../www/fish-status.js';
 import { mergeBreeding } from '../www/breeding.js';
 import { ARCHIVE_FIELDS, ArchiveStore } from '../www/archive.js';
 import { applyInputRows, simulationApplied, worldEdited } from '../www/simulation-changes.js';
@@ -1061,4 +1062,78 @@ test('选主期间跳过的更新只向原发布者补齐，较早的全量及�
   assert(recovery.missed.has('original-publisher'));
   recovery.covered(source(750), direct.request, true);
   assert.equal(recovery.request(source(800), 26000), undefined);
+});
+
+test('已确认的每条鱼按原行序相对累计，绝对修正、旧格式、跨日和本地分支仍可合流', () => {
+  const start = Date.parse('2026-11-27T23:59:59.500+08:00'), day = '2026-11-28', yesterday = '2026-11-27';
+  const ids = ['straight', 'diagonal', 'other'], fishes = Object.fromEntries(ids.map(id => [id, { id }]));
+  const history = { since: start - 10000, days: { [yesterday]: 4 } };
+  const initial = { tick: start, fishes, travel: Object.fromEntries(ids.map(id => [id, history])) };
+  const base = replicaRowBase(crypto.randomUUID(), initial, true);
+  const first = { delta: true, world: { tick: start + 500, fishes,
+    travel: Object.fromEntries([['other', 6.5], ['diagonal', Math.SQRT2], ['straight', 1]]
+      .map(([id, distance]) => [id, { ...history, days: { ...history.days, [day]: distance } }])) } };
+  const wire = encodeReplicaRowDelta(first, base, true, false, true);
+  assert.deepEqual(wire.world.travel, [[2, -1, 6.5], 3, 0]);
+  assert.throws(() => decodeReplicaRowDelta(wire, base, true, false, false));
+  for (const number of [Number.MAX_SAFE_INTEGER, -1, 0.5]) {
+    assert.throws(() => decodeReplicaRowDelta({ ...wire, world: { ...wire.world, travel: [number] } }, base, true, false, true));
+  }
+  const decoded = decodeReplicaRowDelta(wire, base, true, false, true);
+  assert.deepEqual(decoded, first);
+  assert.deepEqual(Object.keys(decoded.world.travel), ['other', 'diagonal', 'straight']);
+  const again = replicaRowBase(crypto.randomUUID(), decoded.world, true, base);
+  const second = structuredClone(first);
+  second.world.tick += 500;
+  for (const row of Object.values(second.world.travel)) row.days[day] += 1;
+  const next = decodeReplicaRowDelta(encodeReplicaRowDelta(second, again, true, false, true), again, true, false, true);
+  const untouched = mergeTravel(history, decoded.world.travel.straight);
+  const local = mergeTravel(history, decoded.world.travel.straight);
+  local.days[yesterday] = 12;
+  const changed = mergeTravel(local, next.world.travel.straight);
+  const following = mergeTravel(untouched, next.world.travel.straight);
+  following.days[day] = 40;
+  assert.deepEqual(changed.days, { [yesterday]: 12, [day]: 2 });
+  assert.equal(untouched.days[day], 1);
+  assert.deepEqual(next.world.travel.straight.days, { [yesterday]: 4, [day]: 2 });
+  assert.deepEqual(structuredClone(changed), changed);
+});
+
+test('连续接收整群位置时不再遍历本地鱼表，分支进食和并发位置仍按完整合流选取', () => {
+  const at = Date.now() - 10000, local = new World(at), reference = new World(at, local.id);
+  const fish = crypto.randomUUID(), cells = [0, 1].map(x => ({ x, y: 0, ch: '鱼', color: '#88aacc' }));
+  const op = { id: fish, actor: 'writer', kind: 'fish', t: at, x: 30, y: 20, cost: 2, cells };
+  assert(local.apply(op).ok && reference.apply(op).ok);
+  const initial = local.serialize(), packet = structuredClone(initial);
+  packet.chars = {}; packet.ops = {}; packet.travel = {}; packet.breeding = {};
+  let scans = 0;
+  local.data.fishes = new Proxy(local.data.fishes, { ownKeys(table) { scans++; return Reflect.ownKeys(table); } });
+  const apply = () => {
+    reference.merge(packet);
+    scans = 0;
+    local.merge(packet, {}, 'replica', true);
+    const count = scans;
+    assert.equal(JSON.stringify(local.data), JSON.stringify(reference.data));
+    return count;
+  };
+  apply();
+  for (let i = 1; i <= 3; i++) {
+    packet.tick += 500;
+    packet.fishes[fish] = { ...packet.fishes[fish], posAt: packet.tick, x: 30 + i };
+    assert.equal(apply(), 0);
+  }
+  packet.tick += 500;
+  packet.fishes[fish] = { ...packet.fishes[fish], posAt: packet.tick, x: 35, hungerAt: at, lastFed: at - 1 };
+  assert.equal(apply(), 0);
+  assert.equal(local.data.fishes[fish].lastFed, at);
+  assert.equal(local.data.fishes[fish].hungerAt, at + CONFIG.hunger);
+  for (const world of [reference, local]) {
+    worldEdited(world);
+    Object.assign(world.data.fishes[fish], { x: 50, posAt: packet.tick + 1500 });
+  }
+  assert(apply() > 0);
+  assert.equal(local.data.fishes[fish].x, 50);
+  packet.tick += 500;
+  assert.equal(apply(), 0);
+  assert.equal(local.data.fishes[fish].x, 50);
 });

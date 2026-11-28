@@ -1,5 +1,5 @@
 import { CONFIG } from './engine.js';
-import { shanghaiDay } from './fish-status.js';
+import { advanceJourney, shanghaiDay } from './fish-status.js';
 import { applyBondIntervals, BondFrame } from './bond-interval.js';
 
 const fields = [['fishes'], ['chars'], ['travel'], ['life', 'bonds'], ['life', 'stories'], ['life', 'events']];
@@ -7,7 +7,16 @@ const poseFields = ['x', 'y', 'facing', 'cx', 'cy'];
 const travelFields = ['since', 'days'];
 const contactFields = ['male', 'female', 'since', 'lastAt'];
 export const committedStepFields = new WeakMap();
-const confirmedRosters = new WeakMap();
+const confirmedRosters = new WeakMap(), idsByRoster = new WeakMap();
+function orderedFishIds(indices) {
+  let ids = idsByRoster.get(indices);
+  if (!ids) idsByRoster.set(indices, ids = [...indices.keys()]);
+  return ids;
+}
+export function replicaFishIds(world) {
+  const indices = confirmedRosters.get(world);
+  return indices ? orderedFishIds(indices) : Object.keys(world.fishes);
+}
 const maxColumns = 30;
 const rowTable = value => value && typeof value === 'object' && !Array.isArray(value);
 const safeId = id => typeof id === 'string' && !['__proto__', 'prototype', 'constructor'].includes(id);
@@ -187,7 +196,9 @@ export function replicaRowBase(id, world, frames = false, previous) {
   // retain its last confirmed journey only while it occurs in the fish roster.
   const indices = poses?.indices ?? confirmedRosters.get(world) ?? new Map(rows[0].map(([fish], i) => [fish, i]));
   const travel = new ConfirmedTravel(indices, trips || world.travel, previous?.travel);
-  return { id, tick: world.tick, rows, tables, travel, roots: world.roots, terrain: world.terrain };
+  return { id, tick: world.tick, rows, tables, travel, roots: world.roots, terrain: world.terrain,
+    get fishIds() { return orderedFishIds(indices); },
+    get fishTable() { return poses ? poses.table() : tables[0]; } };
 }
 
 function mapTables(world, transform, fishRows, trips, bondRows) {
@@ -233,7 +244,7 @@ function todayOnly(old, next, day) {
   return before.every((key, index) => key === after[index] && (key === day || old.days[key] === next.days[key]));
 }
 
-export function encodeReplicaRowDelta(body, base, frames = false, poseBytes = false) {
+export function encodeReplicaRowDelta(body, base, frames = false, poseBytes = false, journeys = false) {
   if (!base || body.delta !== true || body.world.tick !== base.tick + CONFIG.step) return body;
   const compact = frames && !!base.travel;
   const day = compact ? shanghaiDay(body.world.tick) : null;
@@ -249,9 +260,9 @@ export function encodeReplicaRowDelta(body, base, frames = false, poseBytes = fa
   let fishIndices = poses?.indices;
   const world = mapTables(body.world, (table, index) => {
     if (!rowTable(table)) return;
-    if (compact && table === base.tables[index]) return true;
     let known;
     if (compact && index === 0) fishIndices = known = base.travel.indices;
+    if (compact && table === base.tables[index]) return true;
     const rows = compact ? [] : {};
     let next = 0;
     for (const id of Object.keys(table)) {
@@ -259,7 +270,16 @@ export function encodeReplicaRowDelta(body, base, frames = false, poseBytes = fa
       const oldTravel = compact && index === 2 && base.travel.get(id);
       if (oldTravel && fishIndices?.has(id) && (candidate instanceof DailyDistance
           ? candidate.day === day && candidate.follows(oldTravel) : todayOnly(travelRow(oldTravel), candidate, day))) {
-        rows[next++] = [fishIndices.get(id), -1, candidate instanceof DailyDistance ? candidate.distance : candidate.days[day]];
+        const ordinal = fishIndices.get(id);
+        const distance = candidate instanceof DailyDistance ? candidate.distance : candidate.days[day];
+        if (journeys) {
+          const before = oldTravel instanceof DailyDistance && oldTravel.day === day ? oldTravel.distance : travelRow(oldTravel).days[day] || 0;
+          if (before + 1 === distance || before + Math.SQRT2 === distance) {
+            rows[next++] = ordinal * 2 + Number(before + 1 !== distance);
+            continue;
+          }
+        }
+        rows[next++] = [ordinal, -1, distance];
         continue;
       }
       known ??= new Map(base.rows[index].map(([id], row) => [id, row]));
@@ -297,13 +317,15 @@ function decodeRow(encoded, known) {
   return [id, row];
 }
 
-function unpackPoses(encoded, previous, tick) {
-  const { poses, full = [] } = encoded, n = previous.length;
+function unpackPoses(encoded, base, tick) {
+  const ids = base.fishIds, previous = base.fishTable;
+  const { poses, full = [] } = encoded, n = ids.length;
   if (typeof poses !== 'string' || poses.length > 4 * Math.ceil(41 * n / 3) || !Array.isArray(full) || full.length > n) throw new Error('无效的实时鱼位置长度');
   const bytes = Uint8Array.fromBase64(poses, { lastChunkHandling: 'strict' }), view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const rows = {};
   let offset = 0, copied = 0;
-  for (const [id, before] of previous) {
+  for (const id of ids) {
+    const before = previous[id];
     if (!safeId(id)) throw new Error('无效的实时鱼标识');
     const mask = bytes[offset++];
     if (mask === 32 && rowTable(full[copied])) { rows[id] = full[copied++]; continue; }
@@ -321,7 +343,7 @@ function unpackPoses(encoded, previous, tick) {
   return rows;
 }
 
-export function decodeReplicaRowDelta(body, base, frames = false, poseBytes = false) {
+export function decodeReplicaRowDelta(body, base, frames = false, poseBytes = false, journeys = false) {
   if (typeof body.rowBase !== 'string' || body.rowBase.length !== 36 || body.delta !== true) throw new Error('无效的实时变更版本');
   if (base?.id !== body.rowBase) return null;
   if (body.world.tick !== base.tick + CONFIG.step) throw new Error('实时变更不连续');
@@ -333,7 +355,7 @@ export function decodeReplicaRowDelta(body, base, frames = false, poseBytes = fa
       const table = base.tables[rowsIndex];
       return table instanceof BondFrame ? table.table() : table;
     }
-    if (frameRows && rowsIndex === 0 && poseBytes && rowTable(encoded)) return unpackPoses(encoded, base.rows[0], message.world.tick);
+    if (frameRows && rowsIndex === 0 && poseBytes && rowTable(encoded)) return unpackPoses(encoded, base, message.world.tick);
     if (frameRows && rowsIndex === 3 && rowTable(encoded)) {
       const { before, length, kept, added, keys } = encoded;
       return applyBondIntervals(base.tables[rowsIndex], { at: message.world.life.at, keys, intervals: { before, length, kept, added } });
@@ -353,11 +375,17 @@ export function decodeReplicaRowDelta(body, base, frames = false, poseBytes = fa
         if (offset !== values.length || !values.every(Number.isFinite)) throw new Error('无效的实时鱼位置');
         fish.posAt = message.world.tick;
         row = [before[0], fish];
+      } else if (frameRows && journeys && rowsIndex === 2 && typeof entry === 'number') {
+        const ordinal = Math.floor(entry / 2);
+        const id = Number.isSafeInteger(entry) && entry >= 0 && base.fishIds[ordinal];
+        const old = id && travelRow(base.travel.get(id));
+        if (!old) throw new Error('缺少游动行程基准');
+        row = [id, advanceJourney(old, day, (old.days[day] || 0) + (entry % 2 ? Math.SQRT2 : 1))];
       } else if (frameRows && rowsIndex === 2 && Array.isArray(entry) && entry[1] === -1) {
         const [index, , distance] = entry;
-        const id = Number.isSafeInteger(index) && base.rows[0][index]?.[0], old = travelRow(base.travel.get(id));
+        const id = Number.isSafeInteger(index) && base.fishIds[index], old = travelRow(base.travel.get(id));
         if (!old || entry.length !== 3 || !Number.isFinite(distance)) throw new Error('无效的实时行程记录');
-        row = [id, { ...old, days: { ...old.days, [day]: distance } }];
+        row = [id, advanceJourney(old, day, distance)];
       } else row = decodeRow(entry, base.rows[rowsIndex]);
       if (!row || !safeId(row[0]) || Object.hasOwn(table, row[0])) throw new Error('无效或重复的实时变更记录');
       table[row[0]] = row[1];
@@ -376,7 +404,7 @@ export function decodeReplicaRowDelta(body, base, frames = false, poseBytes = fa
         if (!Array.isArray(entry)) throw new Error('无效的实时接触记录');
         let [id, value] = entry;
         if (entry.length === 3 && Number.isSafeInteger(id) && Number.isSafeInteger(value)) {
-          const male = base.rows[0][id]?.[0], female = base.rows[0][value]?.[0], since = entry[2];
+          const male = base.fishIds[id], female = base.fishIds[value], since = entry[2];
           if (!male || !female || !Number.isFinite(since)) throw new Error('无效的实时接触记录');
           id = male + '|' + female; value = { male, female, since, lastAt: world.contactAt };
         } else if (entry.length !== 2 || !rowTable(value)) throw new Error('无效的实时接触记录');

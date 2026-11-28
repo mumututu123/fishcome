@@ -25,6 +25,10 @@ export const NEIGHBORS = [-1, 0, 1].flatMap(x => [-1, 0, 1].map(y => [x, y])).fi
 const AVOID_DIRECTIONS = [[0, -1], [0, 1], [-1, 0], [1, 0]];
 const MOVES = 1, TURNS = 2;
 const DIAGONAL_SWIM = Math.hypot(1, 1);
+export function validateLifeAndLegends(data, sources, latest) {
+  if (!validateLife(data.life, sources, latest)) throw new Error('鱼生记录无效');
+  if (!validLegends(data.legends, sources, latest)) throw new Error('稀有异象记录无效');
+}
 export const clone = value => structuredClone(value);
 // The usual swimmer and relationship rows contain only scalars. Copy each
 // once. Nested ancestry and extension records still get a full detached copy.
@@ -194,7 +198,7 @@ function groupFishCell(groups, cell) {
 const replicaCellIndexes = new WeakMap();
 subscribeSimulationChanges((world, patch, origin) => {
   if (!patch && origin === 'archive') return;
-  if (!patch || patch.tables?.chars || patch.tables?.breeding || patch.values?.tick !== undefined) replicaCellIndexes.delete(world);
+  if (!patch || patch.tables?.chars || patch.tables?.breeding || patch.tables?.fishes || patch.values?.tick !== undefined) replicaCellIndexes.delete(world);
 });
 function indexReplicaCells(world, changedChars) {
   const bodies = new Map(), occupiedScenes = new Map(), latestFeed = new Map(world.archives?.summary.lastMeals || []);
@@ -861,11 +865,10 @@ export class World {
     if (!kept.size) { delete this.data.fishes[id]; recordStory(this, 'depart', id, at); } else if (!illness) f.hungerAt = at + CONFIG.hunger;
     this.foodRevision++; this.dirty = true;
   }
-  merge(other, archived = {}, origin, trackChars = false) {
+  merge(other, archived = {}, origin, trackChars = false, checkedRules) {
     let cellIndex = origin === 'replica' ? replicaCellIndexes.get(this) : undefined;
     const changes = trackChars ? { chars: undefined } : undefined;
     let changedChars = trackChars ? new Set() : undefined;
-    worldEdited(this, origin, changes);
     if (!other || other.protocol !== 1 || !other.chars || !other.fishes || !other.scenes || !other.ops) throw new Error('世界协议不兼容');
     if (other.terrain && !validTerrain(other.terrain, other.roots)) throw new Error('固定海底地形被修改或无效');
     for (const [root, at] of Object.entries(other.roots || {})) if (this.data.roots[root] !== undefined && this.data.roots[root] !== at) throw new Error('世界起源时间不能修改');
@@ -874,12 +877,14 @@ export class World {
       ops: replicaSourceTable(this.data.ops, other.ops, archived.ops), breeding: replicaSourceTable(this.data.breeding, other.breeding, archived.breeding) };
     if (!validPopulation(other.population, sources, Math.max(Date.now() + 60000, other.tick)) || !validRocks(other.rocks, sources, Math.max(Date.now() + 60000, other.tick))) throw new Error('生态控制记录无效');
     const latest = Math.max(Date.now() + 60000, this.data.tick, other.tick);
-    sources.chars = replicaSourceRows(other.chars, this.data.chars, archived.chars);
-    if (!validateLife(other.life, sources, latest)) throw new Error('鱼生记录无效');
-    if (!validLegends(other.legends, sources, latest)) throw new Error('稀有异象记录无效');
+    if (!checkedRules?.(this.data, other, archived, latest)) {
+      sources.chars = replicaSourceRows(other.chars, this.data.chars, archived.chars);
+      validateLifeAndLegends(other, sources, latest);
+    }
     let initial;
     for (const op of Object.values(other.ops)) if (op.genesis !== undefined &&
       !validInitialOp(op, initial ??= initialSources(sources.roots))) throw new Error('初始鱼记录被修改或无效');
+    worldEdited(this, origin, changes);
     this.data.terrain = clone(chooseTerrain(terrainOf(this.data), terrainOf(other)));
     Object.assign(this.data.roots, other.roots);
     for (const [id, op] of Object.entries(other.ops)) {
@@ -932,18 +937,29 @@ export class World {
       if (next !== c) { this.data.chars[id] = next; changedChars?.add(id); }
     }
     const birthOf = id => id.startsWith('born:') ? this.data.breeding[id.slice(5)] || archived.breeding?.[id.slice(5)] : undefined;
-    for (const id of Object.keys(this.data.fishes)) if (id.startsWith('born:')) this.data.fishes[id] = canonicalBirthFish(this.data.fishes[id], birthOf(id));
+    // A retained cell index covers the previous normalized fish and their
+    // birth certificates. Incoming fish still resolve against the current winner.
+    const pendingFish = cellIndex?.posed;
+    for (const id of pendingFish ?? Object.keys(this.data.fishes)) {
+      if (id.startsWith('born:') && this.data.fishes[id]) this.data.fishes[id] = canonicalBirthFish(this.data.fishes[id], birthOf(id));
+    }
     for (const type of ['fishes', 'scenes']) {
-      const table = this.data[type], incomingRows = other[type], winners = {};
+      const table = this.data[type], incomingRows = other[type], winners = origin === 'replica' ? undefined : {};
       for (const id in incomingRows) {
         if (!Object.hasOwn(incomingRows, id)) continue;
         const incoming = incomingRows[id];
         const obj = type === 'fishes' && id.startsWith('born:') ? canonicalBirthFish(incoming, birthOf(id)) : incoming, old = table[id];
         if (!old || (obj.posAt || 0) > (old.posAt || 0) || ((obj.posAt || 0) === (old.posAt || 0) && JSON.stringify(obj).localeCompare(JSON.stringify(old)) > 0)) {
-          winners[id] = origin === 'replica' ? detachReplicaRecord(obj) : obj;
+          if (winners) winners[id] = obj;
+          else table[id] = detachReplicaRecord(obj);
+          // The previous merge normalized each surviving body and its meals.
+          // An unchanged index and equal inputs give the same feeding fields,
+          // even when the local and remote poses came from different writers.
+          if (pendingFish && type === 'fishes' && (!old || obj.created !== old.created ||
+              obj.hungerAt !== old.hungerAt || obj.lastFed !== old.lastFed || obj.lastMealAt !== old.lastMealAt)) pendingFish.add(id);
         }
       }
-      Object.assign(table, origin === 'replica' ? winners : clone(winners));
+      if (winners) Object.assign(table, clone(winners));
     }
     let dependencies;
     for (const field of ['ops', 'breeding']) for (const [id, record] of Object.entries(archived[field] || {})) {
@@ -964,12 +980,15 @@ export class World {
       cellIndex = undefined;
       changedChars?.add(cell.id);
       transition(cell, fields, event);
-    });
+    }, pendingFish);
+    const normalize = cellIndex && pendingFish ? pendingFish : Object.keys(this.data.fishes);
     cellIndex ??= indexReplicaCells(this, changedChars);
     const { bodies, latestFeed, occupiedScenes } = cellIndex;
     let { chatGlyphCount } = cellIndex;
-    for (const id of Object.keys(this.data.fishes)) {
-      const f = this.data.fishes[id], lone = bodies.get(id); if (lone === undefined) { delete this.data.fishes[id]; continue; }
+    for (const id of normalize) {
+      const f = this.data.fishes[id];
+      if (!f) continue;
+      const lone = bodies.get(id); if (lone === undefined) { delete this.data.fishes[id]; continue; }
       const meal = latestFeed.get(id), fed = Math.max(f.created, meal || 0);
       f.lastFed = fed; f.hungerAt = Math.max(f.hungerAt, fed + CONFIG.hunger);
       const mealAt = lastMealAt(f, meal); if (mealAt !== undefined) f.lastMealAt = mealAt;
@@ -999,8 +1018,10 @@ export class World {
     const beforePopulation = this.foodRevision;
     updatePopulation(this, this.data.tick, transition, { resume: true });
     this.data.bubbles = mergeBubbles(this.data.bubbles, other.bubbles, this.data.tick, this.data.chars); this.data.bubbleMinute = Math.max(this.data.bubbleMinute ?? Math.floor(this.data.tick / MINUTE), other.bubbleMinute ?? Math.floor(other.tick / MINUTE));
-    normalizeBreeding(this, this.data.tick);
-    if (origin === 'replica' && !localChatSources.size && beforePopulation === this.foodRevision) {
+    const retainCells = origin === 'replica' && !localChatSources.size && beforePopulation === this.foodRevision;
+    if (retainCells) (cellIndex.posed ??= new Set()).clear();
+    normalizeBreeding(this, this.data.tick, retainCells ? cellIndex.posed : undefined);
+    if (retainCells) {
       cellIndex.table = this.data.chars;
       cellIndex.tick = this.data.tick;
       cellIndex.mealRevision = this.archives?.mealRevision;
