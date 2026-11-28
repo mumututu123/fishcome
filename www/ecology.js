@@ -79,24 +79,55 @@ export function weedExpires(cell, state) {
   return Math.max(ordinary, grace);
 }
 export function weedAlpha(cell, state, now) { const remaining = weedExpires(cell, state) - now; return Math.max(.25, Math.min(1, .25 + remaining / (12 * 3600000) * .75)); }
-export function looseWither(cell) { const lastEat = cell.path.reduce((at, event) => event.reason === 'eat' ? Math.max(at, event.t) : at, -Infinity), lastWither = cell.path.reduce((at, event) => event.reason === 'wither-loose' ? Math.max(at, event.t) : at, -Infinity); return lastWither > lastEat; }
+export function looseWither(cell) {
+  let lastEat = -Infinity, lastWither = -Infinity;
+  for (const event of cell.path) {
+    if (event.reason === 'eat') lastEat = Math.max(lastEat, event.t);
+    else if (event.reason === 'wither-loose') lastWither = Math.max(lastWither, event.t);
+  }
+  return lastWither > lastEat;
+}
 export function naturalSediment(cell, data) {
   if (cell.kind !== 'scene' || cell.chat || !cell.path.some(event => event.reason === 'expire')) return false;
   return !Object.values(data.ops).some(op => op.kind === 'sceneEdit' && op.cell === cell.id);
 }
 export function settleAt(cell) { return Math.max(...cell.path.filter(event => event.reason === 'expire').map(event => event.t)); }
-export function updateEcology(world, now, transition) {
-  const state = ensureEcology(world, now), deadPlants = new Map();
+function settleWithering(world, state, now, transition) {
+  const schedule = world.witherSchedule;
+  const grace = state.legacy ? state.activated : null;
+  if (schedule && schedule.grace === grace && now < schedule.due) return;
+  const deadPlants = new Map();
+  let due = Infinity;
   for (const c of world.charValues('food', 'seaweed')) {
-    if (c.kind === 'seaweed' && now >= weedExpires(c, state)) { if (!deadPlants.has(c.entity)) deadPlants.set(c.entity, []); deadPlants.get(c.entity).push({ index: c.wild.index, at: weedExpires(c, state) }); transition(c, { kind: 'burn', entity: '' }, { id: `wither:${c.id}`, t: weedExpires(c, state), reason: 'wither' }); world.foodRevision++; world.dirty = true; }
-    else if (c.kind === 'food' && looseWither(c) && now >= c.born + ECOLOGY.looseLife) { transition(c, { kind: 'burn', entity: '' }, { id: `wither-dissolve:${c.id}:${c.born}`, t: c.born + ECOLOGY.looseLife, reason: 'wither-dissolve' }); world.dirty = true; }
+    if (c.kind === 'seaweed') {
+      const at = weedExpires(c, state);
+      if (now < at) { due = Math.min(due, at); continue; }
+      if (!(now >= at)) continue;
+      if (!deadPlants.has(c.entity)) deadPlants.set(c.entity, []);
+      deadPlants.get(c.entity).push({ index: c.wild.index, at });
+      transition(c, { kind: 'burn', entity: '' }, { id: `wither:${c.id}`, t: at, reason: 'wither' });
+      world.foodRevision++; world.dirty = true;
+    } else if (c.kind === 'food' && looseWither(c)) {
+      const at = c.born + ECOLOGY.looseLife;
+      if (now < at) { due = Math.min(due, at); continue; }
+      if (now >= at) {
+        transition(c, { kind: 'burn', entity: '' }, { id: `wither-dissolve:${c.id}:${c.born}`, t: at, reason: 'wither-dissolve' });
+        world.dirty = true;
+      }
+    }
   }
   if (deadPlants.size) for (const c of world.charValues('seaweed')) {
     const cuts = (deadPlants.get(c.entity) || []).filter(cut => cut.index < c.wild.index); if (!cuts.length) continue;
     const at = Math.min(...cuts.map(cut => cut.at)); transition(c, { kind: 'food', entity: '', born: at, fall: 0 }, { id: `wither-loose:${c.id}:${at}`, t: at, reason: 'wither-loose' });
     if (now >= at + ECOLOGY.looseLife) transition(c, { kind: 'burn', entity: '' }, { id: `wither-dissolve:${c.id}:${at}`, t: at + ECOLOGY.looseLife, reason: 'wither-dissolve' });
+    else due = Math.min(due, at + ECOLOGY.looseLife);
     world.foodRevision++; world.dirty = true;
   }
+  if (schedule) { schedule.grace = grace; schedule.due = due; }
+}
+export function updateEcology(world, now, transition) {
+  const state = ensureEcology(world, now);
+  settleWithering(world, state, now, transition);
   const hour = Math.floor(now / 3600000); if (hour <= state.hour) return;
   let density;
   const edited = new Set(Object.values(world.data.ops).filter(op => op.kind === 'sceneEdit').map(op => op.cell));

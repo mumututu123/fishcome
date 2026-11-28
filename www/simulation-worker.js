@@ -40,6 +40,7 @@ function trackWorld(source) {
       this.due = Math.min(this.due, patient.nextLossAt);
     }
   };
+  const witherSchedule = { due: -Infinity };
   const raw = object => object?.[observation]?.target ?? object;
   const bondTimes = new WeakMap();
   let characters, ecology, membership, meals, previousBonds, activeBonds, publishedBonds, orderedBonds = false;
@@ -88,6 +89,10 @@ function trackWorld(source) {
   }
   function mealPath(path) { return path?.some(event => event?.reason === 'eat'); }
   function noteCharacterChange(target, parent, key, value, deleting) {
+    // Falling food changes y, fall and moveAt every tick. None changes
+    // withering. A new life stage, provenance or deadline does.
+    if (parent.table || parent.property === 'path' || parent.property === undefined &&
+        ['kind', 'born', 'created', 'ecoGraceAt', 'id', 'path'].includes(key)) witherSchedule.due = -Infinity;
     if (parent.table) {
       const previous = target[key];
       membership?.mark(key, true, deleting);
@@ -201,6 +206,7 @@ function trackWorld(source) {
       if (poses && !poses.has(moved)) poses.set(moved, fish && { x: fish.x, y: fish.y, facing: fish.facing });
     }
     if (parent.root && key === 'chars') {
+      witherSchedule.due = -Infinity;
       ecology = membership = meals = undefined;
       characters = undefined;
       characterViews.clear();
@@ -474,6 +480,7 @@ function trackWorld(source) {
     charValues,
     copyCharacter: id => plain(source.chars[id]),
     illnessSchedule,
+    witherSchedule,
     readBonds: () => materializeBonds(raw(source.life.bonds)),
     readStories: () => raw(source.life.stories),
     activeBondSpans: at => publishedBonds?.at === at && publishedBonds.table === raw(source.life.bonds) ? publishedBonds : null,
@@ -651,6 +658,7 @@ export class WorkerSimulation {
       this.world.originRevision = this.tracker.originRevision;
       this.world.stableFishRoster = this.tracker.fishValues;
       this.world.illnessSchedule = this.tracker.illnessSchedule;
+      this.world.witherSchedule = this.tracker.witherSchedule;
       this.world.mealEdits = this.tracker.mealEdits;
       this.world.readFish = this.tracker.readFish;
       this.world.readContacts = this.tracker.readContacts;
