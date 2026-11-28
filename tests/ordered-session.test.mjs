@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { ARCHIVE, ArchiveStore, archiveChunks, archivePlan } from '../www/archive.js';
 import { World } from '../www/engine.js';
 import { mergeBonds } from '../www/life.js';
+import { AdmissionJournal } from '../www/admission-journal.js';
 import { WorldBroadcast } from '../www/world-broadcast.js';
 import { actorId, signer } from '../www/storage.js';
 import { prepareOrderedArchive } from '../www/ordered-archive.js';
@@ -66,6 +67,29 @@ test('共同检查点保留签名操作的内容和次序，旧步的出生凭�
   aligned.changes.ops['fish-0'].extension.extra = true;
   assert.deepEqual(captured.world.data.ops, old.ops);
   assert.deepEqual(later.world.data.ops, world.data.ops);
+});
+
+test('插入鱼食、删除操作和调整字典次序时，只重新编码实际修改的行，结果与整表一致', async () => {
+  let reads = 0;
+  const cell = { id: 'old', get kind() { reads++; return 'burn'; } };
+  const world = { data: { tick: 1000, chars: { old: cell, second: { kind: 'food' } }, ops: { retired: {}, original: {} } } };
+  const store = new ArchiveStore(), first = new AdmissionJournal(world.data), full = new AdmissionJournal(world.data);
+  delete world.data.ops.retired;
+  world.data.chars.added = { kind: 'food' };
+  const second = world.data.chars.second;
+  delete world.data.chars.second;
+  world.data.chars.second = second;
+  world.data.tick += 500;
+  const patch = { tables: { chars: { set: [['added', world.data.chars.added]], remove: [] },
+    ops: { set: [], remove: ['retired'] } }, values: { tick: world.data.tick } };
+  first.changed(patch);
+  const before = reads;
+  first.capture(world);
+  assert.equal(reads, before);
+  full.changed(null);
+  full.capture(world);
+  assert(reads > before);
+  assert.equal(await first.proof(world, store, 'anchor'), await full.proof(world, store, 'anchor'));
 });
 
 async function earn(world, serial) {

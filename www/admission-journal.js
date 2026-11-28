@@ -15,7 +15,13 @@ function changedRows(table, previous, touched, scan) {
   const keys = Object.keys(table);
   const orderChanged = keys.length !== previous.keys.length || keys.some((key, index) => key !== previous.keys[index]);
   const edits = [];
-  const ids = scan || orderChanged ? new Set([...previous.rows.keys(), ...keys]) : touched;
+  const ids = scan ? new Set([...previous.rows.keys(), ...keys]) : touched;
+  if (!scan && orderChanged) {
+    // Order and row contents are independent parts of the signed result.
+    // A newly added food cell can move every subsequent row to another page.
+    for (const id of keys) if (!previous.rows.has(id)) ids.add(id);
+    for (const id of previous.keys) if (!Object.hasOwn(table, id)) ids.add(id);
+  }
   for (const id of ids) {
     const value = Object.hasOwn(table, id) ? JSON.stringify([id, table[id]]) : undefined;
     if (value === previous.rows.get(id)) continue;
@@ -55,7 +61,7 @@ export class AdmissionJournal {
     if (!changes?.chars || this.pendingMerge !== changes) this.scan = true;
     else {
       for (const id of changes.chars) this.touched.chars.add(id);
-      for (const id of Object.keys(incoming.ops || {})) this.touched.ops.add(id);
+      for (const id of changes.ops ?? Object.keys(incoming.ops || {})) this.touched.ops.add(id);
       for (const id of Object.keys(archived?.ops || {})) this.touched.ops.add(id);
     }
     this.pendingMerge = undefined;
