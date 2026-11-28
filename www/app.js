@@ -342,7 +342,7 @@ function needsReplicaSave(incoming, current, store) {
   if (['chars', 'travel'].some(field => store.ids[field].size && Object.keys(incoming[field] || {}).some(id => store.ids[field].has(id)))) return true;
   return Object.keys(priorCheckpoint?.world?.roots || {}).some(root => Object.hasOwn(current.roots, root));
 }
-async function mergeVerifiedWorld(data, peer, context, { local = false, worldMessage } = {}) {
+async function mergeVerifiedWorld(data, peer, context, { local = false, worldMessage, joined } = {}) {
   const target = world, store = archiveStore, revision = store.revision;
   const delta = context === 'world-delta';
   let incoming = data, archived, checkedRules;
@@ -366,10 +366,11 @@ async function mergeVerifiedWorld(data, peer, context, { local = false, worldMes
     const apply = () => {
       const index = delta && renderer.currentIndex(target);
       let changes;
-      try { changes = target.merge(incoming, archived, delta ? 'replica' : undefined, delta, checkedRules); }
+      try { changes = target.merge(incoming, archived, delta ? 'replica' : undefined, delta || (joined && 'join'), checkedRules); }
       finally { if (delta) noteCheckpointMerge(target.data, changes, incoming, archived); }
       if (delta) pictures.merged(target, changes);
       if (index) renderer.applyMerge(target, index, changes);
+      joined?.(target, priorTick, priorRevision, changes);
       if (worldMessage && delta) followVerifiedReplica(target, priorTick, priorRevision, changes);
     };
     let movement;
@@ -390,9 +391,9 @@ function presentReplicaMovement(movement) {
     renderClient.merged(world, movement);
   } else renderClient.merged(world);
 }
-async function mergeReplica(data, peer, context = 'merge', worldMessage) {
+async function mergeReplica(data, peer, context = 'merge', worldMessage, joined) {
   const previousTerrain = world.data.terrain?.seed;
-  const { joinedWorld, movement, routine, ignored } = await mergeVerifiedWorld(data, peer, context, { worldMessage });
+  const { joinedWorld, movement, routine, ignored } = await mergeVerifiedWorld(data, peer, context, { worldMessage, joined });
   if (ignored) return;
   presentReplicaMovement(movement);
   if (context === 'world-delta' && worldMessage) {
@@ -491,10 +492,12 @@ async function onMessage(message, peer) {
     }
     if (message.from !== peer.node || body.member?.id !== message.from || body.member.actor !== message.actor) return;
     const newKnowledge = Object.keys(body.world.roots || {}).some(r => !world.data.roots[r]) || Object.keys(body.world.ops || {}).some(id => !world.data.ops[id]) || Object.keys(body.world.chats || {}).some(id => !world.data.chats[id]) || Object.keys(body.world.chatSources || {}).some(id => !world.data.chatSources[id]);
-    await mergeReplica(body.world, peer, 'hello'); geometryRepair = true;
+    let joined;
+    const retain = peer.replicaLive && body.member.orderedSteps === 1 && body.member.build === meta.version && simulation.owner === world;
+    await mergeReplica(body.world, peer, 'hello', undefined, retain ? (...state) => { joined = state; } : undefined); geometryRepair = true;
     replicaRecovery.covered(message);
     const own = body.member; members.set(own.id, { ...own, url: peer.url, at: Date.now() }); remember(peer.url);
-    followVerifiedReplica(world);
+    if (joined) followVerifiedReplica(...joined); else followVerifiedReplica(world);
     rememberAuthor(message.actor, own.nick);
     for (const m of body.members || []) remember(m.url);
     if (newKnowledge) await network.broadcast('merge', { world: body.world }, { capturedWorld: true });

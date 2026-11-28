@@ -94,6 +94,22 @@ test('连续两次已核合流只更新热线程里变过的鱼元，保留旧�
   });
   try {
     await client.prepareAgreed(replica, () => true);
+    const revisionAtHello = worldRevision(replica);
+    const hello = authority.serialize();
+    hello.chars[op.id].ecoGraceAt = start + 500;
+    replica.data.chars[op.id].ecoGraceAt = start + 1000;
+    const unchanged = { ...op, id: crypto.randomUUID(), t: start };
+    assert.ok(replica.apply(unchanged).ok);
+    assert.ok(authority.apply(unchanged).ok);
+    hello.chars[unchanged.id] = authority.data.chars[unchanged.id];
+    hello.ops[unchanged.id] = authority.data.ops[unchanged.id];
+    // A locally winning claim can still take the earlier grace time from its
+    // peer. An equal new foreground operation remains in the client's input queue.
+    const joined = replica.merge(hello, {}, undefined, 'join');
+    assert.deepEqual([...joined.chars], [op.id]);
+    await client.followVerifiedReplica(replica, start, revisionAtHello, joined, () => true);
+    assert.equal(workers.length, 1);
+    assert.equal(JSON.stringify(workers[0].world.data.chars), JSON.stringify(replica.data.chars));
     for (let n = 1; n <= 2; n++) {
       const prior = replica.data.tick, revision = worldRevision(replica);
       const input = { ...op, id: crypto.randomUUID(), t: prior };

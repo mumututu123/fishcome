@@ -725,6 +725,7 @@ export class World {
     this.foodRevision++; this.dirty = true;
   }
   merge(other, archived = {}, origin, trackChanges = false, checkedRules) {
+    const joining = trackChanges === 'join';
     let cellIndex = origin === 'replica' ? replicaCellIndexes.get(this) : undefined;
     const changes = trackChanges ? { chars: undefined, fishes: new Set(), scenes: new Set() } : undefined;
     let changedChars = trackChanges ? new Set() : undefined;
@@ -743,7 +744,7 @@ export class World {
     let initial;
     for (const op of Object.values(other.ops)) if (op.genesis !== undefined &&
       !validInitialOp(op, initial ??= initialSources(sources.roots))) throw new Error('初始鱼记录被修改或无效');
-    worldEdited(this, origin, changes);
+    worldEdited(this, origin, joining ? undefined : changes);
     this.data.terrain = clone(chooseTerrain(terrainOf(this.data), terrainOf(other)));
     Object.assign(this.data.roots, other.roots);
     for (const [id, op] of Object.entries(other.ops)) {
@@ -786,10 +787,12 @@ export class World {
       // A newly visible older row or a new array-index key may change iteration order.
       if (changedChars && (live?.kind === 'burn' && chosen.kind !== 'burn' ||
         !live && String(Number(id) >>> 0) === id && Number(id) < 0xffffffff)) changedChars = undefined;
-      changedChars?.add(id);
       this.data.chars[id] = clone(chosen);
       const grace = [old?.ecoGraceAt, c.ecoGraceAt].filter(Number.isFinite);
       if (grace.length) this.data.chars[id].ecoGraceAt = Math.min(...grace);
+      // A complete hello includes rows already won by our validated replica.
+      // The new row is detached as usual, while the worker can retain its copy.
+      if (!joining || chosen !== live || live.ecoGraceAt !== this.data.chars[id].ecoGraceAt) changedChars?.add(id);
     }
     if (competingBirths.size) for (const [id, c] of Object.entries(this.data.chars)) if (!Object.hasOwn(other.chars, id)) {
       const next = reconcilePath(c);
