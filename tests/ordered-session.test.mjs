@@ -64,7 +64,8 @@ test('双方持有已验证的包、确认归档后才同时移出原签名记�
   for (const { manifest, encoded } of chunks) { boundary.chunks[manifest.id] = manifest; packs[manifest.id] = encoded; }
   const agreement = a.session.proposeArchive(boundary);
   while (!a.session.current.archive.plan) await new Promise(r => setTimeout(r, 1));
-  await drain();
+  await drain(message => message.action === 'archiveReady');
+  assert.equal(a.session.current.archive.remote, undefined);
   for (const side of [a,b]) { assert.ok(side.world.data.ops[op.body.id]); assert.equal(side.store.ids.ops.size, 0); }
   for (const side of [a,b]) assert.equal(side.session.run(now + 500), true);
   await drain();
@@ -168,4 +169,24 @@ test('入场保留场景编辑和鱼名册的原遍历次序，只为不同的�
   for (const name of ['chars','fishes','ops','travel']) assert.equal(opening.order[name],undefined);
   assert.deepEqual(Object.keys(traffic.find(r=>r.action==='tableOrder').order), ['fishes']);
   assert.deepEqual(a.stops,[]); assert.deepEqual(b.stops,[]);
+});
+test('漏掉首次归档公告时继续确认鱼步，随后补发同一归档', async () => {
+  const now = Date.now(), { sides: [a,b], drain } = pair(now);
+  await a.session.probe(); await drain();
+  const boundary = { version: 1, at: now + 1, chunks: {} };
+  const completed = a.session.proposeArchive(boundary);
+  while (!a.session.current.archive.plan) await new Promise(r=>setTimeout(r,1));
+  await drain(message => message.action === 'archive');
+  assert.equal(b.session.current.archive, undefined);
+  a.session.current.archive.announced = performance.now() - 1500;
+  for (let index = 1; index <= 2; index++) {
+    for (const side of [a,b]) assert.equal(side.session.run(now + index * 500), true);
+    await drain();
+  }
+  assert.equal(await completed,true);
+  for (const side of [a,b]) {
+    assert.equal(side.world.data.archives.at, boundary.at);
+    assert.deepEqual(side.stops,[]);
+    assert.equal(side.calls.length,2);
+  }
 });

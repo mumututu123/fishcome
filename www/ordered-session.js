@@ -195,7 +195,7 @@ export class OrderedSession {
   async proposeArchive(boundary) {
     const s = this.current;
     if (!s?.owner || !s.steps || s.archive || !this.valid(s)) return false;
-    const ticket = s.archive = { boundary };
+    const ticket = s.archive = { boundary, announced: performance.now() };
     const completion = new Promise(resolve => { ticket.done = resolve; });
     try {
       ticket.id = await stepDigest(boundary);
@@ -243,7 +243,7 @@ export class OrderedSession {
     if (!this.valid(s)) { this.stop('共同结算的连接或归档已更换'); return; }
     if (b.action === 'history' && s.owner && !s.steps && !s.reconciling && b.base === s.base) {
       if (!s.cut?.exceptBonds || b.exceptBonds !== s.cut.exceptBonds) {
-        const different = [...largeTables].filter(name => b.tableProofs?.[name] !== s.cut?.tableProofs?.[name]);
+        const different = [...largeTables].filter(name => /^[0-9a-f]{64}$/.test(b.tableProofs?.[name]) && b.tableProofs[name] !== s.cut?.tableProofs?.[name]);
         if (!s.expanded && different.length) {
           s.expanded = true;
           await this.send(s, { action: 'tableOrder', base: s.base, order: checkpointOrder(s.world.data, different) });
@@ -304,6 +304,14 @@ export class OrderedSession {
     if (b.action === 'finished') {
       if (!s.owner || !Number.isSafeInteger(b.base) || !/^[0-9a-f]{64}$/.test(b.proof) ||
           (b.base !== s.steps.tick && b.base !== s.steps.next?.tick)) return;
+      const ticket = s.archive;
+      if (ticket?.id && !ticket.committed) {
+        if (b.archive === ticket.id && b.verifiedArchive === true) ticket.remote = true;
+        else if (b.archive !== ticket.id && performance.now() - ticket.announced > 1000) {
+          ticket.announced = performance.now();
+          await this.send(s, { action: 'archive', boundary: ticket.boundary, id: ticket.id });
+        }
+      }
       s.finished = { base: b.base, proof: b.proof };
       return this.nextOffer(s);
     }
@@ -387,7 +395,8 @@ export class OrderedSession {
       if (!this.valid(s) || !proof) return;
       s.running = false;
       if (s.owner) await this.nextOffer(s);
-      else await this.send(s, { action: 'finished', base: s.base, proof });
+      else await this.send(s, { action: 'finished', base: s.base, proof,
+        ...(s.archive && { archive: s.archive.id, verifiedArchive: !!s.archive.plan }) });
     }).catch(error => { if (this.current === s) this.stop(error.message); });
     return true;
   }
