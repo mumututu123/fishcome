@@ -407,7 +407,8 @@ test('等各伙伴应用回执后才继续发送，慢伙伴合并积压行而�
       onMessage(message) {
         assert.equal(message.kind, 'world');
         received[peer.node].push(message.body);
-        if (peer.node === 'slow' && message.body.world.tick === 1) return hold;
+        if (peer.node === 'slow' && message.body.world.tick === 1) return hold.then(() => true);
+        return true;
       },
       directControl(_, kind, body) { return sender.receive({ kind, from: peer.node, body }, peer); }
     })
@@ -477,7 +478,7 @@ test('实时更新的末页比中间页更早验签时仍应用完整版本并�
   const received = [], receipts = [];
   const peer = { node: 'source', replicaLive: true };
   const replica = new ReplicaTransfers({
-    onMessage(message) { received.push(message.body); },
+    onMessage(message) { received.push(message.body); return true; },
     directControl(_, kind, body) { receipts.push({ kind, body }); }
   });
   t.after(() => replica.stop());
@@ -530,7 +531,7 @@ for (const frames of [false, true]) test(`一端遗失基准时原格式重发�
     close(_, error) { errors.push(error); }
   });
   const receiver = new ReplicaTransfers({
-    onMessage(message) { received.push(message.body.world); },
+    onMessage(message) { received.push(message.body.world); return true; },
     directControl(_, kind, body) { return sender.receive({ kind, body, from: peer.node }, peer); }
   });
   t.after(() => { sender.stop(); receiver.stop(); });
@@ -766,6 +767,34 @@ test('归档多次发布同一步，漏收这一步的伙伴仍能在下一步�
   assert.deepEqual(current.world.participants, {});
 });
 
+test('伙伴已解码但未提交时保留欠下的记录，下一次更新补齐且不空转重发', async t => {
+  const peer = { node: 'reader', confirmedReplica: 'hello', replicaLive: true };
+  const origin = { node: 'writer', replicaLive: true };
+  const received = [], receipts = [], failures = [];
+  const sender = new ReplicaTransfers({
+    directControl(_, kind, body) { return receiver.receive({ from: origin.node, kind, body }, origin); },
+    close(_, error) { failures.push(error); }
+  });
+  const receiver = new ReplicaTransfers({
+    onMessage(message) { received.push(message.body); if (received.length > 1) return true; },
+    directControl(_, kind, body) { receipts.push(body); return sender.receive({ from: peer.node, kind, body }, peer); }
+  });
+  t.after(() => { sender.stop(); receiver.stop(); });
+  const publish = (fromTick, tick, ops) => sender.publishLive({ delta: true, fromTick, world: { tick, ops } }, [peer]);
+  publish(0, 500, { old: 1 });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(received.length, 1);
+  assert.equal(receipts[0].committed, false);
+  assert.equal(sender.live.get(peer).running, false);
+  publish(500, 1000, { recent: 2 });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(received[1].fromTick, 0);
+  assert.deepEqual(received[1].world.ops, { old: 1, recent: 2 });
+  assert.equal(receipts[1].committed, undefined);
+  assert.equal(sender.live.size, 0);
+  assert.deepEqual(failures, []);
+});
+
 test('修复只占用该伙伴的实时通道，取全海和等待确认期间的增量一起接在后面', async () => {
   const transfers = new ReplicaTransfers({});
   const peer = { confirmedReplica: 'known', replicaCatchingUp: true }, other = {};
@@ -777,7 +806,7 @@ test('修复只占用该伙伴的实时通道，取全海和等待确认期间�
     assert.equal(target, peer);
     sent.push(body);
     if (body === full) { startedSending(); await new Promise(resolve => { acknowledgeFull = resolve; }); }
-    return crypto.randomUUID();
+    return { id: crypto.randomUUID(), committed: true };
   };
   transfers.repairLive(peer, () => new Promise(resolve => { releaseCapture = () => resolve(full); }));
   const lane = transfers.live.get(peer);

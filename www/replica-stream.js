@@ -217,6 +217,7 @@ export class ReplicaTransfers {
     this.resumeLive(peer);
   }
   async sendLive(peer, lane) {
+    let waitForPublication = false;
     try {
       while (lane.pending || lane.snapshot) {
         // Take the full snapshot on the same ordered stream as subsequent
@@ -227,15 +228,24 @@ export class ReplicaTransfers {
         const body = snapshot ? await snapshot() : pending;
         if (this.live.get(peer) !== lane) return;
         if (snapshot && lane.snapshot !== snapshot) continue;
+        lane.sending = body;
         let prior = this.rowsSent.get(peer);
         const encoded = peer.replicaRows ? encodeReplicaRowDelta(body, prior, peer.replicaFrames, peer.replicaPoseBytes) : body;
-        let id = await this.sendLivePacket(peer, lane, encoded);
-        if (!id && encoded !== body) { prior = null; id = await this.sendLivePacket(peer, lane, body); }
-        if (!id) throw new Error('伙伴拒绝世界增量');
-        if (peer.replicaRows) this.rowsSent.set(peer, replicaRowBase(id, body.world, peer.replicaFrames, encoded.frameRows && prior));
+        let receipt = await this.sendLivePacket(peer, lane, encoded);
+        if (!receipt && encoded !== body) { prior = null; receipt = await this.sendLivePacket(peer, lane, body); }
+        if (!receipt) throw new Error('伙伴拒绝世界增量');
+        if (peer.replicaRows) this.rowsSent.set(peer, replicaRowBase(receipt.id, body.world, peer.replicaFrames, encoded.frameRows && prior));
         if (snapshot && lane.snapshot === snapshot) lane.snapshot = null;
+        if (!receipt.committed && lane.sending === body) {
+          if (lane.pending) lane.pending = coalesceWorld(body, lane.pending);
+          else if (!lane.snapshot) { lane.pending = body; waitForPublication = true; return; }
+        }
       }
-    } finally { if (this.live.get(peer) === lane) this.live.delete(peer); }
+    } finally {
+      lane.sending = null;
+      lane.running = false;
+      if (!waitForPublication && this.live.get(peer) === lane) this.live.delete(peer);
+    }
   }
   async sendLivePacket(peer, lane, body) {
     const id = crypto.randomUUID();
@@ -250,15 +260,14 @@ export class ReplicaTransfers {
         const [, next] = await Promise.all([this.network.directControl(peer, 'replicaPage', packet), applied]);
         if (next === -2 && body.rowBase) return null;
         if (next !== index) throw new Error('伙伴拒绝世界增量');
-        return id;
+        return { id, committed: lane.receipt.committed !== false };
       } finally { clearTimeout(timeout); lane.receipt = null; }
     }
   }
   discardPendingLive() {
     this.unpublished = new WeakMap();
-    this.unpublished = new WeakMap();
     for (const [peer, lane] of this.live) {
-      if (lane.running) { lane.pending = null; lane.snapshot = null; }
+      if (lane.running) { lane.pending = null; lane.snapshot = null; lane.sending = null; }
       else this.live.delete(peer);
     }
   }
@@ -324,7 +333,10 @@ export class ReplicaTransfers {
     if (message.kind === 'replicaReceipt') {
       const live = this.live.get(peer)?.receipt;
       const ack = live?.id === id ? live : peer.replicaAck;
-      if (ack?.id === id && ack.index === index && message.from === peer.node) ack.resolve(message.body.next);
+      if (ack?.id === id && ack.index === index && message.from === peer.node) {
+        if (ack === live) ack.committed = message.body.committed;
+        ack.resolve(message.body.next);
+      }
       return false;
     }
     const direct = kind === 'hello' || kind === 'catchup', live = kind === 'live';
@@ -374,16 +386,18 @@ export class ReplicaTransfers {
           if (!live || !peer.replicaRows) throw new Error('伙伴未确认实时变更格式');
           body = decodeReplicaRowDelta(body, this.rowsReceived.get(peer), frame, peer.replicaPoseBytes);
         }
+        let committed;
         if (body) {
           state.applying = this.network.onMessage({ id, kind: kind === 'catchup' ? 'merge' : live ? 'world' : kind, actor: message.actor, from: message.from, key: message.key, body }, peer);
-          await state.applying;
+          committed = await state.applying;
           if (live && peer.replicaRows) this.rowsReceived.set(peer, replicaRowBase(id, body.world, peer.replicaFrames, prior));
         }
         if (kind === 'hello') { peer.confirmedReplica = id; this.resumeLive(peer); }
         clearTimeout(state.timer); this.incoming.delete(key);
         const timer = setTimeout(() => this.completed.delete(key), RESUME_MS);
         this.completed.set(key, { next: state.next, timer });
-        if (live) await this.network.directControl(peer, 'replicaReceipt', { id, index: state.endIndex, next: body ? state.next : -2 });
+        if (live) await this.network.directControl(peer, 'replicaReceipt', { id, index: state.endIndex, next: body ? state.next : -2,
+          ...(body && committed !== true && { committed: false }) });
         break;
       }
       await acknowledge(state.next);
@@ -397,7 +411,6 @@ export class ReplicaTransfers {
     return !direct && !live;
   }
   close(peer, error) {
-    this.unpublished.delete(peer);
     this.unpublished.delete(peer);
     peer.replicaAck?.reject(error);
     const lane = this.live.get(peer);

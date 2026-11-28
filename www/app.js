@@ -282,7 +282,7 @@ function presentReplicaMovement(movement) {
 async function mergeReplica(data, peer, context = 'merge', worldMessage) {
   const previousTerrain = world.data.terrain?.seed;
   const { joinedWorld, movement, routine, ignored } = await mergeVerifiedWorld(data, peer, context, { worldMessage });
-  if (ignored) return false;
+  if (ignored) return;
   presentReplicaMovement(movement);
   if (context === 'world-delta' && worldMessage) {
     const repair = replicaRecovery.request(worldMessage);
@@ -366,7 +366,7 @@ async function onMessage(message, peer) {
   if (message.kind === 'archiveRequest') { const encoded = archiveStore.packs.get(message.body.id) || await get('archive:' + message.body.id); await network.direct(peer, encoded ? 'archiveChunk' : 'archiveMissing', { id: message.body.id, encoded }); return; }
   if (message.kind === 'archiveChunk' || message.kind === 'archiveMissing') { const waiting = archiveWaiters.get(message.body.id); if (waiting?.peer === message.from) { if (message.kind === 'archiveChunk') waiting.resolve(message.body.encoded); else waiting.reject(new Error('伙伴没有这份归档')); } return; }
   await resumeAfterInactivity();
-  if (members.has(message.from) && members.get(message.from).actor !== message.actor) return;
+  if (members.has(message.from) && members.get(message.from).actor !== message.actor) return false;
   const body = message.body;
   if (message.kind === 'hello') {
     if (!body.world?.terrain || !rulesCompatible(body.rules)) {
@@ -408,13 +408,17 @@ async function onMessage(message, peer) {
       } else await network.broadcast('merge', { ...repair, world: await captureReplica() }, { capturedWorld: true });
     }
   } else if (message.kind === 'world') {
-    if (message.from !== leader()) { replicaRecovery.ignore(message); return; }
+    if (message.from !== leader()) { replicaRecovery.ignore(message); return false; }
     if (replicaRecovery.gap(message, world.data.tick)) {
       const repair = replicaRecovery.request(message);
       if (repair) await network.broadcast('replicaRequest', repair);
-      return;
+      return false;
     }
-    try { if (await mergeReplica(body.world, peer, body.delta ? 'world-delta' : 'world-full', message)) update(); }
+    try {
+      const changed = await mergeReplica(body.world, peer, body.delta ? 'world-delta' : 'world-full', message);
+      if (changed) update();
+      return changed !== undefined;
+    }
     catch (error) {
       if (body.delta && Date.now() - lastRepair > 5000) {
         lastRepair = Date.now();
