@@ -3,6 +3,7 @@ import { contactTime, densityField } from './ecology.js';
 
 const glyphOrders = new WeakMap();
 const namedBodies = new WeakMap();
+const relativeContacts = new WeakMap();
 
 export function hasNamedGlyphs(cells) {
   let named = namedBodies.get(cells);
@@ -35,25 +36,64 @@ function gridBodies(layout) {
   return layout.checkedContacts;
 }
 
-function glyphOrder(cells, mother) {
+function glyphOrder(cells, mother, hull) {
   let orders = glyphOrders.get(cells);
   if (!orders) glyphOrders.set(cells, orders = {});
   const side = mother ? 'mother' : 'father';
   // Male contact uses the ordinal minimum ID. Mothers use the first ID in locale order.
-  return orders[side] ??= cells.map(({ x, y, id }) => ({ x, y, id })).sort(mother
-    ? (a, b) => a.id.localeCompare(b.id) : (a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+  if (!orders[side]) {
+    const order = cells.slice().sort(mother
+      ? (a, b) => a.id.localeCompare(b.id) : (a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+    const xy = hull.xy;
+    orders[side] = order.every((c, i) => c.x === xy[2 * i] && c.y === xy[2 * i + 1]) ? xy : order.flatMap(c => [c.x, c.y]);
+  }
+  return orders[side];
+}
+
+function contactOffsets(father, mother, x, y, facing, motherFacing) {
+  const edges = [];
+  for (let i = 0; i < father.length; i += 2) {
+    const px = facing * father[i], py = father[i + 1];
+    for (let j = 0; j < mother.length; j += 2) {
+      const dy = y + mother[j + 1] - py;
+      if (Math.abs(dy) > 1) continue;
+      const dx = deltaX(x + motherFacing * mother[j], px);
+      if (Math.abs(dx) > 1 || !dx && !dy) continue;
+      edges.push(px, py, dx, dy);
+      if (!dx || !dy) return edges;
+    }
+  }
+  return edges;
 }
 
 function waitingTime(density, grid, father, mother, scenery) {
-  const groups = grid.layout.groups;
-  const fatherCells = glyphOrder(groups.get(father.id), false);
-  const motherCells = glyphOrder(groups.get(mother.id), true);
-  for (const male of fatherCells) {
-    const x = father.x + father.facing * male.x, y = father.y + male.y;
-    for (const female of motherCells) {
-      const qy = mother.y + female.y, dy = qy - y;
+  const layout = grid.layout, groups = layout.groups;
+  const fatherCells = groups.get(father.id), motherCells = groups.get(mother.id);
+  const maleHull = layout.hull(fatherCells), femaleHull = layout.hull(motherCells);
+  const male = glyphOrder(fatherCells, false, maleHull), female = glyphOrder(motherCells, true, femaleHull);
+  if (male === maleHull.xy && female === femaleHull.xy && Math.abs(father.x) <= 2 * WORLD_WIDTH && Math.abs(mother.x) <= 2 * WORLD_WIDTH &&
+      Math.abs(father.facing) === 1 && Math.abs(mother.facing) === 1) {
+    let byMother = relativeContacts.get(maleHull);
+    if (!byMother) relativeContacts.set(maleHull, byMother = new WeakMap());
+    let plans = byMother.get(femaleHull);
+    if (!plans) byMother.set(femaleHull, plans = new Map());
+    const x = deltaX(mother.x, father.x), y = mother.y - father.y;
+    const key = (y * WORLD_WIDTH + x) * 4 + Number(father.facing === 1) * 2 + Number(mother.facing === 1);
+    let edges = plans.get(key);
+    if (!edges) plans.set(key, edges = contactOffsets(male, female, x, y, father.facing, mother.facing));
+    for (let i = 0; i < edges.length; i += 4) {
+      const px = father.x + edges[i], py = father.y + edges[i + 1], dx = edges[i + 2], dy = edges[i + 3];
+      if (dx && dy && (scenery.has(worldKey(px, py + dy)) || scenery.has(worldKey(px + dx, py)))) continue;
+      return contactTime(density(px + dx / 2, py + dy / 2));
+    }
+    return Infinity;
+  }
+  for (let i = 0; i < male.length; i += 2) {
+    const x = father.x + father.facing * male[i], y = father.y + male[i + 1];
+    for (let j = 0; j < female.length; j += 2) {
+      const qy = mother.y + female[j + 1], dy = qy - y;
       if (Math.abs(dy) > 1) continue;
-      const qx = mother.x + mother.facing * female.x, dx = deltaX(qx, x);
+      const qx = mother.x + mother.facing * female[j], dx = deltaX(qx, x);
       if (Math.abs(dx) > 1 || !dx && !dy) continue;
       if (dx && dy && (scenery.has(worldKey(x, qy)) || scenery.has(worldKey(qx, y)))) continue;
       return contactTime(density((x + nearX(qx, x)) / 2, (y + qy) / 2));
