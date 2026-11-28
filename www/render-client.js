@@ -5,6 +5,7 @@ export class RenderClient {
     this.renderer = renderer;
     this.generation = 0;
     this.hitId = 0;
+    this.offerId = 0;
     this.hits = new Map();
   }
 
@@ -94,15 +95,31 @@ export class RenderClient {
     return Boolean(this.visible);
   }
 
+  offer(world, roster) {
+    if (!this.visible || !this.active || this.pending || this.world !== world || this.data !== world.data) return;
+    const { port1, port2 } = new MessageChannel();
+    const worker = this.worker, id = ++this.offerId, generation = this.generation;
+    const offer = {
+      id, generation, worker, port: port2,
+      done() { if (!this.permitted) worker.postMessage({ cancel: id }); },
+    };
+    worker.postMessage({ offer: { id, generation, port: port1, stableRoster: roster === this.roster } }, [port1]);
+    return offer;
+  }
+
   changed(world, patch, origin, merge, startedAt) {
     if (!this.worker || !this.active || world !== this.world || this.data !== world.data || origin === 'archive') return;
     if (!patch) { this.pending = { merge }; return; }
     if (this.pending) this.reset(world, patch.swims, startedAt);
     else {
       const roster = patch.tables.fishes?.frame?.knownFish;
-      const message = { generation: this.generation, changes: renderEdits(patch), startedAt };
+      const offer = patch.display;
+      const message = { generation: this.generation, startedAt };
+      if (offer?.worker === this.worker && offer.generation === this.generation) message.permit = offer.id;
+      else message.changes = renderEdits(patch);
       if (roster && roster !== this.roster) message.roster = this.roster = roster;
       this.worker.postMessage(message);
+      if (message.permit !== undefined) offer.permitted = true;
     }
   }
 

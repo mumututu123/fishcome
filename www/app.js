@@ -34,6 +34,7 @@ const $ = id => document.getElementById(id);
 const renderer = new Renderer($('sea'));
 const renderClient = new RenderClient(renderer);
 const simulation = new SimulationClient();
+simulation.displayStep = (world, roster) => renderClient.offer(world, roster);
 let displayedWorld, displayedFish, displayedScenes;
 subscribeSimulationChanges((target, patch, origin, merge) => {
   const shownAt = performance.now();

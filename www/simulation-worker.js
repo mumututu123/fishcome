@@ -8,6 +8,7 @@ import { shanghaiDay } from './fish-status.js';
 import { characterPositionFields, worldTables } from './simulation-changes.js';
 import { encodeFields, motionFields } from './simulation-delta.js';
 import { advanceBond } from './bond-interval.js';
+import { renderEdits } from './render-view.js';
 import { digestJsonText, jsonDigest } from './step-digest.js';
 import { FishStepProof } from './fish-step-proof.js';
 
@@ -885,6 +886,11 @@ if (typeof WorkerGlobalScope !== 'undefined' && globalThis instanceof WorkerGlob
   globalThis.onmessage = async ({ data }) => {
     try {
       const result = await simulation.receive(data), patch = result?.patch;
+      if (patch && data.renderPort) {
+        data.renderPort.postMessage(renderEdits(patch));
+        data.renderPort.close();
+        result.renderCut = true;
+      }
       // The page owns display columns. The signed proof reads the independent
       // authoritative records and changed IDs still held by this worker.
       postMessage({ result }, simulationBuffers(patch));

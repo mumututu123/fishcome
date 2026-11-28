@@ -75,9 +75,10 @@ function characterPositions(table, pages) {
   return positions;
 }
 
-export function applyResult(world, { patch: delta, foodRevision }, knownFish) {
-  const patch = expandSimulationPatch(world.data, delta, knownFish, true);
+export function applyResult(world, { patch: delta, foodRevision, display }, knownFish, prepared) {
+  const patch = prepared ?? expandSimulationPatch(world.data, delta, knownFish, true);
   patch.workerChanges = delta;
+  if (display) patch.display = display;
   simulationWillApply(world, patch);
   for (const [field, changes] of Object.entries(patch.tables)) {
     const table = world.data[field] ||= {};
@@ -130,10 +131,10 @@ export class SimulationClient {
     this.pending = null;
     pending?.resolve(null);
   }
-  request(message) {
+  request(message, transfer) {
     return new Promise((resolve, reject) => {
       this.pending = { resolve, reject };
-      this.worker.postMessage(message);
+      this.worker.postMessage(message, transfer);
     });
   }
   atStepBoundary(commit) {
@@ -322,11 +323,19 @@ export class SimulationClient {
     message.foods = Array.from(this.foods);
     this.names.clear();
     this.foods.clear();
-    const result = await this.request(message);
-    if (!result || !valid()) { this.close(); return null; }
-    if (!this.foods.size) {
-      applyResult(world, result, this.knownFish);
-      return result;
+    const display = message.kind === 'step' && this.displayStep?.(world, this.knownFish);
+    if (display) message.renderPort = display.port;
+    let result;
+    try {
+      result = await this.request(message, display ? [display.port] : undefined);
+      if (!result || !valid()) { this.close(); return null; }
+      if (!this.foods.size) {
+        if (result.renderCut) result.display = display;
+        applyResult(world, result, this.knownFish);
+        return result;
+      }
+    } finally {
+      if (display) display.done();
     }
     // A food arrived during this step. Restore the last committed records on
     // the worker before retrying. Table deletions can affect iteration order,

@@ -1,11 +1,22 @@
 import { World } from './engine.js';
 import { Renderer, observationCamera } from './renderer.js';
 import { applyResult } from './simulation-client.js';
+import { expandSimulationPatch } from './simulation-delta.js';
+import { RenderInbox } from './render-inbox.js';
 
 let world, painter, generation, roster = [], active, animation;
 const paintedKeys = ['paintedCells', 'paintedFish', 'paintedFishOwners', 'paintedCoordinates'];
 const preparedFrames = Array.from({ length: 4 }, () => ({}));
 let slot = 0;
+
+const inbox = new RenderInbox(({ changes, swims, roster: nextRoster, startedAt }, prepared) => {
+  if (changes) {
+    if (nextRoster) roster = nextRoster;
+    const patch = applyResult(world, { patch: changes, foodRevision: 0 }, roster, prepared);
+    painter.worldChanged(world, patch, undefined, startedAt - performance.timeOrigin);
+  }
+  if (swims) painter.presentSwims(world, swims, startedAt - performance.timeOrigin);
+}, changes => expandSimulationPatch(world.data, changes, roster, true));
 
 function paint(now) {
   animation = undefined;
@@ -38,22 +49,20 @@ function updateView({ dimensions, ...view }) {
 }
 
 onmessage = ({ data }) => {
+  if (data.offer) { inbox.offer(data.offer); return; }
+  if (data.cancel !== undefined) { inbox.cancel(data.cancel); return; }
   if (data.canvas) painter = new Renderer(data.canvas, data.view.dimensions);
   if (data.view) updateView(data.view);
   if (data.base) {
     generation = data.generation;
+    inbox.reset(generation);
     world = new World(data.base.tick, 'draw-owner', { populate: false });
     world.data = { ...world.data, ...data.base };
     roster = [];
     painter.cellIndex(world);
   }
   if (data.active !== undefined) active = data.active;
-  if (data.generation === generation && data.changes) {
-    if (data.roster) roster = data.roster;
-    const changes = applyResult(world, { patch: data.changes, foodRevision: 0 }, roster);
-    painter.worldChanged(world, changes, undefined, data.startedAt - performance.timeOrigin);
-  }
-  if (data.generation === generation && data.swims) painter.presentSwims(world, data.swims, data.startedAt - performance.timeOrigin);
+  if (data.changes || data.swims || data.permit !== undefined) inbox.update(data);
   if (data.hit) {
     const [request, x, y, at] = data.hit;
     let frame;
