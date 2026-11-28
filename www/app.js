@@ -5,6 +5,7 @@ import { atCheckpointBoundary, get, getMany, readCheckpointVersion, sameStoredCh
 import { beforeCheckpointPatch, noteCheckpointChanges, noteCheckpointMerge } from './checkpoint-pages.js';
 import { CheckpointPictures } from './checkpoint-picture.js';
 import { Network } from './network.js';
+import { OrderedSession } from './ordered-session.js';
 import { ReplicaInventory, ReplicaRecovery, ReplicaSwims, WorldBroadcast } from './world-broadcast.js';
 import { DiagnosticLog, inspectFishOrigins, repairFishOriginIssues, diagnosticSummary } from './diagnostics.js';
 import { loadReplicaArchives, verifyChats, verifyLocalCheckpoint, verifyReplica } from './replica.js';
@@ -58,7 +59,10 @@ const replicaRecovery = new ReplicaRecovery();
 const replicaInventory = new ReplicaInventory();
 subscribeSimulationChanges((target, patch) => {
   if (target === world && started && !updateFrozen && !replacingCheckpoint && Number.isFinite(patch?.values?.tick)) {
-    broadcastWorld(patch.swims);
+    if (!ordered.current?.running) {
+      broadcastWorld(patch.swims);
+      if (amLeader()) queueMicrotask(() => ordered.probe().catch(stopOrdered));
+    }
   }
 });
 async function captureReplica() {
@@ -97,10 +101,57 @@ const historyQueues = new Map();
 function authorNick(actor, fallback) { return actor === identity?.actor ? identity.nick : active().find(member => member.actor === actor)?.nick || world.data.participants[actor] || displayNick(fallback) || '匿名'; }
 function rememberAuthor(actor, nick) { if (setParticipantName(world, actor, nick)) { renderedChatCount = -1; renderChat(); } }
 function toast(text) { $('toast').textContent = text; $('toast').hidden = false; clearTimeout(toast.timer); toast.timer = setTimeout(() => $('toast').hidden = true, 5000); }
-function member() { return { replicaPages: 1, id: network.node, actor: identity.actor, nick: displayNick(identity.nick), url: meta.url, at: Date.now(), visible: !document.hidden, peers: network.live().length }; }
+function member() { return { replicaPages: 1, orderedSteps: 1, build: meta.version, id: network.node, actor: identity.actor, nick: displayNick(identity.nick), url: meta.url, at: Date.now(), visible: !document.hidden, peers: network.live().length }; }
 function active() { return [...members.values()].filter(m => Date.now() - m.at < 120000); }
 function leader() { return active().sort((a, b) => +b.visible - +a.visible || a.id.localeCompare(b.id))[0]?.id || network.node; }
 function amLeader() { return !!network && leader() === network.node; }
+function orderedPeer() {
+  if (!started || updateFrozen || replacingCheckpoint || archiveImports || archiveBusy || !meta.version || !network) return;
+  const peers = network.live(), people = active();
+  if (peers.length !== 1 || people.length !== 2 || network.hasRelayedWorldPeer(peers)) return;
+  const peer = peers[0], other = members.get(peer.node);
+  if (other?.orderedSteps === 1 && other.build === meta.version && peer.sentHello && peer.confirmedReplica &&
+      !peer.replicaCatchingUp && (!amLeader() || !geometryRepair && !world.data.pendingChatGlyphs)) return peer;
+}
+function orderedInputs() {
+  return [...inbox.values()].filter(op => !rejectedOps.has(op.body.id) && !world.data.ops[op.body.id] && !archiveStore.ids.ops.has(op.body.id))
+    .sort((a, b) => a.body.t - b.body.t || a.body.id.localeCompare(b.body.id)).slice(0, 64);
+}
+async function resumeOrderedInputs() {
+  for (const op of orderedInputs()) {
+    if (!amLeader() || ordered.current?.steps) return;
+    const result = await applyAtBoundary(op, true);
+    if (!result) return;
+    if (!result.ok) rejectOperation(op.body.id);
+    await network.broadcast('ack', { id: op.body.id, result });
+  }
+}
+const ordered = new OrderedSession({
+  world: () => world, store: () => archiveStore, peer: orderedPeer, leader, isLeader: amLeader, inputs: orderedInputs,
+  send: (peer, body) => network.directControl(peer, 'orderedStep', body),
+  validOp: async (target, op) => op.body.roots?.some(root => Object.hasOwn(target.data.roots, root)) &&
+    !target.validOp(op.body) && (op.body.kind !== 'referral' || await verifyReferral(op.body)),
+  install: (target, changes, valid, apply) => atCheckpointBoundary(target.data, () => {
+    if (valid()) apply(() => { worldEdited(target); Object.assign(target.data, changes); target.dirty = true; });
+  }),
+  apply(target, op, archived, owner) {
+    const result = target.apply({ ...clone(op.body), proof: clone(op) }, archived);
+    inbox.delete(op.body.id);
+    if (!result.ok) rejectOperation(op.body.id);
+    if (pending.delete(op.body.id) && !result.ok) toast(result.error);
+    if (owner) network.broadcast('ack', { id: op.body.id, result }).catch(() => {});
+    return result;
+  },
+  prepare: (target, valid) => simulation.prepareAgreed(target, valid),
+  advance: (target, nextTick, valid, handle) => simulation.advanceAgreed(target, nextTick, valid, handle),
+  stopped(session, reason) {
+    diagnostics.record('info', 'ordered-steps', reason);
+    if (session.executed && amLeader()) worldBroadcast.reset();
+    if (session.steps && amLeader()) resumeOrderedInputs().catch(error => diagnostics.record('warn', 'ordered-steps', error.message));
+  }
+});
+subscribeSimulationChanges((target, patch) => ordered.changed(target, patch));
+function stopOrdered(error) { ordered.stop(error.message); }
 function pendingCost() {
   let total = 0;
   for (const [id, operation] of pending) if (!world.data.ops[id] && !archiveStore.ids.ops.has(id)) total += operation.cost || 0;
@@ -183,6 +234,7 @@ async function archiveWorld(now = Date.now()) {
     const hasNewRecords = Object.values(plan).some(table => Object.keys(table).length);
     const mealTargets = new Set();
     if (hasNewRecords) {
+      ordered.stop('历史归档发生变化');
       archiveBusy = true;
       const chunks = await archiveChunks(plan, target.data.roots);
       if (!canArchive()) return;
@@ -195,6 +247,7 @@ async function archiveWorld(now = Date.now()) {
     const compact = await prepareCompaction(target, store, dependencies);
     const changed = await simulation.archiveAtStepBoundary(target, () => {
       if (!isCurrent() || (!hasNewRecords && !canArchive())) return;
+      ordered.stop('历史归档时刻已更新');
       const removed = compact();
       (target.data.archives ||= emptyArchiveState()).at = now;
       if (!hasNewRecords && !removed) return;
@@ -354,6 +407,12 @@ async function onMessage(message, peer) {
   await resumeAfterInactivity();
   if (members.has(message.from) && members.get(message.from).actor !== message.actor) return false;
   const body = message.body;
+  if (message.kind === 'orderedStep') {
+    if (peer.node !== message.from || members.get(message.from)?.actor !== message.actor) return;
+    try { await ordered.receive(peer, body); }
+    catch (error) { stopOrdered(error); throw error; }
+    return;
+  }
   if (message.kind === 'hello') {
     if (!body.world?.terrain || !rulesCompatible(body.rules)) {
       if (!peer.silent) { status = '对方使用不兼容的世界规则，请双方更新后再连接'; toast(status); }
@@ -403,6 +462,7 @@ async function onMessage(message, peer) {
     }
     try {
       const changed = await mergeReplica(body.world, peer, body.delta ? 'world-delta' : 'world-full', message);
+      if (changed !== undefined) ordered.afterReplica().catch(stopOrdered);
       if (changed) update();
       if (changed !== undefined && body.settledRecords && peer?.replicaLive && peer.node === message.from && message.from === leader()) {
         checkReplicaInventory(body, message.from, true);
@@ -421,7 +481,7 @@ async function onMessage(message, peer) {
     if (rejectedOps.has(body.id)) return;
     if (body.kind === 'referral' && !await verifyReferral(body)) return;
     inbox.set(body.id, clone(message));
-    if (amLeader()) {
+    if (amLeader() && !ordered.current?.steps) {
       const result = await applyAtBoundary(message, true);
       if (!result) return;
       if (result.ok) await save({ reusePicture: true }); else rejectOperation(body.id);
@@ -507,7 +567,7 @@ async function submit(payload) {
     const message = await network.broadcast('op', op);
     if (rejectedOps.has(op.id)) { pending.delete(op.id); update(); return; }
     inbox.set(op.id, clone(message));
-    const result = amLeader() && await applyAtBoundary(message, true);
+    const result = amLeader() && !ordered.current?.steps && await applyAtBoundary(message, true);
     if (result) {
       pending.delete(op.id);
       if (!result.ok) { rejectOperation(op.id); toast(result.error); }
@@ -969,8 +1029,9 @@ async function tick() {
   if (replacingCheckpoint) return;
   if (!updateFrozen && identity.remainder >= 3600) { identity.remainder -= 3600; identity.serial = (identity.serial || 0) + 1; await submit({ kind: 'earn', cost: 0, serial: identity.serial }); }
   members.set(network.node, member());
-  const currentLeader = leader(); if (currentLeader !== lastLeader) { simulation.close(); lastLeader = currentLeader; worldBroadcast.reset(); replicaSwims.reset(); renderer.presentSwims(world); if (amLeader()) { geometryRepair = true; world.data.tick = Math.max(world.data.tick, now - 2000); for (const envelope of [...inbox.values()].sort((a, b) => a.body.t - b.body.t || a.body.id.localeCompare(b.body.id))) { if (!world.data.ops[envelope.body.id]) { const result = world.apply({ ...clone(envelope.body), proof: clone(envelope) }); if (!result.ok) rejectOperation(envelope.body.id); network.broadcast('ack', { id: envelope.body.id, result }).catch(() => {}); } } for (const id of pending.keys()) if (world.data.ops[id]) pending.delete(id); } }
+  const currentLeader = leader(); if (currentLeader !== lastLeader) { ordered.stop('权威成员已更换'); simulation.close(); lastLeader = currentLeader; worldBroadcast.reset(); replicaSwims.reset(); renderer.presentSwims(world); if (amLeader()) { geometryRepair = true; world.data.tick = Math.max(world.data.tick, now - 2000); for (const envelope of [...inbox.values()].sort((a, b) => a.body.t - b.body.t || a.body.id.localeCompare(b.body.id))) { if (!world.data.ops[envelope.body.id]) { const result = world.apply({ ...clone(envelope.body), proof: clone(envelope) }); if (!result.ok) rejectOperation(envelope.body.id); network.broadcast('ack', { id: envelope.body.id, result }).catch(() => {}); } } for (const id of pending.keys()) if (world.data.ops[id]) pending.delete(id); } }
   if (amLeader() && fishRepairWaiting && now - lastSave > 5000) geometryRepair = true;
+  if (ordered.run(now)) return;
   if (amLeader() && !updateFrozen && !replacingCheckpoint) {
     const target = world;
     simulation.advance(target, now, () => target === world && amLeader() && !updateFrozen && !replacingCheckpoint && !archiveImports, {
@@ -985,7 +1046,7 @@ async function tick() {
         status = '后台模拟已暂停，刷新页面可重试。' + error.message;
         toast(status);
       });
-  } else simulation.close();
+  } else if (!ordered.current) simulation.close();
 }
 // Start periodic storage, presence and HUD work between ecology deadlines.
 // Foreground edits, pagehide and explicit archive requests keep their own cuts.

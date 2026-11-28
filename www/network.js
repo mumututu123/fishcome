@@ -258,6 +258,11 @@ export class Network {
     }
     if (this.seen.has(id)) return;
     this.seen.set(id, Date.now()); if (this.seen.size > 20000) { for (const [k, at] of this.seen) if (Date.now() - at > 120000) this.seen.delete(k); }
+    if (message.kind === 'orderedStep') {
+      if (message.from !== p.node) throw new Error('共同结算只能来自已验证的直连伙伴');
+      await this.onMessage(message, p);
+      return;
+    }
     const replicaPage = message.kind === 'replicaPage';
     if (signedFrame || replicaPage || message.kind === 'replicaReceipt') {
       const relayingWorld = replicaPage && message.body?.kind === 'world' && this.liveReplicaFrom(message.from);
