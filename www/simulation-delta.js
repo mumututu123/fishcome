@@ -1,5 +1,7 @@
-import { applyBondIntervals } from './bond-interval.js';
+import { applyBondIntervals, BondFrame } from './bond-interval.js';
 import { SimulationRows } from './simulation-rows.js';
+
+const bondProjection = Symbol();
 
 // A standalone swimmer publishes one fixed-width row. Ordinary edits and
 // lifecycle changes retain their sparse record format.
@@ -21,6 +23,29 @@ function applyFields(record, [set, remove]) {
   const result = { ...record, ...set };
   for (const key of remove || []) delete result[key];
   return result;
+}
+
+function applyLifeFields(life, [set, remove], bonds) {
+  if (!bonds) return applyFields(life, [set, remove]);
+  const fields = Reflect.ownKeys(life).filter(key => Object.prototype.propertyIsEnumerable.call(life, key));
+  const record = Object.fromEntries(fields.map(key => [key, key === 'bonds' ? undefined : life[key]]));
+  const next = applyFields(record, [set, remove]);
+  if (Object.hasOwn(next, 'bonds') && !(set && Object.hasOwn(set, 'bonds'))) assignBonds(next, bonds);
+  return next;
+}
+
+const bondProperty = {
+  enumerable: true, configurable: true,
+  get() { return this[bondProjection].table(); },
+  set(value) {
+    delete this[bondProjection];
+    Object.defineProperty(this, 'bonds', { value, enumerable: true, configurable: true, writable: true });
+  }
+};
+
+function assignBonds(life, frame) {
+  Object.defineProperty(life, bondProjection, { value: frame, configurable: true });
+  Object.defineProperty(life, 'bonds', bondProperty);
 }
 
 function expandedRecord(table, row) {
@@ -152,11 +177,15 @@ export function expandSimulationPatch(data, patch, knownFish, commitRows = false
   }
   if (patch.life) {
     const { properties, stories, bonds } = patch.life;
-    values.life = applyFields(data.life, properties);
+    const descriptor = commitRows && Object.getOwnPropertyDescriptor(data.life, 'bonds');
+    const projection = descriptor?.get === bondProperty.get ? data.life[bondProjection] : undefined;
+    values.life = applyLifeFields(data.life, properties, projection);
     if (stories) values.life.stories = applyStoryChanges(data.life.stories, stories);
     if (bonds) {
-      const previous = data.life.bonds;
-      if (bonds.intervals) values.life.bonds = applyBondIntervals(previous, bonds);
+      if (bonds.intervals && commitRows) {
+        assignBonds(values.life, new BondFrame(projection?.materialized ?? projection ?? data.life.bonds, bonds, true));
+      }
+      else if (bonds.intervals) values.life.bonds = applyBondIntervals(data.life.bonds, bonds);
       else if (bonds.counters) {
         const table = {}, { keys, counters, at } = bonds;
         let exception = 0;
@@ -164,7 +193,9 @@ export function expandSimulationPatch(data, patch, knownFish, commitRows = false
           const key = keys[i];
           const seconds = counters[i * 2];
           if (Number.isNaN(seconds)) {
-            Object.defineProperty(table, key, { value: expandRow(previous, bonds.set[exception++])[1], writable: true, enumerable: true, configurable: true });
+            const row = bonds.set[exception++];
+            const value = row.length === 2 ? row[1] : expandedRecord(data.life.bonds, row);
+            Object.defineProperty(table, key, { value, writable: true, enumerable: true, configurable: true });
             continue;
           }
           const split = key.indexOf('|');
@@ -172,8 +203,8 @@ export function expandSimulationPatch(data, patch, knownFish, commitRows = false
         }
         values.life.bonds = table;
       } else {
-        const changed = Object.fromEntries(bonds.set.map(row => expandRow(previous, row)));
-        values.life.bonds = bonds.ordered ? changed : applyFields(previous, [changed, bonds.remove]);
+        const changed = Object.fromEntries(bonds.set.map(row => row.length === 2 ? row : expandRow(data.life.bonds, row)));
+        values.life.bonds = bonds.ordered ? changed : applyFields(data.life.bonds, [changed, bonds.remove]);
       }
     }
   }

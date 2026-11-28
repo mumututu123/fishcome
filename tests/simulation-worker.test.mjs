@@ -541,6 +541,49 @@ test('伙伴变更拒绝多余的位、不匹配的记录数、重复加入和�
   ]) assert.throws(() => applyBondIntervals(previous, invalid));
 });
 
+test('主端伙伴关系跨帧保持顺序、旧记录和存档值', () => {
+  const world = new World(start, root, { populate: false });
+  const row = (a, b, seconds, at, run) => ({ a, b, seconds, at, lastNear: at, run });
+  const initial = world.data.life.bonds = {
+    'a|b': row('a', 'b', 0.001, start, 0.001),
+    'a|c': row('a', 'c', 7, start, 4)
+  };
+  const install = (at, bonds) => {
+    const patch = { tables: {}, values: { tick: at }, life: { properties: [{ at }], bonds } };
+    Object.assign(world.data, expandSimulationPatch(world.data, patch, [], true).values);
+    return world.data.life;
+  };
+  const firstAt = start + 1000, secondAt = start + 2000, thirdAt = start + 3000;
+  const first = install(firstAt, { at: firstAt, intervals: { before: 2, length: 3, kept: [3], added: [4] }, keys: ['b|c'] });
+  const firstHalf = install(firstAt + 500);
+  initial['a|b'].seconds = 30;
+  initial['a|c'].seconds = 40;
+  const second = install(secondAt, { at: secondAt, intervals: { before: 3, length: 3, kept: [5], added: [2] }, keys: ['a|d'] });
+
+  assert.equal(first.bonds, firstHalf.bonds);
+  assert.deepEqual(first.bonds, {
+    'a|b': row('a', 'b', 1.001, firstAt, 1.001),
+    'a|c': row('a', 'c', 8, firstAt, 5),
+    'b|c': row('b', 'c', 1, firstAt, 0)
+  });
+  first.bonds['b|c'].seconds = 99;
+  const checkpoint = structuredClone({ world: { ...world.data } });
+  const expected = {
+    'a|b': row('a', 'b', 2.001, secondAt, 2.001),
+    'a|d': row('a', 'd', 1, secondAt, 0),
+    'b|c': row('b', 'c', 2, secondAt, 1)
+  };
+  assert.equal(JSON.stringify(second.bonds), JSON.stringify(expected));
+  assert.deepEqual(checkpoint.world.life.bonds, expected);
+  assert.deepEqual(world.serialize().life.bonds, expected);
+
+  second.bonds['a|d'].seconds = 8;
+  const third = install(thirdAt, { at: thirdAt, intervals: { before: 3, length: 3, kept: [7], added: [0] }, keys: [] });
+  assert.deepEqual(third.bonds['a|d'], row('a', 'd', 9, thirdAt, 1));
+  assert.equal(second.bonds['a|d'].at, secondAt);
+  assert.deepEqual(checkpoint.world.life.bonds, expected);
+});
+
 test('长时间相处仍逐秒保留旧存档的小数舍入和熟鱼故事，旧表的编辑只影响旧表', () => {
   const world = new World(start, root, { populate: false }), worker = new WorkerSimulation(), key = 'a|b';
   for (const id of ['a', 'b', 'c']) {

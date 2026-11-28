@@ -29,12 +29,25 @@ function validBits(bits, size) {
     (!(size & 7) || !(bits[bits.length - 1] >>> (size & 7)));
 }
 
+function sameBondKeys(kept, added, length) {
+  const tail = length % 8;
+  return added.every(byte => byte === 0) &&
+    kept.every((byte, i) => byte === (tail && i === kept.length - 1 ? (1 << tail) - 1 : 255));
+}
+
 function readBondIntervals(previous, { at, intervals, keys }, frame) {
   const prior = previous instanceof BondFrame ? previous : null;
   const { before, length, added, kept } = intervals, oldKeys = prior?.names ?? Object.keys(previous);
   if (!Number.isFinite(at) || !Number.isInteger(length) || length < 0 || length > bondLimit ||
       oldKeys.length !== before || oldKeys.length > bondLimit || !Array.isArray(keys) || keys.length > length ||
       !validBits(added, length) || !validBits(kept, oldKeys.length)) throw new Error('无效的伙伴变更范围');
+  if (frame?.writableTable && prior?.writableTable && !prior.fractionalRows && prior.at === at - 1000 &&
+      length === before && keys.length === 0 && sameBondKeys(kept, added, length)) {
+    prior.sharedRows = true;
+    frame.names = prior.names;
+    frame.rows = prior.rows;
+    return;
+  }
   const table = frame ? null : {};
   const oldNames = prior && keys.length ? new Set(oldKeys) : null;
   const newNames = frame && keys.length ? new Set() : null;
@@ -59,7 +72,10 @@ function readBondIntervals(previous, { at, intervals, keys }, frame) {
       if ((prior?.at ?? row?.at) !== at - 1000 || row.lastNear !== row.at || !Number.isFinite(row.seconds) || !Number.isFinite(row.run)) {
         throw new Error('伙伴基准时间不连续');
       }
-      if (!frame || !Number.isInteger(row.seconds) || !Number.isInteger(row.run)) row = advanceBond(row, at);
+      const fractional = !Number.isInteger(row.seconds) || !Number.isInteger(row.run);
+      if (!frame || fractional || frame.writableTable && !prior) row = advanceBond(row, at);
+      else if (frame.writableTable) prior.sharedRows = true;
+      if (frame?.writableTable && fractional) frame.fractionalRows = true;
     }
     if (frame) { frame.names[i] = key; frame.rows[i] = row; }
     else table[key] = row;
@@ -74,8 +90,9 @@ export function applyBondIntervals(previous, changes) {
 }
 
 export class BondFrame {
-  constructor(previous, changes) {
+  constructor(previous, changes, writableTable = false) {
     this.at = changes.at;
+    this.writableTable = writableTable;
     this.names = [];
     this.rows = [];
     readBondIntervals(previous, changes, this);
@@ -83,7 +100,10 @@ export class BondFrame {
   table() {
     if (this.materialized) return this.materialized;
     const table = {};
-    for (let i = 0; i < this.names.length; i++) table[this.names[i]] = advanceBond(this.rows[i], this.at);
+    for (let i = 0; i < this.names.length; i++) {
+      const row = this.rows[i], record = advanceBond(row, this.at);
+      table[this.names[i]] = this.sharedRows && record === row ? { ...row } : record;
+    }
     return this.materialized = table;
   }
 }
