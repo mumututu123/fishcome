@@ -231,7 +231,8 @@ function indexReplicaCells(world, changedChars) {
         changedChars?.add(cell.id);
       }
       const body = bodies.get(cell.entity);
-      if (body !== null) bodies.set(cell.entity, body ? null : cell);
+      // Keep the glyph itself only when it is the entire body.
+      bodies.set(cell.entity, typeof body === 'number' ? body + 1 : body ? 2 : cell);
     }
     if (cell.kind === 'scene') occupiedScenes.set(cell.entity, (occupiedScenes.get(cell.entity) || 0) + 1);
     if (cell.chat) chatGlyphCount++;
@@ -240,14 +241,20 @@ function indexReplicaCells(world, changedChars) {
   return { bodies, occupiedScenes, latestFeed, chatGlyphCount };
 }
 function updateReplicaCellIndex(previous, next, index) {
-  if (next.kind === 'fish' || previous?.kind === 'fish') {
-    if (previous?.kind !== next.kind || previous.entity !== next.entity || index.bodies.get(next.entity) !== null ||
-        next.path.at(-1)?.reason === 'birth') return false;
-  }
   if (previous !== next && (previous?.path.length || next.path.length)) {
     const meals = path => path.filter(event => event.reason === 'eat');
     const before = meals(previous?.path ?? []), after = meals(next.path);
     if (before.length !== after.length || before.some((event, i) => event.target !== after[i].target || event.t !== after[i].t)) return false;
+  }
+  if (next.kind === 'fish') {
+    if (previous?.kind !== next.kind || previous.entity !== next.entity ||
+        typeof index.bodies.get(next.entity) !== 'number' || next.path.at(-1)?.reason === 'birth') return false;
+  } else if (previous?.kind === 'fish') {
+    const body = index.bodies.get(previous.entity);
+    if (body === undefined) return false;
+    if (typeof body === 'number' && body > 1) index.bodies.set(previous.entity, body - 1);
+    else index.bodies.delete(previous.entity);
+    index.posed.add(previous.entity);
   }
   const oldScene = previous?.kind === 'scene' ? previous.entity : undefined;
   const nextScene = next.kind === 'scene' ? next.entity : undefined;
@@ -1014,6 +1021,10 @@ export class World {
       pendingFish?.add(id);
       changes?.fishes.add(id);
     });
+    // Only a surviving singleton needs its exact glyph for the food transition.
+    if (cellIndex) for (const id of pendingFish) {
+      if (cellIndex.bodies.get(id) === 1) { cellIndex = undefined; break; }
+    }
     const normalize = cellIndex && pendingFish ? pendingFish : Object.keys(this.data.fishes);
     cellIndex ??= indexReplicaCells(this, changedChars);
     const { bodies, latestFeed, occupiedScenes } = cellIndex;
@@ -1021,12 +1032,12 @@ export class World {
     for (const id of normalize) {
       const f = this.data.fishes[id];
       if (!f) continue;
-      const lone = bodies.get(id);
-      if (lone === undefined) { delete this.data.fishes[id]; changes?.fishes.add(id); continue; }
+      const body = bodies.get(id);
+      if (!body) { delete this.data.fishes[id]; changes?.fishes.add(id); continue; }
       const meal = latestFeed.get(id), fed = Math.max(f.created, meal || 0);
       f.lastFed = fed; f.hungerAt = Math.max(f.hungerAt, fed + CONFIG.hunger);
       const mealAt = lastMealAt(f, meal); if (mealAt !== undefined) f.lastMealAt = mealAt;
-      if (lone) { const p = cellPosition(f, lone); changedChars?.add(lone.id); transition(lone, { kind: 'food', entity: '', x: wrapX(p.x), y: p.y, born: Math.max(this.data.tick, other.tick), fall: 0 }, { id: `normalize:${id}`, t: Math.max(this.data.tick, other.tick), reason: 'shed' }); delete this.data.fishes[id]; bodies.delete(id); changes?.fishes.add(id); }
+      if (typeof body !== 'number') { const lone = body, p = cellPosition(f, lone); changedChars?.add(lone.id); transition(lone, { kind: 'food', entity: '', x: wrapX(p.x), y: p.y, born: Math.max(this.data.tick, other.tick), fall: 0 }, { id: `normalize:${id}`, t: Math.max(this.data.tick, other.tick), reason: 'shed' }); delete this.data.fishes[id]; bodies.delete(id); changes?.fishes.add(id); }
     }
     for (const id of Object.keys(this.data.scenes)) if (!occupiedScenes.has(id)) {
       delete this.data.scenes[id];

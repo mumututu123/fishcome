@@ -269,6 +269,36 @@ test('连续合流跳过未变的鱼元归属，仍与完整合流同样处理�
   assert.equal(live.data.chars[fish + ':1'].kind, 'food');
 });
 
+test('一条鱼消散时仅核对它的鱼元，剩下一字的鱼仍在原位置变为鱼食', () => {
+  const at = Date.now() - 10000, full = new World(at), live = new World(at, full.id);
+  const lost = crypto.randomUUID(), lone = crypto.randomUUID();
+  for (const [i, id] of [lost, lone].entries()) {
+    const cells = [0, 1, 2].map(x => ({ x, y: 0, ch: x ? '鱼' : 'o', color: '#88aacc' }));
+    for (const world of [full, live]) assert(world.apply({ id, actor: id, kind: 'fish', t: at, x: 40 + 10 * i, y: 20, cost: cells.length, cells }).ok);
+  }
+  let tick = at, scans = 0;
+  const all = live.charValues.bind(live);
+  live.charValues = (...kinds) => { if (!kinds.length) scans++; return all(...kinds); };
+  function remove(ids) {
+    tick += CONFIG.step;
+    const chars = {};
+    for (const id of ids) chars[id] = { ...full.data.chars[id], kind: 'burn', entity: '', path: [{ reason: 'ecoDeath', t: tick }] };
+    const packet = { protocol: 1, roots: full.data.roots, tick, chars, fishes: {}, scenes: {}, ops: {} };
+    scans = 0;
+    full.merge(packet);
+    live.merge(packet, {}, 'replica', true);
+    assert.deepEqual(live.serialize(), full.serialize());
+  }
+  remove([]);
+  remove([lost + ':0', lost + ':1', lost + ':2', lone + ':0']);
+  assert.equal(scans, 0);
+  assert.equal(live.data.fishes[lost], undefined);
+  assert(live.data.fishes[lone]);
+  remove([lone + ':1']);
+  assert.equal(live.data.fishes[lone], undefined);
+  assert.equal(live.data.chars[lone + ':2'].kind, 'food');
+});
+
 test('日常广播只读取变化行，签名时的新变化进入下一包，未知前台编辑只重建一次', async () => {
   const world = new World(100), data = world.data;
   data.fishes = { fish: { x: 1 }, resting: { x: 2 } };
