@@ -321,7 +321,18 @@ for (const [object, method, name] of [
 }
 if (${Boolean(values['rebuild-viewport'])}) renderer.applyMerge = () => {};
 (${recordDraw.toString()})(renderer, testData.frames, window.densePage, ${Boolean(values.trace)});
-window.denseSurvey = () => ({ ...testData, node: network?.node, leader: network && leader(), peers: network?.live().length,
+const ownerFrames = [];
+if (typeof renderClient !== 'undefined') {
+  const openRender = renderClient.open.bind(renderClient);
+  renderClient.open = (...args) => {
+    openRender(...args);
+    renderClient.worker?.addEventListener('message', event => {
+      if (event.data.denseOwnerFrames) ownerFrames.push(...event.data.denseOwnerFrames);
+    });
+  };
+}
+window.denseSurvey = () => ({ ...testData, frames: ownerFrames.length ? [...testData.frames, ...ownerFrames].sort((a, b) => a.at - b.at) : testData.frames,
+  offscreen: ownerFrames.length > 0, node: network?.node, leader: network && leader(), peers: network?.live().length,
   simulationFailure: simulation.failure?.error?.message,
   page: window.densePage, timeOrigin: performance.timeOrigin,
   tick: world.data.tick, step: CONFIG.step, fish: Object.keys(world.data.fishes).length, rejected: network?.stats.rejected,
@@ -352,7 +363,7 @@ window.denseJoinSettled = () => {
     [...network.replicas.incoming.values()].every(state => state.kind === 'world' || state.kind === 'live');
 };
 window.denseFrameSampleFish = () => {
-  if (testData.frames.at(-1)?.visible) return;
+  if (denseSurvey().frames.at(-1)?.visible) return;
   const id = Object.keys(world.data.fishes)[0];
   if (id) moveCameraToFish(world.data.fishes[id], bounds(world.fishCells(id)));
 };
@@ -486,6 +497,23 @@ OrderedSteps.prototype.complete = async function (slot, result) {
       if (pathname === '/replica-stream.js') return route.fulfill({ contentType: 'text/javascript',
         body: readFileSync(file, 'utf8') + observeReplicaPages + (values['step-boundaries-only'] ? '' : observeFirstReplicaPage) });
       if (pathname === '/simulation-changes.js') return route.fulfill({ contentType: 'text/javascript', body: readFileSync(file, 'utf8') + observeCommit });
+      if (pathname === '/render-owner.js') {
+        const source = readFileSync(file, 'utf8'), anchor = 'if (data.canvas) painter = new Renderer(data.canvas, data.view.dimensions);';
+        assert(source.includes(anchor), '未找到正式绘制线程入口');
+        return route.fulfill({ contentType: 'text/javascript', body: source.replace(anchor, `
+if (data.canvas) {
+  painter = new Renderer(data.canvas, data.view.dimensions);
+  ${clockShift ? '(' + shiftGameClock.toString() + ')(' + clockShift + ');' : ''}
+  const frames = { length: 0, batch: [], push(frame) {
+    this.length++;
+    this.batch.push(frame);
+    if (this.batch.length < 16) return;
+    postMessage({ denseOwnerFrames: this.batch });
+    this.batch = [];
+  } };
+  (${recordDraw.toString()})(painter, frames, ${JSON.stringify(options)}, ${Boolean(values.trace)}, true);
+}`) });
+      }
       if (pathname === '/simulation-worker.js') return route.fulfill({
         contentType: 'text/javascript', body: readFileSync(file, 'utf8') + `
 ${clockShift ? "if (typeof document === 'undefined') (" + shiftGameClock.toString() + ")(" + clockShift + ");" : ''}
@@ -615,7 +643,8 @@ async function main([urlA, urlB], assets) {
   }, { count, real: Boolean(backup) }, { polling: 100, timeout: count < 200 ? 20000 : 95000 })));
   const joined = observationNow();
   await Promise.all([a, b].map(page => page.waitForFunction(() => denseJoinSettled(), null, { polling: 125, timeout: 45000 })));
-  const stopTrace = values.trace && await Promise.all(browsers.map(browser => startTrace(browser, values['step-boundaries-only'], values['trace-cpu'])));
+  const offscreen = await Promise.all([a,b].map(page => page.evaluate(() => denseSurvey().offscreen)));
+  const stopTrace = values.trace && await Promise.all(browsers.map((browser, i) => startTrace(browser, values['step-boundaries-only'], values['trace-cpu'], offscreen[i])));
   if (stopTrace) await pause(300);
   const recent = observationNow();
   await survey({ a, b, fixture, cold, joining, joined, recent, stopTrace, browserVersion: browsers[0].version(), graphics });

@@ -1,12 +1,13 @@
 const { once } = require('node:events');
 const { writeFile } = require('node:fs/promises');
+const { decodeGraphicsTrace, indexOffscreenPresentations } = require('./offscreen-presentation.cjs');
 
-function recordDraw(renderer, frames, page, trace) {
+function recordDraw(renderer, frames, page, trace, owner = false) {
   const draw = renderer.draw.bind(renderer);
   const glyphIds = new Map();
   renderer.draw = (...args) => {
     const sequence = frames.length;
-    const prefix = `tide.refresh.${page}.${sequence}`;
+    const prefix = `tide.refresh.${page}.${owner ? 'owner.' : ''}${sequence}`;
     const beforeMark = performance.now();
     const start = trace ? performance.mark(prefix + '.start').startTime : beforeMark;
     const afterMark = trace && performance.now();
@@ -32,16 +33,17 @@ function recordDraw(renderer, frames, page, trace) {
       // Retaining glyph strings beside boxed doubles on every frame perturbs GC.
       poses.push(ordinal, x, y);
     }
-    frames.push({ sequence, at: performance.timeOrigin + start, draw: drawMs,
+    frames.push({ sequence, at: performance.timeOrigin + start, draw: drawMs, ...(owner && { owner }),
       ...(trace && { beforeMark: performance.timeOrigin + beforeMark, afterMark: performance.timeOrigin + afterMark }),
       tick: args[0].data.tick, visible, poses });
   };
 }
 
-async function startTrace(browser, boundariesOnly, profileRules = false) {
+async function startTrace(browser, boundariesOnly, profileRules = false, offscreen = false) {
   const client = await browser.newBrowserCDPSession();
   const complete = once(client, 'Tracing.tracingComplete');
   const categories = ['devtools.timeline', 'blink.user_timing'];
+  if (offscreen) categories.push('blink', 'cc', 'viz', 'benchmark', 'graphics.pipeline');
   if (profileRules) categories.push('disabled-by-default-v8.cpu_profiler');
   if (!boundariesOnly) categories.push('toplevel');
   await client.send('Tracing.start', { categories: categories.join(','), transferMode: 'ReturnAsStream' });
@@ -62,13 +64,14 @@ async function startTrace(browser, boundariesOnly, profileRules = false) {
     }
     const json = Buffer.concat(chunks);
     await writeFile(filename, json);
-    return JSON.parse(json);
+    return offscreen ? decodeGraphicsTrace(json.toString()) : JSON.parse(json);
   };
 }
 
 function readPresentations(events, page, start, end) {
   const startMarks = new Map(), samples = new Map(), presentation = new Map();
   const prefix = `tide.refresh.${page.page}.`;
+  const ownerPresentation = page.frames.some(frame => frame.owner) && indexOffscreenPresentations(events);
   const sorted = events.filter(event => event.name.startsWith('AnimationFrame') || event.name.startsWith(prefix))
     .sort((a, b) => (a.args?.data?.callTime ?? a.ts) - (b.args?.data?.callTime ?? b.ts));
   for (const event of sorted) {
@@ -78,10 +81,11 @@ function readPresentations(events, page, start, end) {
     if (name === 'AnimationFrame' && ph === 'e') samples.delete(thread);
     if (name === 'AnimationFrame::Presentation') presentation.set(`${thread}:${args.id}`, ts);
     if (!name.startsWith(prefix)) continue;
-    const [sequence, phase] = name.slice(prefix.length).split('.');
-    if (phase === 'start') startMarks.set(Number(sequence), { ts: args.data.callTime, tts, pid, tid });
+    const tail = name.slice(prefix.length), dot = tail.lastIndexOf('.');
+    const sequence = tail.slice(0, dot), phase = tail.slice(dot + 1);
+    if (phase === 'start') startMarks.set(sequence, { ts: args.data.callTime, tts, pid, tid });
     else {
-      const start = startMarks.get(Number(sequence));
+      const start = startMarks.get(sequence);
       if (start) Object.assign(start, { endTs: args.data.callTime, endTts: tts, frame: `${thread}:${samples.get(thread)}` });
     }
   }
@@ -89,7 +93,7 @@ function readPresentations(events, page, start, end) {
   let minClockOffset = -Infinity, maxClockOffset = Infinity;
   const displayed = new Map();
   for (const frame of page.frames) {
-    const mark = startMarks.get(frame.sequence);
+    const mark = startMarks.get(`${frame.owner ? 'owner.' : ''}${frame.sequence}`);
     if (!mark?.endTs) continue;
     // The thread can be suspended inside performance.mark(). Its trace timestamp
     // lies between these two readings. Intersect every observation, allowing
@@ -98,7 +102,8 @@ function readPresentations(events, page, start, end) {
     maxClockOffset = Math.min(maxClockOffset, (frame.afterMark ?? frame.at) - mark.ts / 1000 + .1);
     const drawCpu = (mark.endTts - mark.tts) / 1000;
     if (Number.isFinite(drawCpu)) drawn.push({ at: frame.at, drawCpu });
-    const presented = presentation.get(mark.frame);
+    const presented = frame.owner ? ownerPresentation(mark, startMarks.get(`owner.${frame.sequence + 1}`)?.ts ?? Infinity)?.presented
+      : presentation.get(mark.frame);
     if (!(presented >= mark.endTs)) continue;
     const at = frame.at + (presented - mark.ts) / 1000;
     displayed.set(presented, { ...frame, at, traceTs: presented, drawStartTs: mark.ts, drawEndTs: mark.endTs,

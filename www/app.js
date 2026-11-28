@@ -10,7 +10,8 @@ import { prepareOrderedArchive } from './ordered-archive.js';
 import { ReplicaInventory, ReplicaRecovery, ReplicaSwims, WorldBroadcast } from './world-broadcast.js';
 import { DiagnosticLog, inspectFishOrigins, repairFishOriginIssues, diagnosticSummary } from './diagnostics.js';
 import { loadReplicaArchives, verifyChats, verifyLocalCheckpoint, verifyReplica } from './replica.js';
-import { Renderer } from './renderer.js';
+import { Renderer, observationCamera } from './renderer.js';
+import { RenderClient } from './render-client.js';
 import { Creator } from './creator.js';
 import { restoreCheckpoint } from './lifecycle.js';
 import { CHAT_FLOOR, orderedChats, chatColor, mergeChatRecords } from './chat.js';
@@ -20,7 +21,7 @@ import { defaultFishName, displayFishName, fishCatalog } from './fish-profile.js
 import { drawPedigree, setupPedigreeViewport } from './pedigree.js';
 import { normalizeInvite, encodeInvite, decodeInvite, inviteDetails } from './invite.js';
 import { verifyReferral } from './referral.js';
-import { wrapX, nearX } from './geography.js';
+import { wrapX } from './geography.js';
 import { weatherAt, fishLifeText, storiesFor, storyText, returnStory, mergeBonds, newLife, validateLife } from './life.js';
 import { memoryForCell, ancestralGlyph, ancestralText } from './easter-eggs.js';
 import { activeEvent, eventSchedule, eventTitle, eventPosition, eventLetter, radioTranscript, eventNarration } from './random-events.js';
@@ -31,9 +32,14 @@ import { WORLD_RULES, rulesCompatible } from './rules.js';
 import { assetPlatformLabel, classifyPeerCompatibility, detectUpdateSource, formatUpdateBytes, normalizeAssetSuffix, pickHigherVersionPeers } from './update.js';
 const $ = id => document.getElementById(id);
 const renderer = new Renderer($('sea'));
+const renderClient = new RenderClient(renderer);
 const simulation = new SimulationClient();
 let displayedWorld, displayedFish, displayedScenes;
-subscribeSimulationChanges((target, patch, origin) => renderer.worldChanged(target, patch, origin));
+subscribeSimulationChanges((target, patch, origin, merge) => {
+  const shownAt = performance.now();
+  renderClient.changed(target, patch, origin, merge, performance.timeOrigin + shownAt);
+  renderer.worldChanged(target, patch, origin, shownAt);
+});
 subscribeSimulationChanges((target, patch) => {
   if (target !== displayedWorld) return;
   if (!patch) { displayedWorld = null; return; }
@@ -220,6 +226,7 @@ function balance() {
   return world.wallet(identity.actor) - pendingCost();
 }
 function updateCameraLabels() {
+  renderClient.cameraChanged(trackedFish);
   $('depthLabel').textContent = `水深 ${Math.max(0, Math.round(renderer.camera.y))} 格 · ${renderer.camera.y < CONFIG.shallow ? '浅水区' : '深水区'}`;
   $('zoomLabel').textContent = Math.round(renderer.scale * 100) + '%';
   if (selected?.kind === 'fish') $('followFish').textContent = trackedFish === selected.id ? '停止跟随' : '跟随观察';
@@ -372,7 +379,8 @@ async function mergeVerifiedWorld(data, peer, context, { local = false, worldMes
 function presentReplicaMovement(movement) {
   if (movement && movement === replicaSwims.latest && movement.data === world.data && movement.tick === world.data.tick && movement.from === leader()) {
     renderer.presentSwims(world, movement.directions, movement.startedAt);
-  }
+    renderClient.merged(world, movement);
+  } else renderClient.merged(world);
 }
 async function mergeReplica(data, peer, context = 'merge', worldMessage) {
   const previousTerrain = world.data.terrain?.seed;
@@ -654,9 +662,8 @@ function observationRect() {
   if (innerWidth <= 700) return { left: tools.right + 12, right: innerWidth - 16, top: Math.max(120, inspector.bottom + 16), bottom: innerHeight - 100 };
   return { left: tools.right + 20, right: Math.max(tools.right + 160, inspector.left - 20), top: 128, bottom: innerHeight - 52 };
 }
-function moveCameraToFish(fish, body) {
-  const rect = observationRect(), size = renderer.cell * renderer.scale, x = (rect.left + rect.right) / 2, y = (rect.top + rect.bottom) / 2;
-  renderer.camera = { x: nearX(fish.x + fish.facing * (body.minX + body.maxX) / 2, renderer.camera.x) + (renderer.width / 2 - x) / size, y: fish.y + (body.minY + body.maxY) / 2 + (renderer.height / 2 - y) / size };
+function moveCameraToFish(fish, body, rect = observationRect()) {
+  renderer.camera = observationCamera(fish, body, renderer.camera, rect, renderer.width, renderer.height, renderer.cell * renderer.scale);
 }
 function focusFish(id, follow = false) {
   const fish = world.data.fishes[id]; if (!fish) { toast('这条鱼已不再存活'); renderMyFishes(); return; }
@@ -1794,7 +1801,17 @@ $('deleteScene').onclick = () => { if (!selected) return; submit({ kind: 'sceneD
 $('sea').oncontextmenu = e => { e.preventDefault(); cancelMode(); };
 $('sea').addEventListener('pointerdown', e => { if (e.button !== 0) return; if (mode) { const p = renderer.point(e.clientX, e.clientY); if (mode.kind === 'food') { if (p.y !== 0) { toast('请在亮蓝色水面行点击投食'); return; } submit({ kind: 'food', ch: mode.ch, color: mode.color, x: p.x, y: 0, cost: 1 }); } else { const b = bounds(mode.cells), x = wrapX(p.x - b.minX), y = p.y - b.minY; submit({ kind: mode.kind, cells: mode.cells, ...(mode.kind === 'fish' ? { gender: mode.gender, name: mode.name } : {}), scene: mode.scene, x, y, cost: mode.kind === 'sceneMove' ? 0 : mode.cells.length }); cancelMode(); } return; } dragging = { startX: e.clientX, startY: e.clientY, x: renderer.camera.x, y: renderer.camera.y, moved: false }; $('sea').setPointerCapture(e.pointerId); });
 $('sea').addEventListener('pointermove', e => { if (mode) { const p = renderer.point(e.clientX, e.clientY), b = bounds(mode.cells || []); renderer.preview = { ...mode, x: mode.kind === 'food' ? p.x : wrapX(p.x - b.minX), y: mode.kind === 'food' ? 0 : p.y - b.minY }; if (mode.kind === 'fish') renderer.preview.valid = world.canOccupy({ id: '', x: renderer.preview.x, y: renderer.preview.y, facing: 1 }, mode.cells); } else if (dragging) { const s = renderer.cell * renderer.scale; renderer.camera.x = wrapX(dragging.x - (e.clientX - dragging.startX) / s); renderer.camera.y = Math.min(CONFIG.depth, Math.max(0, dragging.y - (e.clientY - dragging.startY) / s)); dragging.moved ||= Math.hypot(e.clientX - dragging.startX, e.clientY - dragging.startY) > 4; if (dragging.moved) trackedFish = null; updateCameraLabels(); } });
-$('sea').addEventListener('pointerup', e => { if (dragging && !dragging.moved) { const hit = renderer.hit(e.clientX, e.clientY); if (hit) inspect(hit); else { selected = null; renderer.selected = null; $('inspector').hidden = true; } } dragging = null; });
+let lastHit = 0;
+$('sea').addEventListener('pointerup', async e => {
+  const click = dragging && !dragging.moved;
+  dragging = null;
+  const request = ++lastHit;
+  if (!click) return;
+  const target = world, hit = await renderClient.hit(e.clientX, e.clientY);
+  if (request !== lastHit || world !== target) return;
+  if (hit) inspect(hit);
+  else { selected = null; renderer.selected = null; $('inspector').hidden = true; }
+});
 $('sea').addEventListener('wheel', e => { e.preventDefault(); renderer.zoom(renderer.scale * (e.deltaY < 0 ? 1.1 : .9)); updateCameraLabels(); }, { passive: false });
 function renderDiagnosticsLogs() {
   $('diagLogs').textContent = diagnostics.format();
@@ -1993,12 +2010,20 @@ document.addEventListener('keydown', e => {
 document.addEventListener('keyup', e => heldShortcuts.delete(e.code || e.key.toLowerCase()));
 window.addEventListener('blur', () => heldShortcuts.clear());
 function render(now) {
+  let follow;
   if (trackedFish) {
     const fish = renderer.fishPose(world, trackedFish, now);
-    if (fish && followBounds) moveCameraToFish(fish, followBounds);
+    if (fish && followBounds) {
+      const rect = observationRect();
+      moveCameraToFish(fish, followBounds, rect);
+      follow = { id: trackedFish, body: followBounds, rect };
+    }
     else { trackedFish = null; toast('这条鱼已不再存活'); }
   }
-  try { renderer.draw(world, now); }
+  try {
+    if (started && renderClient.frame(world, follow)) renderer.cellIndex(world).advance();
+    else renderer.draw(world, now);
+  }
   catch (error) {
     if (!renderer.scene3d) throw error;
     applyScene3d(null);

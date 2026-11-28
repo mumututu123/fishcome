@@ -119,6 +119,11 @@ export class BondFrame {
     this.rows = [];
     readBondIntervals(previous, changes, this);
   }
+  read(name) {
+    if (this.materialized) return this.materialized[name];
+    const index = this.names.indexOf(name);
+    if (index >= 0) return advanceBond(this.rows[index], this.at);
+  }
   table() {
     if (this.materialized) return this.materialized;
     const table = {};

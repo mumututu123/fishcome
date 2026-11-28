@@ -1,12 +1,23 @@
 import { EYES } from './engine.js';
 
-export function fishRuns(characters) {
+export function spriteCanvas() {
+  return typeof document === 'undefined' ? new OffscreenCanvas(1, 1) : document.createElement('canvas');
+}
+
+export function fishRuns(characters, previous) {
   const runs = [];
   let run;
   for (const cell of characters) {
     if (cell.kind !== 'fish') continue;
     if (run?.id !== cell.entity) runs.push(run = { id: cell.entity, cells: [] });
     run.cells.push(cell);
+  }
+  if (previous) {
+    const before = new Map(previous.map(run => [run.cells[0], run]));
+    for (let i = 0; i < runs.length; i++) {
+      const cells = runs[i].cells, old = before.get(cells[0]);
+      if (old?.cells.length === cells.length && cells.every((cell, j) => cell === old.cells[j])) runs[i] = old;
+    }
   }
   return runs;
 }
@@ -48,7 +59,7 @@ export class FishSprites {
       this.pixels -= old.image.width * old.image.height;
       old.image = null;
     }
-    const image = document.createElement('canvas');
+    const image = spriteCanvas();
     image.width = width; image.height = height;
     const ctx = image.getContext('2d');
     for (const cell of parts) renderer.glyph(ctx, cell.ch, cell.color,

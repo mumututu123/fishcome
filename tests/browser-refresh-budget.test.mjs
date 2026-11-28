@@ -1,6 +1,27 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readPresentations, frameSummary, bothDisplays, scheduledSteps, matchStepStarts } from './browser-refresh-budget.cjs';
+import { decodeGraphicsTrace } from './offscreen-presentation.cjs';
+
+test('独立画布必须找到同一子图层与实际合成器呈现', () => {
+  const worker = (name, ts) => ({ name, ts, pid: 1, tid: 2, tts: ts, args: { data: { callTime: ts } } });
+  const viz = (name, ts, fields = {}) => ({ name, ts, pid: 3, tid: 4, ...fields });
+  const pipeline = (step, ts, fields) => viz('Graphics.Pipeline', ts, { dur: 30, args: { chrome_graphics_pipeline: { step, ...fields } } });
+  const child = '9223372036854775701', other = '9223372036854775702', display = '21';
+  const trace = [worker('tide.refresh.A.owner.0.start', 1000), worker('tide.refresh.A.owner.0.end', 2000),
+    worker('CanvasResourceDispatcher::DispatchFrame', 2010),
+    pipeline('STEP_RECEIVE_COMPOSITOR_FRAME', 2015, { surface_frame_trace_id: child, frame_sink_id: { frame_sink_client_id: 6, frame_sink_id: 2147483648 } }),
+    pipeline('STEP_DRAW_AND_SWAP', 2020, { display_trace_id: display }),
+    pipeline('STEP_SURFACE_AGGREGATION', 2025, { display_trace_id: display, aggregated_surface_frame_trace_ids: [other, child] }),
+    viz('Graphics.Pipeline.DrawAndSwap', 2030, { ph: 'b', id2: { local: '0x1' } }),
+    viz('Graphics.Pipeline.DrawAndSwap', 8000, { ph: 'e', id2: { local: '0x1' } }), viz('Display::FrameDisplayed', 8000)];
+  const raw = JSON.stringify(trace).replace(/"(922337203685477570[12]|21)"/g, '$1');
+  const events = decodeGraphicsTrace(raw), page = { page: 'A', frames: [{ at: 1, sequence: 0, owner: true, poses: [1, 20, 30] }] };
+  assert.equal(readPresentations(events, page, 0, 15).rows[0].traceTs, 8000);
+  assert.equal(readPresentations(events.slice(0, -1), page, 0, 15).rows.length, 0);
+  events[5].args.chrome_graphics_pipeline.aggregated_surface_frame_trace_ids.pop();
+  assert.equal(readPresentations(events, page, 0, 15).rows.length, 0);
+});
 
 test('双端本地结算从最先发起的请求计时，遗漏对方的时标或确认均不能通过', () => {
   const requests = [500, 1000, 1500, 2000].map((tick, sequence) => ({ tick, sequence, agreed: sequence > 0 }));

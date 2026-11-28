@@ -75,7 +75,7 @@ function characterPositions(table, pages) {
   return positions;
 }
 
-function applyResult(world, { patch: delta, foodRevision }, knownFish) {
+export function applyResult(world, { patch: delta, foodRevision }, knownFish) {
   const patch = expandSimulationPatch(world.data, delta, knownFish, true);
   patch.workerChanges = delta;
   simulationWillApply(world, patch);
@@ -104,6 +104,7 @@ function applyResult(world, { patch: delta, foodRevision }, knownFish) {
   world.foodRevision += foodRevision;
   world.dirty = true;
   simulationApplied(world, patch);
+  return patch;
 }
 
 // The UI owns the last committed step. A foreground operation or coordinator

@@ -2,13 +2,20 @@ import { hash } from './world-hash.js';
 import { wrapX, worldKey } from './geography.js';
 import { LIFE, pairKey } from './life.js';
 import { CHAT_FLOOR, chatGlyphs, validChatMessage } from './chat.js';
+import { lifeBond, visitLifeStories } from './simulation-delta.js';
 
 export const hasFriendSecret = story => story.kind === 'reunion' && hash(`greeting:${story.id}`) % 3 === 0;
-export function friendSignals(data, now) {
+export function greetingStories(life, now) {
+  const selected = [];
+  visitLifeStories(life, story => { if (now - story.at < 6000 && hasFriendSecret(story)) selected.push(story); });
+  return selected;
+}
+
+export function friendSignals(data, now, stories = greetingStories(data.life, now)) {
   const signals = [], used = new Set();
-  const recent = Object.values(data.life?.stories || {}).filter(story => now >= story.at && now - story.at < 6000 && hasFriendSecret(story));
+  const recent = stories.filter(story => now >= story.at && now - story.at < 6000);
   for (const story of recent.sort((a, b) => b.at - a.at || a.id.localeCompare(b.id))) {
-    const age = now - story.at, bond = data.life.bonds[pairKey(story.fish, story.other)];
+    const age = now - story.at, bond = lifeBond(data.life, pairKey(story.fish, story.other));
     if (!bond || bond.seconds < LIFE.familiar || now - bond.lastNear > 2500 || used.has(story.fish) || used.has(story.other)) continue;
     const a = data.fishes[story.fish], b = data.fishes[story.other]; if (!a || !b) continue;
     used.add(a.id); used.add(b.id);

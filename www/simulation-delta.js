@@ -121,6 +121,20 @@ class StoryFrame {
   table() { return this.materialized ??= Object.fromEntries(this.entries); }
 }
 
+export function visitLifeStories(life, visit) {
+  const frame = life?.[storyProjection];
+  if (frame && !frame.materialized) {
+    for (const [, story] of frame.entries) visit(story);
+  } else {
+    for (const story of Object.values(life?.stories || {})) visit(story);
+  }
+}
+
+export function lifeBond(life, key) {
+  const frame = life?.[bondProjection];
+  return frame ? frame.read(key) : life?.bonds?.[key];
+}
+
 // Retain the worker's numbers and the unchanged fields of each record.
 class CommittedRows {
   constructor(table, change, knownFish, tick, commitRows) {
