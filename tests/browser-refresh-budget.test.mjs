@@ -17,7 +17,10 @@ test('从实际呈现的同一鱼元坐标核实游动，切换可见鱼元不�
       { name: 'AnimationFrame::Presentation', ts: at + 4, args: { id } }
     ].map(event => ({ ...event, pid: 1, tid: 2 }));
   });
-  const { rows, moving } = readPresentations(events, { frames, page: 'A' }, 0, 40);
+  // One frame has a different page-clock origin. A median would hide it.
+  frames[2].at += 2;
+  const { rows, moving, clockOffsets } = readPresentations(events, { frames, page: 'A' }, 0, 40);
+  assert.ok(Math.abs(clockOffsets[1] - clockOffsets[0] - 2) < 1e-6);
   assert.equal(rows.length, 4);
   assert.deepEqual(moving.map(frame => frame.sequence), [3]);
 });

@@ -74,12 +74,14 @@ function readPresentations(events, page, start, end) {
     }
   }
   const drawn = [];
-  const clockOffsets = [];
+  let minClockOffset = Infinity, maxClockOffset = -Infinity;
   const displayed = new Map();
   for (const frame of page.frames) {
     const mark = startMarks.get(frame.sequence);
     if (!mark?.endTs) continue;
-    clockOffsets.push(frame.at - mark.ts / 1000);
+    const offset = frame.at - mark.ts / 1000;
+    minClockOffset = Math.min(minClockOffset, offset);
+    maxClockOffset = Math.max(maxClockOffset, offset);
     const drawCpu = (mark.endTts - mark.tts) / 1000;
     if (Number.isFinite(drawCpu)) drawn.push({ at: frame.at, drawCpu });
     const presented = presentation.get(mark.frame);
@@ -123,7 +125,7 @@ function readPresentations(events, page, start, end) {
   // Both independent browser processes run on the same machine. Check the
   // mapping from trace ticks to the page clock before comparing their events.
   return { drawn, rows, moving, longestGaps,
-    clockOffsets: clockOffsets.length ? [Math.min(...clockOffsets), Math.max(...clockOffsets)] : undefined };
+    clockOffsets: Number.isFinite(minClockOffset) ? [minClockOffset, maxClockOffset] : undefined };
 }
 
 function distribution(values) {
