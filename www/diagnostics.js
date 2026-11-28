@@ -1,4 +1,4 @@
-import { CONFIG, clone } from './engine.js';
+import { CONFIG, clone, replicaSourceTable } from './engine.js';
 import { fishOrigin, inheritedGlyph, validBreedingRecord, canonicalBirthFish, canonicalBirthPath } from './breeding.js';
 
 const MAX_LOGS = 200;
@@ -36,12 +36,14 @@ export class DiagnosticLog {
   }
 }
 
-export function buildOriginSources(data, extra = {}, current = null) {
+export function buildOriginSources(data, extra = {}, current = null, chars) {
   return {
-    ops: { ...extra?.ops, ...current?.ops, ...data?.ops },
-    breeding: { ...extra?.breeding, ...current?.breeding, ...data?.breeding },
+    // A verification that awaits chat signatures keeps its own
+    // dictionary membership across the await. A live read finishes synchronously.
+    ops: chars ? replicaSourceTable(current?.ops, data?.ops, extra?.ops) : { ...extra?.ops, ...current?.ops, ...data?.ops },
+    breeding: chars ? replicaSourceTable(current?.breeding, data?.breeding, extra?.breeding) : { ...extra?.breeding, ...current?.breeding, ...data?.breeding },
     roots: { ...current?.roots, ...data?.roots },
-    chars: { ...extra?.chars, ...current?.chars, ...data?.chars }
+    chars: chars ?? { ...extra?.chars, ...current?.chars, ...data?.chars }
   };
 }
 

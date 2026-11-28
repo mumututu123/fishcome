@@ -1,9 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { World, clone, cellPosition, key, chooseClaim } from '../www/engine.js';
+import { World, clone, cellPosition, key, chooseClaim, hash } from '../www/engine.js';
+import { wrapX } from '../www/geography.js';
 import { POPULATION, updatePopulation, illnessOf, volcanoPlan, predatorCells, validPopulation, validRocks, mergePopulation, mergeRocks } from '../www/population.js';
 import { restoreCheckpoint } from '../www/lifecycle.js';
-import { verifyReplica } from '../www/replica.js';
+import { verifyLocalCheckpoint, verifyReplica } from '../www/replica.js';
 import { validateLife } from '../www/life.js';
 import { WorkerSimulation } from '../www/simulation-worker.js';
 import { SimulationClient } from '../www/simulation-client.js';
@@ -14,7 +15,8 @@ const HOUR = 3600000, now = Math.floor((Date.now() - 48 * HOUR) / HOUR) * HOUR, 
 const glyph = (x, y, ch = '鱼') => ({ x, y, ch, color: '#88aacc' });
 const transition = (cell, next, record) => { Object.assign(cell, next); cell.path.push({ ...record, target: next.entity || '', x: next.x, y: next.y }); };
 function fish(w, x, y, cells = [glyph(0, 0, 'o'), glyph(1, 0)], created = born) {
-  const id = crypto.randomUUID(); assert(w.apply({ id, actor: crypto.randomUUID(), nick: '生态测试', kind: 'fish', t: created, cells, cost: cells.length, gender: 'male', x, y }).ok); return id;
+  const id = crypto.randomUUID(), result = w.apply({ id, actor: crypto.randomUUID(), nick: '生态测试', kind: 'fish', t: created, cells, cost: cells.length, gender: 'male', x, y });
+  assert(result.ok, result.error); return id;
 }
 function world(count = 0) {
   const w = new World(born, crypto.randomUUID(), { populate: false }); w.data.tick = w.data.population.at = now;
@@ -23,12 +25,12 @@ function world(count = 0) {
 }
 const advance = (w, t) => { updatePopulation(w, t, transition); w.data.tick = t; };
 function erupt(w, at = now) {
-  let slot = Math.floor(at / POPULATION.volcanoPeriod), plan;
-  while (!(plan = volcanoPlan(w.data, slot))) slot++;
-  const started = slot * POPULATION.volcanoPeriod;
-  w.data.population.eruption = { ...plan, at: started, emitted: 0, nextAt: started + POPULATION.warning, particles: {} };
-  w.data.population.at = w.data.tick = started; w.data.population.volcanoSlot = slot;
-  return w.data.population.eruption;
+  for (let slot = Math.floor(at / POPULATION.volcanoPeriod); ; slot++) {
+    if (!volcanoPlan(w.data, slot)) continue;
+    w.data.population.volcanoSlot = slot - 1;
+    advance(w, slot * POPULATION.volcanoPeriod);
+    if (w.data.population.eruption?.slot === slot) return w.data.population.eruption;
+  }
 }
 function particle(w, e, index, x, y, at = e.at + POPULATION.warning) {
   const id = `${e.id}:${index}`; e.emitted = Math.max(e.emitted, index + 1);
@@ -99,6 +101,37 @@ test('食肉鱼真实嘴部接触才捕食，30分钟个体冷却和10分钟全�
   advance(w, now + 3000); assert(w.data.fishes[blocked]); assert.equal(p.x, 500);
   assert(predatorCells(p).every(c => !w.fishMap().has(key(c.x, c.y))));
 });
+test('捕食保留同一鱼体的鱼元顺序，以及环绕和旧坐标的视距', () => {
+  const base = world(201);
+  for (const f of base.fishValues()) f.y -= 8;
+  function hunt(mouthX, fishX, fishY, cells, legacyX) {
+    const w = new World(now, 'test', { populate: false });
+    w.data = clone(base.data);
+    const id = fish(w, fishX, fishY, cells);
+    if (legacyX !== undefined) w.data.fishes[id].x = legacyX;
+    const predator = { id: '0', x: mouthX, y: 40, facing: 1, created: born, lastBite: 0, cx: .6, cy: .9 };
+    w.data.population.predators[0] = predator;
+    advance(w, now + 500);
+    return { predator, caught: !w.data.fishes[id] };
+  }
+  assert(hunt(999, 0, 40).caught);
+  const rightFirst = hunt(300, 300, 38, [glyph(2, 2, 'o'), glyph(0, 0), glyph(1, 1)]).predator;
+  const topFirst = hunt(300, 300, 38, [glyph(0, 0, 'o'), glyph(2, 2), glyph(1, 1)]).predator;
+  assert.deepEqual([rightFirst.x, rightFirst.y], [301, 40]);
+  assert.deepEqual([topFirst.x, topFirst.y], [300, 39]);
+  assert.equal(hunt(999, 0, 40, undefined, .5).predator.x, 0);
+  assert.equal(hunt(11, 0, 40, [glyph(0, 0, 'o'), glyph(0, 1)], 2 ** 60).predator.facing, -1);
+});
+test('火山预警和冷却后保留的喷发记录无需读取鱼体或造景', () => {
+  const w = world(1), e = erupt(w);
+  w.ambient = false;
+  w.fishGroups = w.sceneryMap = () => assert.fail('没有岩浆需要定位时不应扫描海洋');
+  advance(w, e.nextAt - 1);
+  e.emitted = POPULATION.magmaLimit;
+  advance(w, e.at + POPULATION.cooling + HOUR);
+  assert.equal(w.data.population.eruption.id, e.id);
+});
+
 test('火山预警、发射上升、回落与32字上限；间隔至少6小时，离线不补喷', () => {
   const w = world(), e = erupt(w), start = e.at;
   advance(w, start + POPULATION.warning - 500); assert.equal(e.emitted, 0);
@@ -114,16 +147,59 @@ test('火山预警、发射上升、回落与32字上限；间隔至少6小时�
   assert.equal(w.data.population.eruption.id, e.id);
 });
 test('红色浆真实碰鱼致死；正好10分钟冷却不再伤鱼，岩石堆叠且挡住鱼与食物', () => {
-  const w = world(), e = erupt(w), bornAt = e.at + POPULATION.warning, y = w.floorAt(e.x) - 1;
-  const target = fish(w, e.x, y - 3), c = particle(w, e, 0, e.x, y - 3, bornAt);
+  const start = Date.UTC(2026, 0, 1), created = start - 3 * HOUR;
+  const w = new World(created, '00000000-0000-4000-8000-0000000009e5', { populate: false });
+  const e = erupt(w, start), bornAt = e.at + POPULATION.warning, y = w.floorAt(e.x) - 1;
+  assert.equal(e.x, 999, '同时覆盖火山紧邻环海接缝时的投放');
+  const target = fish(w, e.x, y - 3, undefined, created), c = particle(w, e, 0, e.x, y - 3, bornAt);
   advance(w, bornAt + 500); assert(!w.data.fishes[target]);
   c.y = y; advance(w, bornAt + POPULATION.cooling - 1); assert.equal(Object.keys(w.data.rocks).length, 0);
   advance(w, bornAt + POPULATION.cooling); const rock = w.data.rocks[c.id]; assert(rock); assert.equal(rock.y, y); assert(w.sceneryMap().has(key(e.x, y)));
   const second = particle(w, e, 1, e.x, y - 1, bornAt + 2000); advance(w, bornAt + 2000 + POPULATION.cooling); assert.equal(w.data.rocks[second.id].y, y - 1);
   const f = { id: 'preview', x: e.x, y: y - 1, facing: 1 }; assert.equal(w.canOccupy(f, [glyph(0, 0)]), false);
-  const coldFish = fish(w, e.x + 5, y - 4), cold = particle(w, e, 2, e.x + 5, y - 4, bornAt + 4000);
+  const x = wrapX(e.x + 5), coldY = Math.min(w.floorAt(x), w.floorAt(x + 1)) - 5;
+  const coldFish = fish(w, x, coldY, undefined, created), cold = particle(w, e, 2, x, coldY, bornAt + 4000);
   advance(w, cold.born + POPULATION.cooling); assert(w.data.fishes[coldFish]);
   assert(validRocks(w.data.rocks, w.data));
+});
+test('岩浆竖直移动超过四秒时，每一步仍可同步；恢复旧存档也能继续同步', async () => {
+  const started = Date.UTC(2025, 0, 1);
+  const w = new World(started, 'd17f6454-c149-487d-a9f9-5a5d3c3fa775', { populate: false });
+  const e = erupt(w, started + HOUR), at = e.at + POPULATION.warning;
+  const index = Array.from({ length: POPULATION.magmaLimit }, (_, i) => i).find(i => hash(`${e.id}:${i}`) % 3 === 1);
+  const x = wrapX(e.x + hash(`${e.id}:${index}`) % 5 - 2);
+  const c = particle(w, e, index, x, 50, at);
+  c.settled = false;
+  c.rise = 4;
+  const peer = world();
+  peer.data = w.serialize();
+  for (let i = 0; i <= 10; i++) {
+    advance(w, at + i * 500);
+    const next = w.serialize();
+    await verifyReplica(next, {}, undefined, { current: peer.data });
+    peer.merge(next);
+    assert.equal(peer.data.population.eruption.particles[c.id].x, x);
+  }
+  assert(c.y < 50);
+  const legacy = w.serialize(), old = legacy.population.eruption.particles[c.id];
+  old.settled = true;
+  old.cx = 1.125;
+  await assert.rejects(verifyReplica(legacy, {}, undefined, { current: peer.data }), /生态控制/);
+  assert.throws(() => peer.merge(legacy), /生态控制/);
+  for (const context of ['start', 'import']) {
+    const checked = await verifyLocalCheckpoint(legacy, {}, undefined, { context });
+    assert.deepEqual(checked.population.eruption.particles[c.id], { ...old, cx: 0 });
+    const recovered = restoreCheckpoint({ world: checked, lastOnlineAt: checked.tick }, checked.tick + 500).world;
+    const saved = recovered.serialize();
+    await verifyReplica(saved, {}, undefined, { current: peer.data });
+    peer.merge(saved);
+  }
+  assert.equal(old.cx, 1.125);
+  for (const change of [p => p.x = wrapX(p.x + 1), p => p.drift = -1, p => p.cx = 1000, p => p.cy = -1]) {
+    const invalid = clone(legacy);
+    change(invalid.population.eruption.particles[c.id]);
+    await assert.rejects(verifyLocalCheckpoint(invalid, {}, undefined, { context: 'import' }), /生态控制/);
+  }
 });
 test('岩石和康复合流顺序一致，旧快照不重新加热或重复沉积', () => {
   const w = world(), e = erupt(w), bornAt = e.at + POPULATION.warning, c = particle(w, e, 0, e.x, w.floorAt(e.x) - 1, bornAt), hot = w.serialize();

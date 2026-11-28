@@ -1,8 +1,20 @@
 import { signer, verifyEnvelope } from './storage.js';
 import { normalizeInvite, decodeInvite } from './invite.js';
 import { changesSince, coalesceWorld, fitsLegacyEnvelope, ReplicaTransfers } from './replica-stream.js';
+import { supportsPoseBytes } from './replica-row-delta.js';
 const CHUNK = 16000, MAX_PEERS = 8, MAX_RAW = 32 * 1024 * 1024, encoder = new TextEncoder(), decoder = new TextDecoder();
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+const replicaRowsVersion = 1;
+const replicaOffer = { replicaPages: 1, replicaLive: 1, replicaRows: replicaRowsVersion, replicaFrames: 1, replicaPoseBytes: Number(supportsPoseBytes), replicaTransitions: 1 };
+const signedPageBytes = new WeakMap();
+function replicaCapabilities(peer, signal) {
+  peer.replicaPages = signal.replicaPages === 1;
+  peer.replicaLive = peer.replicaPages && signal.replicaLive === 1;
+  peer.replicaRows = peer.replicaLive && replicaRowsVersion === 1 && signal.replicaRows === 1;
+  peer.replicaFrames = peer.replicaRows && signal.replicaFrames === 1;
+  peer.replicaTransitions = peer.replicaFrames && signal.replicaTransitions === 1;
+  peer.replicaPoseBytes = peer.replicaFrames && supportsPoseBytes && signal.replicaPoseBytes === 1;
+}
 const DIRECT_ERROR = '入口可访问，但浏览器直连未建立，请检查双方网络及防火墙后重试';
 export async function lanDescription(description, fromUrl) {
   const ip = new URL(await decodeInvite(fromUrl)).hostname;
@@ -30,7 +42,7 @@ export class Network {
     const target = possible.sort((a, b) => a.peers - b.peers)[0];
     if (!target) { for (const hint of (status.hints || []).slice(0, 8)) { if (hint.id !== this.node && !this.has(hint.id)) { try { await this.connect(hint.url, hint.id, visited, entryInvite, silent); if (this.live().length) return; } catch { } } } throw new Error('入口可访问，但暂时没有正在玩的伙伴或空位'); }
     const id = crypto.randomUUID(), p = this.make(id, url, target.id); p.entryInvite = entryInvite; p.silent = silent; this.attach(p, p.pc.createDataChannel('tide'));
-    try { await p.pc.setLocalDescription(await p.pc.createOffer()); await this.ice(p.pc); const result = await this.local('relay', { url, signal: { type: 'offer', replicaPages: 1, replicaLive: 1, from: this.node, to: target.id, connection: id, sdp: p.pc.localDescription.toJSON() } }); if (!result.ok) throw new Error(result.error || '配对入口繁忙'); await this.waitForConnection(p); } catch (e) { this.close(p, e); throw e; }
+    try { await p.pc.setLocalDescription(await p.pc.createOffer()); await this.ice(p.pc); const result = await this.local('relay', { url, signal: { type: 'offer', ...replicaOffer, from: this.node, to: target.id, connection: id, sdp: p.pc.localDescription.toJSON() } }); if (!result.ok) throw new Error(result.error || '配对入口繁忙'); await this.waitForConnection(p); } catch (e) { this.close(p, e); throw e; }
   }
   waitForConnection(p) { if (p.dc?.readyState === 'open') return Promise.resolve(); if (!this.connections.has(p.id)) return Promise.reject(p.error || new Error(DIRECT_ERROR)); return new Promise((resolve, reject) => p.waiters.add({ resolve, reject })); }
   make(id, url, node) {
@@ -45,8 +57,8 @@ export class Network {
     s.fromUrl = await normalizeInvite(s.fromUrl);
     if (s.type === 'offer') {
       if (this.connections.size >= MAX_PEERS || this.has(s.from)) { await this.local('relay', { url: s.fromUrl, signal: { type: 'reject', from: this.node, to: s.from, connection: s.connection } }); return; }
-      const p = this.make(s.connection, s.fromUrl, s.from); p.replicaPages = s.replicaPages === 1; p.replicaLive = p.replicaPages && s.replicaLive === 1; try { await p.pc.setRemoteDescription(await lanDescription(s.sdp, s.fromUrl)); await p.pc.setLocalDescription(await p.pc.createAnswer()); await this.ice(p.pc); await this.local('relay', { url: p.url, signal: { type: 'answer', replicaPages: 1, replicaLive: 1, from: this.node, to: s.from, connection: s.connection, sdp: p.pc.localDescription.toJSON() } }); } catch (e) { this.close(p); throw e; }
-    } else { const p = this.connections.get(s.connection); if (!p) return; if (s.type === 'reject') { this.close(p, new Error('对方暂时无法接受连接，请稍后重试')); return; } p.node = s.from; p.url = s.fromUrl; p.replicaPages = s.replicaPages === 1; p.replicaLive = p.replicaPages && s.replicaLive === 1; await p.pc.setRemoteDescription(await lanDescription(s.sdp, s.fromUrl)); }
+      const p = this.make(s.connection, s.fromUrl, s.from); replicaCapabilities(p, s); try { await p.pc.setRemoteDescription(await lanDescription(s.sdp, s.fromUrl)); await p.pc.setLocalDescription(await p.pc.createAnswer()); await this.ice(p.pc); await this.local('relay', { url: p.url, signal: { type: 'answer', ...replicaOffer, from: this.node, to: s.from, connection: s.connection, sdp: p.pc.localDescription.toJSON() } }); } catch (e) { this.close(p); throw e; }
+    } else { const p = this.connections.get(s.connection); if (!p) return; if (s.type === 'reject') { this.close(p, new Error('对方暂时无法接受连接，请稍后重试')); return; } p.node = s.from; p.url = s.fromUrl; replicaCapabilities(p, s); await p.pc.setRemoteDescription(await lanDescription(s.sdp, s.fromUrl)); }
   }
   attach(p, dc) {
     p.dc = dc; dc.binaryType = 'arraybuffer'; dc.bufferedAmountLowThreshold = 65536;
@@ -65,9 +77,32 @@ export class Network {
       body = { ...structuredClone(metadata), [key]: snapshot };
     } else body = structuredClone(body);
     const message = { id: crypto.randomUUID(), kind, from: this.node, actor: this.identity.actor, key: this.identity.pub, body };
+    if (page && this.sign.bytes) {
+      const bytes = encoder.encode(JSON.stringify(message));
+      const envelope = { ...message, signature: await this.sign.bytes(bytes) };
+      signedPageBytes.set(envelope, bytes);
+      return envelope;
+    }
     return { ...message, signature: await this.sign(message) };
   }
-  async encode(message) { const raw = encoder.encode(JSON.stringify(message)); if (raw.byteLength > 32 * 1024 * 1024) throw new Error('世界快照过大'); if (raw.byteLength > 2048 && typeof CompressionStream !== 'undefined') { const bytes = new Uint8Array(await new Response(new Blob([raw]).stream().pipeThrough(new CompressionStream('gzip'))).arrayBuffer()); const result = new Uint8Array(bytes.length + 1); result[0] = 1; result.set(bytes, 1); return result; } const result = new Uint8Array(raw.length + 1); result.set(raw, 1); return result; }
+  async encode(message) {
+    const signed = signedPageBytes.get(message);
+    // JSON.stringify appended the envelope's closing brace after the body. The
+    // receiver authenticates precisely those bytes, including property order.
+    const parts = signed ? [signed.subarray(0, -1), encoder.encode(',"signature":' + JSON.stringify(message.signature) + '}')]
+      : [encoder.encode(JSON.stringify(message))];
+    const size = parts.reduce((sum, part) => sum + part.byteLength, 0);
+    if (size > MAX_RAW) throw new Error('世界快照过大');
+    if (size > 2048 && typeof CompressionStream !== 'undefined') {
+      const bytes = new Uint8Array(await new Response(new Blob(parts).stream().pipeThrough(new CompressionStream('gzip'))).arrayBuffer());
+      const result = new Uint8Array(bytes.length + 1);
+      result[0] = 1; result.set(bytes, 1); return result;
+    }
+    const result = new Uint8Array(size + 1);
+    let offset = 1;
+    for (const part of parts) { result.set(part, offset); offset += part.length; }
+    return result;
+  }
   replicaPeers() { return this.live().filter(p => !p.replicaPages || p.sentHello && p.confirmedReplica); }
   worldReplicaPeers() {
     const ready = this.replicaPeers();
@@ -93,6 +128,7 @@ export class Network {
     return fitsLegacyEnvelope(body, MAX_RAW - encoder.encode(JSON.stringify(header)).length + 4);
   }
   async broadcastEnvelope(message, peers = this.live()) { this.seen.set(message.id, Date.now()); const bytes = await this.encode(message); await Promise.allSettled(peers.map(p => this.send(p, message.id, bytes))); return message; }
+  stageWorld(body, peers) { this.replicas.stageLive(body, peers.filter(peer => peer.replicaLive)); }
   clearPendingWorld() {
     this.replicas.discardPendingLive();
     this.worldRelayPending = null;

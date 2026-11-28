@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { World, CONFIG, clone } from '../www/engine.js';
+import { World, CONFIG, clone, hash } from '../www/engine.js';
 import { restoreCheckpoint } from '../www/lifecycle.js';
 import { LIFE, personality, personalityText, weatherAt, lifeContext, updateLife, idleMotion, fishLifeText, recordStory, mergeLife, newLife, validateLife, spawnPlankton, planktonSource, validPlankton, freshPlankton, pairKey, storiesFor, storyText, returnStory } from '../www/life.js';
 import { fishCatalog } from '../www/fish-profile.js';
@@ -88,6 +88,30 @@ test('环形边界的遮挡、等距邻居和常去造景在完整模拟中保�
   const state = JSON.stringify({ fishes, life }, (_, value) => value && typeof value === 'object' && !Array.isArray(value)
     ? Object.fromEntries(Object.keys(value).sort().map(key => [key, value[key]])) : value);
   assert.equal(createHash('sha256').update(state).digest('hex'), '122247f3e711c3b2cad080a2f05e1a606440380e020d22db56d3f55f3b22c18d');
+});
+test('距离与标识排序都相等时保留跨海界的分桶和桶内顺序', () => {
+  const w = world(), groups = new Map(), right = 'e\u0301', left = 'é', alsoLeft = 'é\u0001';
+  assert.equal(right.localeCompare(left), 0);
+  assert.equal(left.localeCompare(alsoLeft), 0);
+  for (const [id, x] of [['center', 0], [right, 1], [alsoLeft, 999], [left, 999]]) {
+    w.data.fishes[id] = { id, x, y: 20, facing: 1 };
+    groups.set(id, [{ x: 0, y: 0 }]);
+  }
+  const ctx = lifeContext(w, t, new Map(), groups);
+  assert.deepEqual(ctx.neighbors.get('center').map(p => p.id), [alsoLeft, left, right]);
+  assert.equal(ctx.crowdedNeighbor(ctx.points.get('center')).id, alsoLeft);
+});
+test('避让时隔着环形边界的鱼与同侧鱼相距相同，按标识选择，再考虑遮挡', () => {
+  const w = world(), groups = new Map();
+  for (const [id, x, width] of [['center', 1, 2], ['first', 996, 4], ['second', 4, 2]]) {
+    w.data.fishes[id] = { id, x, y: 20, facing: 1 };
+    groups.set(id, Array.from({ length: width }, (_, x) => cell(x, 0)));
+  }
+  const open = lifeContext(w, t, w.sceneryMap(), groups);
+  assert.equal(open.crowdedNeighbor(open.points.get('center')).id, 'first');
+  scene(w, 0, 20);
+  const blocked = lifeContext(w, t, w.sceneryMap(), groups);
+  assert.equal(blocked.crowdedNeighbor(blocked.points.get('center')).id, 'second');
 });
 test('旧存档的分数坐标保留距离边界上的单向视线', () => {
   const w = world(), a = fish(w, 7, 20), b = crypto.randomUUID();
@@ -187,7 +211,14 @@ test('浮游食物被吃后正常增长，脱落重新计时并可沉积与付�
   f.x = (f.x + 300) % 1000; f.y = 20; w.step(c.born + CONFIG.foodLife); assert.equal(c.kind, 'scene'); assert(validPlankton(c, w.data.roots));
   const scaled = crypto.randomUUID(); assert(w.apply({ id: scaled, actor: 'maker', kind: 'sceneScale', scene: c.entity, factor: 2, cost: 3, t: w.data.tick }).ok === false); // Cannot enlarge through the fixed seabed.
   assert.equal(w.wallet('maker'), 20);
-  assert(w.apply({ id: crypto.randomUUID(), actor: 'maker', kind: 'sceneMove', scene: c.entity, x: 70, y: 20, cost: 0, t: w.data.tick }).ok);
+  // The random sea can put the swimmer at the old fixed destination. Choose
+  // open water for the move and its subsequent 2×2 expansion.
+  const blocked = new Set([...w.fishMap().keys(), ...w.sceneryMap().keys()]);
+  for (const row of Object.values(w.data.chars)) if (row.kind === 'seaweed') blocked.add(`${row.x},${row.y}`);
+  const x = Array.from({ length: CONFIG.width - 1 }, (_, i) => i).find(i =>
+    [i, i + 1].every(col => [20, 21].every(y => w.waterAt(col, y) && !blocked.has(`${col},${y}`))));
+  assert.notEqual(x, undefined);
+  assert(w.apply({ id: crypto.randomUUID(), actor: 'maker', kind: 'sceneMove', scene: c.entity, x, y: 20, cost: 0, t: w.data.tick }).ok);
   const grow = crypto.randomUUID(); assert(w.apply({ id: grow, actor: 'maker', kind: 'sceneScale', scene: c.entity, factor: 2, cost: 3, t: w.data.tick }).ok);
   assert.equal(w.wallet('maker'), 17); assert(validPlankton(c, w.data.roots));
   assert(Object.values(w.data.chars).filter(c => c.id.startsWith(grow)).every(c => !c.plankton && c.payer === 'maker'));
@@ -216,4 +247,123 @@ test('无效时间、关系、来源和浮游凭据被拒绝，合法自然记�
   const w = world(), a = fish(w), b = fish(w, 25, 20, 'bob'); track(w, 45); assert(validateLife(w.data.life, source(w)));
   for (const mutate of [l => l.at = Infinity, l => l.bonds[pairKey(a, b)].seconds = -1, l => l.bonds[pairKey(a, b)].run = 999, l => l.stories[Object.keys(l.stories)[0]].fish = 'forged', l => l.bloomThrough.nope = 1]) { const bad = clone(w.data.life); mutate(bad); assert(!validateLife(bad, source(w))); const snapshot = w.serialize(); snapshot.life = bad; assert.throws(() => w.merge(snapshot), /鱼生记录/); }
   const at = weatherTime(w, 'plankton'); spawnPlankton(w, at); const c = Object.values(w.data.chars).find(c => c.plankton); assert(validPlankton(c, w.data.roots)); c.color = '#ffffff'; assert(!validPlankton(c, w.data.roots));
+});
+
+test('密集鱼群混有自然出生鱼时，关系上限和同一秒的熟鱼故事保留原有顺序', () => {
+  const start = Date.UTC(2025, 5, 15, 12, 17);
+  const actual = new World(start, 'mixed-school', { populate: false });
+  const ids = Array.from({ length: 105 }, (_, i) => i % 19 === 0 ? 'born:breed:older:' + i
+    : '00000000-0000-4000-8000-' + String(i).padStart(12, '0')).reverse();
+  for (const [i, id] of ids.entries()) {
+    actual.data.fishes[id] = { id, x: 997 + i % 5, y: 20 + i % 3, facing: 1 };
+    actual.data.chars[id] = { id, entity: id, kind: 'fish', x: 0, y: 0, path: [] };
+  }
+  for (let i = 0; i < ids.length; i++) for (let j = i + 1; j < ids.length; j++) {
+    if ((i + j) % 7) continue;
+    const [a, b] = [ids[i], ids[j]].sort(), key = a + '|' + b;
+    actual.data.life.bonds[key] = { a, b, seconds: 44, at: start, lastNear: start, run: 9 };
+    if ((i + j) % 3 === 0) recordStory(actual, 'friend', a, start - i, { other: b });
+  }
+  for (let i = 0; i < LIFE.storyLimit; i++) recordStory(actual, 'meal', 'older-' + i, start - i);
+  const expected = new World(start, 'mixed-school', { populate: false });
+  expected.data = actual.serialize();
+  const now = start + 1000, c = context(actual, now), bonds = expected.data.life.bonds, seen = new Set();
+  for (const [id, others] of c.neighbors) for (const q of others) {
+    const [a, b] = [id, q.id].sort(), key = a + '|' + b;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const old = bonds[key];
+    if (old) recordStory(expected, 'friend', a, now, { other: b });
+    bonds[key] = { a, b, seconds: (old?.seconds || 0) + 1, at: now, lastNear: now, run: old ? old.run + 1 : 0 };
+  }
+  const keys = Object.keys(bonds).sort((a, b) => a.localeCompare(b)).slice(0, LIFE.bondLimit);
+  updateLife(actual, now, c);
+  assert.deepEqual(Object.keys(actual.data.life.bonds), keys);
+  assert.deepEqual(actual.data.life.bonds, Object.fromEntries(keys.map(key => [key, bonds[key]])));
+  assert.deepEqual(Object.keys(actual.data.life.stories), Object.keys(expected.data.life.stories));
+  assert.deepEqual(actual.data.life.stories, expected.data.life.stories);
+});
+
+test('时钟回退时，暂时分开的旧伙伴仍优先于新建立的关系', () => {
+  const w = world(), now = t - 1000;
+  const ids = Array.from({ length: 94 }, (_, i) => 'fish-' + String(i).padStart(3, '0'));
+  for (const [i, id] of ids.entries()) {
+    w.data.fishes[id] = { id, x: i === ids.length - 1 ? 200 : 10, y: 20, facing: 1 };
+    w.data.chars[id] = { id, entity: id, kind: 'fish', x: 0, y: 0, path: [] };
+  }
+  const [a, b] = ids.slice(-2), old = { a, b, seconds: 8, at: t, lastNear: t, run: 7 };
+  w.data.life.bonds[pairKey(a, b)] = old;
+  const c = context(w, now), active = new Set();
+  for (const [id, others] of c.neighbors) for (const q of others) active.add(pairKey(id, q.id));
+  assert(active.size > LIFE.bondLimit);
+  const expected = [pairKey(a, b), ...[...active].sort((a, b) => a.localeCompare(b)).slice(0, LIFE.bondLimit - 1)];
+  updateLife(w, now, c);
+  assert.deepEqual(Object.keys(w.data.life.bonds), expected);
+  assert.deepEqual(w.data.life.bonds[pairKey(a, b)], old);
+});
+
+test('旧鱼名按语言规则排序并列时，保留已有伙伴的相对位置', () => {
+  const w = world(), now = t + 1000, ids = ['a', '\u00e9', 'e\u0301'];
+  for (const id of ids) {
+    w.data.fishes[id] = { id, x: 10, y: 20, facing: 1 };
+    w.data.chars[id] = { id, entity: id, kind: 'fish', x: 0, y: 0, path: [] };
+  }
+  const [a, fresh, b] = ids, oldKey = pairKey(a, b), freshKey = pairKey(a, fresh);
+  assert.equal(oldKey.localeCompare(freshKey), 0);
+  w.data.life.bonds[oldKey] = { a, b, seconds: 8, at: t, lastNear: t, run: 7 };
+  updateLife(w, now, context(w, now));
+  assert.deepEqual(Object.keys(w.data.life.bonds), [oldKey, freshKey, pairKey(fresh, b)]);
+  assert.equal(w.data.life.bonds[oldKey].seconds, 9);
+});
+
+test('伙伴合流保留上限外的较新旧记录、同时间戳的并列顺序和原始字段胜者', () => {
+  const left = newLife(t), right = newLife(t);
+  for (let i = 0; i < LIFE.bondLimit; i++) {
+    const a = 'a', b = 'fish-' + String(i).padStart(4, '0'), key = pairKey(a, b);
+    right.bonds[key] = { a, b, seconds: 3, at: t, lastNear: t, run: 2 };
+    if (i % 3) left.bonds[key] = { ...right.bonds[key], seconds: i % 7 };
+  }
+  function check() {
+    const union = {};
+    for (const key of new Set([...Object.keys(left.bonds), ...Object.keys(right.bonds)])) {
+      const x = left.bonds[key], y = right.bonds[key];
+      const fresh = !x ? y : !y ? x : x.at !== y.at ? x.at > y.at ? x : y : JSON.stringify(x) < JSON.stringify(y) ? x : y;
+      union[key] = { ...fresh, seconds: Math.max(x?.seconds || 0, y?.seconds || 0) };
+    }
+    const expected = Object.fromEntries(Object.entries(union).sort(([a, x], [b, y]) => y.at - x.at || a.localeCompare(b)).slice(0, LIFE.bondLimit));
+    assert.equal(JSON.stringify(mergeLife(left, right, { tick: t }).bonds), JSON.stringify(expected));
+  }
+  left.bonds['a|x'] = { a: 'a', b: 'x', seconds: 80, at: t - 1, lastNear: t - 1, run: 1 };
+  check();
+  left.bonds['a|x'].at = t + 1;
+  const key = 'a|fish-0001';
+  left.bonds[key] = { extra: { n: 2 }, ...left.bonds[key], seconds: 11 };
+  right.bonds[key] = { ...right.bonds[key], extra: { n: 1 } };
+  for (const b of ['\u00e9', 'e\u0301']) left.bonds[pairKey('a', b)] = { a: 'a', b, seconds: 0, at: t, lastNear: t, run: 0 };
+  check();
+});
+
+test('关系验证核对整条键和真实创建凭据，旧字典的索引名可以与凭据标识不同', () => {
+  const life = newLife(t), a = 'a|part', b = 'born:b', row = { a, b, seconds: 3, at: t, lastNear: t, run: 2 };
+  const key = pairKey(a, b);
+  life.bonds[key] = row;
+  const legacy = { roots: {}, ops: { older: { kind: 'fish', id: a } }, breeding: { other: { status: 'born', baby: { id: b } } } };
+  assert(validateLife(life, legacy));
+  const indexed = { roots: {}, ops: { [a]: legacy.ops.older }, breeding: { b: legacy.breeding.other } };
+  assert(validateLife(life, indexed));
+  for (const bad of [key + 'x', key.replace('part|', 'part-'), key.replace('part', 'past'), key.replace('born', 'barn')]) {
+    assert(!validateLife({ ...life, bonds: { [bad]: row } }, indexed));
+  }
+  assert(!validateLife(life, { ...indexed, ops: { [a]: { kind: 'fish', id: 'x' } } }));
+});
+test('饥饿游动换相按原鱼标识逐字计算，兼容改名标识和回退时间', () => {
+  const fish = { id: '海🐟:甲', created: 100000, lastFed: -200000000 };
+  for (const id of ['海🐟:甲', 'id:2', '海🐟:甲']) {
+    fish.id = id;
+    for (const at of [0, 99999, 100000, 111999, 112000, 232000, 123321, 123321]) {
+      const phase = Math.floor((at - fish.created) / 12000);
+      const value = hash(`${id}:${phase}`);
+      assert.deepEqual(idleMotion({}, fish, at), { dx: value % 3 - 1, dy: Math.floor(value / 3) % 3 - 1 });
+    }
+  }
 });

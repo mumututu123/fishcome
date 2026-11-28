@@ -1,6 +1,12 @@
-import { World, CONFIG } from './engine.js';
+import { BodyMembership } from './body-membership.js';
+import { BodyLayout } from './motion-hull.js';
+import { World, CONFIG, indexEcologyCharacters } from './engine.js';
+import { shanghaiDay } from './fish-status.js';
 import { worldTables } from './simulation-changes.js';
-import { encodeFields } from './simulation-delta.js';
+import { encodeFields, motionFields } from './simulation-delta.js';
+import { advanceBond, encodeBondIntervals } from './bond-interval.js';
+
+const motionEdit = { properties: motionFields };
 
 // Only a user operation, a verified replica or archiving writes these fields.
 // Natural simulation and geometry repair use them as lookup tables.
@@ -10,22 +16,91 @@ const inputFields = new Set(['ops', 'terrain', 'roots', 'participants', 'archive
 // them in a message. Collections can be replaced by the simulation as a whole
 // (notably contacts), in which case additions and removals must both be sent.
 function trackWorld(source) {
+  const knownFish = new Map(Object.keys(source.fishes).map((id, index) => [id, index]));
+  const daysByOrdinal = new Array(knownFish.size);
   const proxies = new WeakMap(), originals = new WeakMap();
   const values = new Set(), rows = new Map(), lifeFields = new Set(), bondRows = new Map();
   const raw = object => originals.get(object) || object;
-  let characters, orderedBonds = false;
+  const bondTimes = new WeakMap();
+  let characters, ecology, membership, meals, previousBonds, activeBonds, publishedBonds, orderedBonds = false;
+  let fishRoster, previousStories, poseRevision = 0, originRevision = 0;
   const characterViews = new Map();
+  const activeKinds = ['food', 'seaweed', 'scene'];
+  const activeKey = JSON.stringify(activeKinds);
+  let poses = new Map();
   const allCharacters = () => characters ??= Object.values(raw(source.chars));
   function charValues(...kinds) {
     if (kinds[0] === undefined) return allCharacters();
     const key = JSON.stringify(kinds), cached = characterViews.get(key);
     if (cached) return cached.cells;
-    const cells = allCharacters().filter(cell => kinds.includes(cell.kind));
+    // Settling changes the food and scenery lists together. Rebuild them from
+    // their shared membership, without revisiting every glyph of every fish.
+    if (key === activeKey && membership) {
+      const cells = membership.activeCells();
+      characterViews.set(key, { kinds, cells });
+      return cells;
+    }
+    const source = key !== activeKey && kinds.every(kind => activeKinds.includes(kind))
+      ? charValues(...activeKinds) : allCharacters();
+    const cells = source.filter(cell => kinds.includes(cell.kind));
     characterViews.set(key, { kinds, cells });
     return cells;
   }
-  function invalidateCharacterViews(previous, next) {
-    for (const [key, view] of characterViews) if (view.kinds.includes(previous) || view.kinds.includes(next)) characterViews.delete(key);
+  function invalidateCharacterViews(previous, next, sameRow = false) {
+    for (const [key, view] of characterViews) {
+      const before = view.kinds.includes(previous), after = view.kinds.includes(next);
+      if (sameRow ? before !== after : before || after) characterViews.delete(key);
+    }
+  }
+  function ecologyCharacters() {
+    if (!ecology) {
+      // Food settling into scenery keeps the same position in this combined
+      // view. It changes neither the shape of a swimmer nor a previous meal.
+      membership ??= new BodyMembership(raw(source.chars), activeKinds);
+      membership.flush();
+      const cells = meals ? charValues(...activeKinds) : allCharacters();
+      ecology = indexEcologyCharacters(cells, membership.groups, meals);
+      const { pastMeals, pastGrass, latestMeals } = ecology;
+      meals = { pastMeals, pastGrass, latestMeals };
+    }
+    return ecology;
+  }
+  function mealPath(path) { return path?.some(event => event?.reason === 'eat'); }
+  function noteCharacterChange(target, parent, key, value, deleting) {
+    if (parent.table) {
+      const previous = target[key];
+      membership?.mark(key, true, deleting);
+      if (mealPath(previous?.path) || mealPath(value?.path)) meals = undefined;
+      characters = ecology = undefined;
+      invalidateCharacterViews(previous?.kind, value?.kind);
+      return;
+    }
+    if (parent.property === 'path') {
+      // A path edit can replace an event, edit its payload, or truncate its array.
+      const changesMeal = Array.isArray(target) ? key === 'length' || target[key]?.reason === 'eat' || value?.reason === 'eat'
+        : target.reason === 'eat' || key === 'reason' && value === 'eat';
+      if (meals && Array.isArray(target) && target === raw(source.chars[parent.id]?.path) && key === String(target.length) && value?.reason === 'eat') {
+        const { target: diner, t } = value;
+        meals.pastMeals.add(diner);
+        if (source.chars[parent.id]?.wild) meals.pastGrass.add(diner);
+        if (Number.isFinite(t) && t > (meals.latestMeals.get(diner) ?? -Infinity)) {
+          meals = { ...meals, latestMeals: new Map(meals.latestMeals).set(diner, t) };
+          ecology = undefined;
+        }
+      } else if (changesMeal) meals = ecology = undefined;
+      return;
+    }
+    if (parent.property !== undefined) return;
+    if (key === 'kind') {
+      membership?.mark(parent.id);
+      if (target === raw(source.chars[parent.id])) invalidateCharacterViews(target.kind, value, true);
+      ecology = undefined;
+    } else if (target.kind === 'fish' && (key === 'entity' || key === 'x' || key === 'y' || key === 'id')) {
+      membership?.mark(parent.id);
+      ecology = undefined;
+    } else if (key === 'path' && (mealPath(target.path) || mealPath(value)) || key === 'wild' && mealPath(target.path)) {
+      meals = ecology = undefined;
+    }
   }
   function tableChanges(field) {
     if (!rows.has(field)) rows.set(field, new Map());
@@ -36,6 +111,7 @@ function trackWorld(source) {
     if (location.root) return { field: key, table: worldTables.has(key) };
     const { field, id, property, part, bond } = location;
     if (location.table) return { field, id: key, editable: field === 'fishes' || field === 'travel' };
+    if (field === 'chars' && property === undefined) return { field, id, property: key };
     if (location.editable && property === undefined) return { ...location, property: key };
     if (field === 'travel' && property === 'days' && location.day === undefined) return { ...location, day: key };
     if (field === 'life') {
@@ -46,42 +122,81 @@ function trackWorld(source) {
   }
   function markLife(location, target, key, value) {
     const { part, bond } = location;
+    if (part === undefined && key === 'stories' && target.stories && value &&
+        !Array.isArray(value) && typeof value === 'object' && !lifeFields.has('stories')) {
+      previousStories ??= raw(target.stories);
+      return;
+    }
+    if ((part ?? key) === 'stories') previousStories = undefined;
+    if (part === 'bonds' || part === undefined && key === 'bonds') {
+      materializeBonds(raw(source.life.bonds));
+      if (previousBonds) materializeBonds(previousBonds);
+      activeBonds = publishedBonds = undefined;
+    }
     if (part === 'bonds') {
       if (bond !== undefined) bondRows.set(bond, null);
-      else if (!bondRows.has(key)) bondRows.set(key, raw(target[key]));
+      else if (!bondRows.has(key)) bondRows.set(key, raw((previousBonds || target)[key]));
+      else if (!Object.hasOwn(target, key) && bondRows.get(key) !== undefined) orderedBonds = true;
     } else if (part === undefined && key === 'bonds' && target[key] && value) {
       const previous = raw(target[key]), next = raw(value);
       const before = Object.keys(previous), after = Object.keys(next);
-      if (before.length !== after.length) orderedBonds = true;
-      for (const [index, id] of after.entries()) {
-        if (before[index] !== id) orderedBonds = true;
-        if (!bondRows.has(id) && raw(previous[id]) !== raw(next[id])) bondRows.set(id, raw(previous[id]));
+      if (orderedBonds || before.length !== after.length || before.some((id, index) => after[index] !== id)) {
+        previousBonds ??= previous;
+        orderedBonds = true;
+        return;
       }
+      for (const id of after) if (!bondRows.has(id) && raw(previous[id]) !== raw(next[id])) bondRows.set(id, raw(previous[id]));
+      if (after.length && bondRows.size === after.length) orderedBonds = true;
     } else lifeFields.add(part ?? key);
   }
   function mark(target, parent, key, value, deleting = false) {
     const { field, id, property } = parent;
+    if (parent.root && key === 'life') activeBonds = publishedBonds = undefined;
+    if (parent.root && (key === 'fishes' || key === 'ops' || key === 'breeding') ||
+        field === 'fishes' && (parent.table || !property && (key === 'id' || key === 'gender')) ||
+        field === 'breeding' && (key === 'baby' || key === 'gender' || key === 'status' ||
+          parent.table && (target[key]?.status === 'born' || value?.status === 'born'))) originRevision++;
+    if (parent.root && (key === 'fishes' || key === 'travel') ||
+        field === 'fishes' && (parent.table || !property && (key === 'id' || key === 'created' || key === 'lastFed' || key === 'lastMealAt')) ||
+        field === 'travel' && parent.table && !value) fishRoster = undefined;
+    if (parent.root && key === 'travel') daysByOrdinal.fill(undefined);
+    else if (field === 'travel' && (parent.table || !property && key === 'days')) {
+      const ordinal = knownFish.get(parent.table ? key : id);
+      if (ordinal !== undefined) daysByOrdinal[ordinal] = undefined;
+    }
+    if (parent.root && key === 'fishes') {
+      poseRevision++;
+      poses = undefined;
+    } else if (field === 'fishes' && (parent.table || !property && (key === 'x' || key === 'y' || key === 'facing'))) {
+      poseRevision++;
+      const fish = parent.table ? target[key] : target, moved = parent.table ? key : id;
+      if (poses && !poses.has(moved)) poses.set(moved, fish && { x: fish.x, y: fish.y, facing: fish.facing });
+    }
     if (parent.root && key === 'chars') {
+      ecology = membership = meals = undefined;
       characters = undefined;
       characterViews.clear();
-    } else if (field === 'chars') {
-      if (parent.table) {
-        characters = undefined;
-        invalidateCharacterViews(target[key]?.kind, value?.kind);
-      } else if (key === 'kind' && target === raw(source.chars[id])) invalidateCharacterViews(target.kind, value);
-    }
+    } else if (field === 'chars') noteCharacterChange(target, parent, key, value, deleting);
     if (parent.root) {
-      if (worldTables.has(key) && !deleting) {
+      // The contact clock replaces the entire ordered table, including rows
+      // that kept their value but moved after another pair joined or left.
+      if (key === 'contacts') values.add(key);
+      else if (worldTables.has(key) && !deleting) {
         const previous = raw(target[key]) || {}, next = raw(value) || {};
         for (const id in previous) if (!Object.hasOwn(next, id)) tableChanges(key).set(id, null);
         for (const id in next) if (raw(previous[id]) !== raw(next[id])) tableChanges(key).set(id, null);
       } else values.add(key);
     } else if (parent.table) tableChanges(field).set(key, null);
-    else if (parent.editable) {
+    else if (parent.editable || (field === 'chars' && property === undefined && !deleting &&
+      (value === null || typeof value !== 'object'))) {
       const changed = tableChanges(field);
       if (!changed.has(id)) changed.set(id, { properties: new Set() });
-      const edit = changed.get(id);
+      let edit = changed.get(id);
       if (!edit) return;
+      if (edit === motionEdit || typeof edit === 'string') {
+        edit = edit === motionEdit ? { properties: new Set(motionFields) } : { properties: new Set(), days: new Set([edit]) };
+        changed.set(id, edit);
+      }
       if (field === 'travel' && property === 'days') (edit.days ||= new Set()).add(parent.day ?? key);
       else edit.properties.add(property ?? key);
     } else if (field === 'life') markLife(parent, target, key, value);
@@ -110,8 +225,27 @@ function trackWorld(source) {
     if (location.field === 'breeding' && location.id !== undefined && object.status && object.status !== 'active') return object;
     object = raw(object);
     if (proxies.has(object)) return proxies.get(object);
-    const proxy = new Proxy(object, writes);
+    const bondTable = location.field === 'life' && location.part === 'bonds' && location.bond === undefined;
+    const contactTable = location.field === 'contacts' && location.table;
+    const proxy = new Proxy(object, bondTable || contactTable ? {
+      ...writes,
+      get(table, key, receiver) {
+        let value = Reflect.get(table, key, receiver);
+        if (bondTable && value && typeof value === 'object') {
+          const at = bondTimes.get(table);
+          if (at !== undefined) {
+            const row = raw(value);
+            // A caller may still hold an older table. Its first mutable read
+            // owns a private row even when several observations share an anchor.
+            if (at !== null && row.at !== at) value = table[key] = advanceBond(row, at);
+            else if (!proxies.has(row)) value = table[key] = { ...row };
+          }
+        }
+        return Object.hasOwn(table, key) && value && typeof value === 'object' ? watch(value, child(location, key)) : value;
+      }
+    } : writes);
     proxies.set(object, proxy); originals.set(proxy, object); locations.set(object, location);
+    if (bondTable || contactTable) return proxy;
     for (const key of Object.keys(object)) {
       const value = object[key];
       if (value && typeof value === 'object') object[key] = watch(value, child(location, key));
@@ -123,6 +257,7 @@ function trackWorld(source) {
   function plain(value) {
     if (!value || typeof value !== 'object') return value;
     value = raw(value);
+    if (bondTimes.get(value) != null) materializeBonds(value);
     if (Array.isArray(value)) return value.map(plain);
     const result = {};
     for (const key of Object.keys(value)) result[key] = plain(value[key]);
@@ -131,13 +266,16 @@ function trackWorld(source) {
   function encodeRow(id, row, edit) {
     if (!edit) return [id, plain(row)];
     row = raw(row);
+    if (typeof edit === 'string') return [id, edit, raw(row.days)[edit]];
     const delta = [id, ...encodeFields(row, edit.properties, plain)];
     if (edit.days && !edit.properties.has('days')) delta.push(encodeFields(raw(row.days), edit.days, plain));
     return delta;
   }
   function encodeBond(id, row) {
-    if (!bondRows.has(id)) return [id];
-    const old = bondRows.get(id), next = raw(row);
+    const next = raw(row);
+    if (!bondRows.has(id) && !previousBonds) return [id];
+    const old = bondRows.has(id) ? bondRows.get(id) : raw(previousBonds[id]);
+    if (old === next) return [id];
     if (!old || !next) return [id, plain(row)];
     const before = Object.keys(old), after = Object.keys(next);
     // Existing bond records come from saves as well. A replacement can put its
@@ -146,39 +284,207 @@ function trackWorld(source) {
     const changed = after.filter(key => raw(old[key]) !== raw(next[key]));
     return changed.length ? [id, ...encodeFields(next, changed, plain)] : [id];
   }
+  function materializeBonds(table) {
+    const at = bondTimes.get(table);
+    if (at == null) return table;
+    for (const key in table) if (table[key].at !== at) table[key] = advanceBond(raw(table[key]), at);
+    bondTimes.set(table, null);
+    return table;
+  }
   function encodeBonds(table) {
     table = raw(table);
+    if (activeBonds?.table === table) {
+      const { keys, at, base } = activeBonds;
+      publishedBonds = { table, keys, at, retain: row => proxies.has(row) ? { ...row } : row };
+      if (base) return encodeBondIntervals(base, table, keys, at);
+      const counters = new Float64Array(keys.length * 2);
+      for (let i = 0; i < keys.length; i++) {
+        const row = table[keys[i]];
+        counters[i * 2] = row.seconds;
+        counters[i * 2 + 1] = row.run;
+      }
+      return { keys, counters, at, set: [] };
+    }
     const set = [], remove = [];
-    if (orderedBonds) for (const id of Object.keys(table)) set.push(encodeBond(id, table[id]));
-    else for (const id of bondRows.keys()) {
+    if (orderedBonds) {
+      const keys = Object.keys(table), counters = new Float64Array(keys.length * 2), at = source.life.at;
+      for (const [i, id] of keys.entries()) {
+        const row = raw(table[id]);
+        if (row && Object.is(row.at, at) && Object.is(row.lastNear, at) && Number.isFinite(row.seconds) && Number.isFinite(row.run) &&
+            typeof row.a === 'string' && typeof row.b === 'string' && !row.a.includes('|') && id === row.a + '|' + row.b &&
+            Object.keys(row).join(',') === 'a,b,seconds,at,lastNear,run') {
+          counters[i * 2] = row.seconds;
+          counters[i * 2 + 1] = row.run;
+        } else {
+          counters[i * 2] = NaN;
+          set.push(encodeBond(id, row));
+        }
+      }
+      return { keys, counters, at, set };
+    }
+    for (const id of bondRows.keys()) {
       if (Object.hasOwn(table, id)) set.push(encodeBond(id, table[id]));
       else remove.push(id);
     }
     return { set, remove, ordered: orderedBonds };
   }
+  function finitePose(row) {
+    return Number.isFinite(row.x) && Number.isFinite(row.y) && Number.isFinite(row.facing) &&
+      Number.isFinite(row.cx) && Number.isFinite(row.cy);
+  }
+  function movingFish(fish) {
+    const edits = tableChanges('fishes'), id = fish.id;
+    if (!edits.has(id)) edits.set(id, motionEdit);
+    else {
+      const edit = edits.get(id);
+      if (edit && edit !== motionEdit) for (const key of motionFields) edit.properties.add(key);
+    }
+    poseRevision++;
+    return raw(fish);
+  }
+  // Ordinary fish publish their motion directly in the wire format. Later
+  // feeding, death or repairs can still supersede that row in the same step.
+  let swimming;
+  function readDays(id, ordinal) {
+    const record = raw(source.travel[id]);
+    if (record) return daysByOrdinal[ordinal] = raw(record.days);
+  }
+  function beginSwimBatch() {
+    const count = knownFish.size;
+    return { motion: new Float64Array(count * 5), poses: [], travel: [], distances: new Float64Array(count),
+      poseIndex: new Int32Array(count), tripIndex: new Int32Array(count), daysByOrdinal, readDays };
+  }
+  function completeSwimBatch(frame, day) {
+    if (frame.poses.length) {
+      poseRevision++;
+      tableChanges('fishes');
+    }
+    if (frame.travel.length) {
+      frame.day = day;
+      tableChanges('travel');
+    }
+    if (frame.poses.length || frame.travel.length) swimming = frame;
+  }
+  function frameRows(field, edits) {
+    if (!swimming || (field !== 'fishes' && field !== 'travel')) return [];
+    const poses = field === 'fishes', list = poses ? swimming.poses : swimming.travel;
+    const index = poses ? swimming.poseIndex : swimming.tripIndex;
+    let holes = 0;
+    for (const id of edits.keys()) {
+      const at = index[knownFish.get(id)];
+      if (!at) continue;
+      list[at - 1] = null;
+      edits.set(id, null);
+      holes++;
+    }
+    if (holes) {
+      let count = 0;
+      for (let i = 0; i < list.length; i++) if (list[i] !== null) {
+        list[count] = list[i];
+        if (i !== count) {
+          if (poses) swimming.motion.copyWithin(count * 5, i * 5, i * 5 + 5);
+          else swimming.distances[count] = swimming.distances[i];
+        }
+        count++;
+      }
+      list.length = count;
+    }
+    return list;
+  }
   function reset() {
-    values.clear(); rows.clear(); lifeFields.clear(); bondRows.clear(); orderedBonds = false;
+    swimming = undefined;
+    previousStories = undefined;
+    values.clear(); rows.clear(); lifeFields.clear(); bondRows.clear(); previousBonds = activeBonds = undefined; orderedBonds = false;
   }
   return {
     data: watch(source, { root: true }),
     // Callers enumerate this read-only list. Its rows still carry tracked writes.
     charValues,
+    readBonds: () => materializeBonds(raw(source.life.bonds)),
+    readStories: () => raw(source.life.stories),
+    activeBondSpans: at => publishedBonds?.at === at && publishedBonds.table === raw(source.life.bonds) ? publishedBonds : null,
+    writeActiveBonds(table, keys, at, base) {
+      const previous = raw(source.life.bonds);
+      previousBonds ??= previous;
+      raw(source.life).bonds = watch(table, { field: 'life', part: 'bonds' });
+      orderedBonds = true;
+      bondTimes.set(table, base ? at : null);
+      activeBonds = { table, keys, at, base };
+    },
+    ecologyCharacters,
+    bodyEdits: (before, after) => membership?.edits(before, after),
+    poseEdits: () => poses,
+    clearPoseEdits: () => { if (poses) poses.clear(); else poses = new Map(); },
+    poseRevision: () => poseRevision,
+    readFish: id => raw(source.fishes[id]),
+    readContacts: () => raw(source.contacts),
+    fishValues: () => fishRoster ??= Object.values(raw(source.fishes)),
+    originRevision: () => originRevision,
+    invalidateOrigins: () => { originRevision++; },
+    // Swimming owns these six scalar fields until the ordered movement pass
+    // completes. Other writes to the same fish still join the ordinary edit.
+    movingFish,
+    swimOrdinal: id => knownFish.get(id),
+    beginSwimBatch,
+    completeSwimBatch,
+    recordMovement(id, distance, now, day) {
+      if (!Number.isFinite(distance) || distance <= 0 || !source.fishes[id]) return;
+      day ??= shanghaiDay(now);
+      const table = source.travel, record = raw(table[id]);
+      if (!record) { table[id] = { since: now, days: { [day]: distance } }; return; }
+      const days = raw(record.days);
+      days[day] = (days[day] || 0) + distance;
+      const edits = tableChanges('travel');
+      if (!edits.has(id)) edits.set(id, day);
+      else {
+        const prior = edits.get(id);
+        if (typeof prior === 'string' && prior !== day) edits.set(id, { properties: new Set(), days: new Set([prior, day]) });
+        else if (prior && typeof prior !== 'string') (prior.days ||= new Set()).add(day);
+      }
+    },
     reset,
     changes() {
       const patch = { values: {}, tables: {} };
       for (const field of values) patch.values[field] = plain(source[field]);
       for (const [field, edits] of rows) {
-        const set = [], remove = [];
+        if (values.has(field)) continue;
+        const set = frameRows(field, edits), remove = [];
+        const distances = field === 'travel' && swimming?.distances?.subarray(0, set.length);
         const table = raw(source[field]) || {};
+        let motion = field === 'fishes' ? swimming?.motion : undefined;
+        let offset = motion ? set.length * 5 : 0;
         for (const [id, edit] of edits) {
-          if (Object.hasOwn(table, id)) set.push(encodeRow(id, table[id], edit));
-          else remove.push(id);
+          if (!Object.hasOwn(table, id)) { remove.push(id); continue; }
+          const row = raw(table[id]);
+          if (edit === motionEdit && row.posAt === source.tick && finitePose(row)) {
+            motion ??= new Float64Array(edits.size * 5);
+            if (offset + 5 > motion.length) {
+              const full = new Float64Array(offset + edits.size * 5);
+              full.set(motion); motion = full;
+            }
+            set.push(knownFish.get(id) ?? id);
+            motion[offset++] = row.x;
+            motion[offset++] = row.y;
+            motion[offset++] = row.facing;
+            motion[offset++] = row.cx;
+            motion[offset++] = row.cy;
+          } else set.push(encodeRow(id, row, edit));
         }
+        if (motion && offset * 2 < motion.length) motion = motion.slice(0, offset);
         patch.tables[field] = { set, remove };
+        if (motion) patch.tables[field].motion = motion.subarray(0, offset);
+        if (distances?.length) Object.assign(patch.tables[field], { day: swimming.day, distances });
       }
-      if (!values.has('life') && (lifeFields.size || bondRows.size || orderedBonds)) {
+      if (!values.has('life') && (lifeFields.size || previousStories || bondRows.size || orderedBonds)) {
         const life = raw(source.life);
         patch.life = { properties: encodeFields(life, lifeFields, plain) };
+        if (previousStories) {
+          // The bounded chronicle reorders on insertion. Preserve the previous
+          // order as a dictionary, even for stories from older saves.
+          const before = new Map(Object.keys(previousStories).map((id, i) => [id, i]));
+          patch.life.stories = Object.entries(raw(life.stories)).map(([id, row]) =>
+            before.has(id) && raw(previousStories[id]) === raw(row) ? before.get(id) : [id, plain(row)]);
+        }
         if (!lifeFields.has('bonds') && (bondRows.size || orderedBonds)) patch.life.bonds = encodeBonds(life.bonds);
       }
       reset();
@@ -212,7 +518,33 @@ export class WorkerSimulation {
       this.tracker = trackWorld(this.world.data);
       this.world.data = this.tracker.data;
       this.world.charValues = this.tracker.charValues;
+      this.world.readBonds = this.tracker.readBonds;
+      this.world.readStories = this.tracker.readStories;
+      this.world.activeBondSpans = this.tracker.activeBondSpans;
+      this.world.writeActiveBonds = this.tracker.writeActiveBonds;
+      this.world.ecologyCharacters = this.tracker.ecologyCharacters;
+      this.world.fishGroups = () => this.world.ecologyCharacters().groups;
+      this.world.poseRevision = this.tracker.poseRevision;
+      this.world.originRevision = this.tracker.originRevision;
+      this.world.stableFishRoster = this.tracker.fishValues;
+      this.world.readFish = this.tracker.readFish;
+      this.world.readContacts = this.tracker.readContacts;
+      let layout;
+      this.world.bodyLayout = groups => {
+        if (layout?.groups !== groups) layout = layout
+          ? layout.updated(groups, this.tracker.bodyEdits(layout.groups, groups)) : new BodyLayout(groups);
+        return layout;
+      };
+      this.world.bodyEdits = this.tracker.bodyEdits;
+      this.world.poseEdits = this.tracker.poseEdits;
+      this.world.clearPoseEdits = this.tracker.clearPoseEdits;
+      this.world.movingFish = this.tracker.movingFish;
+      this.world.swimOrdinal = this.tracker.swimOrdinal;
+      this.world.beginSwimBatch = this.tracker.beginSwimBatch;
+      this.world.completeSwimBatch = this.tracker.completeSwimBatch;
+      this.world.recordMovement = this.tracker.recordMovement;
     } else if (message.kind === 'restore') {
+      this.tracker.invalidateOrigins();
       for (const [field, id, value] of message.rows) {
         if (value === undefined) delete this.world.data[field][id];
         else this.world.data[field][id] = value;
@@ -232,6 +564,7 @@ export class WorkerSimulation {
           for (const id of ids) delete this.world.data[field]?.[id];
         }
         const { lastMeals, grassMeals } = this.archive.summary;
+        if (meals.length) this.world.appliedClaims = undefined;
         for (const [id, at, grass] of meals) {
           if (at === undefined) lastMeals.delete(id); else lastMeals.set(id, at);
           if (grass) grassMeals.add(id); else grassMeals.delete(id);
@@ -258,7 +591,13 @@ export class WorkerSimulation {
 if (typeof WorkerGlobalScope !== 'undefined' && globalThis instanceof WorkerGlobalScope) {
   const simulation = new WorkerSimulation();
   globalThis.onmessage = ({ data }) => {
-    try { postMessage({ result: simulation.receive(data) }); }
+    try {
+      const result = simulation.receive(data), patch = result?.patch;
+      const bonds = patch?.life?.bonds;
+      const buffers = [patch?.tables.fishes?.motion?.buffer, patch?.tables.travel?.distances?.buffer, bonds?.counters?.buffer,
+        bonds?.intervals?.kept.buffer, bonds?.intervals?.added.buffer].filter(Boolean);
+      postMessage({ result }, buffers);
+    }
     catch (error) { postMessage({ error: error.message }); }
   };
 }

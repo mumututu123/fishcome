@@ -1,6 +1,13 @@
 export const WORLD_WIDTH = 1000;
 export const MIN_FLOOR = 80, MAX_FLOOR = 100;
-export const wrapX = x => ((x % WORLD_WIDTH) + WORLD_WIDTH) % WORLD_WIDTH;
+export function wrapX(x) {
+  if (typeof x !== 'number' || x < -WORLD_WIDTH || x >= 2 * WORLD_WIDTH) return ((x % WORLD_WIDTH) + WORLD_WIDTH) % WORLD_WIDTH;
+  // Retain the addition before reducing so fractional positions round exactly
+  // as they did in older saves. Ordinary adjacent cells need no division.
+  const shifted = (x >= WORLD_WIDTH ? x - WORLD_WIDTH : x) + WORLD_WIDTH;
+  if (shifted >= 2 * WORLD_WIDTH) return shifted - 2 * WORLD_WIDTH;
+  return shifted >= WORLD_WIDTH ? shifted - WORLD_WIDTH : shifted;
+}
 // Integer water cells recur across movement, contacts and sight. Reuse their
 // string keys; old fractional coordinates keep the original wrap semantics.
 const waterKeys = Array.from({ length: MAX_FLOOR }, () => []);

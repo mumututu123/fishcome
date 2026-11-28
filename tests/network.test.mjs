@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { Network } from '../www/network.js';
 import { ReplicaReader, replicaPages } from '../www/replica-stream.js';
 import { WorldBroadcast } from '../www/world-broadcast.js';
+import { actorId, signer, verifyEnvelope } from '../www/storage.js';
 
 class PeerConnection {
   connectionState = 'new';
@@ -27,6 +28,19 @@ globalThis.RTCPeerConnection = PeerConnection;
 const flush = () => new Promise(resolve => setImmediate(resolve));
 async function until(check) { for (let i = 0; i < 10000; i++) { if (check()) return; await flush(); } throw new Error('握手未进入预期状态'); }
 const url = 'http://127.0.0.1:39241';
+
+test('双方具备字节帧能力才启用紧凑鱼群位置，旧伙伴继续使用行格式', async () => {
+  const network = new Network({ actor: 'local' });
+  const peer = { pc: { async setRemoteDescription() {} } };
+  network.connections.set('link', peer);
+  const answer = { type: 'answer', from: 'peer', fromUrl: url, connection: 'link', sdp: { type: 'answer', sdp: 'test' },
+    replicaPages: 1, replicaLive: 1, replicaRows: 1, replicaFrames: 1 };
+  await network.signal({ ...answer, replicaPoseBytes: 1 });
+  assert.equal(peer.replicaPoseBytes, typeof Uint8Array.prototype.toBase64 === 'function' && typeof Uint8Array.fromBase64 === 'function');
+  await network.signal({ ...answer });
+  assert.equal(peer.replicaFrames, true);
+  assert.equal(peer.replicaPoseBytes, false);
+});
 
 test('未通过签名校验的消息只记录一次拒收原因', async () => {
   const reasons = [], frames = [];
@@ -59,6 +73,24 @@ test('分块签名复用不可变文本并保留发送时的页码', async t => 
   const { body } = await sending;
   assert.equal(body.index, 2);
   assert.equal(body.text, page.text);
+});
+
+test('页内容只编码一次，发送的完整信封与旧格式逐字节相同并通过原验签器', async () => {
+  const keys = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
+  const pub = await crypto.subtle.exportKey('jwk', keys.publicKey);
+  const identity = { actor: await actorId(pub), pub, secret: await crypto.subtle.exportKey('jwk', keys.privateKey) };
+  const network = new Network(identity);
+  network.sign = await signer(identity);
+  for (const text of ['鱼"\\\n', '海🐟'.repeat(3000)]) {
+    const signed = await network.makeEnvelope('replicaPage', { id: crypto.randomUUID(), kind: 'live', index: 0, text, last: true });
+    const wire = await network.encode(signed), payload = new Blob([wire.subarray(1)]);
+    assert.equal(wire[0], Number(new TextEncoder().encode(JSON.stringify(signed)).length > 2048));
+    const bytes = wire[0] ? new Uint8Array(await new Response(payload.stream().pipeThrough(new DecompressionStream('gzip'))).arrayBuffer())
+      : wire.subarray(1);
+    assert.deepEqual(bytes, new TextEncoder().encode(JSON.stringify(signed)));
+    assert(await verifyEnvelope(JSON.parse(new TextDecoder().decode(bytes))));
+    assert.equal(await verifyEnvelope({ ...signed, body: { ...signed.body, text: text + 'x' } }), false);
+  }
 });
 
 test('旧伙伴接收已截取的世界时复用快照，并在签名前固定握手资料', async () => {

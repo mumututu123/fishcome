@@ -32,7 +32,7 @@ export function updateBubbles(world, now) {
   const current = Math.floor(now / MINUTE), prior = data.bubbleMinute ?? current;
   // Old, already surfaced bubbles need no offline catch-up or stored tombstones.
   const first = Math.max(prior + 1, Math.ceil((now - MAX_FLOOR / BUBBLE_SPEED * 1000) / MINUTE));
-  const sources = first <= current ? Object.values(data.chars).filter(cell => cell.kind === 'seaweed').sort((a, b) => a.id.localeCompare(b.id)) : [];
+  const sources = first <= current ? [...world.charValues('seaweed')].sort((a, b) => a.id.localeCompare(b.id)) : [];
   for (let minute = first; minute <= current; minute++) for (const source of sources) {
     const born = minute * MINUTE;
     if (source.created > born - MINUTE || !bubbleRoll(source.id, minute, source.y)) continue;

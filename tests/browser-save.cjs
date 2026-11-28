@@ -140,6 +140,215 @@ async function exercisePages(page, count) {
   return result;
 }
 
+async function motionCheckpoint(page) {
+  await page.goto(origin + '/welcome.html');
+  await page.evaluate(async () => {
+    const { get, putMany } = await import('./storage.js');
+    const { beforeCheckpointPatch, noteCheckpointChanges } = await import('./checkpoint-pages.js');
+    const { expandSimulationPatch } = await import('./simulation-delta.js');
+    const ids = Array.from({ length: 768 }, (_, i) => 'fish-' + i);
+    const world = { tick: 0, fishes: {}, travel: {} }, day = '2026-11-28';
+    for (const id of ids) {
+      world.fishes[id] = { id, x: 0, y: 0, facing: 1, cx: 0, cy: 0, posAt: 0 };
+      world.travel[id] = { since: 0, days: { [day]: 0 } };
+    }
+    const save = () => putMany(() => [['checkpoint', { world }]], { simulationChanges: true });
+    await save();
+    function move(tick, indices) {
+      const motion = new Float64Array(indices.length * 5);
+      for (let i = 0; i < indices.length; i++) { motion[i * 5] = tick; motion[i * 5 + 2] = 1; }
+      const patch = expandSimulationPatch(world, { values: { tick }, tables: {
+        fishes: { set: indices, motion, remove: [] },
+        travel: { set: indices, day, distances: Float64Array.from(indices, () => tick), remove: [] }
+      } }, ids, true);
+      beforeCheckpointPatch(world, patch);
+      for (const [field, updates] of Object.entries(patch.tables)) updates.frame.commit(world[field]);
+      world.tick = tick;
+      noteCheckpointChanges(world, patch);
+      if (Object.values(patch.tables).some(updates => updates.frame.pairs)) throw new Error('存档展开了额外的整批记录');
+    }
+    move(1, [0, 410]);
+    const cut = JSON.stringify(world), original = IDBObjectStore.prototype.put, pages = [];
+    let advanced = false;
+    IDBObjectStore.prototype.put = function (value, key) {
+      const request = original.call(this, value, key);
+      if (Array.isArray(key) && (key[1] === 'fishes' || key[1] === 'travel')) {
+        pages.push([key[1], key[2]]);
+        if (!advanced) { advanced = true; move(2, ids.map((_, i) => i)); }
+      }
+      return request;
+    };
+    try { await save(); } finally { IDBObjectStore.prototype.put = original; }
+    if (!advanced || pages.length !== 4) throw new Error('稀疏运动没有只写入对应四页');
+    if (JSON.stringify((await get('checkpoint', { observeCheckpoint: false })).world) !== cut) throw new Error('中途游动改变了正在写入的存档');
+    await save();
+    if (JSON.stringify((await get('checkpoint', { observeCheckpoint: false })).world) !== JSON.stringify(world)) throw new Error('下一次存档没有取得游动后的完整状态');
+  });
+}
+
+async function replicaCheckpointJournal(page) {
+  await page.goto(origin + '/welcome.html');
+  const result = await page.evaluate(async () => {
+    const { get, putMany } = await import('./storage.js');
+    const { noteCheckpointChanges, noteCheckpointMerge } = await import('./checkpoint-pages.js');
+    const world = { tick: 1, chars: Object.fromEntries(Array.from({ length: 9216 }, (_, n) => ['c' + n, { x: n }])), fishes: { f: { x: 1 } } };
+    const save = () => putMany(() => [['checkpoint', { world }]], { simulationChanges: true });
+    await save();
+    const original = IDBObjectStore.prototype.get;
+    let charReads = 0;
+    IDBObjectStore.prototype.get = function (key) {
+      if (Array.isArray(key) && key[1] === 'chars') charReads++;
+      return original.call(this, key);
+    };
+    const merge = (ids, apply) => {
+      const edit = {};
+      noteCheckpointChanges(world, null, edit);
+      apply();
+      edit.chars = new Set(ids);
+      noteCheckpointMerge(world, edit);
+    };
+    const check = async () => {
+      charReads = 0;
+      await save();
+      const saved = await get('checkpoint', { observeCheckpoint: false });
+      if (JSON.stringify(saved.world) !== JSON.stringify(world)) throw new Error('合流后的存档内容或字典顺序不一致');
+      return charReads;
+    };
+    try {
+      world.chars.c1 = { x: -1 };
+      noteCheckpointChanges(world, { tables: { chars: { set: [['c1', world.chars.c1]], remove: [] } } });
+      merge(['c400'], () => { world.chars.c400.x = 77; world.fishes.f.x = 99; });
+      const precise = await check();
+      merge(['c1'], () => { delete world.chars.c1; });
+      merge(['c1'], () => { world.chars.c1 = { x: 11 }; });
+      const reordered = await check();
+      noteCheckpointChanges(world, null, {});
+      world.chars.c600.x = -2;
+      merge([], () => { world.fishes.f.x++; });
+      const interrupted = await check();
+      const put = IDBObjectStore.prototype.put;
+      merge(['c600'], () => { world.chars.c600.x = -3; });
+      let rejected;
+      try {
+        IDBObjectStore.prototype.put = function (value, key) {
+          if (Array.isArray(key) && key[1] === 'chars') throw new Error('中断合流存档');
+          return put.call(this, value, key);
+        };
+        await save();
+      } catch (error) { rejected = error.message; }
+      finally { IDBObjectStore.prototype.put = put; }
+      const durable = await get('checkpoint', { observeCheckpoint: false });
+      await check();
+      const changed = Object.keys(world.chars).filter((_, n) => n % 256 === 0);
+      merge(changed, () => { for (const id of changed) world.chars[id].x++; });
+      await check();
+      const packed = (await get(['checkpoint-page', 'chars', 0])).length;
+      merge(['c8000'], () => { world.chars.c8000.path = Array.from({ length: 48 }, (_, n) => ({ reason: 'eat', t: n })); });
+      await check();
+      merge(changed, () => { for (const id of changed) world.chars[id].x++; });
+      await check();
+      const longHistory = (await get(['checkpoint-page', 'chars', 0])).length;
+      return { precise, reordered, interrupted, rejected, beforeRetry: durable.world.chars.c600.x, packed, longHistory };
+    } finally { IDBObjectStore.prototype.get = original; }
+  });
+  assert.equal(result.precise, 0);
+  assert(result.reordered > 0 && result.interrupted > 0);
+  assert.equal(result.rejected, '中断合流存档');
+  assert.equal(result.beforeRetry, -2);
+  assert.equal(result.packed, 1024);
+  assert.equal(result.longHistory, 256);
+}
+
+async function detachedReplicaCheckpoint(page) {
+  await page.goto(origin + '/welcome.html');
+  await page.evaluate(async () => {
+    const { get, putMany, atCheckpointBoundary } = await import('./storage.js');
+    const { noteCheckpointChanges, noteCheckpointMerge } = await import('./checkpoint-pages.js');
+    const world = {
+      tick: 1, roots: { home: 1 }, participants: { local: '甲' }, chats: {}, chatSources: {},
+      ops: { first: { id: 'first' }, old: { id: 'old' } },
+      chars: Object.fromEntries(Array.from({ length: 800 }, (_, i) => ['c' + i, { kind: 'fish', path: [] }])),
+      fishes: { f: { x: 1, parents: ['p'] } }, travel: { f: { days: { today: 1 } } },
+      breeding: { pair: { status: 'active' } }, scenes: { s: { x: 1 } }, life: { history: [1] }
+    };
+    const save = (captureCheckpoint = false) => putMany(() => [
+      ['checkpoint', { world, picture: { tick: world.tick } }], ['known', [world.tick]]
+    ], { simulationChanges: true, captureCheckpoint });
+    const edit = (incoming, archived, chars, act) => {
+      const handle = {};
+      noteCheckpointChanges(world, null, handle);
+      act();
+      handle.chars = new Set(chars);
+      noteCheckpointMerge(world, handle, incoming, archived);
+    };
+    await save();
+    edit({ ops: { new: {} }, roots: world.roots, chats: { m: { id: 'm', actor: 'guest' } } },
+      { ops: { old: {} } }, ['c500', 'c700'], () => {
+        world.tick++;
+        delete world.ops.old;
+        world.ops.new = { id: 'new' };
+        world.chats.m = { id: 'm', actor: 'guest' };
+        world.participants.guest = '乙';
+        world.chars.c500.path.push({ reason: 'birth' });
+        delete world.chars.c700;
+        world.travel.f.days.today++;
+      });
+    const expected = JSON.stringify(world);
+    const original = IDBObjectStore.prototype.get;
+    let during = false, completed;
+    IDBObjectStore.prototype.get = function (key) {
+      const request = original.call(this, key);
+      if (!during && Array.isArray(key) && key[1] === 'chars') {
+        during = true;
+        completed = atCheckpointBoundary(world, () => {
+          edit({ ops: {}, participants: { guest: '丙' } }, {}, ['c100', 'c500'], () => {
+            world.tick++;
+            world.chars.c100.path.push({ reason: 'eat' });
+            world.chars.c500.path.push({ reason: 'burn' });
+            world.fishes.f.parents.push('q');
+            world.travel.f.days.today++;
+            delete world.scenes.s;
+            world.breeding.pair.status = 'cancelled';
+            world.life.history.push(2);
+            world.participants.guest = '丙';
+          });
+        });
+        if (world.tick !== 3) throw new Error('普通合流等待了独立存档的读盘');
+      }
+      return request;
+    };
+    let first;
+    try { first = await save(true); } finally { IDBObjectStore.prototype.get = original; }
+    await completed;
+    if (!during || JSON.stringify(first.world) !== expected || first.picture.tick !== 2 ||
+        (await get('known'))[0] !== 2) throw new Error('并发合流改变了已截取的版本或配套记录');
+    const put = IDBObjectStore.prototype.put;
+    let failed = false;
+    IDBObjectStore.prototype.put = function (value, key) {
+      if (Array.isArray(key) && key[1] === 'chars') throw new Error('中断独立存档');
+      return put.call(this, value, key);
+    };
+    try { await save(); } catch (error) { failed = error.message === '中断独立存档'; }
+    finally { IDBObjectStore.prototype.put = put; }
+    if (!failed || JSON.stringify((await get('checkpoint', { observeCheckpoint: false })).world) !== expected ||
+        (await get('known'))[0] !== 2) throw new Error('存档失败时未保留完整旧版本');
+    await save();
+    const last = await get('checkpoint', { observeCheckpoint: false });
+    if (last.picture.tick !== 3 || (await get('known'))[0] !== 3 ||
+        JSON.stringify(last.world) !== JSON.stringify(world)) throw new Error('重试后的记录或插入顺序错误');
+    edit({ ops: {} }, {}, ['c100', 'c500'], () => {
+      world.chars.c500 = structuredClone(world.chars.c500);
+    });
+    let charWrites = 0;
+    IDBObjectStore.prototype.put = function (value, key) {
+      if (Array.isArray(key) && key[1] === 'chars') charWrites++;
+      return put.call(this, value, key);
+    };
+    try { await save(); } finally { IDBObjectStore.prototype.put = put; }
+    if (charWrites) throw new Error('重复合流相同内容重写了字符页');
+  });
+}
+
 async function concurrentCheckpoints(context) {
   const writer = await context.newPage(), other = await context.newPage();
   await Promise.all([writer.goto(origin + '/welcome.html'), other.goto(origin + '/welcome.html')]);
@@ -281,7 +490,12 @@ async function main() {
   const isolated = await browser.newContext();
   try {
     console.log(JSON.stringify(await exercisePages(await isolated.newPage(), count)));
-    if (!countArg) await concurrentCheckpoints(isolated);
+    if (!countArg) {
+      await motionCheckpoint(await isolated.newPage());
+      await replicaCheckpointJournal(await isolated.newPage());
+      await detachedReplicaCheckpoint(await isolated.newPage());
+      await concurrentCheckpoints(isolated);
+    }
   }
   finally { await isolated.close(); }
   if (countArg) return;

@@ -123,7 +123,16 @@ async function main() {
     assert.equal(join.invite, invite, 'Downloaded package must carry the registered player\'s invitation');
     assert.equal(join.url, undefined, 'Downloaded package must hide the plain invitation address');
     await page.keyboard.press('Escape');
-    await page.reload(); await page.waitForFunction(() => window.tide);
+    await page.reload();
+    try { await page.waitForFunction(() => window.tide); }
+    catch (error) {
+      const state = await page.evaluate(() => ({
+        status: document.querySelector('#networkStatus')?.textContent,
+        notice: document.querySelector('#toast')?.textContent,
+        welcome: document.querySelector('#welcomeDialog')?.open
+      }));
+      throw new Error('重新打开存档未完成 ' + JSON.stringify({ ...state, errors }), { cause: error });
+    }
     assert.deepEqual(await page.evaluate(() => tide.world.data.roots), roots, 'Reload must restore the same world');
     assert(await page.evaluate(id => !!tide.world.data.fishes[id], created.id), 'Created fish must survive reload');
     assert.equal(await page.evaluate(() => tide.balance()), 18);

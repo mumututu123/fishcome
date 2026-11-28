@@ -1,19 +1,19 @@
 import { World, CONFIG, clone, EYES, bounds, validGlyph, displayNick, hash, sceneryCount, chooseClaim } from './engine.js';
-import { SimulationClient, subscribeSimulationChanges } from './simulation-client.js';
+import { SimulationClient, startSimulationClock, subscribeSimulationChanges } from './simulation-client.js';
 import { setParticipantName, subscribeBeforeSimulationPatch, worldEdited } from './simulation-changes.js';
 import { atCheckpointBoundary, get, getMany, readCheckpointVersion, sameStoredCheckpoint, putMany, readHandoffCheckpoint, replaceFromBackup, getOldBranch, LEGACY_NOTICE_SEEN, claimLegacyNotice, newIdentity, signer, verifyEnvelope, actorId, download } from './storage.js';
-import { beforeCheckpointPatch, noteCheckpointChanges } from './checkpoint-pages.js';
+import { beforeCheckpointPatch, noteCheckpointChanges, noteCheckpointMerge } from './checkpoint-pages.js';
 import { CheckpointPictures } from './checkpoint-picture.js';
 import { Network } from './network.js';
-import { ReplicaRecovery, ReplicaSwims, WorldBroadcast } from './world-broadcast.js';
+import { ReplicaInventory, ReplicaRecovery, ReplicaSwims, WorldBroadcast } from './world-broadcast.js';
 import { DiagnosticLog, inspectFishOrigins, repairFishOriginIssues, diagnosticSummary } from './diagnostics.js';
-import { loadReplicaArchives, verifyChats, verifyReplica } from './replica.js';
+import { loadReplicaArchives, verifyChats, verifyLocalCheckpoint, verifyReplica } from './replica.js';
 import { Renderer } from './renderer.js';
 import { Creator } from './creator.js';
 import { restoreCheckpoint } from './lifecycle.js';
 import { CHAT_FLOOR, orderedChats, chatColor, mergeChatRecords } from './chat.js';
 import { DAY, shanghaiDay } from './fish-status.js';
-import { fishOrigin, repairLocalBirthTimes } from './breeding.js';
+import { fishOrigin } from './breeding.js';
 import { defaultFishName, displayFishName, fishCatalog } from './fish-profile.js';
 import { drawPedigree, setupPedigreeViewport } from './pedigree.js';
 import { normalizeInvite, encodeInvite, decodeInvite, inviteDetails } from './invite.js';
@@ -24,14 +24,14 @@ import { memoryForCell, ancestralGlyph, ancestralText } from './easter-eggs.js';
 import { activeEvent, eventSchedule, eventTitle, eventPosition, eventLetter, radioTranscript, eventNarration } from './random-events.js';
 import { activeLegend, legendSchedule, legendTitle, legendPosition, capturedFish } from './legends.js';
 import { POPULATION, illnessOf } from './population.js';
-import { ARCHIVE, ARCHIVE_FIELDS, ArchiveStore, archivePlanAsync, reachesArchiveThreshold, archiveChunks, emptyArchiveState, mergeArchiveState, prepareCompaction, compactKnown } from './archive.js';
+import { ARCHIVE, ARCHIVE_FIELDS, ArchiveStore, archivePlanAsync, reachesArchiveThreshold, archiveChunks, emptyArchiveState, mergeArchiveState, prepareCompaction, compactKnown, observeArchiveDependencies } from './archive.js';
 import { WORLD_RULES, rulesCompatible } from './rules.js';
 import { assetPlatformLabel, classifyPeerCompatibility, detectUpdateSource, formatUpdateBytes, normalizeAssetSuffix, pickHigherVersionPeers } from './update.js';
 const $ = id => document.getElementById(id);
 const renderer = new Renderer($('sea'));
 const simulation = new SimulationClient();
 let displayedWorld, displayedFish, displayedScenes;
-subscribeSimulationChanges((target, patch) => renderer.worldChanged(target, patch));
+subscribeSimulationChanges((target, patch, origin) => renderer.worldChanged(target, patch, origin));
 subscribeSimulationChanges((target, patch) => {
   if (target !== displayedWorld) return;
   if (!patch) { displayedWorld = null; return; }
@@ -55,6 +55,7 @@ let lastHello = new Set(), lastMeter = Date.now(), lastSave = 0, lastPictureTime
 const worldBroadcast = new WorldBroadcast(subscribeSimulationChanges);
 const replicaSwims = new ReplicaSwims();
 const replicaRecovery = new ReplicaRecovery();
+const replicaInventory = new ReplicaInventory();
 subscribeSimulationChanges((target, patch) => {
   if (target === world && started && !updateFrozen && !replacingCheckpoint && Number.isFinite(patch?.values?.tick)) {
     broadcastWorld(patch.swims);
@@ -159,7 +160,7 @@ async function ensureArchives(data, peer, bundle, target = archiveStore, current
     finally {
       if (live) {
         archiveImports--;
-        if (target === archiveStore && revision !== target.revision) worldEdited(world);
+        if (target === archiveStore && revision !== target.revision) worldEdited(world, 'archive');
       }
     }
   };
@@ -170,13 +171,14 @@ async function archiveWorld(now = Date.now()) {
   archiveCheckAt = now; archiveScanning = true;
   const target = world, store = archiveStore;
   const initialRevision = store.revision;
+  const dependencies = observeArchiveDependencies(target);
   let committed = false;
   const isCurrent = () => target === world && store === archiveStore;
   const canArchive = () => isCurrent() && !updateFrozen && !replacingCheckpoint && amLeader();
   try {
     const pressure = await reachesArchiveThreshold(target.data);
     if (now - (target.data.archives?.at || 0) < ARCHIVE.period && !pressure) return;
-    const plan = await archivePlanAsync(target.data, now, { pressure });
+    const plan = await archivePlanAsync(target.data, now, { pressure, dependencies });
     if (!canArchive()) return;
     const hasNewRecords = Object.values(plan).some(table => Object.keys(table).length);
     const mealTargets = new Set();
@@ -190,7 +192,7 @@ async function archiveWorld(now = Date.now()) {
       target.data.archives ||= emptyArchiveState();
       for (const { manifest } of chunks) target.data.archives.chunks[manifest.id] = manifest;
     }
-    const compact = await prepareCompaction(target, store);
+    const compact = await prepareCompaction(target, store, dependencies);
     const changed = await simulation.archiveAtStepBoundary(target, () => {
       if (!isCurrent() || (!hasNewRecords && !canArchive())) return;
       const removed = compact();
@@ -206,25 +208,9 @@ async function archiveWorld(now = Date.now()) {
   } catch (error) {
     if (!committed && isCurrent() && store.revision !== initialRevision) worldEdited(target);
     status = '记忆整理稍后重试：' + error.message;
-  } finally { archiveBusy = false; archiveScanning = false; }
+  } finally { dependencies.close(); archiveBusy = false; archiveScanning = false; }
 }
 async function requestHistory(peer) { const ids = (historyQueues.get(peer.id) || []).filter(id => !histories[id]); historyQueues.set(peer.id, ids); if (ids.length) await network.direct(peer, 'historyRequest', { ids: ids.slice(0, 32) }); else historyQueues.delete(peer.id); }
-// Never relax network validation; only local checkpoints and explicit backup
-// imports can take the legacy repair path, and the repaired copy must validate.
-async function verifyLocalCheckpoint(data, archived, store, options = {}) {
-  const ctx = options.context || 'checkpoint';
-  try { await verifyReplica(data, archived, store, { diagnostics, ...options }); return data; }
-  catch (error) {
-    const repaired = repairLocalBirthTimes(data, archived);
-    if (repaired === data) {
-      diagnostics.record('warn', ctx, `本地自动修复未命中：${error.message}`);
-      throw error;
-    }
-    await verifyReplica(repaired, archived, store, { diagnostics, ...options, context: `${ctx}:repaired` });
-    diagnostics.record('info', ctx, '本地旧版出生时间已自动修复');
-    return repaired;
-  }
-}
 function needsReplicaSave(incoming, current, store) {
   if (['ops', 'scenes', 'chats', 'chatSources'].some(field => Object.keys(incoming[field] || {}).length)) return true;
   if (Object.keys(incoming.roots).some(root => !Object.hasOwn(current.roots, root))) return true;
@@ -236,16 +222,16 @@ function needsReplicaSave(incoming, current, store) {
 }
 async function mergeVerifiedWorld(data, peer, context, { local = false, worldMessage } = {}) {
   const target = world, store = archiveStore, revision = store.revision;
-  let incoming = data, archived;
+  const delta = context === 'world-delta';
+  let incoming = data, archived, checkedRules;
   await ensureArchives(data, peer, null, store, target.data, async (sources, current) => {
     archived = sources;
     const options = { context, current, diagnostics };
     if (local) incoming = await verifyLocalCheckpoint(data, sources, store, options);
-    else await verifyReplica(data, sources, store, options);
+    else checkedRules = await verifyReplica(data, sources, store, { ...options, mergeCut: delta && current === target.data });
   });
   // Overlapping archive rows have a canonical winner after ingestion.
   if (revision !== store.revision) archived = await store.dependencies(incoming, target.data);
-  const delta = context === 'world-delta';
   const commit = () => {
     if (target !== world || store !== archiveStore) throw new Error('运行世界已更换，请重新同步');
     if (worldMessage && (worldMessage.from !== leader() || replacingCheckpoint || updateRestarting)) {
@@ -254,11 +240,21 @@ async function mergeVerifiedWorld(data, peer, context, { local = false, worldMes
     }
     const rootCount = target.roots.length;
     const routine = delta && !needsReplicaSave(incoming, target.data, store);
-    const apply = () => target.merge(incoming, archived, routine ? 'replica' : undefined);
+    const apply = () => {
+      const index = delta && renderer.currentIndex(target);
+      let changes;
+      try { changes = target.merge(incoming, archived, delta ? 'replica' : undefined, delta, checkedRules); }
+      finally { if (delta) noteCheckpointMerge(target.data, changes, incoming, archived); }
+      if (delta) pictures.merged(target, changes);
+      if (index) renderer.applyMerge(target, index, changes);
+    };
     let movement;
     if (worldMessage && worldMessage.from !== network.node) movement = replicaSwims.merge(target.data, worldMessage, apply);
     else { apply(); replicaSwims.reset(); }
-    if (worldMessage && !delta) replicaRecovery.covered(worldMessage);
+    if (worldMessage && !delta) {
+      const orderedRepair = peer?.replicaLive && peer.node === worldMessage.from && worldMessage.body.repairFor === network.node;
+      replicaRecovery.covered(worldMessage, orderedRepair ? worldMessage.body.request : undefined, orderedRepair);
+    }
     if (target.archives !== store) target.attachArchives(store);
     return { joinedWorld: target.roots.length > rootCount, movement, routine };
   };
@@ -266,41 +262,44 @@ async function mergeVerifiedWorld(data, peer, context, { local = false, worldMes
 }
 function presentReplicaMovement(movement) {
   if (movement && movement === replicaSwims.latest && movement.data === world.data && movement.tick === world.data.tick && movement.from === leader()) {
-    renderer.presentSwims(world, movement.directions);
+    renderer.presentSwims(world, movement.directions, movement.startedAt);
   }
 }
 async function mergeReplica(data, peer, context = 'merge', worldMessage) {
   const previousTerrain = world.data.terrain?.seed;
   const { joinedWorld, movement, routine, ignored } = await mergeVerifiedWorld(data, peer, context, { worldMessage });
-  if (ignored) return false;
+  if (ignored) return;
+  presentReplicaMovement(movement);
   if (context === 'world-delta' && worldMessage) {
     const repair = replicaRecovery.request(worldMessage);
     if (repair) network.broadcast('replicaRequest', repair).catch(() => {});
   }
-  if (routine) {
-    for (const member of active()) setParticipantName(world, member.actor, member.nick);
-    setParticipantName(world, identity.actor, identity.nick);
-    presentReplicaMovement(movement);
-    return false;
+  if (!routine) {
+    await compactKnown(world, archiveStore);
+    if (world.data.terrain?.seed !== previousTerrain) geometryRepair = true;
   }
-  await compactKnown(world, archiveStore);
-  if (world.data.terrain?.seed !== previousTerrain) geometryRepair = true;
-  worldEdited(world);
-  for (const member of active()) world.data.participants[member.actor] = member.nick; if (identity) world.data.participants[identity.actor] = identity.nick;
+  for (const member of active()) setParticipantName(world, member.actor, member.nick);
+  if (identity) setParticipantName(world, identity.actor, identity.nick);
+  if (routine) return false;
   // An expired local copy can be restored only after hearing its roots from a live peer.
   const checkpoint = priorCheckpoint; let recovered = false;
   if (checkpoint?.world?.roots && Object.keys(checkpoint.world.roots).some(r => world.roots.includes(r))) {
     const checkpointStore = newArchiveStore();
     await ensureArchives(checkpoint.world, peer, null, checkpointStore);
     const older = await checkpointStore.dependencies(checkpoint.world);
-    const local = await verifyLocalCheckpoint(checkpoint.world, older, checkpointStore);
+    const local = await verifyLocalCheckpoint(checkpoint.world, older, checkpointStore, { diagnostics });
     await mergeVerifiedWorld(local, peer, 'checkpoint');
     if (priorCheckpoint === checkpoint) priorCheckpoint = null;
     recovered = true;
   }
-  presentReplicaMovement(movement);
   for (const id of pending.keys()) if (world.data.ops[id] || archiveStore.ids.ops.has(id)) pending.delete(id);
-  reconcileHistory(); syncIncomeSerial(); await save({ reusePicture: true }); renderChat();
+  reconcileHistory(); syncIncomeSerial();
+  const saved = save({ reusePicture: true });
+  // A live receipt confirms the verified in-memory base for the next delta.
+  // Its archive chunks are already durable. The local checkpoint owns its cut.
+  if (worldMessage && context === 'world-delta' && !joinedWorld && !recovered) saved.catch(reportSaveError);
+  else await saved;
+  renderChat();
   if (joinedWorld) toast('两片海合流了');
   if (recovered) await network.broadcast('merge', { world: await captureReplica() }, { capturedWorld: true });
   return true;
@@ -353,7 +352,7 @@ async function onMessage(message, peer) {
   if (message.kind === 'archiveRequest') { const encoded = archiveStore.packs.get(message.body.id) || await get('archive:' + message.body.id); await network.direct(peer, encoded ? 'archiveChunk' : 'archiveMissing', { id: message.body.id, encoded }); return; }
   if (message.kind === 'archiveChunk' || message.kind === 'archiveMissing') { const waiting = archiveWaiters.get(message.body.id); if (waiting?.peer === message.from) { if (message.kind === 'archiveChunk') waiting.resolve(message.body.encoded); else waiting.reject(new Error('伙伴没有这份归档')); } return; }
   await resumeAfterInactivity();
-  if (members.has(message.from) && members.get(message.from).actor !== message.actor) return;
+  if (members.has(message.from) && members.get(message.from).actor !== message.actor) return false;
   const body = message.body;
   if (message.kind === 'hello') {
     if (!body.world?.terrain || !rulesCompatible(body.rules)) {
@@ -375,18 +374,41 @@ async function onMessage(message, peer) {
     await completeReferral(peer, message.actor);
     status = ''; update();
   } else if (message.kind === 'beat') {
-    if (body.member?.id === message.from && body.member.actor === message.actor) { const direct = network.live().find(p => p.node === message.from); members.set(message.from, { ...body.member, direct: !!direct, url: await normalizeInvite(direct?.url || body.member.url), at: Date.now() }); remember(body.member.url); rememberAuthor(message.actor, body.member.nick); if (Date.now() - lastRepair > 5000 && (body.rootCount > world.roots.length || body.opCount > Object.keys(world.data.ops).length || body.chatCount > Object.keys(world.data.chats).length || body.chatSourceCount > Object.keys(world.data.chatSources).length)) { lastRepair = Date.now(); network.broadcast('replicaRequest', { to: message.from }).catch(() => {}); } }
+    if (body.member?.id === message.from && body.member.actor === message.actor) {
+      const direct = network.live().find(p => p.node === message.from);
+      members.set(message.from, { ...body.member, direct: !!direct, url: await normalizeInvite(direct?.url || body.member.url), at: Date.now() });
+      remember(body.member.url); rememberAuthor(message.actor, body.member.nick);
+      // The ordered world stream checks these counts after the matching data commits.
+      // Legacy and indirect peers still audit history through their heartbeat.
+      if (!(body.inventoryOnWorld === true && direct?.replicaLive && direct.confirmedReplica && message.from === leader())) {
+        checkReplicaInventory(body, message.from, false);
+      }
+    }
   } else if (message.kind === 'merge') {
     await mergeReplica(body.world, peer, 'merge'); geometryRepair = true; reconcileHistory(); syncIncomeSerial(); update();
     if (!body.base && body.repairFor === network.node && typeof body.request === 'string') replicaRecovery.covered(message, body.request);
   } else if (message.kind === 'replicaRequest') {
     if (body.to === network.node) {
       const repair = typeof body.request === 'string' && body.request.length === 36 ? { repairFor: message.from, request: body.request } : {};
-      await network.broadcast('merge', { ...repair, world: await captureReplica() }, { capturedWorld: true });
+      if (repair.request && amLeader() && peer?.node === message.from && peer.replicaLive && peer.sentHello && peer.confirmedReplica) {
+        network.replicas.repairLive(peer, async () => ({ ...repair, delta: false, world: await captureReplica() }));
+      } else await network.broadcast('merge', { ...repair, world: await captureReplica() }, { capturedWorld: true });
     }
   } else if (message.kind === 'world') {
-    if (message.from !== leader()) { replicaRecovery.ignore(message); return; }
-    try { if (await mergeReplica(body.world, peer, body.delta ? 'world-delta' : 'world-full', message)) update(); }
+    if (message.from !== leader()) { replicaRecovery.ignore(message); return false; }
+    if (replicaRecovery.gap(message, world.data.tick)) {
+      const repair = replicaRecovery.request(message);
+      if (repair) await network.broadcast('replicaRequest', repair);
+      return false;
+    }
+    try {
+      const changed = await mergeReplica(body.world, peer, body.delta ? 'world-delta' : 'world-full', message);
+      if (changed) update();
+      if (changed !== undefined && body.settledRecords && peer?.replicaLive && peer.node === message.from && message.from === leader()) {
+        checkReplicaInventory(body, message.from, true);
+      }
+      return changed !== undefined;
+    }
     catch (error) {
       if (body.delta && Date.now() - lastRepair > 5000) {
         lastRepair = Date.now();
@@ -456,8 +478,16 @@ async function networkChange(error) {
 async function probeGone(id, url) { if (!id || id === network.node || !members.has(id)) return; try { url = await normalizeInvite(url); const s = await network.local('probe', { url }); if (!(s.clients || []).some(c => c.id === id)) { members.delete(id); await network.broadcast('lost', { id, url }); update(); } } catch { /* Membership lease expires if the publishing computer is unreachable. */ } }
 async function broadcastWorld(directions) {
   if (!amLeader()) return;
-  try { await worldBroadcast.send(network, world.data, Date.now(), captureReplica, directions); }
+  const now = Date.now();
+  try { await worldBroadcast.send(network, world.data, now, captureReplica, directions,
+    () => replicaInventory.atPublication(world.data, archiveStore, now)); }
   catch (error) { status = error.message; }
+}
+function checkReplicaInventory(body, from, ordered) {
+  const now = Date.now();
+  if (now - lastRepair <= 5000 || !replicaInventory.missing(body, world.data, archiveStore)) return;
+  lastRepair = now;
+  network.broadcast('replicaRequest', { to: from, ...(ordered && { request: crypto.randomUUID() }) }).catch(() => {});
 }
 async function applyAtBoundary(message, requiresLeader) {
   const target = world, store = archiveStore;
@@ -749,8 +779,7 @@ async function renderArchives() {
   $('archiveMore').hidden = view.limit >= Math.max(view.works.length, view.ledger.length);
 }
 const pictures = new CheckpointPictures(() => world, target => renderer.snapshotAsync(target));
-subscribeBeforeSimulationPatch((target, patch) => pictures.beforePatch(target, patch));
-subscribeSimulationChanges((target, patch, source) => pictures.changed(target, patch, source));
+subscribeSimulationChanges((target, patch, source, merge) => pictures.changed(target, patch, source, merge));
 async function captureLocalCheckpoint() {
   for (;;) {
     const picture = pictures.atCut(await pictures.prepare());
@@ -790,7 +819,11 @@ async function receiveHistory(card, peer) {
   for (const message of joining) { const result = world.addChat(message); if (!result.ok) throw new Error(result.error); }
   renderChat();
 }
-subscribeSimulationChanges((current, patch) => noteCheckpointChanges(current.data, patch));
+subscribeSimulationChanges((current, patch, origin, merge) => {
+  // Importing a verified archive updates the cold index. The checkpoint head
+  // always captures its manifest. Compaction publishes the exact live deletions.
+  if (origin !== 'archive') noteCheckpointChanges(current.data, patch, merge);
+});
 subscribeBeforeSimulationPatch((current, patch) => beforeCheckpointPatch(current.data, patch));
 async function saveInternal({ capture = false, mirrorLegacy = false, reconciledRevision, reusePicture = false } = {}) {
   if (replacingCheckpoint) throw new Error('正在更换存档');
@@ -816,6 +849,7 @@ async function saveInternal({ capture = false, mirrorLegacy = false, reconciledR
   try { return await task; } finally { if (activeSavePromise === task) activeSavePromise = null; }
 }
 async function save(options) { if (!started || updateFrozen || replacingCheckpoint) return; return saveInternal(options); }
+function reportSaveError(error) { toast('本地保存失败：' + error.message); }
 async function saveHandoff({ mirrorLegacy = false, startup = false } = {}) {
   if (!started && !startup) throw new Error('世界尚未启动，暂时无法交接进度');
   let revision;
@@ -895,7 +929,7 @@ async function start() {
   if (previous?.world) await ensureArchives(previous.world);
   const expires = previous?.world && now - (previous.lastOnlineAt ?? previous.at ?? previous.world.tick) >= CONFIG.offlineLife;
   const savedWorld = previous?.world;
-  if (savedWorld) previous.world = await verifyLocalCheckpoint(savedWorld, await archiveStore.dependencies(savedWorld), archiveStore, { context: 'start' });
+  if (savedWorld) previous.world = await verifyLocalCheckpoint(savedWorld, await archiveStore.dependencies(savedWorld), archiveStore, { context: 'start', diagnostics });
   if (expires) previous.world.chats = await archiveStore.chats(Infinity, previous.world.chats, previous.world.archives);
   const restored = restoreCheckpoint(previous, now);
   world = restored.world; world.data.participants[identity.actor] = identity.nick; lastOnlineAt = now; lastMeter = now;
@@ -918,7 +952,9 @@ async function start() {
   if (network.live().length) networkChange().catch(error => { status = error.message; });
   syncUpdateStatus(); refreshPeerUpdates().catch(() => {});
   reconnect().catch(() => {}); update();
-  setInterval(tick, CONFIG.step); setInterval(() => { network.presence(active().filter(m => m.id !== network.node).map(m => ({ id: m.id, url: m.url }))).catch(() => {}); if (network.connections.size < 6) { const candidate = active().filter(m => m.id !== network.node && !network.has(m.id)).sort((a, b) => hash(`${network.node}:${a.id}`) - hash(`${network.node}:${b.id}`))[0]; if (candidate) network.connect(candidate.url, candidate.id).catch(() => {}); } }, 6000);
+  startSimulationClock(() => world.data.tick, tick);
+  startSimulationClock(() => world.data.tick + CONFIG.step / 2, maintainWorld);
+  setInterval(() => { network.presence(active().filter(m => m.id !== network.node).map(m => ({ id: m.id, url: m.url }))).catch(() => {}); if (network.connections.size < 6) { const candidate = active().filter(m => m.id !== network.node && !network.has(m.id)).sort((a, b) => hash(`${network.node}:${a.id}`) - hash(`${network.node}:${b.id}`))[0]; if (candidate) network.connect(candidate.url, candidate.id).catch(() => {}); } }, 6000);
   document.addEventListener('visibilitychange', async () => { if (!document.hidden) { lifeSince = identity.lifeSeenAt || Date.now(); returnVisit = Date.now() - lifeSince > 60000; lifeMessage = null; } await resumeAfterInactivity(); if (network.live().length) network.broadcast('beat', { member: member() }).catch(() => {}); save().catch(() => {}); });
   window.addEventListener('pagehide', () => { simulation.close(); const blob = new Blob([JSON.stringify({ node: network.node, token: meta.token })], { type: 'application/json' }); navigator.sendBeacon('/local/unregister', blob); if (updateFrozen || updateRestarting || replacingCheckpoint) return; save({ reusePicture: true }).catch(() => {}); });
   if (!sawLegacyNotice) refreshOldBackups(true);
@@ -933,7 +969,6 @@ async function tick() {
   if (replacingCheckpoint) return;
   if (!updateFrozen && identity.remainder >= 3600) { identity.remainder -= 3600; identity.serial = (identity.serial || 0) + 1; await submit({ kind: 'earn', cost: 0, serial: identity.serial }); }
   members.set(network.node, member());
-  if (now - selfBeat >= 3000 && network.live().length) { selfBeat = now; network.broadcast('beat', { member: member(), rootCount: world.roots.length, opCount: Object.keys(world.data.ops).length, chatCount: Object.keys(world.data.chats).length, chatSourceCount: Object.keys(world.data.chatSources).length }).catch(() => {}); }
   const currentLeader = leader(); if (currentLeader !== lastLeader) { simulation.close(); lastLeader = currentLeader; worldBroadcast.reset(); replicaSwims.reset(); renderer.presentSwims(world); if (amLeader()) { geometryRepair = true; world.data.tick = Math.max(world.data.tick, now - 2000); for (const envelope of [...inbox.values()].sort((a, b) => a.body.t - b.body.t || a.body.id.localeCompare(b.body.id))) { if (!world.data.ops[envelope.body.id]) { const result = world.apply({ ...clone(envelope.body), proof: clone(envelope) }); if (!result.ok) rejectOperation(envelope.body.id); network.broadcast('ack', { id: envelope.body.id, result }).catch(() => {}); } } for (const id of pending.keys()) if (world.data.ops[id]) pending.delete(id); } }
   if (amLeader() && fishRepairWaiting && now - lastSave > 5000) geometryRepair = true;
   if (amLeader() && !updateFrozen && !replacingCheckpoint) {
@@ -951,7 +986,19 @@ async function tick() {
         toast(status);
       });
   } else simulation.close();
-  if (!activeSavePromise && now - lastSave > 5000) { lastSave = now; save().catch(e => toast('本地保存失败：' + e.message)); }
+}
+// Start periodic storage, presence and HUD work between ecology deadlines.
+// Foreground edits, pagehide and explicit archive requests keep their own cuts.
+async function maintainWorld() {
+  if (replacingCheckpoint) return;
+  const now = Date.now();
+  await resumeAfterInactivity(now);
+  if (replacingCheckpoint) return;
+  if (now - selfBeat >= 3000 && network.live().length) {
+    selfBeat = now;
+    network.broadcast('beat', { member: member(), ...replicaInventory.heartbeat(world.data, archiveStore, amLeader()) }).catch(() => {});
+  }
+  if (!activeSavePromise && now - lastSave > 5000) { lastSave = now; save().catch(reportSaveError); }
   if (amLeader() && now - lastPictureTime > 30000) { lastPictureTime = now; takePicture().catch(() => {}); }
   update();
   archiveWorld(now).catch(() => {});
@@ -1577,7 +1624,7 @@ $('importBackup').onchange = async e => {
     const checkpoint = data.checkpoint;
     if (checkpoint) {
       await ensureArchives(checkpoint.world, null, bundle, store);
-      checkpoint.world = await verifyLocalCheckpoint(checkpoint.world, await store.dependencies(checkpoint.world), store, { context: 'import' });
+      checkpoint.world = await verifyLocalCheckpoint(checkpoint.world, await store.dependencies(checkpoint.world), store, { context: 'import', diagnostics });
     }
     if (data.known != null && (!Array.isArray(data.known) || !data.known.every(invite => typeof invite === 'string'))) throw new Error('备份中的接入记录无效');
     const chunks = new Set(Object.keys(store.manifests));

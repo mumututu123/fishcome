@@ -1,8 +1,87 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { ViewportCells } from '../www/viewport.js';
+import { FishSprites, fishRuns } from '../www/fish-sprites.js';
 import { makeFishWorld } from './capacity-fish.mjs';
-import { subscribeSimulationChanges } from '../www/simulation-changes.js';
+import { simulationApplied, subscribeSimulationChanges, worldEdited } from '../www/simulation-changes.js';
+import { expandSimulationPatch } from '../www/simulation-delta.js';
+
+test('相同鱼形可共用图像，穿插在其他鱼之后的字符保留叠放顺序', t => {
+  const glyph = (entity, x, ch) => ({ entity, kind: 'fish', x, y: 0, ch, color: '#89abcd' });
+  const a = glyph('甲', 0, '鱼'), b = glyph('甲', 1, '口');
+  const c = glyph('乙', 3, '鱼'), d = glyph('乙', 4, '口'), e = glyph('甲', 2, '尾');
+  const runs = fishRuns([a, { kind: 'scene' }, b, c, d, e]);
+  assert.deepEqual(runs.map(run => run.cells), [[a, b], [c, d], [e]]);
+  const paints = [], renderer = { frameTime: 1, glyph(ctx, ch, color, x, y) { paints.push([ch, x, y]); } };
+  const previous = Object.getOwnPropertyDescriptor(globalThis, 'document');
+  Object.defineProperty(globalThis, 'document', { configurable: true, value: { createElement() { return { getContext() { return {}; } }; } } });
+  t.after(() => { if (previous) Object.defineProperty(globalThis, 'document', previous); else delete globalThis.document; });
+  const sprites = new FishSprites();
+  const right = sprites.get(renderer, runs[0], 18, 1);
+  assert.equal(sprites.get(renderer, runs[1], 18, 1), right);
+  const left = sprites.get(renderer, runs[1], 18, -1);
+  assert.notEqual(left, right);
+  assert.deepEqual(paints, [['鱼', 6, 6], ['口', 24, 6], ['鱼', 24, 6], ['口', 6, 6]]);
+});
+
+test('页面写入完整运动记录，视窗只处理改变占格的鱼，旧帧仍可读取', () => {
+  const fishes = { a: { id: 'a', x: 5, y: 5, facing: 1 }, b: { id: 'b', x: 10, y: 5, facing: 1 } };
+  const data = { fishes, scenes: {}, chars: {} };
+  for (const id of Object.keys(fishes)) data.chars[id] = { id, kind: 'fish', entity: id, x: 0, y: 0 };
+  const viewport = new ViewportCells(data), known = ['a', 'b'];
+  function commit(tick, x) {
+    const patch = expandSimulationPatch(data, { values: { tick }, tables: { fishes: {
+      set: [0, 1], remove: [], motion: Float64Array.of(5, 5, 1, .5, 0, x, 5, 1, 0, .5)
+    } } }, known, true);
+    const frame = patch.tables.fishes.frame;
+    frame.commit(fishes);
+    viewport.update(patch.tables);
+    assert.equal(frame.pairs, undefined);
+    assert.equal(viewport.owners.fish.get('a').x, 5);
+    assert.equal(viewport.owners.fish.get('b').x, x);
+    return patch.tables.fishes;
+  }
+  const first = commit(500, 33);
+  const observed = fishes.b;
+  commit(1000, 65);
+  observed.nick = '旧改动';
+  assert.equal(observed.x, 33);
+  assert.equal(structuredClone(fishes).b.x, 65);
+  assert.equal(fishes.b.nick, undefined);
+  assert.deepEqual(first.set.map(([id, f]) => [id, f.x, f.posAt]), [['a', 5, 500], ['b', 33, 500]]);
+  assert.deepEqual(viewport.query(64, 66, 4, 6).map(cell => cell.id), ['b']);
+  assert.equal(fishes.a.posAt, 1000);
+});
+
+test('归档或合流移除再写入同编号时，下一步沿用新鱼和新行程', () => {
+  const data = { fishes: { a: { x: 0, nick: '旧鱼' } }, travel: { a: { since: 50, days: { yesterday: 1 } } } };
+  const world = { data }, known = ['a'];
+  function move(tick, day, distance) {
+    const { tables } = expandSimulationPatch(data, { values: { tick }, tables: {
+      fishes: { set: [0], remove: [], motion: Float64Array.of(2, 3, 1, 0, 0) },
+      travel: { set: [0], remove: [], day, distances: Float64Array.of(distance) }
+    } }, known, true);
+    tables.fishes.frame.commit(data.fishes);
+    tables.travel.frame.commit(data.travel);
+  }
+  move(500, 'today', 3);
+  const oldTravel = data.travel.a;
+  move(1000, 'tomorrow', 1);
+  oldTravel.days.yesterday = 8;
+  assert.deepEqual(data.travel.a.days, { yesterday: 1, today: 3, tomorrow: 1 });
+
+  delete data.travel.a;
+  simulationApplied(world, { tables: { travel: { set: [], remove: ['a'] } } });
+  data.travel.a = { since: 1000, days: { tomorrow: 2 } };
+  move(1500, 'tomorrow', 4);
+  assert.deepEqual(data.travel.a, { since: 1000, days: { tomorrow: 4 } });
+
+  worldEdited(world, 'replica');
+  delete data.fishes.a;
+  data.fishes.a = { x: 12, nick: '新鱼' };
+  move(2000, 'tomorrow', 6);
+  assert.equal(data.fishes.a.nick, '新鱼');
+});
 
 test('跟随端连续合流时，五千条鱼的海域保留已绘制的鱼和点击位置', async () => {
   const { World, CONFIG } = await import('../www/engine.js');
@@ -47,6 +126,63 @@ test('鱼在同一分区游动或只有计时改变时，画面复用已经选�
   assert.deepEqual(index.query(32, 32, 3, 3), [cell]);
 });
 
+test('整条鱼留在同一分区时免逐格更新，鱼体增长与重新合流后仍在正确的分区', () => {
+  const body = (id, x, y = 0) => ({ id, kind: 'fish', entity: 'f', x, y });
+  const data = { fishes: { f: { x: 12, y: 10, facing: 1 } }, scenes: {},
+    chars: { a: body('a', -1), b: body('b', 1) } };
+  const index = new ViewportCells(data);
+  let placements = 0;
+  const place = index.place.bind(index);
+  index.place = entry => { placements++; place(entry); };
+  const move = (x, y, facing) => {
+    data.fishes.f = { x, y, facing };
+    index.update({ fishes: { set: [['f', data.fishes.f]], remove: [] } });
+  };
+  function check() {
+    const rebuilt = new ViewportCells(data);
+    for (const x of [0, 32, 64, 960, 992]) for (const y of [0, 32]) {
+      assert.deepEqual(index.query(x, x, y, y), rebuilt.query(x, x, y, y));
+    }
+  }
+  move(13, 11, -1);
+  assert.equal(placements, 0);
+  move(12, 10, 1);
+  data.chars.c = body('c', 19, 21);
+  index.update({ chars: { set: [['c', data.chars.c]], remove: [] } });
+  move(13, 11, 1);
+  check();
+  delete data.chars.c;
+  index.update({ chars: { set: [], remove: ['c'] } });
+  move(12, 10, 1);
+  data.chars.a.x = 19;
+  index.reconcile();
+  move(13, 10, 1);
+  check();
+  for (const x of [991.9999999999999, 992, 999.5, 0, 1, 998]) {
+    move(x, 31.5, -1);
+    check();
+  }
+});
+
+test('鱼身横跨两个分区时，只在某个鱼元真的越界后重新定位', () => {
+  const body = x => ({ kind: 'fish', entity: 'f', x, y: 0 });
+  const data = { fishes: { f: { x: 30, y: 5, facing: 1 } }, scenes: {}, chars: { a: body(-3), b: body(4) } };
+  const index = new ViewportCells(data);
+  let placements = 0;
+  const place = index.place.bind(index);
+  index.place = entry => { placements++; place(entry); };
+  for (const x of [31, 32, 33]) {
+    data.fishes.f = { x, y: 5, facing: 1 };
+    index.update({ fishes: { set: [['f', data.fishes.f]], remove: [] } });
+    assert.deepEqual(index.query(0, 0, 5, 5), Object.values(data.chars));
+  }
+  assert.equal(placements, 0);
+  data.fishes.f.x = 35;
+  index.update({ fishes: { set: [['f', data.fishes.f]], remove: [] } });
+  assert.deepEqual(index.query(0, 0, 5, 5), []);
+  assert.deepEqual(index.query(32, 32, 5, 5), Object.values(data.chars));
+});
+
 test('画面依次播放已结算的横移、下潜，海域接缝上点击跟随绘制位置', async () => {
   const { World } = await import('../www/engine.js');
   const { Renderer } = await import('../www/renderer.js');
@@ -65,6 +201,8 @@ test('画面依次播放已结算的横移、下潜，海域接缝上点击跟�
   assert.deepEqual(renderer.paintedFish.slice(0, 2), [55, 50]);
   assert.deepEqual(renderer.hit(56, 52), { kind: 'fish', id: 'f' });
   assert.equal(renderer.hit(65, 62), null);
+  renderer.worldChanged(world, null);
+  renderer.presentSwims(world, swims, start);
   renderer.draw(world, start + 375);
   assert.deepEqual(renderer.paintedFish.slice(0, 2), [60, 55]);
   assert.equal(renderer.fishPose(world, 'f', start + 501), fish);
@@ -160,4 +298,72 @@ test('合流后绘制前仍可选中上一帧的鱼，水面候选只来自当�
   renderer.draw(next);
   assert.equal(world.surfaceCandidates?.(10), undefined);
   assert.equal(renderer.hit(50, 50), null);
+});
+
+test('追随端提交合流后，鱼体换主人、食物沉积和跨接缝镜头的索引与整表重建一致', async () => {
+  const { World } = await import('../www/engine.js');
+  const { Renderer } = await import('../www/renderer.js');
+  const now = Date.now(), world = new World(now, 'test', { populate: false, ambient: false });
+  const runtime = Object.assign(Object.create(Renderer.prototype), {
+    width: 120, height: 100, scale: 1, cell: 10, camera: { x: 998, y: 10 }, ctx: {},
+    glyph() {}, background() {}, weather() {}, eventHit() { return null; }
+  });
+  const fish = (id, x) => ({ id, x, y: 10, facing: 1, created: now, hungerAt: now + 86400000, posAt: now });
+  const cell = (id, entity, x) => ({ id, kind: 'fish', entity, x, y: 0, ch: '鱼', path: [], moveAt: now });
+  world.data.fishes.f = fish('f', 999);
+  world.data.fishes.g = fish('g', 200);
+  Object.assign(world.data.chars, { a: cell('a', 'f', 0), b: cell('b', 'f', 1), c: cell('c', 'f', 2),
+    d: cell('d', 'g', 0), e: cell('e', 'g', 1), food: { id: 'food', kind: 'food', entity: '', x: 997, y: 10, ch: '食', path: [], moveAt: now } });
+  runtime.draw(world);
+  const index = runtime.currentIndex(world), tick = now + 500;
+  const move = (id, x) => ({ ...world.data.fishes[id], x, posAt: tick });
+  const incoming = { protocol: 1, tick, roots: world.data.roots, ops: {}, fishes: { f: move('f', 1), g: move('g', 999) },
+    scenes: { s: { id: 's', x: 100, y: 38, posAt: tick } },
+    chars: { b: { ...world.data.chars.b, entity: 'g', x: 2, moveAt: tick },
+      food: { ...world.data.chars.food, kind: 'scene', entity: 's', x: 0, y: 0, moveAt: tick },
+      plant: { id: 'plant', kind: 'seaweed', entity: '', x: 220, y: 45, ch: '草', path: [], moveAt: tick } } };
+  runtime.worldChanged(world, null);
+  const changed = world.merge(incoming, {}, 'replica', true);
+  runtime.applyMerge(world, index, changed);
+  const reference = new ViewportCells(world.data);
+  const rows = items => items.map(item => [item.id, item.kind, item.entity, item.x, item.y]);
+  for (const [left, right, top, bottom] of [[-1, 2, 0, 31], [996, 1002, 0, 31], [91, 125, 32, 57], [210, 240, 32, 57]]) {
+    assert.deepEqual(rows(index.query(left, right, top, bottom)), rows(reference.query(left, right, top, bottom)));
+  }
+  assert.deepEqual(rows(index.fishCells('g')).map(row => row[0]).sort(), ['b', 'd', 'e']);
+  runtime.camera.x = 999;
+  runtime.draw(world);
+  assert.deepEqual(runtime.hit(71, 51), { kind: 'fish', id: 'g' });
+
+  const movedOwners = [];
+  const moveOwner = index.moveOwner.bind(index);
+  index.moveOwner = (group, pose) => { movedOwners.push(pose?.id); moveOwner(group, pose); };
+  const nextTick = tick + 500;
+  const next = { ...incoming, tick: nextTick, chars: {}, scenes: {},
+    fishes: Object.fromEntries(Object.entries(world.data.fishes).map(([id, fish]) => [id, { ...fish, posAt: nextTick, cx: 0.25 }])) };
+  // The clocks and fractional swim counters changed, but none of these bodies
+  // left its anchor. Hit-testing and drawing still use the latest fish rows.
+  const steady = world.merge(next, {}, 'replica', true);
+  runtime.applyMerge(world, index, steady);
+  assert.deepEqual(movedOwners, []);
+  const cross = { ...next, tick: nextTick + 500, fishes: { g: { ...next.fishes.g, x: 35, posAt: nextTick + 500 } } };
+  runtime.applyMerge(world, index, world.merge(cross, {}, 'replica', true));
+  assert.deepEqual(movedOwners, ['g']);
+  const rebuilt = new ViewportCells(world.data);
+  for (const x of [0, 33, 997]) assert.deepEqual(rows(index.query(x, x + 5, 0, 31)), rows(rebuilt.query(x, x + 5, 0, 31)));
+  runtime.camera.x = 35;
+  runtime.draw(world);
+  assert.deepEqual(runtime.hit(71, 51), { kind: 'fish', id: 'g' });
+});
+
+test('旧存档合流新增整数键时，画面沿用实际字符顺序', async () => {
+  const { World } = await import('../www/engine.js');
+  const now = Date.now(), world = new World(now, 'test', { populate: false, ambient: false });
+  const food = id => ({ id, kind: 'food', entity: '', x: 20, y: 5, path: [] });
+  world.data.chars[2] = food('2');
+  const index = new ViewportCells(world.data);
+  const incoming = { protocol: 1, tick: now + 500, roots: world.data.roots, ops: {}, fishes: {}, scenes: {}, chars: { 1: food('1') } };
+  const changes = world.merge(incoming, {}, 'replica', true);
+  if (changes.chars) index.reconcileMerge(changes); else index.reconcile();
+  assert.deepEqual(index.query(20, 20, 5, 5).map(cell => cell.id), ['1', '2']);
 });

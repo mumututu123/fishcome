@@ -2,13 +2,36 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { CONFIG, World, chooseClaim } from '../www/engine.js';
 import { ARCHIVE_FIELDS, ArchiveStore, encodeArchive, prepareCompaction } from '../www/archive.js';
-import { SimulationClient, subscribeSimulationChanges } from '../www/simulation-client.js';
+import { SimulationClient, startSimulationClock, subscribeSimulationChanges } from '../www/simulation-client.js';
 import { WorkerSimulation } from '../www/simulation-worker.js';
+import { expandSimulationPatch } from '../www/simulation-delta.js';
+import { applyBondIntervals } from '../www/bond-interval.js';
+import { LIFE, lifeContext, updateLife } from '../www/life.js';
 import { applyInputRows, setParticipantName, subscribeBeforeSimulationPatch, worldEdited } from '../www/simulation-changes.js';
 import { CONTACT_TIME, updateContacts } from '../www/breeding.js';
 
 const start = Date.UTC(2025, 5, 15, 12, 17);
 const root = '00000000-0000-4000-8000-000000000012';
+
+test('半秒时钟对齐存档步，提前醒来只等剩余时间，迟醒也不累积偏移', t => {
+  let now = 1320, base = 1000, wake;
+  const requested = [], updates = [];
+  t.mock.method(Date, 'now', () => now);
+  t.mock.method(globalThis, 'setTimeout', (callback, delay) => { wake = callback; requested.push(delay); });
+  startSimulationClock(() => base, () => updates.push(now));
+  for (now of [1499, 1500, 2020, 2499, 2500]) wake();
+  assert.deepEqual(updates, [1500, 2020, 2500]);
+  assert.deepEqual(requested, [180, 1, 500, 480, 1, 500]);
+  // A handoff can supply a future tick with a different phase. A clock jump
+  // while suspended must also leave the next wake within one half-second.
+  base = 3110;
+  now = 3000; wake();
+  assert.equal(requested.at(-1), 110);
+  now = 1600; wake();
+  assert.equal(requested.at(-1), 10);
+  now = 7610; wake();
+  assert.equal(requested.at(-1), 500);
+});
 
 test('连续八步的在途投喂按提交顺序入海，每步只计算一次', async () => {
   const world = new World(start, root, { populate: false, ambient: false });
@@ -49,6 +72,32 @@ function localWorker(beforeReceive = () => {}, simulation = new WorkerSimulation
     }
   };
 }
+
+test('半秒结算把接触顺序完整交给页面，包括仍保留的旧配对', async () => {
+  const world = new World(start, root, { populate: false, ambient: false });
+  for (let i = 0; i < 4; i++) {
+    const id = `00000000-0000-4000-8000-00000000000${i}`;
+    const cells = [0, 1, 2].map(x => ({ x, y: 0, ch: 'Q', color: '#acaabc' }));
+    assert(world.apply({ id, kind: 'fish', gender: i % 2 ? 'female' : 'male', actor: id, nick: '鱼',
+      t: start, cost: 3, x: 20 + 20 * Math.floor(i / 2) + 3 * (i % 2), y: 20, cells }).ok);
+  }
+  updateContacts(world, start, world.fishGroups(), world.sceneryMap());
+  const expected = Object.keys(world.data.contacts);
+  assert.equal(expected.length, 2);
+  world.data.contacts = Object.fromEntries(Object.entries(world.data.contacts).reverse());
+  const worker = new WorkerSimulation(), client = new SimulationClient(() => localWorker(undefined, worker));
+  try {
+    // Use the normal contact decision while keeping the four bodies in place.
+    await client.open(world, () => true);
+    worker.world.step = now => {
+      updateContacts(worker.world, now, worker.world.fishGroups(), worker.world.sceneryMap());
+      worker.world.data.tick = now;
+    };
+    await client.advance(world, start + CONFIG.step);
+    assert.deepEqual(Object.keys(world.data.contacts), expected);
+    assert.deepEqual(world.data.contacts, worker.world.data.contacts);
+  } finally { client.close(); }
+});
 
 test('追赶中在第一步交接真实归档，保留鱼的最后一餐并清除线程里的旧热行', async () => {
   const world = new World(start, root), store = new ArchiveStore(), worker = new WorkerSimulation();
@@ -232,15 +281,22 @@ test('后台只发送变化的鱼记录与当日行程，订阅者收到完整�
       assert.equal(before.at(-1).patch, after.at(-1));
       for (const [id, fish] of after.at(-1).tables.fishes.set) assert.deepEqual(fish, world.data.fishes[id]);
     }
-    for (const change of sent) for (const [, fields] of change.tables.fishes.set) {
+    for (const change of sent) for (const row of change.tables.fishes.set) {
+      if (!Array.isArray(row)) { assert(change.tables.fishes.motion instanceof Float64Array); continue; }
+      const [, fields] = row;
       assert.equal(Object.hasOwn(fields, 'actor'), false);
       assert.equal(Object.hasOwn(fields, 'id'), false);
     }
-    const travel = sent.flatMap(change => change.tables.travel?.set || []);
-    assert(travel.length > 0);
-    for (const [, fields, , days] of travel) {
-      assert.equal(Object.hasOwn(fields, 'since'), false);
-      assert.equal(Object.hasOwn(days[0], '2025-06-14'), false);
+    const trips = sent.map(change => change.tables.travel).filter(Boolean);
+    assert(trips.some(trip => trip.distances instanceof Float64Array && trip.distances.length > 0));
+    for (const trip of trips) for (const row of trip.set) {
+      if (typeof row === 'number') { assert.equal(trip.day, '2025-06-15'); continue; }
+      const [, fields, , days] = row;
+      if (typeof fields === 'string') assert.equal(fields, '2025-06-15');
+      else {
+        assert.equal(Object.hasOwn(fields, 'since'), false);
+        assert.equal(Object.hasOwn(days[0], '2025-06-14'), false);
+      }
     }
     const life = sent.find(change => change.life?.bonds);
     assert(life);
@@ -375,4 +431,224 @@ test('线程故障保留已完成步骤并暂停，协调者重新接管后可�
     assert.equal(world.data.tick, start + CONFIG.step);
     assert.equal(starts, 2);
   } finally { client.close(); }
+});
+
+test('后台关系逐项修改、删除再加入和回滚都保留原始字段与顺序', () => {
+  const world = new World(start, root, { populate: false }), worker = new WorkerSimulation();
+  const bond = (a, b) => ({ a, b, seconds: 10, at: start, lastNear: start, run: 3 });
+  const first = bond('a', 'b'), second = bond('c', 'd');
+  world.data.life.bonds = { 'a|b': first, 'c|d': second };
+  worker.receive({ kind: 'open', values: world.serialize(), tables: [], ambient: false });
+  worker.receive({ kind: 'ready' });
+  const table = worker.world.data.life.bonds;
+  table['c|d'].seconds++;
+  delete table['a|b'];
+  table['a|b'] = { ...first, run: 4 };
+  delete table['c|d'].run;
+  const patch = worker.tracker.changes(), updated = expandSimulationPatch(world.data, patch).values.life;
+  assert.deepEqual(Object.keys(updated.bonds), ['c|d', 'a|b']);
+  assert.deepEqual(updated.bonds['c|d'], { a: 'c', b: 'd', seconds: 11, at: start, lastNear: start });
+  assert.deepEqual(updated.bonds['a|b'], { ...first, run: 4 });
+  worker.world.data.life.bonds = { 'a|b': { ...updated.bonds['a|b'], seconds: 30, legacy: true }, 'c|d': updated.bonds['c|d'] };
+  worker.world.data.life.bonds['a|b'] = { ...worker.world.data.life.bonds['a|b'], run: 15 };
+  const again = expandSimulationPatch({ life: updated }, worker.tracker.changes()).values.life;
+  assert.deepEqual(Object.keys(again.bonds), ['a|b', 'c|d']);
+  assert.deepEqual(again.bonds['a|b'], { ...first, seconds: 30, run: 15, legacy: true });
+  worker.receive({ kind: 'restore', rows: [], previous: { life: structuredClone(world.data.life) }, foodRevision: 0 });
+  assert.deepEqual(worker.world.readBonds(), world.data.life.bonds);
+});
+
+test('故事按上一版序号保留，替换、重排、删减和嵌套修改均可重放', () => {
+  const world = new World(start, root, { populate: false }), worker = new WorkerSimulation();
+  world.data.life.stories = { a: { id: 'a', old: { value: 1 } }, b: { id: 'b' }, c: { id: 'c' } };
+  worker.receive({ kind: 'open', values: world.serialize(), tables: [], ambient: false });
+  worker.receive({ kind: 'ready' });
+  const src = worker.world.data.life;
+  const apply = () => {
+    const patch = worker.tracker.changes();
+    world.data.life = expandSimulationPatch(world.data, patch).values.life;
+    return patch.life;
+  };
+  src.stories = { c: src.stories.c, a: src.stories.a, d: { id: 'd', new: 2 } };
+  const moved = apply();
+  assert.deepEqual(moved.stories, [2, 0, ['d', { id: 'd', new: 2 }]]);
+  assert.deepEqual(Object.keys(world.data.life.stories), ['c', 'a', 'd']);
+  const old = world.data.life.stories;
+  src.stories = { a: src.stories.a };
+  src.stories.a.old.value = 3;
+  assert.equal(apply().stories, undefined);
+  assert.deepEqual(world.data.life.stories, { a: { id: 'a', old: { value: 3 } } });
+  assert.equal(old.a.old.value, 1);
+  src.stories = {};
+  assert.deepEqual(apply().stories, []);
+  assert.deepEqual(world.data.life.stories, {});
+});
+
+test('连续关系只交付进出名单，时间跳变、逐项编辑和回滚按实际版本复原', () => {
+  const world = new World(start, root, { populate: false }), worker = new WorkerSimulation();
+  const ids = Array.from({ length: 94 }, (_, i) => 'fish-' + String(i).padStart(3, '0'));
+  for (const [i, id] of ids.entries()) {
+    world.data.fishes[id] = { id, x: i % 5, y: 20, facing: 1 };
+    world.data.chars[id] = { id, entity: id, kind: 'fish', x: 0, y: 0, path: [] };
+  }
+  worker.receive({ kind: 'open', values: world.serialize(), tables: [], ambient: false });
+  worker.receive({ kind: 'ready' });
+  let replica = { life: structuredClone(world.data.life) };
+  function update(at, x) {
+    worker.tracker.reset();
+    for (const source of [world, worker.world]) {
+      source.data.fishes[ids[0]].x = x;
+      updateLife(source, at, lifeContext(source, at, source.sceneryMap(), source.fishGroups()));
+    }
+    const patch = worker.tracker.changes();
+    replica = { life: expandSimulationPatch({ ...world.data, ...replica }, patch).values.life };
+    assert.deepEqual(Object.keys(replica.life.bonds), Object.keys(world.data.life.bonds));
+    assert.deepEqual(replica.life, world.data.life);
+    return patch.life.bonds;
+  }
+  assert.equal(update(start + 1000, 1).intervals, undefined);
+  const changed = update(start + 2000, 32);
+  assert(changed.intervals && changed.keys.length > 0 && changed.keys.length < changed.intervals.length);
+  assert.deepEqual(update(start + 3000, 32).keys, []);
+  const key = Object.keys(replica.life.bonds)[100];
+  assert.deepEqual(worker.world.data.life.bonds[key], replica.life.bonds[key]);
+  worker.tracker.reset();
+  worker.world.data.life.bonds[key].custom = true;
+  world.data.life.bonds[key].custom = true;
+  replica = { life: expandSimulationPatch(replica, worker.tracker.changes()).values.life };
+  assert.deepEqual(replica.life, world.data.life);
+  assert.equal(update(start + 4000, 32).intervals, undefined);
+  assert(update(start + 5000, 32).intervals);
+  assert.equal(update(start + 8000, 32).intervals, undefined);
+  assert.equal(update(start + 6000, 32).intervals, undefined);
+  worker.receive({ kind: 'restore', rows: [], previous: { life: structuredClone(replica.life) }, foodRevision: 0 });
+  assert.equal(update(start + 7000, 32).intervals, undefined);
+});
+
+test('伙伴变更拒绝多余的位、不匹配的记录数、重复加入和中断的基准', () => {
+  const at = start + 1000, previous = { 'a|b': { a: 'a', b: 'b', at: start, lastNear: start, seconds: 3599.25, run: 120 } };
+  const change = { at, intervals: { before: 1, kept: [1], added: [2], length: 2 }, keys: ['b|c'] };
+  assert.deepEqual(applyBondIntervals(previous, change), {
+    'a|b': { a: 'a', b: 'b', seconds: 3600, at, lastNear: at, run: 120 },
+    'b|c': { a: 'b', b: 'c', seconds: 1, at, lastNear: at, run: 0 }
+  });
+  for (const invalid of [
+    { ...change, at: at + 1000 }, { ...change, keys: [] }, { ...change, keys: ['a|b'] },
+    { ...change, intervals: { ...change.intervals, before: 2 } },
+    { ...change, intervals: { ...change.intervals, kept: [2] } },
+    { ...change, intervals: { ...change.intervals, kept: [0] } },
+    { ...change, intervals: { before: 1, kept: [1], added: [], length: 0 }, keys: [] }
+  ]) assert.throws(() => applyBondIntervals(previous, invalid));
+});
+
+test('主端伙伴关系跨帧保持顺序、旧记录和存档值', () => {
+  const world = new World(start, root, { populate: false });
+  const row = (a, b, seconds, at, run) => ({ a, b, seconds, at, lastNear: at, run });
+  const initial = world.data.life.bonds = {
+    'a|b': row('a', 'b', 0.001, start, 0.001),
+    'a|c': row('a', 'c', 7, start, 4)
+  };
+  const install = (at, bonds) => {
+    const patch = { tables: {}, values: { tick: at }, life: { properties: [{ at }], bonds } };
+    Object.assign(world.data, expandSimulationPatch(world.data, patch, [], true).values);
+    return world.data.life;
+  };
+  const firstAt = start + 1000, secondAt = start + 2000, thirdAt = start + 3000;
+  const first = install(firstAt, { at: firstAt, intervals: { before: 2, length: 3, kept: [3], added: [4] }, keys: ['b|c'] });
+  const firstHalf = install(firstAt + 500);
+  initial['a|b'].seconds = 30;
+  initial['a|c'].seconds = 40;
+  const second = install(secondAt, { at: secondAt, intervals: { before: 3, length: 3, kept: [5], added: [2] }, keys: ['a|d'] });
+
+  assert.equal(first.bonds, firstHalf.bonds);
+  assert.deepEqual(first.bonds, {
+    'a|b': row('a', 'b', 1.001, firstAt, 1.001),
+    'a|c': row('a', 'c', 8, firstAt, 5),
+    'b|c': row('b', 'c', 1, firstAt, 0)
+  });
+  first.bonds['b|c'].seconds = 99;
+  const checkpoint = structuredClone({ world: { ...world.data } });
+  const expected = {
+    'a|b': row('a', 'b', 2.001, secondAt, 2.001),
+    'a|d': row('a', 'd', 1, secondAt, 0),
+    'b|c': row('b', 'c', 2, secondAt, 1)
+  };
+  assert.equal(JSON.stringify(second.bonds), JSON.stringify(expected));
+  assert.deepEqual(checkpoint.world.life.bonds, expected);
+  assert.deepEqual(world.serialize().life.bonds, expected);
+
+  second.bonds['a|d'].seconds = 8;
+  const third = install(thirdAt, { at: thirdAt, intervals: { before: 3, length: 3, kept: [7], added: [0] }, keys: [] });
+  assert.deepEqual(third.bonds['a|d'], row('a', 'd', 9, thirdAt, 1));
+  assert.equal(second.bonds['a|d'].at, secondAt);
+  assert.deepEqual(checkpoint.world.life.bonds, expected);
+});
+
+test('长时间相处仍逐秒保留旧存档的小数舍入和熟鱼故事，旧表的编辑只影响旧表', () => {
+  const world = new World(start, root, { populate: false }), worker = new WorkerSimulation(), key = 'a|b';
+  for (const id of ['a', 'b', 'c']) {
+    world.data.fishes[id] = { id, x: 3, y: 20, facing: 1 };
+    world.data.chars[id] = { id, entity: id, kind: 'fish', x: 0, y: 0, path: [] };
+  }
+  world.data.life.bonds[key] = { a: 'a', b: 'b', seconds: 0.001, at: start, lastNear: start, run: 0.001 };
+  worker.receive({ kind: 'open', values: world.serialize(), tables: [], ambient: false });
+  worker.receive({ kind: 'ready' });
+  let replica = { life: structuredClone(world.data.life) }, oldTable, oldRow;
+  for (let i = 1; i <= 125; i++) {
+    const at = start + 1000 * i;
+    worker.tracker.reset();
+    for (const source of [world, worker.world]) {
+      updateLife(source, at, lifeContext(source, at, source.sceneryMap(), source.fishGroups()));
+    }
+    replica = { life: expandSimulationPatch(replica, worker.tracker.changes()).values.life };
+    if (i === 1) { oldTable = worker.world.data.life.bonds; oldRow = oldTable['a|c']; }
+    if (i === 3) { oldRow.seconds = 999; oldTable['b|c'].seconds = 888; }
+    assert.deepEqual(replica.life, world.data.life);
+    assert.deepEqual(worker.world.data.life.bonds[key], world.data.life.bonds[key]);
+  }
+  assert.equal(replica.life.stories['friend:a:b'].at, start + 45000);
+});
+
+test('游动同一步的进食、消亡和行程修订只交付一次，并保留其余鱼的位置', () => {
+  const world = new World(start, root, { populate: false }), worker = new WorkerSimulation();
+  const ids = ['gone', 'fed', 'swam'], day = '2025-06-15', now = start + CONFIG.step;
+  for (const [i, id] of ids.entries()) {
+    const facing = id === 'fed' ? -1 : 1, phase = id === 'fed' ? 3 : 2;
+    world.data.fishes[id] = { id, x: 20 * (i + 1), y: 7, facing, cx: 0, cy: 0, posAt: start,
+      created: start - phase * LIFE.wanderPeriod, hungerAt: now + CONFIG.hunger };
+    world.data.travel[id] = { since: start, days: { [day]: 3 } };
+    for (let x = 0; x < 2; x++) {
+      const cellId = `${id}:${x}`;
+      world.data.chars[cellId] = { id: cellId, kind: 'fish', entity: id, x, y: 0, ch: '鱼', path: [] };
+    }
+  }
+  worker.receive({ kind: 'open', values: world.serialize(), tables: [], ambient: false });
+  worker.receive({ kind: 'ready' });
+  const sea = worker.world;
+  const swims = [];
+  sea.step(now, swims);
+  assert.deepEqual(swims[3], ['fed']);
+  assert.deepEqual(swims[5], ['gone', 'swam']);
+  delete sea.data.fishes.gone;
+  delete sea.data.travel.gone;
+  sea.data.fishes.fed.lastFed = now;
+  sea.data.travel.fed.days[day] += 2;
+  const patch = worker.tracker.changes(), expanded = expandSimulationPatch(world.data, patch, ids);
+  for (const field of ['fishes', 'travel']) {
+    const { set, remove } = expanded.tables[field];
+    assert.deepEqual(remove, ['gone']);
+    assert.deepEqual(set.map(([id]) => id).sort(), ['fed', 'swam']);
+    for (const [id, record] of set) assert.deepEqual(record, sea.data[field][id]);
+  }
+  assert.equal(patch.tables.fishes.motion.length, 5);
+  assert.deepEqual(Array.from(patch.tables.travel.distances), [4]);
+  assert.equal(patch.tables.travel.set[0], ids.indexOf('swam'));
+  assert.equal(expanded.tables.travel.set.find(([id]) => id === 'fed')[1].days[day], 6);
+
+  worker.receive({ kind: 'restore', rows: [['travel', 'swam', { since: start, days: { [day]: 10 } }]] });
+  worker.receive({ kind: 'step', base: now, names: [], foods: [] });
+  assert.equal(sea.data.travel.swam.days[day], 11);
+  sea.data.travel.swam.days = { [day]: 20 };
+  worker.receive({ kind: 'step', base: now + CONFIG.step, names: [], foods: [] });
+  assert.equal(sea.data.travel.swam.days[day], 21);
 });

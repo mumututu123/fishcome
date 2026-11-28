@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { World, hash, clone } from '../www/engine.js';
 import { updateContacts, finishBreeding } from '../www/breeding.js';
+import { collectGridPairs } from '../www/breeding-contacts.js';
 import { ECOLOGY, newEcology, densityField, contactTime, growthChance, weedExpires, weedAlpha, updateEcology, looseWither, mergeEcology, validEcology } from '../www/ecology.js';
 import { restoreCheckpoint } from '../www/lifecycle.js';
 const HOUR = 3600000, now = Date.now(), cell = (x, y, ch = 'Q') => ({ x, y, ch, color: '#88aacc' });
@@ -47,6 +48,10 @@ test('繁殖密度按公鱼编号和母鱼本地化编号取接触点，兼容�
     assert.equal(contactTime(density(25, 20)), 5000);
 
     const groups = w.fishGroups(), scenery = w.sceneryMap();
+    const grid = w.movementGrid(groups), pairs = new Map();
+    const roster = { males: [w.readFish(male)], females: new Set([female]), probeCount: grid.cells.length };
+    assert.equal(collectGridPairs(w, grid, scenery, roster, new Set(), new Set(), pairs), left === 19);
+    if (left === 19) assert.equal(pairs.get(male + '|' + female)?.wait, 20000);
     for (let elapsed = 0; elapsed < 20000; elapsed += 500) {
       updateContacts(w, now + elapsed, groups, scenery);
       assert.equal(w.breedingState(male), undefined);
@@ -57,6 +62,61 @@ test('繁殖密度按公鱼编号和母鱼本地化编号取接触点，兼容�
       female: left === 19 ? ['Z-female', 'a-female', 'extra-female'] : ['Z-female', 'extra-female']
     });
   }
+});
+test('海图四条接触边跨越接缝，墙角遮挡与拥挤区都不触发繁殖', () => {
+  for (const [dx, dy] of [[1, 0], [0, 1], [1, 1], [-1, 1]]) {
+    const w = sea(), male = fish(w, 'male', 20), female = fish(w, 'female', 24);
+    const x = dx < 0 ? 0 : 999, y = 20;
+    const groups = w.fishGroups(), dad = w.readFish(male), mum = w.readFish(female);
+    dad.x = x; mum.x = (x + dx + 1000) % 1000; mum.y = y + dy;
+    for (const cells of groups.values()) cells.splice(1);
+    const grid = w.movementGrid(groups), females = new Set([female]);
+    const pairs = scenery => {
+      const rows = new Map();
+      assert(collectGridPairs(w, grid, scenery, { males: [dad], females, probeCount: grid.cells.length }, new Set(), new Set(), rows));
+      return rows;
+    };
+    assert.equal(pairs(new Map()).get(male + '|' + female)?.wait, 5000);
+    if (dx && dy) {
+      const corner = { scene: { x: mum.x, y }, cell: { x: 0, y: 0 } };
+      assert.equal(pairs(new Map([[mum.x + ',' + y, corner]])).size, 0);
+    }
+    fill(w, x, y, 500);
+    assert.equal(pairs(w.sceneryMap()).size, 0);
+  }
+});
+test('同形鱼按各自鱼元编号选择接触点', () => {
+  const w = sea(), groups = new Map(), males = [], females = new Set(), scenery = new Map();
+  for (const [i, x] of [20, 100].entries()) {
+    const father = { id: 'dad' + i, x, y: 20, facing: 1 };
+    const mother = { id: 'mum' + i, x, y: 20, facing: 1 };
+    w.data.fishes[father.id] = father;
+    w.data.fishes[mother.id] = mother;
+    groups.set(father.id, [
+      { id: (i ? 'Z' : 'a') + i, x: 4, y: 0 },
+      { id: (i ? 'a' : 'Z') + i, x: 0, y: 0 },
+      { id: 'spare' + i, x: 8, y: 0 }
+    ]);
+    groups.set(mother.id, [
+      { id: 'a' + i, x: 1, y: 0 },
+      { id: 'Z' + i, x: -1, y: 0 },
+      { id: 'spare' + i, x: 5, y: 0 }
+    ]);
+    males.push(father); females.add(mother.id);
+    for (let n = 0; n < 187; n++) {
+      const px = x - 14 + n % 31, py = 5 + Math.floor(n / 31);
+      scenery.set(px + ',' + py, { scene: { x: px, y: py }, cell: { x: 0, y: 0 } });
+    }
+  }
+  const grid = w.movementGrid(groups), pairs = new Map();
+  const roster = { males, females, probeCount: grid.cells.length };
+  assert(collectGridPairs(w, grid, scenery, roster, new Set(), new Set(), pairs));
+  assert.equal(pairs.get('dad0|mum0')?.wait, 20000);
+  assert.equal(pairs.get('dad1|mum1')?.wait, 5000);
+
+  const repeated = groups.get('dad1').map(glyph => ({ ...glyph, id: 'same' }));
+  const legacy = w.movementGrid(new Map(groups).set('dad1', repeated));
+  assert.equal(collectGridPairs(w, legacy, scenery, roster, new Set(), new Set(), new Map()), false);
 });
 test('已经开始的繁殖不因后来的拥挤被取消，出生不增加鱼元', () => {
   const w = sea(), male = fish(w, 'male', 20); fish(w, 'female', 23); for (let e = 0; e <= 5000; e += 500) updateContacts(w, now + e, w.fishGroups(), w.sceneryMap()); const r = w.breedingState(male); fill(w, 22, 20, 400); const count = Object.keys(w.data.chars).length;
@@ -102,3 +162,47 @@ test('人工字符、主动改字后的沉积与聊天记忆不会风化，风�
   w.data.ecology.hour = hour - 1; updateEcology(w, now, transition); assert.equal(c.kind, 'scene'); assert.equal(memory.kind, 'scene'); assert.equal(w.sceneCells(created).length, 2); assert.equal(w.wallet('maker'), 18);
 });
 test('生态时钟合流取稳定起点和最新小时，非法时间拒绝', () => { const a = newEcology(now, true), b = newEcology(now + HOUR); assert.deepEqual(mergeEcology(a, b), mergeEcology(b, a)); assert(validEcology(a)); assert(!validEcology({ ...a, activated: Infinity })); });
+
+test('恢复时所有沉积物都在保护期内，更新整点无需扫描全海密度', () => {
+  const w = sea(), start = Math.floor(now / HOUR) * HOUR;
+  const grain = sediment(w, 'young', start);
+  const read = w.charValues.bind(w);
+  w.charValues = (...kinds) => {
+    assert(kinds.length, '未到风化时间不应枚举全海字符');
+    return read(...kinds);
+  };
+  updateEcology(w, start + ECOLOGY.sedimentGrace - HOUR, transition);
+  assert.equal(grain.kind, 'scene');
+  assert.equal(w.data.ecology.hour, Math.floor((start + ECOLOGY.sedimentGrace - HOUR) / HOUR));
+});
+
+test('鱼体横跨接缝、海面或密度分界时，整片繁殖区域与逐点密度相同', () => {
+  const w = sea();
+  fill(w, 0, 9, 420);
+  const density = densityField(w);
+  let crowded = 0, open = 0;
+  for (const left of [-17, -4, 0, 5, 990, 998, 1010]) for (const top of [0, 1, 8, 20]) {
+    for (const width of [1, 3, 8]) {
+      const right = left + width, bottom = top + 3;
+      let allCrowded = true;
+      for (let x = left; x <= right; x++) for (let y = top; y <= bottom; y++) {
+        if (Number.isFinite(contactTime(density(x, y)))) allCrowded = false;
+      }
+      assert.equal(density.crowdedRegion(left, top, right, bottom), allCrowded);
+      if (allCrowded) crowded++; else open++;
+    }
+  }
+  assert(crowded && open);
+});
+
+test('旧鱼体重复编号仍按原来的首个鱼元寻找接触点', () => {
+  const w = sea();
+  fish(w, 'male', 60); fish(w, 'female', 63);
+  const male = fish(w, 'male', 20), female = fish(w, 'female', 23);
+  const cells = w.fishCells(male);
+  cells[0].id = cells[2].id;
+  fill(w, 22, 20, 420);
+  assert.equal(contactTime(densityField(w)(23, 20)), Infinity);
+  updateContacts(w, now, w.fishGroups(), w.sceneryMap());
+  assert.deepEqual(w.data.contacts[male + '|' + female], { male, female, since: now, lastAt: now });
+});

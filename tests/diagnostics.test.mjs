@@ -6,6 +6,7 @@ import { DiagnosticLog, inspectFishOrigins, repairFishOriginIssues, diagnosticSu
 
 import { ArchiveStore, ARCHIVE_FIELDS, encodeArchive, compactKnown } from '../www/archive.js';
 import { loadReplicaArchives, verifyReplica } from '../www/replica.js';
+import { worldEdited } from '../www/simulation-changes.js';
 import { Network } from '../www/network.js';
 import { actorId, signer, verifyEnvelope } from '../www/storage.js';
 
@@ -307,6 +308,20 @@ test('共享诊断摘要只含统计，不携带聊天、邀请码、身份或�
   assert.deepEqual(diagnosticSummary({ state: 'archive_missing', verifyError: privateText }, []).scan, { state: 'archive_missing' });
 });
 
+test('只有签名操作的归档不遍历活鱼和鱼元，随包世界仍按已验证的操作核对', async () => {
+  const { data, maleId } = await signedFamily();
+  const records = Object.fromEntries(ARCHIVE_FIELDS.map(field => [field, {}]));
+  records.ops[maleId] = data.ops[maleId];
+  const chunk = await encodeArchive(records, data.roots);
+  const incoming = { roots: data.roots, archives: { ...data.archives, chunks: { [chunk.manifest.id]: chunk.manifest } } };
+  const current = { ...data, ops: {}, fishes: new Proxy(data.fishes, { ownKeys: () => assert.fail('归档遍历了活鱼') }),
+    chars: new Proxy(data.chars, { ownKeys: () => assert.fail('归档遍历了鱼元') }) };
+  let verified = false;
+  await loadReplicaArchives(incoming, new ArchiveStore(), () => chunk.encoded, { current,
+    beforeIngest(prior) { assert.deepEqual(prior.ops[maleId], records.ops[maleId]); verified = true; } });
+  assert.equal(verified, true);
+});
+
 test('归档中的鱼依赖热存档的凭据，独立导入时只能使用本份备份', async () => {
   const { data, maleId } = await signedFamily();
   const records = Object.fromEntries(ARCHIVE_FIELDS.map(field => [field, {}]));
@@ -392,4 +407,26 @@ test('分支在不同位置完成同一次出生，增量只带胜出凭据也�
   for (const inherited of early.breeding[breedingId].baby.cells) {
     assert.equal(saved.chars[inherited.id].path.at(-1).x, inherited.x);
   }
+});
+
+test('鱼生验证只覆盖收到的消息和原有来源，等待期间更换世界、归档或创建凭据均重查', async () => {
+  const world = new World(Date.now() - 1000), data = world.serialize();
+  const [first, second] = Object.keys(world.data.fishes).sort();
+  const key = first + '|' + second, at = data.tick;
+  data.life.bonds[key] = { a: first, b: second, seconds: 1, at, lastNear: at, run: 0 };
+  data.ops = {}; data.fishes = {}; data.chars = {};
+  const archive = new ArchiveStore(), extra = {};
+  const receipt = await verifyReplica(data, extra, archive, { current: world.data, mergeCut: true });
+  const latest = Date.now() + 60000;
+  assert(receipt(world.data, data, extra, latest));
+  assert(!receipt(world.data, { ...data }, extra, latest));
+  assert(!receipt(world.data, data, {}, latest));
+  assert(!receipt({ ...world.data }, data, extra, latest));
+  assert(!receipt(world.data, data, extra, 0));
+  archive.revision = 1;
+  assert(!receipt(world.data, data, extra, latest));
+  const newer = await verifyReplica(data, extra, archive, { current: world.data, mergeCut: true });
+  worldEdited(world);
+  delete world.data.ops[first];
+  assert.throws(() => world.merge(data, extra, 'replica', true, newer), /鱼生记录无效/);
 });

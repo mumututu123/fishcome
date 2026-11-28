@@ -1,21 +1,27 @@
-import { CONFIG, chooseClaim, hash, validGlyph, validateOperation } from './engine.js';
+import { CONFIG, chooseClaim, hash, replicaSourceRows, validateLifeAndLegends, validGlyph, validateOperation } from './engine.js';
+import { subscribeSimulationChanges } from './simulation-changes.js';
 import { verifyEnvelope } from './storage.js';
 import { verifyReferral } from './referral.js';
 import { CHAT_FLOOR, validChatMessage, chatGlyphs, chatColor, chatCellId } from './chat.js';
 import { validTravel } from './fish-status.js';
 import { HOUR, validWildCell } from './seaweed.js';
 import { MINUTE, validBubble } from './bubbles.js';
-import { fishOrigin, validBreedingRecord, inheritedGlyph } from './breeding.js';
+import { fishOrigin, validBreedingRecord, inheritedGlyph, repairLocalBirthTimes } from './breeding.js';
 import { validTerrain } from './geography.js';
 import { validInitialOp, initialSources } from './genesis.js';
-import { validateLife, validPlankton } from './life.js';
+import { validPlankton } from './life.js';
 import { validEcology } from './ecology.js';
-import { validPopulation, validRocks } from './population.js';
-import { validLegends, validGhostCell } from './legends.js';
+import { validPopulation, validRocks, repairLocalMagma } from './population.js';
+import { validGhostCell } from './legends.js';
 import { ARCHIVE_FIELDS, assembleFragments, decodeArchive, mergeArchiveRecord, validArchiveState } from './archive.js';
 import { buildOriginSources, inspectFishOrigin } from './diagnostics.js';
 
+// Verification can wait for signatures, archives and an open checkpoint. A
+// receipt only covers the exact records and local sources that were checked.
+const sourceVersions = new WeakMap();
+subscribeSimulationChanges(({ data }) => sourceVersions.set(data, (sourceVersions.get(data) || 0) + 1));
 const opBody = op => { const { proof, ...body } = op; return body; };
+
 export async function verifyChats(messages = {}, store, current = {}, roots) {
   for (const [id, message] of Object.entries(messages)) {
     if (!validChatMessage(message) || id !== message.id) throw new Error('聊天记录无效');
@@ -29,7 +35,25 @@ export async function verifyChats(messages = {}, store, current = {}, roots) {
     } else if (!await verifyEnvelope(message)) throw new Error('聊天签名无效');
   }
 }
-export async function verifyReplica(data, extra = {}, store, { current = {}, context: ctx = 'replica', diagnostics } = {}) {
+// Local starts and explicit imports can repair recognizable legacy data.
+// Every correction goes back through the full network verifier.
+export async function verifyLocalCheckpoint(data, archived, store, options = {}) {
+  const { diagnostics, context = 'checkpoint' } = options;
+  try { await verifyReplica(data, archived, store, options); return data; }
+  catch (error) {
+    const birth = repairLocalBirthTimes(data, archived), repaired = repairLocalMagma(birth);
+    if (repaired === data) {
+      diagnostics?.record('warn', context, `本地自动修复未命中：${error.message}`);
+      throw error;
+    }
+    await verifyReplica(repaired, archived, store, { ...options, context: `${context}:repaired` });
+    if (birth !== data) diagnostics?.record('info', context, '本地旧版出生时间已自动修复');
+    if (repaired !== birth) diagnostics?.record('info', context, '本地旧版岩浆移动记录已自动修复');
+    return repaired;
+  }
+}
+export async function verifyReplica(data, extra = {}, store, { current = {}, context: ctx = 'replica', diagnostics, mergeCut = false } = {}) {
+  const version = sourceVersions.get(current), archiveRevision = store?.revision;
   if (!data || data.protocol !== 1 || !data.roots || !data.chars || !data.fishes || !data.scenes || !data.ops || Object.keys(data.chars).length > 100000 || Object.keys(data.ops).length > 500000) throw new Error('世界快照不兼容或超出首版规模');
   if (data.terrain && !validTerrain(data.terrain, data.roots)) throw new Error('固定海底地形被修改或无效');
   if (!validEcology(data.ecology) || !validArchiveState(data.archives) || data.archives?.at > Date.now() + 60000) throw new Error('生态或归档时钟无效');
@@ -47,14 +71,16 @@ export async function verifyReplica(data, extra = {}, store, { current = {}, con
   if (data.seaweedHour !== undefined && (!Number.isInteger(data.seaweedHour) || data.seaweedHour < 0 || data.seaweedHour > Math.floor((Date.now() + 60000) / HOUR))) throw new Error('海草生长时钟无效');
   if (data.bubbleMinute !== undefined && (!Number.isInteger(data.bubbleMinute) || data.bubbleMinute < 0 || data.bubbleMinute > Math.floor((Date.now() + 60000) / MINUTE))) throw new Error('气泡生成时钟无效');
   if (data.bubbles !== undefined && (!data.bubbles || typeof data.bubbles !== 'object' || Array.isArray(data.bubbles) || Object.keys(data.bubbles).length > 200000)) throw new Error('气泡记录无效');
-  const sources = buildOriginSources(data, extra, current);
-  if (!validPopulation(data.population, { ...sources, fishes: { ...current.fishes, ...extra.fishes, ...data.fishes } }) || !validRocks(data.rocks, sources)) throw new Error('生态控制记录无效');
+  const chats = Object.keys(data.chats || {}).length > 0, chatSources = Object.keys(data.chatSources || {}).length > 0;
+  const chars = chats || chatSources ? undefined : replicaSourceRows(data.chars, current.chars, extra.chars);
+  const sources = buildOriginSources(data, extra, current, chars);
+  if (!validPopulation(data.population, { ...sources, fishes: replicaSourceRows(data.fishes, extra.fishes, current.fishes) }) || !validRocks(data.rocks, sources)) throw new Error('生态控制记录无效');
   // Check branch-local structure here; reconcile the source's final history during merge.
   for (const [id, bubble] of Object.entries(data.bubbles || {})) if (id !== bubble.id || !validBubble(bubble, sources.chars, false) || bubble.born > Date.now() + 60000) throw new Error('气泡缺少合法海草来源');
-  await verifyChats(data.chats, store, current, sources.roots);
-  await verifyChats(data.chatSources, store, { ...current, chats: { ...current.chats, ...data.chats } });
-  if (!validateLife(data.life, sources)) throw new Error('鱼生记录无效');
-  if (!validLegends(data.legends, sources)) throw new Error('稀有异象记录无效');
+  if (chats) await verifyChats(data.chats, store, current, sources.roots);
+  if (chatSources) await verifyChats(data.chatSources, store, { ...current, chats: { ...current.chats, ...data.chats } });
+  const checkedLifeUntil = Date.now() + 60000;
+  validateLifeAndLegends(data, sources, checkedLifeUntil);
   if (data.breeding !== undefined && (!data.breeding || typeof data.breeding !== 'object' || Array.isArray(data.breeding) || Object.keys(data.breeding).length > 500000)) throw new Error('繁殖记录无效');
   for (const [id, record] of Object.entries(data.breeding || {})) if (record.id !== id || !validBreedingRecord(record, sources) || record.at > Date.now() + 60000) throw new Error('繁殖记录缺少合法来源');
   if (data.contacts !== undefined && (!data.contacts || typeof data.contacts !== 'object' || Array.isArray(data.contacts) || Object.keys(data.contacts).length > 500000 || !Number.isFinite(data.contactAt) || data.contactAt > Date.now() + 60000)) throw new Error('接触计时无效');
@@ -105,6 +131,8 @@ export async function verifyReplica(data, extra = {}, store, { current = {}, con
     if (!initial || source.actor !== c.payer) throw new Error('鱼元缺少合法消费凭据');
     if (c.kind === 'fish' || c.kind === 'food') { if (!['food', 'fish'].includes(source.kind) || inheritedGlyph(c, initial.ch, sources) !== c.ch || initial.color !== c.color) throw new Error('鱼鱼元只能由合法创建与生态流转生成'); if (c.kind === 'fish' && !c.path.length && (c.entity !== source.id || c.x !== initial.x || c.y !== initial.y)) throw new Error('禁止人工重排已投放的鱼'); }
   }
+  if (mergeCut) return (target, incoming, archived, latest) => target === current && incoming === data &&
+    archived === extra && archiveRevision === store?.revision && sourceVersions.get(current) === version && checkedLifeUntil <= latest;
 }
 
 async function verifyArchivedOps(ops, roots, scope = roots) {
@@ -161,8 +189,17 @@ export async function loadReplicaArchives(data, target, load, { current = {}, pe
   }
   await assembleFragments(chunks, data.archives, async id => ({ manifest: target.manifests[id], raw: await target.raw(id) }));
   const pool = Object.fromEntries(ARCHIVE_FIELDS.map(f => [f, {}])); for (const chunk of chunks) for (const field of ARCHIVE_FIELDS) Object.assign(pool[field], (chunk.logical || chunk.raw.records)[field]);
-  const prior = await target.dependencies({ ...data, ...Object.fromEntries(ARCHIVE_FIELDS.map(f => [f, { ...data[f], ...pool[f] }])) }, current);
-  const sources = Object.fromEntries(ARCHIVE_FIELDS.map(f => [f, { ...prior[f], ...current[f], ...pool[f], ...data[f] }]));
+  // The received world already owns its tables. Only a table with additional
+  // archived records needs an overlay for dependency discovery.
+  const incoming = { ...data };
+  const fields = ARCHIVE_FIELDS.filter(field => Object.keys(pool[field]).length);
+  for (const field of fields) incoming[field] = { ...data[field], ...pool[field] };
+  const prior = await target.dependencies(incoming, current);
+  // Signed operations are verified from their envelope and roots. The world
+  // that accompanies them is verified separately below against the merged
+  // archive. Its live fish and glyphs are not dependencies of the operations.
+  const sources = fields.some(field => field !== 'ops') ?
+    Object.fromEntries(ARCHIVE_FIELDS.map(f => [f, { ...prior[f], ...current[f], ...pool[f], ...data[f] }])) : {};
   await verifyArchivedOps({ ...pool.ops, ...data.ops }, { ...current.roots, ...data.roots }, data.roots);
   verifyArchiveBirthSources(chunks, sources);
   // Records in this batch become trusted only after their own signatures have passed.

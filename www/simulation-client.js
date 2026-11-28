@@ -1,8 +1,30 @@
 import { CONFIG } from './engine.js';
 import { fishOrigin, writeBreedingRecord } from './breeding.js';
 import { simulationWillApply, simulationApplied, subscribeSimulationChanges, worldRevision, worldTables } from './simulation-changes.js';
-import { expandSimulationPatch } from './simulation-delta.js';
+import { expandSimulationPatch, rowId } from './simulation-delta.js';
+import { SimulationRows } from './simulation-rows.js';
 export { subscribeSimulationChanges } from './simulation-changes.js';
+
+// The stored sea supplies the phase of the simulation clock. An independent
+// half-second interval can fire just before a step is due, then skip a whole turn.
+export function startSimulationClock(readTick, update) {
+  function schedule(now) {
+    const phase = (now - readTick()) % CONFIG.step;
+    const delay = phase < 0 ? -phase : CONFIG.step - phase;
+    const due = now + delay;
+    function wake() {
+      const at = Date.now(), remaining = due - at;
+      if (remaining > 0 && remaining <= CONFIG.step) {
+        setTimeout(wake, remaining);
+        return;
+      }
+      schedule(at);
+      update();
+    }
+    setTimeout(wake, delay);
+  }
+  schedule(Date.now());
+}
 
 function* initialRows(world) {
   let scanned = 0;
@@ -34,16 +56,24 @@ function* initialRows(world) {
   for (const id of summary.grassMeals) yield ['@grassMeals', id, true];
 }
 
-function applyResult(world, { patch: delta, foodRevision }) {
-  const patch = expandSimulationPatch(world.data, delta);
+function applyResult(world, { patch: delta, foodRevision }, knownFish) {
+  const patch = expandSimulationPatch(world.data, delta, knownFish, true);
+  patch.workerChanges = delta;
   simulationWillApply(world, patch);
   for (const [field, changes] of Object.entries(patch.tables)) {
     const table = world.data[field] ||= {};
+    const slots = changes.frame && SimulationRows.for(table, knownFish);
     changes.addedCount = 0;
     changes.removedCount = 0;
     for (const id of changes.remove) if (Object.hasOwn(table, id)) {
       changes.removedCount++;
       delete table[id];
+      slots?.remove(id);
+    }
+    if (changes.frame) {
+      changes.addedCount = changes.frame.added.length;
+      changes.frame.commit(table);
+      continue;
     }
     for (const [id, record] of changes.set) {
       if (!Object.hasOwn(table, id)) changes.addedCount++;
@@ -69,6 +99,7 @@ export class SimulationClient {
     this.worker?.terminate();
     this.worker = null;
     this.owner = null;
+    this.knownFish = null;
     this.failure = null;
     const pending = this.pending;
     this.pending = null;
@@ -102,6 +133,9 @@ export class SimulationClient {
   async open(world, valid) {
     this.close();
     const worker = this.worker = this.makeWorker();
+    this.knownFish = Object.keys(world.data.fishes);
+    SimulationRows.for(world.data.fishes, this.knownFish);
+    SimulationRows.for(world.data.travel, this.knownFish);
     this.names = new Map();
     this.foods = new Map();
     this.archiveChanges = [];
@@ -160,7 +194,7 @@ export class SimulationClient {
     const result = await this.request(message);
     if (!result || !valid()) { this.close(); return null; }
     if (!this.foods.size) {
-      applyResult(world, result);
+      applyResult(world, result, this.knownFish);
       return result;
     }
     // A food arrived during this step. Restore the last committed records on
@@ -172,7 +206,8 @@ export class SimulationClient {
       return null;
     }
     let rows = [];
-    for (const [field, changes] of Object.entries(tables)) for (const [id] of changes.set) {
+    for (const [field, changes] of Object.entries(tables)) for (const row of changes.set) {
+      const id = rowId(row, this.knownFish);
       rows.push([field, id, world.data[field][id]]);
       if (rows.length < 256) continue;
       await this.request({ kind: 'restore', rows });

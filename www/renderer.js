@@ -9,6 +9,7 @@ import { eventGlyphs } from './random-event-visuals.js';
 import { activeLegend, legendGeometry } from './legends.js';
 import { predatorCells, illnessOf, POPULATION } from './population.js';
 import { ViewportCells } from './viewport.js';
+import { FishSprites, fishRuns } from './fish-sprites.js';
 const FONT = "'Microsoft YaHei',Consolas,monospace";
 export { MONUMENT } from './engine.js';
 export class Renderer {
@@ -33,7 +34,8 @@ export class Renderer {
       if (py > -size && py < h) this.glyph(ctx, '底', '#527d72', px, py, size, .8);
     }
   }
-  worldChanged(world, patch) {
+  worldChanged(world, patch, origin) {
+    if (!patch && origin === 'archive') return;
     if (!patch || patch.tables?.rocks) this.rockCells = null;
     if (this.cachedWorld !== world) return;
     if (!patch) {
@@ -49,13 +51,24 @@ export class Renderer {
       world.dirty = false;
     }
   }
-  presentSwims(world, directions) {
+  currentIndex(world) {
+    const index = this.viewport;
+    if (this.cachedWorld === world && index?.data === world.data && !index.remaining && !this.indexInvalid && !world.dirty && this.indexedTick === world.data.tick) return index;
+  }
+  applyMerge(world, index, changes) {
+    if (!index || !changes?.chars || this.viewport !== index || world.data !== index.data) return;
+    index.reconcileMerge(changes);
+    this.indexInvalid = false;
+    this.indexedTick = world.data.tick;
+    world.dirty = false;
+  }
+  presentSwims(world, directions, startedAt = performance.now()) {
     if (world !== this.cachedWorld) return;
     this.swims = null;
     if (directions?.length) {
       this.swims = new Map();
       directions.forEach((ids, direction) => { if (ids) for (const id of ids) this.swims.set(id, direction); });
-      this.swimStart = performance.now();
+      this.swimStart = startedAt;
     }
     this.poseFrame = undefined;
   }
@@ -81,12 +94,7 @@ export class Renderer {
     if (this.cachedWorld !== world) {
       this.swims = null;
       if (this.cachedWorld) delete this.cachedWorld.surfaceCandidates;
-      world.surfaceCandidates = x => {
-        const index = this.viewport;
-        if (this.cachedWorld === world && index?.data === world.data && !index.remaining && !this.indexInvalid && !world.dirty && this.indexedTick === world.data.tick) {
-          return index.query(x, x, 0, 0);
-        }
-      };
+      world.surfaceCandidates = x => this.currentIndex(world)?.query(x, x, 0, 0);
     }
     if (this.viewport?.data !== world.data || this.cachedWorld !== world) {
       this.viewport = new ViewportCells(world.data, true);
@@ -119,27 +127,45 @@ export class Renderer {
     this.paintedTop = this.camera.y - this.height / (2 * size);
     this.paintedSize = size;
     const characters = index.query(left - 2, right + 2, top - 2, bottom + 2);
-    if (this.characters !== characters) { this.characters = characters; this.echoes = echoCells(world.data, characters); }
+    if (this.characters !== characters) {
+      this.characters = characters;
+      this.echoes = echoCells(world.data, characters);
+      this.fishRuns = fishRuns(characters);
+    }
     const legend = activeLegend(world.data, Date.now());
     if (legend) this.drawLegend(world, legend, Date.now(), size, visible, false);
     const occasion = activeEvent(world.data, Date.now());
     if (occasion?.kind === 'whale') this.drawEvent(world, occasion, Date.now(), size, visible);
     for (const c of characters) if (c.kind === 'scene') { const s = world.data.scenes[c.entity]; if (!s) continue; const p = { x: s.x + c.x, y: s.y + c.y }; if (!visible(p)) continue; this.paintedCells.set(worldKey(p.x, p.y), { id: c.id, entity: c.entity }); const pixel = this.screen(p.x, p.y), selected = this.selected === c.entity && (!c.chat || this.selectedCell === c.id), echo = this.echoes.has(c.id); paint.glyph(ctx, c.ch, echo ? '#d7efe1' : c.color, pixel.x, pixel.y, size, selected ? 1 : echo ? .8 + .2 * Math.sin(Date.now() / 450) : .85, echo, c.kind); if (selected) { ctx.strokeStyle = '#b7f7de55'; ctx.strokeRect(pixel.x, pixel.y, size, size); } }
     this.scene3d?.drawFishLinks?.(this, world, characters, size, visible);
-    const drawPart = (cell, observed) => {
-      const pose = this.fishPose(world, cell.entity);
+    const batchFish = !this.scene3d && this.dpr === 1 && Number.isInteger(size) && right - left < CONFIG.width / 2;
+    const drawFish = (run, observed) => {
+      const pose = this.fishPose(world, run.id);
       if (!pose) return;
-      const p = cellPosition(pose, cell);
-      if (!visible(p)) return;
-      const pixel = this.screen(p.x, p.y);
-      this.paintedFish.push(pixel.x, pixel.y, cell);
-      this.paintedFishOwners.push(cell.entity);
-      if (observed) { ctx.fillStyle = '#9aeee015'; ctx.fillRect(pixel.x, pixel.y, size, size); }
-      paint.glyph(ctx, cell.ch, cell.color, pixel.x, pixel.y, size, 1, EYES.has(cell.ch), cell.kind, cell, pose.facing);
-      if (observed) { ctx.strokeStyle = '#9aeee077'; ctx.lineWidth = 1; ctx.strokeRect(pixel.x, pixel.y, size, size); }
+      let canBatch = batchFish && !observed && run.cells.length > 1, stamp;
+      for (const cell of run.cells) {
+        const p = cellPosition(pose, cell);
+        if (!visible(p)) continue;
+        const pixel = this.screen(p.x, p.y);
+        this.paintedFish.push(pixel.x, pixel.y, cell);
+        this.paintedFishOwners.push(run.id);
+        if (canBatch) {
+          canBatch = false;
+          stamp = (this.fishSprites ??= new FishSprites()).get(this, run, size, pose.facing);
+          if (stamp) {
+            const first = run.cells[0];
+            ctx.drawImage(stamp.image, pixel.x + (first.x - cell.x) * pose.facing * size + stamp.left,
+              pixel.y + (first.y - cell.y) * size + stamp.top);
+          }
+        }
+        if (stamp) continue;
+        if (observed) { ctx.fillStyle = '#9aeee015'; ctx.fillRect(pixel.x, pixel.y, size, size); }
+        paint.glyph(ctx, cell.ch, cell.color, pixel.x, pixel.y, size, 1, EYES.has(cell.ch), cell.kind, cell, pose.facing);
+        if (observed) { ctx.strokeStyle = '#9aeee077'; ctx.lineWidth = 1; ctx.strokeRect(pixel.x, pixel.y, size, size); }
+      }
     };
-    for (const c of characters) if (c.kind === 'fish' && c.entity !== this.observedFish) drawPart(c, false);
-    if (this.observedFish) for (const c of characters) if (c.kind === 'fish' && c.entity === this.observedFish) drawPart(c, true);
+    for (const run of this.fishRuns) if (run.id !== this.observedFish) drawFish(run, false);
+    if (this.observedFish) for (const run of this.fishRuns) if (run.id === this.observedFish) drawFish(run, true);
     for (const c of characters) if ((c.kind === 'food' || c.kind === 'seaweed') && visible(c)) { const pixel = c.kind === 'seaweed' ? this.seaweedScreen(c) : this.screen(c.x, c.y); paint.glyph(ctx, c.ch, c.color, pixel.x, pixel.y, size, c.kind === 'seaweed' ? weedAlpha(c, world.data.ecology, Date.now()) : 1, false, c.kind); if (c.kind === 'food' && world.data.tick - c.born >= CONFIG.foodLife) { ctx.strokeStyle = '#84a2b355'; ctx.strokeRect(pixel.x + size * .2, pixel.y + size * .2, size * .6, size * .6); } }
     const bubbleNow = Date.now();
     const sick = new Set();

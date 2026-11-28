@@ -58,3 +58,11 @@ test('昵称完整写入作品及鱼谱，旧打码显示可由已知完整昵�
   assert.equal(displayNick(' 小鱼老师 '), '小鱼老师'); const world = new World(t), id = fish(world, 20, 20, undefined, undefined, undefined, '小鱼老师'); assert.equal(world.data.fishes[id].nick, '小鱼老师'); assert.equal(fishCatalog(world.data).get(id).nick, '小鱼老师');
   world.data.ops[id].nick = '小＊＊师'; world.data.participants[id] = '小鱼老师'; assert.equal(fishCatalog(world.data).get(id).nick, '小鱼老师'); assert.equal(world.data.ops[id].nick, '小＊＊师');
 });
+
+test('邻近海域与远处旧坐标沿用相同的循环边界和小数舍入', () => {
+  for (const x of [NaN, Infinity, -Infinity, -0, '12.5', undefined,
+    ...[-3000, -1000, -500, 0, 500, 1000, 2000, 5000].flatMap(edge =>
+      [-1, -.5, -1e-13, -Number.EPSILON, 0, Number.EPSILON, 1e-13, .5, 1].map(offset => edge + offset))]) {
+    assert(Object.is(wrapX(x), ((x % CONFIG.width) + CONFIG.width) % CONFIG.width));
+  }
+});

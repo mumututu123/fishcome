@@ -6,9 +6,10 @@ const hash = text => { let n = 2166136261; for (const c of text) n = Math.imul(n
 export const hasFriendSecret = story => story.kind === 'reunion' && hash(`greeting:${story.id}`) % 3 === 0;
 export function friendSignals(data, now) {
   const signals = [], used = new Set();
-  for (const story of Object.values(data.life?.stories || {}).sort((a, b) => b.at - a.at || a.id.localeCompare(b.id))) {
-    const age = now - story.at, bond = data.life?.bonds[pairKey(story.fish, story.other)];
-    if (!hasFriendSecret(story) || age < 0 || age >= 6000 || !bond || bond.seconds < LIFE.familiar || now - bond.lastNear > 2500 || used.has(story.fish) || used.has(story.other)) continue;
+  const recent = Object.values(data.life?.stories || {}).filter(story => now >= story.at && now - story.at < 6000 && hasFriendSecret(story));
+  for (const story of recent.sort((a, b) => b.at - a.at || a.id.localeCompare(b.id))) {
+    const age = now - story.at, bond = data.life.bonds[pairKey(story.fish, story.other)];
+    if (!bond || bond.seconds < LIFE.familiar || now - bond.lastNear > 2500 || used.has(story.fish) || used.has(story.other)) continue;
     const a = data.fishes[story.fish], b = data.fishes[story.other]; if (!a || !b) continue;
     used.add(a.id); used.add(b.id);
     const beat = Math.floor(age / 1500), letters = ['好', '久', '不', '见'];

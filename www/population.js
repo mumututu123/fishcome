@@ -38,7 +38,7 @@ export function killFish(world, id, now, cause, transition, groups = world.fishG
   delete world.data.fishes[id]; delete world.data.population.illnesses[id];
   recordStory(world, 'depart', id, now, { cause }); world.foodRevision++; world.dirty = true;
 }
-function settleIllness(world, now) {
+function settleIllness(world, now, changeCell) {
   const state = world.data.population;
   let groups;
   for (const [id, r] of Object.entries(state.illnesses)) {
@@ -50,7 +50,7 @@ function settleIllness(world, now) {
         const at = r.nextLossAt;
         groups ??= world.fishGroups();
         const cells = (groups.get(id) || []).filter(cell => cell.kind === 'fish');
-        world.starve(id, at, null, { illness: true, cells });
+        world.starve(id, at, null, { illness: true, cells, changeCell });
         r.nextLossAt = at + POPULATION.dissolveEvery;
       }
       if (!world.data.fishes[id]) delete state.illnesses[id];
@@ -62,7 +62,7 @@ function checkIllness(world, now) {
   if (slot <= state.illnessSlot || !world.ambient) return;
   state.illnessSlot = slot;
   // Never backfill infections for unattended/offline hours.
-  const fishes = Object.values(world.data.fishes);
+  const fishes = world.fishValues();
   if (fishes.length < POPULATION.threshold) return;
   const active = fishes.filter(f => illnessOf(world.data, f.id)).length;
   const quota = Math.max(0, Math.ceil(fishes.length * POPULATION.sickRatio) - active);
@@ -82,14 +82,14 @@ function lineClear(world, a, b, scenery) {
   return true;
 }
 function updatePredators(world, now, dt, transition) {
-  const state = world.data.population, count = Object.keys(world.data.fishes).length;
+  const state = world.data.population, fishes = world.fishValues(), count = fishes.length;
   const wanted = Math.min(POPULATION.predators, Math.max(0, Math.ceil((count - POPULATION.predatorThreshold) / 100)));
   for (const id of Object.keys(state.predators)) if (+id >= wanted) delete state.predators[id];
   if (!wanted && !Object.keys(state.predators).length) return;
   const groups = world.fishGroups();
   const scenery = populationScenery(world.data, world.sceneryMap(false), { predators: false });
-  const occupants = world.fishMap(groups);
-  const fits = p => predatorCells(p).every(c => world.waterAt(c.x, c.y) && !scenery.has(key(c.x, c.y)) && !occupants.has(key(c.x, c.y)));
+  const occupants = world.movementGrid(groups);
+  const fits = p => predatorCells(p).every(c => world.waterAt(c.x, c.y) && !scenery.has(key(c.x, c.y)) && !occupants.get(c.x, c.y));
   for (let i = 0; i < wanted; i++) if (!state.predators[i]) {
     for (let attempt = 0; attempt < 32; attempt++) {
       const x = hash(`predator:${world.id}:${i}:${attempt}`) % 1000;
@@ -104,9 +104,10 @@ function updatePredators(world, now, dt, transition) {
     const mouth = predatorCells(p)[0], ready = now - p.lastBite >= POPULATION.biteCooldown && now - state.huntAt >= POPULATION.huntCooldown;
     const targets = [];
     if (ready) {
-      prey ??= Object.values(world.data.fishes).filter(f => now - f.created >= POPULATION.juvenile && (groups.get(f.id)?.length || Infinity) <= POPULATION.preySize);
+      prey ??= fishes.filter(f => now - f.created >= POPULATION.juvenile && (groups.get(f.id)?.length || Infinity) <= POPULATION.preySize);
+      const nearby = !occupants.unsafeHorizontal && occupants.ownersNear([mouth], POPULATION.sight);
       for (const f of prey) {
-        if (!world.data.fishes[f.id]) continue;
+        if ((nearby && !nearby[occupants.slots.get(f.id)]) || !world.data.fishes[f.id]) continue;
         for (const cell of groups.get(f.id) || []) {
           const at = cellPosition(f, cell);
           if (Math.max(Math.abs(deltaX(at.x, mouth.x)), Math.abs(at.y - mouth.y)) <= POPULATION.sight && lineClear(world, mouth, at, scenery)) targets.push({ fish: f, ...at });
@@ -121,7 +122,7 @@ function updatePredators(world, now, dt, transition) {
       const m = predatorCells(p)[0], dx = Math.abs(deltaX(target.x, m.x)), dy = Math.abs(target.y - m.y);
       if (dx + dy !== 1) return false; // No attacks across diagonal corners or scenery.
       const f = target.fish;
-      for (const c of groups.get(f.id) || []) { const at = cellPosition(f, c); occupants.delete(key(at.x, at.y)); }
+      for (const c of groups.get(f.id) || []) { const at = cellPosition(f, c); occupants.clear(at.x, at.y); }
       killFish(world, f.id, now, 'predator', transition, groups); p.lastBite = state.huntAt = now; target = null; return true;
     };
     if (bite()) continue;
@@ -130,7 +131,7 @@ function updatePredators(world, now, dt, transition) {
     if (dx && dx !== p.facing) {
       // Mirror about the body midpoint, checking every swept grid cell.
       const next = { ...p, x: wrapX(p.x - 3 * p.facing), facing: -p.facing };
-      const swept = predatorCells(p).every(c => Array.from({ length: 7 }, (_, i) => p.x - 3 + i).every(x => world.waterAt(x, c.y) && !scenery.has(key(x, c.y)) && !occupants.has(key(x, c.y))));
+      const swept = predatorCells(p).every(c => Array.from({ length: 7 }, (_, i) => p.x - 3 + i).every(x => world.waterAt(x, c.y) && !scenery.has(key(x, c.y)) && !occupants.get(x, c.y)));
       if (swept && free(next)) { p.x = next.x; p.facing = next.facing; }
     }
     p.cx = dx ? Math.min(1, p.cx + dt) : 0; p.cy = dy ? Math.min(1, p.cy + dt * .6) : 0;
@@ -144,6 +145,29 @@ export function volcanoPlan(data, slot) {
   if (!Object.hasOwn(data.roots, seed) || !Number.isInteger(slot) || slot < 0 || slot * POPULATION.volcanoPeriod < data.roots[seed] || hash(id) % 10000 >= POPULATION.volcanoChance * 10000) return null;
   return { id, seed, slot, x: hash(`vent:${id}`) % 1000 };
 }
+function magmaOrigin(vent, id) {
+  const roll = hash(id);
+  return { x: wrapX(vent + roll % 5 - 2), rise: 8 + roll % 8, drift: roll % 3 - 1 };
+}
+
+export function repairLocalMagma(data) {
+  const population = data?.population, eruption = population?.eruption;
+  let repaired;
+  for (const [id, c] of Object.entries(eruption?.particles || {})) {
+    if (c?.drift !== 0 || !Number.isFinite(c.cx) || c.cx <= 1) continue;
+    const index = Number(id.slice(id.lastIndexOf(':') + 1));
+    if (!Number.isInteger(index) || index < 0 || index >= eruption.emitted || id !== `${eruption.id}:${index}`) continue;
+    const source = magmaOrigin(eruption.x, id);
+    // Old writers added at most one second on emission, then a quarter cell
+    // per active second. Vertical particles never left their emission column.
+    const age = Math.min(population.at - c.born, POPULATION.cooling);
+    if (source.drift !== 0 || source.x !== c.x || !(age >= 0 && c.cx <= (age / 1000 + 1) * .25)) continue;
+    repaired ??= { ...eruption.particles };
+    repaired[id] = { ...c, cx: 0 };
+  }
+  return repaired ? { ...data, population: { ...population, eruption: { ...eruption, particles: repaired } } } : data;
+}
+
 function updateVolcano(world, now, dt, transition, resume = false) {
   const state = world.data.population, slot = Math.floor(now / POPULATION.volcanoPeriod);
   if (!resume && world.ambient && slot > state.volcanoSlot) {
@@ -155,12 +179,15 @@ function updateVolcano(world, now, dt, transition, resume = false) {
     }
   }
   const e = state.eruption; if (!e) return;
-  const groups = world.fishGroups(), scenery = world.sceneryMap(), occupancy = world.fishOccupants(groups);
-  const hit = c => { for (const id of occupancy.get(key(c.x, c.y)) || []) if (world.data.fishes[id]) killFish(world, id, now, 'magma', transition, groups); };
-  if (!resume && now >= e.nextAt && e.emitted < POPULATION.magmaLimit && now - e.at <= POPULATION.warning + POPULATION.emission * POPULATION.magmaLimit + 2000) {
-    const index = e.emitted++, r = hash(`${e.id}:${index}`), x = wrapX(e.x + r % 5 - 2), y = world.floorAt(x) - 1;
+  const emitting = !resume && now >= e.nextAt && e.emitted < POPULATION.magmaLimit &&
+    now - e.at <= POPULATION.warning + POPULATION.emission * POPULATION.magmaLimit + 2000;
+  if (!emitting && !Object.keys(e.particles).length) return;
+  const groups = world.fishGroups(), scenery = world.sceneryMap(), occupancy = world.movementGrid(groups);
+  const hit = c => { for (const id of occupancy.get(c.x, c.y) || []) if (world.data.fishes[id]) killFish(world, id, now, 'magma', transition, groups); };
+  if (emitting) {
+    const id = `${e.id}:${e.emitted++}`, { x, rise, drift } = magmaOrigin(e.x, id), y = world.floorAt(x) - 1;
     e.nextAt = now + POPULATION.emission;
-    if (!scenery.has(key(x, y))) { const id = `${e.id}:${index}`; e.particles[id] = { id, x, y, born: now, rise: 8 + r % 8, drift: r % 3 - 1, cx: 0, cy: 0, settled: false }; }
+    if (!scenery.has(key(x, y))) e.particles[id] = { id, x, y, born: now, rise, drift, cx: 0, cy: 0, settled: false };
   }
   const hot = new Set(Object.values(e.particles).map(c => key(c.x, c.y)));
   for (const [id, c] of Object.entries(e.particles)) {
@@ -168,11 +195,16 @@ function updateVolcano(world, now, dt, transition, resume = false) {
     if (world.data.rocks[id]) { delete e.particles[id]; continue; }
     // Restoring a suspended world cools existing lava but never replays damage.
     const cooled = now >= c.born + POPULATION.cooling;
+    const moving = !resume && !cooled && !c.settled;
+    // Vertical particles have no horizontal progress. This also corrects the
+    // unused remainder left on stationary particles by older checkpoints.
+    if (c.drift === 0) c.cx = 0;
+    else if (moving) c.cx += dt * .25;
     if (!resume && !cooled) hit(c);
-    if (!resume && !cooled && !c.settled) {
+    if (moving) {
       const rising = c.rise > 0;
-      c.cy += dt * (rising ? 2 : .25); c.cx += dt * .25;
-      if (c.cx >= 1 && c.drift) { const x = wrapX(c.x + c.drift); if (world.waterAt(x, c.y) && !scenery.has(key(x, c.y)) && !hot.has(key(x, c.y))) { hot.delete(key(c.x, c.y)); c.x = x; hot.add(key(c.x, c.y)); hit(c); } c.cx = 0; }
+      c.cy += dt * (rising ? 2 : .25);
+      if (c.cx >= 1) { const x = wrapX(c.x + c.drift); if (world.waterAt(x, c.y) && !scenery.has(key(x, c.y)) && !hot.has(key(x, c.y))) { hot.delete(key(c.x, c.y)); c.x = x; hot.add(key(c.x, c.y)); hit(c); } c.cx = 0; }
       while (c.cy >= 1 && !c.settled) {
         const y = c.y + (c.rise > 0 ? -1 : 1);
         if (!world.waterAt(c.x, y) || scenery.has(key(c.x, y)) || hot.has(key(c.x, y))) { if (c.rise > 0) c.rise = 0; else c.settled = true; c.cy = 0; break; }
@@ -183,7 +215,7 @@ function updateVolcano(world, now, dt, transition, resume = false) {
     // Rock is always supported on the seabed/scenery, never suspended in water.
     let y = c.y;
     while (world.waterAt(c.x, y + 1) && !scenery.has(key(c.x, y + 1))) y++;
-    if (Object.keys(world.data.rocks).length < POPULATION.rockLimit && y >= 60 && !scenery.has(key(c.x, y)) && !occupancy.has(key(c.x, y))) {
+    if (Object.keys(world.data.rocks).length < POPULATION.rockLimit && y >= 60 && !scenery.has(key(c.x, y)) && !occupancy.get(c.x, y)) {
       world.data.rocks[id] = { id, seed: e.seed, slot: e.slot, index: +id.split(':').at(-1), x: c.x, y, at: c.born + POPULATION.cooling };
       populationScenery({ rocks: { [id]: world.data.rocks[id] } }, scenery, { predators: false });
     } else if (Object.keys(world.data.rocks).length < POPULATION.rockLimit && y >= 60 && !scenery.has(key(c.x, y))) {
@@ -195,7 +227,7 @@ function updateVolcano(world, now, dt, transition, resume = false) {
 export function updatePopulation(world, now, transition, { resume = false } = {}) {
   world.data.population ||= newPopulation(now); world.data.rocks ||= {};
   const state = world.data.population, dt = Math.min(1, Math.max(0, (now - state.at) / 1000));
-  settleIllness(world, now);
+  settleIllness(world, now, transition);
   if (resume) {
     state.illnessSlot = Math.max(state.illnessSlot, Math.floor(now / POPULATION.check));
     state.volcanoSlot = Math.max(state.volcanoSlot, Math.floor(now / POPULATION.volcanoPeriod));

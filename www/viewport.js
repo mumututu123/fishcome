@@ -5,6 +5,33 @@ const columns = Math.ceil(WORLD_WIDTH / side);
 const sector = (x, y) => Math.floor(wrapX(x) / side) + columns * Math.floor(y / side);
 const drawable = kind => kind === 'fish' || kind === 'scene' || kind === 'food' || kind === 'seaweed';
 
+// Intersect the anchor positions that keep each glyph in its current sector.
+// This also covers bodies spanning several sectors and turns about their anchor.
+function sectorRange(group) {
+  if (!Number.isInteger(group.x) || group.x < 0 || group.x >= WORLD_WIDTH ||
+      !Number.isInteger(group.y) || Math.abs(group.y) > WORLD_WIDTH || Math.abs(group.facing) !== 1) return;
+  let left = -Infinity, right = Infinity, flippedLeft = -Infinity, flippedRight = Infinity;
+  let top = -Infinity, bottom = Infinity;
+  for (const entry of group) {
+    if (!Number.isInteger(entry.x) || !Number.isInteger(entry.y) ||
+        Math.abs(entry.x) > WORLD_WIDTH || Math.abs(entry.y) > WORLD_WIDTH) return;
+    const x = group.x + group.facing * entry.x, y = group.y + entry.y;
+    const wrapped = wrapX(x), column = wrapped - wrapped % side, row = Math.floor(y / side) * side;
+    const start = x - wrapped + column, end = start + Math.min(side, WORLD_WIDTH - column);
+    left = Math.max(left, start - entry.x); right = Math.min(right, end - entry.x);
+    flippedLeft = Math.max(flippedLeft, start + entry.x); flippedRight = Math.min(flippedRight, end + entry.x);
+    top = Math.max(top, row - entry.y); bottom = Math.min(bottom, row + side - entry.y);
+  }
+  return { left, right, flippedLeft, flippedRight, top, bottom };
+}
+
+function staysInSector(group, x, y, facing) {
+  if (!Number.isInteger(x) || !Number.isInteger(y) || Math.abs(facing) !== 1) return false;
+  const range = group.range ??= sectorRange(group);
+  if (!range || y < range.top || y >= range.bottom) return false;
+  return facing === 1 ? x >= range.left && x < range.right : x >= range.flippedLeft && x < range.flippedRight;
+}
+
 // Several cells can share an owner. Moving the owner changes their sectors
 // without changing the insertion order used by painting and hit testing.
 export class ViewportCells {
@@ -75,6 +102,7 @@ export class ViewportCells {
     this.move(entry, undefined);
     if (entry.owner) {
       entry.owner.delete(entry);
+      entry.owner.range = null;
       if (!entry.owner.size) this.owners[entry.kind].delete(entry.entity);
     }
     this.cells.delete(id);
@@ -94,6 +122,7 @@ export class ViewportCells {
       }
       entry.owner = owners.get(cell.entity);
       entry.owner.add(entry);
+      entry.owner.range = null;
     }
     this.cells.set(id, entry);
     this.place(entry);
@@ -101,38 +130,54 @@ export class ViewportCells {
   }
 
   moveOwner(group, pose) {
-    if (!group || group.x === pose?.x && group.y === pose?.y && group.facing === pose?.facing) return;
-    group.x = pose?.x; group.y = pose?.y; group.facing = pose?.facing;
-    for (const entry of group) this.place(entry);
+    this.moveOwnerTo(group, pose?.x, pose?.y, pose?.facing);
+  }
+
+  moveOwnerTo(group, x, y, facing) {
+    if (!group || group.x === x && group.y === y && group.facing === facing) return;
+    const inside = Math.abs(group.facing) === 1 && staysInSector(group, x, y, facing);
+    group.x = x; group.y = y; group.facing = facing;
+    if (!inside) {
+      group.range = null;
+      for (const entry of group) this.move(entry, x === undefined ? undefined : sector(x + (entry.kind === 'fish' ? facing : 1) * entry.x, y + entry.y));
+    }
+  }
+
+  refresh(id, cell) {
+    const entry = this.cells.get(id);
+    if (!drawable(cell?.kind)) { this.remove(id); return; }
+    if (!entry || entry.kind !== cell.kind || entry.entity !== cell.entity) return this.put(id, cell);
+    entry.cell = cell;
+    if (entry.x !== cell.x || entry.y !== cell.y) {
+      entry.x = cell.x;
+      entry.y = cell.y;
+      if (entry.owner) entry.owner.range = null;
+      this.place(entry);
+    }
+    return entry;
+  }
+
+  reconcileMerge({ chars, fishes, scenes }) {
+    if (chars.size) this.queryKey = undefined;
+    for (const id of chars) this.refresh(id, this.data.chars[id]);
+    for (const id of fishes) this.moveOwner(this.owners.fish.get(id), this.data.fishes[id]);
+    for (const id of scenes) this.moveOwner(this.owners.scene.get(id), this.data.scenes[id]);
   }
 
   reconcile() {
-    const { chars, fishes, scenes } = this.data;
+    const { chars } = this.data;
     this.queryKey = undefined;
     this.remaining = null;
     this.appended.clear();
     let order = 0;
     for (const id in chars) {
-      const cell = chars[id];
-      let entry = this.cells.get(id);
-      if (!drawable(cell?.kind)) {
-        if (entry) this.remove(id);
-        continue;
-      }
-      if (!entry || entry.kind !== cell.kind || entry.entity !== cell.entity) entry = this.put(id, cell);
-      else {
-        entry.cell = cell;
-        if (entry.x !== cell.x || entry.y !== cell.y) {
-          entry.x = cell.x; entry.y = cell.y;
-          this.place(entry);
-        }
-      }
-      entry.order = order++;
+      const entry = this.refresh(id, chars[id]);
+      if (entry) entry.order = order++;
     }
     if (order !== this.cells.size) for (const id of this.cells.keys()) if (!Object.hasOwn(chars, id)) this.remove(id);
     this.order = order;
-    for (const [id, group] of this.owners.fish) this.moveOwner(group, fishes[id]);
-    for (const [id, group] of this.owners.scene) this.moveOwner(group, scenes[id]);
+    for (const [id, group] of this.owners.fish) this.moveOwner(group, this.data.fishes[id]);
+    for (const [id, group] of this.owners.scene) this.moveOwner(group, this.data.scenes[id]);
   }
 
   update(tables) {
@@ -142,12 +187,14 @@ export class ViewportCells {
     for (const id of chars?.remove || []) this.remove(id);
     for (const [id, cell] of chars?.set || []) {
       if (this.remaining && !this.cells.has(id)) this.appended.add(id);
-      else this.put(id, cell);
+      else this.refresh(id, cell);
     }
     for (const [changes, owners] of [[fishes, this.owners.fish], [scenes, this.owners.scene]]) {
       if (!changes) continue;
       for (const id of changes.remove || []) this.moveOwner(owners.get(id));
-      for (const [id, pose] of changes.set || []) this.moveOwner(owners.get(id), pose);
+      const frame = changes.frame;
+      if (frame) frame.forEachPose((id, x, y, facing) => this.moveOwnerTo(owners.get(id), x, y, facing));
+      else for (const [id, pose] of changes.set || []) this.moveOwner(owners.get(id), pose);
     }
   }
 

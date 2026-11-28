@@ -41,6 +41,7 @@ async function setup(page, rows, nick) {
         source.merge(message.body.world);
         if (message.body.base) window.catchupRows = Object.keys(message.body.world.participants).length;
         window.arrivals.push(message.kind);
+        return true;
       }
     }, () => {});
     net.sign = await signer(identity);
@@ -130,6 +131,7 @@ async function setupFish(page, fishCount) {
         rows: Object.keys(data.fishes).length, verifiedMs: verified - started, mergeMs: merged - verified,
         merged, samples: samples(), animated: motion?.directions?.flat().length || 0
       });
+      return true;
     }, () => {}, error => rejected.push(error.message));
     net.sign = await signer(identity);
     const ops = Object.values(world.data.ops);
