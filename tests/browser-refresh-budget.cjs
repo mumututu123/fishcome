@@ -261,7 +261,8 @@ function matchStepStarts(requests, peers, hostMarks, peerMarks) {
       (!request.agreed || others.some(row => row.agreed && row.committed))
       ? Math.min(host, ...stamps) : undefined;
     if (others.length) request.peerSteps = others.map((row, i) => ({
-      agreed: row.agreed, committed: row.committed, startFromHost: (stamps[i] - host) / 1000, compute: row.ms
+      agreed: row.agreed, committed: row.committed, startFromHost: (stamps[i] - host) / 1000, compute: row.ms,
+      rule: row.rule, toWorker: row.toWorker, inWorker: row.inWorker, fromWorker: row.fromWorker, authority: row.authority
     }));
   }
 }
