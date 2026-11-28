@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { readPresentations, frameSummary, bothDisplays, scheduledSteps, matchStepStarts } from './browser-refresh-budget.cjs';
+import { readPresentations, frameSummary, bothDisplays, scheduledSteps, matchStepStarts, calibrateTraceClock, traceClockSkew } from './browser-refresh-budget.cjs';
 import { decodeGraphicsTrace, readGraphicsEvents } from './offscreen-presentation.cjs';
 
 test('连续多轮的图层跟踪可跨块读取，保留原始帧编号并拒绝截断', async () => {
@@ -20,6 +20,54 @@ test('只采入场时仍按相同步号核对双方实际提交，并保留未�
   assert.equal(requests[2].peerSteps, undefined);
   assert.equal(requests[0].peerSteps[0].startFromHost, undefined);
   assert.equal(requests[0].traceAt, undefined);
+});
+
+test('两段宿主单调时钟夹测交叉验证偏移，并拒绝缺失或矛盾的标记', () => {
+  const sample = (id, ts, low, high) => [
+    { name: 'clock_sync', ph: 'c', ts, args: { sync_id: 'tide.clock.' + id } },
+    { id: 'tide.clock.' + id, kind: 'native', before: ts + low, after: ts + high },
+  ];
+  const rows = [sample('a', 1000, 12, 50), sample('b', 1200, 20, 60),
+    sample('c', 100000, 30, 70), sample('d', 100200, 10, 60)];
+  const events = rows.map(([event]) => event);
+  const brackets = { before: rows.slice(0, 2).map(row => row[1]), after: rows.slice(2).map(row => row[1]) };
+  const clock = calibrateTraceClock(events, brackets);
+  assert.deepEqual(clock.intersection, [28, 52]);
+  assert.deepEqual(clock.bounds, [18, 62]);
+  assert.deepEqual(clock.traceRange, [1200, 100000]);
+  assert.equal(clock.driftUs, 44);
+  assert.equal(traceClockSkew([clock, clock]), .046);
+  assert.equal(calibrateTraceClock(events.slice(0, 3), brackets), undefined);
+  assert.equal(calibrateTraceClock(events.concat(events[0]), brackets), undefined);
+  assert.equal(calibrateTraceClock(events, { ...brackets, after: brackets.after.map(row => ({ ...row, before: row.before + 200, after: row.after + 200 })) }), undefined);
+  assert.equal(traceClockSkew([clock, undefined]), undefined);
+  assert.equal(traceClockSkew([clock, { ...clock, bounds: [1000, 1020] }]), undefined);
+  const pageEvents = events.map(event => ({ name: event.args.sync_id, ts: event.ts - 75, args: { data: { callTime: event.ts } } }));
+  const pageBrackets = Object.fromEntries(Object.entries(brackets).map(([phase, entries]) =>
+    [phase, entries.map(row => ({ ...row, kind: 'page' }))]));
+  assert.deepEqual(calibrateTraceClock(pageEvents, pageBrackets), clock);
+});
+
+test('计入独立夹测上界，名义20毫秒以内的真实同一步也可能超时', () => {
+  const clocks = [{ offsetUs: 25, bounds: [0, 50], traceRange: [0, 80000] },
+    { offsetUs: 5, bounds: [-20, 30], traceRange: [0, 80000] }];
+  const requests = [{ tick: 500, marker: 0, agreed: true, committed: true }];
+  const peers = [{ tick: 500, marker: 0, agreed: true, committed: true }];
+  matchStepStarts(requests, peers,new Map([[0, 10000]]), new Map([[0, 10001]]), clocks);
+  assert.equal(requests[0].traceAt, 10006);
+  assert.deepEqual(requests[0].traceStartBounds, [9980, 10032]);
+  for (const [i, node] of ['host','peer'].entries()) {
+    const rows = [{ tick: 500, at: 35, traceTs: 29970, drawStartTs: 28000, drawEndTs: 29000, poses: ['鱼', 4, 6] }];
+    frameSummary({ node, leader: 'host', frames: [], steps: [] }, { drawn: [], rows, moving: [], clock: clocks[i] }, 0, 100, [], requests);
+  }
+  const report = bothDisplays(requests);
+  assert.equal(report.over20, 1);
+  assert.equal(report.max, 20.041);
+  assert.equal(report.slowest.host.presented, 19.989);
+  const missing = [{ tick:500, marker:0, agreed: true, committed:true }];
+  matchStepStarts(missing, peers, new Map([[0,10000]]), new Map([[0,10001]]), [clocks[0], undefined]);
+  assert.equal(missing[0].traceAt, undefined);
+  assert.equal(bothDisplays(missing).missing, 1);
 });
 
 test('独立画布必须找到同一子图层与实际合成器呈现', () => {

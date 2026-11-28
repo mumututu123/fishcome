@@ -38,7 +38,7 @@ async function readGraphicsEvents(chunks) {
         const json = fragment + text.slice(start, i + 1);
         fragment = '';
         start = -1;
-        if (/tide\.|"AnimationFrame(?:::Presentation)?"|Graphics\.Pipeline\.DrawAndSwap|Display::FrameDisplayed|CanvasResourceDispatcher::DispatchFrame|STEP_(RECEIVE_COMPOSITOR_FRAME|DRAW_AND_SWAP|SURFACE_AGGREGATION)|Profile|RunTask|MicrotaskCheckpoint|HandlePostMessage|GC/.test(json)) {
+        if (/tide\.|"clock_sync"|"AnimationFrame(?:::Presentation)?"|Graphics\.Pipeline\.DrawAndSwap|Display::FrameDisplayed|CanvasResourceDispatcher::DispatchFrame|STEP_(RECEIVE_COMPOSITOR_FRAME|DRAW_AND_SWAP|SURFACE_AGGREGATION)|Profile|RunTask|MicrotaskCheckpoint|HandlePostMessage|GC/.test(json)) {
           traceEvents.push(decodeGraphicsTrace(json));
         }
       }

@@ -8,7 +8,7 @@ const path = require('node:path');
 const { setTimeout: pause } = require('node:timers/promises');
 const { parseArgs } = require('node:util');
 const { unpackZip, launcherName, withReleaseFixtures } = require('./release-fixtures.cjs');
-const { recordDraw, frameSummary, startTrace, readPresentations, bothDisplays, scheduledSteps, matchStepStarts } = require('./browser-refresh-budget.cjs');
+const { recordDraw, frameSummary, startTrace, readPresentations, bothDisplays, scheduledSteps, matchStepStarts, traceClockSkew } = require('./browser-refresh-budget.cjs');
 
 const { positionals, values } = parseArgs({ allowPositionals: true, options: {
   profile: { type: 'string' }, source: { type: 'string' }, seconds: { type: 'string', default: '10' },
@@ -881,9 +881,10 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
     const stamps = page => {
       const prefix = 'tide.request.' + page.page + '.';
       return new Map(traces[pages.indexOf(page)].traceEvents.filter(event => event.name.startsWith(prefix))
-        .map(event => [Number(event.name.slice(prefix.length)), event.args.data.callTime]));
+        .map(event => [Number(event.name.slice(prefix.length)), Math.min(event.ts, event.args.data.callTime)]));
     };
-    matchStepStarts(requests, follower.stepRequests, stamps(coordinator), stamps(follower));
+    matchStepStarts(requests, follower.stepRequests, stamps(coordinator), stamps(follower),
+      [traces[pages.indexOf(coordinator)].clock, traces[pages.indexOf(follower)].clock]);
   } else matchStepStarts(requests, follower.stepRequests);
   const completed = requests.filter(row => row.committed).map(row => row.ms);
   const over20 = completed.filter(ms => ms > 20).length;
@@ -924,7 +925,7 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
     const frames = page.frames.filter(sampled), noFish = frames.filter(frame => !frame.visible).length;
     const phases = {};
     for (const row of page.phases.filter(sampled)) (phases[row.phase] ||= []).push(row);
-    const presentations = traces && readPresentations(traces[i].traceEvents, page, recent, ended);
+    const presentations = traces && readPresentations(traces[i].traceEvents, page, recent, ended, traces[i].clock);
     return { leader: page.node === page.leader, fish: page.fish, simulationFailure: page.simulationFailure, surface: page.surface,
       traceClockOffsets: presentations?.clockOffsets,
       ...frameSummary(page, presentations, recent, ended, coordinator.steps, requests),
@@ -934,8 +935,8 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
       failed: page.receives.filter(event => event.failed), replicaFailures: page.replicaFailures, logs: page.logs,
       orderedHistory: page.orderedHistory, stoppedSessions: page.stoppedSessions, workerLoads: page.workerLoads };
   });
-  const offsets = traces && summaries.flatMap(page => page.traceClockOffsets ?? []);
-  const traceClockSkewMs = offsets?.length === 4 ? Math.max(...offsets) - Math.min(...offsets) : undefined;
+  const traceClockSkewMs = traces && traceClockSkew(traces.map(trace => trace.clock));
+  const traceClockCalibration = traces && traces.map(trace => ({ clock: trace.clock, brackets: trace.clockBrackets, error: trace.clockError }));
   const confirmed = traces && bothDisplays(requests);
   const agreed = requests.filter(row => row.agreed && row.committed && row.peerSteps?.some(peer => peer.agreed && peer.committed));
   const matchedProofs = agreed.filter(({ tick }) => coordinator.proofs.some(left => left.tick === tick &&
@@ -960,7 +961,7 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
   const replicaRows = Object.fromEntries(['fishes', 'chars', 'breeding', 'contacts', 'travel', 'ops', 'scenes']
     .map(field => [field, stats(received.flatMap(row => row.rows ? [row.rows[field]] : []))]));
   const report = JSON.stringify({ count, realBackup: Boolean(backup), browserVersion, cold, joinedMs: joined - joining, settledMs: recent - joining, steadyMs: ended - recent,
-    saved, liveWire, browserProcesses: browsers.length, graphics, traceClockSkewMs, worldStart,
+    saved, liveWire, browserProcesses: browsers.length, graphics, traceClockSkewMs, traceClockCalibration, worldStart,
     agreedSteps: agreed.length, matchedProofs, commonCheckpoint, checkpointError,
     bundledArchives: new Set(follower.receives.filter(sampled).flatMap(row => row.bundled || [])).size,
     separateArchiveMessages: follower.receives.filter(row => sampled(row) && row.kind === 'archiveChunk').length,
@@ -985,7 +986,7 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
     summaries, profileStartedAt, profileSummary, errors }, null, 2);
   if (values.report) await writeFile(values.report, report + '\n');
   console.log(report);
-  if (traces) assert(traceClockSkewMs < 1, '两端跟踪时钟的映射差达到 1 毫秒，本次跨端耗时不可用');
+  if (traces) assert(traceClockSkewMs !== undefined, '缺少有效的观察前后宿主时钟校准，或两端偏差上界超过 1 毫秒，本次跨端耗时不可用');
   assertProgress(leaderProgress, ended - recent, '主端');
   if (dropSteps > 1 && resumed && resumeSent) {
     // Keep the full physical gap in the report. Check normal continuity up to

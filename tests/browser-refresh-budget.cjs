@@ -1,9 +1,57 @@
 const { once } = require('node:events');
+const { randomUUID } = require('node:crypto');
 const { writeFile } = require('node:fs/promises');
 const { createReadStream, createWriteStream } = require('node:fs');
 const { pipeline } = require('node:stream/promises');
 const { createGunzip } = require('node:zlib');
 const { readGraphicsEvents, indexOffscreenPresentations } = require('./offscreen-presentation.cjs');
+
+const monotonicUs = () => Number(process.hrtime.bigint() / 1000n);
+
+function calibrateTraceClock(events, samples) {
+  const marks = new Map();
+  for (const event of events) {
+    const native = event.name === 'clock_sync' && event.ph === 'c';
+    const id = native ? event.args?.sync_id : event.name;
+    if (!id?.startsWith('tide.clock.')) continue;
+    marks.set(id, marks.has(id) ? null : { kind: native ? 'native' : 'page',
+      ts: native ? event.ts : event.args?.data?.callTime });
+  }
+  function measure(rows) {
+    if (!rows || rows.length < 2) return;
+    let low = -Infinity, high = Infinity;
+    const stamps = [];
+    for (const { id, before, after, kind } of rows) {
+      const mark = marks.get(id);
+      if (!mark || mark.kind !== kind || !Number.isSafeInteger(mark.ts) || !Number.isSafeInteger(before) ||
+          !Number.isSafeInteger(after) || after < before || mark.ts <= (stamps.at(-1) ?? -Infinity)) return;
+      stamps.push(mark.ts);
+      // Both samples and the exported trace ticks have integer microsecond resolution.
+      low = Math.max(low, before - mark.ts - 2);
+      high = Math.min(high, after - mark.ts + 2);
+    }
+    if (low <= high) return { bounds: [low, high], stamps };
+  }
+  const before = measure(samples?.before), after = measure(samples?.after);
+  if (!before || !after || before.stamps.at(-1) >= after.stamps[0]) return;
+  const [a, b] = before.bounds, [c, d] = after.bounds;
+  const intersection = [Math.max(a, c), Math.min(b, d)];
+  if (intersection[0] > intersection[1]) return;
+  return { intersection, bounds: [Math.min(a, c), Math.max(b, d)], offsetUs: (intersection[0] + intersection[1]) / 2,
+    traceRange: [before.stamps.at(-1), after.stamps[0]], samples: [before.stamps.length, after.stamps.length],
+    driftUs: Math.max(Math.abs(a - d), Math.abs(b - c)) };
+}
+
+function traceClockSkew(clocks) {
+  if (clocks?.length !== 2 || clocks.some(clock => !clock)) return;
+  const spanUs = Math.max(...clocks.map(clock => clock.bounds[1])) - Math.min(...clocks.map(clock => clock.bounds[0])) + 2;
+  if (spanUs <= 1000) return spanUs / 1000;
+}
+
+function traceInstant(ts, clock) {
+  if (!Number.isFinite(ts) || !clock || ts < clock.traceRange[0] || ts > clock.traceRange[1]) return;
+  return { at: ts + clock.offsetUs, low: ts + clock.bounds[0] - 1, high: ts + clock.bounds[1] + 1 };
+}
 
 function recordDraw(renderer, frames, page, trace, owner = false) {
   const draw = renderer.draw.bind(renderer);
@@ -45,14 +93,42 @@ function recordDraw(renderer, frames, page, trace, owner = false) {
 async function startTrace(browser, boundariesOnly, profileRules = false, offscreen = false) {
   const client = await browser.newBrowserCDPSession();
   const complete = once(client, 'Tracing.tracingComplete');
-  const categories = ['devtools.timeline', 'blink.user_timing'];
+  const categories = ['__metadata', 'devtools.timeline', 'blink.user_timing'];
   if (offscreen) categories.push('blink', 'viz');
   if (profileRules) categories.push('disabled-by-default-v8.cpu_profiler');
   if (!boundariesOnly) categories.push('toplevel');
   await client.send('Tracing.start', { traceConfig: { includedCategories: categories, excludedCategories: ['*'],
     ...(offscreen && { traceBufferSizeInKb: 384 * 1024 }) }, transferMode: 'ReturnAsStream',
     ...(offscreen && { streamCompression: 'gzip' }) });
+  const id = 'tide.clock.' + randomUUID();
+  let native = true, clockError;
+  async function bracketClock(phase) {
+    const rows = [];
+    try {
+      for (let i = 0; i < 12; i++) {
+        const syncId = id + '.' + phase + '.' + i;
+        let before = monotonicUs();
+        if (native) {
+          try { await client.send('Tracing.recordClockSyncMarker', { syncId }); }
+          catch (error) {
+            if (!/not supported|wasn't found|method not found|unknown method/i.test(error.message)) throw error;
+            native = false;
+          }
+        }
+        if (!native) {
+          const page = browser.contexts()[0]?.pages()[0];
+          if (!page) throw Error('浏览器没有可记录时钟标记的页面');
+          before = monotonicUs();
+          await page.evaluate(name => { performance.mark(name); performance.clearMarks(name); }, syncId);
+        }
+        rows.push({ id: syncId, kind: native ? 'native' : 'page', before, after: monotonicUs() });
+      }
+    } catch (error) { clockError = error.message; return; }
+    return rows;
+  }
+  const before = await bracketClock('before');
   return async filename => {
+    const after = await bracketClock('after');
     await client.send('Tracing.end');
     const [{ stream, dataLossOccurred }] = await complete;
     if (!stream) throw new Error('浏览器未提供跟踪数据');
@@ -72,14 +148,20 @@ async function startTrace(browser, boundariesOnly, profileRules = false, offscre
       await client.send('IO.close', { handle: stream });
       await client.detach();
     }
-    if (offscreen) return readGraphicsEvents(createReadStream(filename, { encoding: 'utf8' }));
-    const json = Buffer.concat(chunks);
-    await writeFile(filename, json);
-    return JSON.parse(json);
+    let data;
+    if (offscreen) data = await readGraphicsEvents(createReadStream(filename, { encoding: 'utf8' }));
+    else {
+      const json = Buffer.concat(chunks);
+      await writeFile(filename, json);
+      data = JSON.parse(json);
+    }
+    const clock = calibrateTraceClock(data.traceEvents, { before, after });
+    return { ...data, clock, clockBrackets: { before, after }, clockError: clockError ||
+      (!clock && '观察前后缺少可相互验证的宿主时钟标记') || undefined };
   };
 }
 
-function readPresentations(events, page, start, end) {
+function readPresentations(events, page, start, end, clock) {
   const startMarks = new Map(), samples = new Map(), presentation = new Map();
   const prefix = `tide.refresh.${page.page}.`;
   const dispatchThreads = new Set(events.filter(e => e.name === 'CanvasResourceDispatcher::DispatchFrame').map(e => `${e.pid}:${e.tid}`));
@@ -172,9 +254,9 @@ function readPresentations(events, page, start, end) {
       .sort((a, b) => b.dur - a.dur).slice(0, 5)
       .map(task => ({ name: task.name, wallMs: task.dur / 1000, cpuMs: task.tdur / 1000 }))
   }));
-  // Both independent browser processes run on the same machine. Check the
-  // mapping from trace ticks to the page clock before comparing their events.
-  return { drawn, rows, moving, longestGaps, longestMotionGaps, unverifiedCanvas,
+  // Page-clock estimates remain diagnostic. Inter-process acceptance uses
+  // the independently bracketed trace clock supplied by the test host.
+  return { drawn, rows, moving, longestGaps, longestMotionGaps, unverifiedCanvas, clock,
     clockOffsets: Number.isFinite(minClockOffset) && minClockOffset <= maxClockOffset ? [minClockOffset, maxClockOffset] : undefined };
 }
 
@@ -220,11 +302,16 @@ function frameSummary(page, presentations, start, end, authority = page.steps, r
   const endName = page.node === page.leader ? 'host' : 'peer';
   for (const request of requests) {
     const frame = firstVisible.get(request.tick);
-    if (!request.committed || !frame || !Number.isFinite(request.traceAt) || frame.drawStartTs < request.traceAt) continue;
-    const elapsed = ts => (ts - request.traceAt) / 1000;
-    (request.display ??= {})[endName] = { drawStart: elapsed(frame.drawStartTs), drawEnd: elapsed(frame.drawEndTs),
-      presented: elapsed(frame.traceTs) };
-    requestToConfirmed.push(elapsed(frame.traceTs));
+    if (!request.committed || !frame || !Number.isFinite(request.traceAt)) continue;
+    const clock = presentations.clock, bounds = request.traceStartBounds;
+    const startFrame = clock && traceInstant(frame.drawStartTs, clock);
+    const endFrame = clock && traceInstant(frame.traceTs, clock);
+    if (bounds ? !startFrame || !endFrame || startFrame.low < bounds[1] : frame.drawStartTs < request.traceAt) continue;
+    const elapsed = ts => (ts + (clock?.offsetUs ?? 0) - request.traceAt) / 1000;
+    const display = { drawStart: elapsed(frame.drawStartTs), drawEnd: elapsed(frame.drawEndTs), presented: elapsed(frame.traceTs) };
+    if (bounds) display.presentedUpper = (endFrame.high - bounds[0]) / 1000;
+    (request.display ??= {})[endName] = display;
+    requestToConfirmed.push(display.presentedUpper ?? display.presented);
   }
   return { ...result,
     drawCpu: distribution(presentations.drawn.filter(inWindow).map(frame => frame.drawCpu)),
@@ -246,7 +333,7 @@ function bothDisplays(requests) {
   let slowest;
   for (const { tick, display } of requests) {
     if (!display?.host || !display.peer) continue;
-    const ms = Math.max(display.host.presented, display.peer.presented);
+    const ms = Math.max(display.host.presentedUpper ?? display.host.presented, display.peer.presentedUpper ?? display.peer.presented);
     for (const side of ['host', 'peer']) drawToPresent[side].push(display[side].presented - display[side].drawEnd);
     completed.push(ms);
     if (!slowest || slowest.ms < ms) slowest = { tick, ms, ...display };
@@ -269,21 +356,27 @@ function scheduledSteps(requests, phase, step, start, end) {
   return { expected, unrequested, unpresented };
 }
 
-function matchStepStarts(requests, peers, hostMarks = new Map(), peerMarks = new Map()) {
+function matchStepStarts(requests, peers, hostMarks = new Map(), peerMarks = new Map(), clocks) {
+  const validClocks = !clocks || traceClockSkew(clocks) !== undefined;
   const byTick = new Map();
   for (const row of peers) {
     if (!byTick.has(row.tick)) byTick.set(row.tick, []);
     byTick.get(row.tick).push(row);
   }
   for (const request of requests) {
-    const host = hostMarks.get(request.marker ?? request.sequence);
+    const hostStamp = hostMarks.get(request.marker ?? request.sequence);
     const others = byTick.get(request.tick) || [];
-    const stamps = others.map(row => peerMarks.get(row.marker ?? row.sequence));
+    const peerStamps = others.map(row => peerMarks.get(row.marker ?? row.sequence));
+    const hostInstant = clocks && traceInstant(hostStamp, clocks[0]), peerInstants = clocks && peerStamps.map(ts => traceInstant(ts, clocks[1]));
+    const host = clocks ? hostInstant?.at : hostStamp;
+    const stamps = clocks ? peerInstants.map(stamp => stamp?.at) : peerStamps;
     // A sealed tick belongs to both engines. Its clock starts at the first
     // request, including earlier peer attempts. Missing evidence fails closed.
-    request.traceAt = Number.isFinite(host) && stamps.every(Number.isFinite) &&
+    request.traceAt = validClocks && Number.isFinite(host) && stamps.every(Number.isFinite) &&
       (!request.agreed || others.some(row => row.agreed && row.committed))
       ? Math.min(host, ...stamps) : undefined;
+    if (clocks && request.traceAt !== undefined) request.traceStartBounds =
+      [Math.min(hostInstant.low, ...peerInstants.map(stamp => stamp.low)), Math.min(hostInstant.high, ...peerInstants.map(stamp => stamp.high))];
     if (others.length) request.peerSteps = others.map((row, i) => ({
       agreed: row.agreed, committed: row.committed, compute: row.ms,
       startFromHost: Number.isFinite(stamps[i]) && Number.isFinite(host) ? (stamps[i] - host) / 1000 : undefined,
@@ -292,4 +385,5 @@ function matchStepStarts(requests, peers, hostMarks = new Map(), peerMarks = new
   }
 }
 
-module.exports = { recordDraw, frameSummary, startTrace, readPresentations, bothDisplays, scheduledSteps, matchStepStarts };
+module.exports = { recordDraw, frameSummary, startTrace, readPresentations, bothDisplays, scheduledSteps, matchStepStarts,
+  calibrateTraceClock, traceClockSkew };
