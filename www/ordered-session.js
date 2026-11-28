@@ -129,9 +129,12 @@ export class OrderedSession {
     if (!this.valid(s)) return;
     return this.io.send(s.peer, { ...message, epoch: s.epoch });
   }
-  stop(reason, inform = true) {
+  stop(reason, inform = true, retryAdmission = false) {
     const s = this.current;
     if (!s) return;
+    // Both members accepted the checkpoint and sealed the first input. A late
+    // ready can retry admission on the next ordinary publication.
+    if (retryAdmission && !s.executed && s.steps?.next?.sealed && (s.localReady || s.remoteReady)) this.retryAt = 0;
     this.current = null;
     s.joined?.(false);
     s.steps?.close();
@@ -318,7 +321,7 @@ export class OrderedSession {
       return s.cut ? this.finishCheckpoint(s) : this.afterReplica();
     }
     if (!s || s.peer !== peer || b.epoch !== s.epoch) return;
-    if (b.action === 'stop') { this.stop('伙伴已切回世界同步', false); return; }
+    if (b.action === 'stop') { this.stop('伙伴已切回世界同步', false, true); return; }
     if (!this.valid(s)) { this.stop('共同结算的连接或归档已更换'); return; }
     if (b.action === 'history' && s.owner && !s.steps && !s.reconciling && b.base === s.base) {
       if (!s.cut?.exceptBonds || b.exceptBonds !== s.cut.exceptBonds || !b.bonds) {
@@ -460,7 +463,7 @@ export class OrderedSession {
       return false;
     }
     if (!s.localReady || s.localReady !== s.remoteReady) {
-      this.stop('本步输入尚未得到双方确认'); return false;
+      this.stop('本步输入尚未得到双方确认', true, true); return false;
     }
     const slot = s.steps.take(s.world.data.tick);
     if (!slot) { this.stop('共同基准已变更'); return false; }

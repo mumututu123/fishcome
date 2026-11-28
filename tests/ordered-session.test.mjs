@@ -151,6 +151,25 @@ test('缺少起始步的接收端能释放旧会话，成员更换后没有旧�
   assert.equal(a.session.current, null); assert.deepEqual(a.calls, []);
   assert.equal(a.session.valid(past), false);
 });
+test('首次共同基准和输入均已验、仅迟到一张就绪时，下一次权威发布即可重新会合', async () => {
+  const now = Date.now(), { sides: [a,b], drain } = pair(now);
+  await a.session.probe();
+  await drain(message => message.action === 'prepared');
+  const epoch = a.session.current.epoch;
+  assert.ok(a.session.current.localReady);
+  assert.equal(a.session.current.remoteReady, undefined);
+  assert.equal(a.session.run(now + 500), false);
+  await drain();
+  assert.deepEqual(a.calls, []);
+  assert.equal(b.session.current, null);
+  for (const side of [a,b]) side.world.data.tick += 500;
+  await a.session.probe(); await drain();
+  assert.notEqual(a.session.current.epoch, epoch);
+  for (const side of [a,b]) assert.equal(side.session.run(now + 1000), true);
+  await drain();
+  assert.deepEqual(a.calls, [now + 1000]);
+  assert.deepEqual(a.calls, b.calls);
+});
 test('同一步归并离线期间不同的伙伴成员与累计相处，随后共同执行', async () => {
   const now = Date.now(), { sides: [a,b], drain } = pair(now);
   const bond = (first, second, seconds) => ({ a: first, b: second, seconds, at: now, lastNear: now, run: 1 });

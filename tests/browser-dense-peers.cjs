@@ -123,6 +123,16 @@ const instrument = `
 const testData = { frames: [], steps: [], stepRequests: [], applied: [], sends: [], receives: [], merges: [], worldMerges: [], repairs: [], saves: [], liveBytes: [] };
 const stoppedSessions = [];
 const workerLoads = [], activeWorkerLoad = new WeakMap();
+let revisionChange;
+const installedFields = new WeakMap(), originalInstall = ordered.installChecked;
+ordered.installChecked = function (session, changes) {
+  installedFields.set(session, Object.keys(changes));
+  return originalInstall.call(this, session, changes);
+};
+subscribeSimulationChanges((target, patch, origin) => {
+  if (patch || !ordered.current || ordered.current.executed) return;
+  revisionChange = { at: Date.now(), revision: worldRevision(target), origin, stack: new Error().stack.split(String.fromCharCode(10)).slice(2,7) };
+});
 const originalWitness = SimulationClient.prototype.checkRetained;
 SimulationClient.prototype.checkRetained = async function (world, valid) {
   if (this.hasSavedCharacters(world) || activeWorkerLoad.has(this)) return originalWitness.call(this, world, valid);
@@ -138,6 +148,8 @@ SimulationClient.prototype.open = async function (world, valid, cut, rebase) {
   const row = { at: Date.now(), tick: world.data.tick, oldWorker: !!this.worker, cached: this.savedCharacters?.size || 0,
     previousTick: this.tick, sameWorld: this.owner === world, previousRevision: this.revision, revision: worldRevision(world),
     rebased: !!rebase, orderedInputCount: ordered.current?.steps?.next?.inputs?.length,
+    changedBeforeOpen: ordered.current && !ordered.current.executed ? revisionChange : undefined,
+    checkpointOrderFields: ordered.current && installedFields.get(ordered.current),
     cutPages: cut?.hashes.length || 0, reused: 0, characters: 0, otherRows: 0, rowBatches: 0, rowMs: 0 };
   activeWorkerLoad.set(this,row); workerLoads.push(row);
   const start = performance.now();
