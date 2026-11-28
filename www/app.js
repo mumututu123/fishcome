@@ -201,6 +201,7 @@ const ordered = new OrderedSession({
   firstCommit: () => worldBroadcast.reset(),
   checkRetained: target => simulation.checkRetained(target, () => target === world && mayRetainWorker()),
   hasSavedCharacters: target => simulation.hasSavedCharacters(target),
+  archiveStable: () => !archiveBusy && !archiveImports,
   prepare: (target, valid, pages) => simulation.prepareAgreed(target, valid, pages),
   advance: (target, nextTick, valid, handle) => simulation.advanceAgreed(target, nextTick, valid, handle),
   stopped(session, reason) {
@@ -209,7 +210,7 @@ const ordered = new OrderedSession({
     if (amLeader()) resumeOrderedInputs().catch(error => diagnostics.record('warn', 'ordered-steps', error.message));
   }
 });
-subscribeSimulationChanges((target, patch) => ordered.changed(target, patch));
+subscribeSimulationChanges((target, patch, origin, merge) => ordered.changed(target, patch, origin, merge));
 function runOrdered(action) {
   const task = action(), session = ordered.current;
   return task.catch(error => {
@@ -310,7 +311,7 @@ async function archiveWorld(now = Date.now()) {
     }
     const mealTargets = new Set();
     if (hasNewRecords) {
-      ordered.stop('历史归档发生变化');
+      ordered.archiveChanging('历史归档发生变化');
       archiveBusy = true;
       for (const chunk of chunks) await store.ingest(chunk, chooseClaim, mealTargets);
       target.data.archives ||= emptyArchiveState();
@@ -319,7 +320,7 @@ async function archiveWorld(now = Date.now()) {
     const compact = await prepareCompaction(target, store, dependencies);
     const changed = await simulation.archiveAtStepBoundary(target, () => {
       if (!isCurrent() || (!hasNewRecords && !canArchive())) return;
-      ordered.stop('历史归档时刻已更新');
+      ordered.archiveChanging('历史归档时刻已更新');
       const removed = compact();
       (target.data.archives ||= emptyArchiveState()).at = now;
       if (!hasNewRecords && !removed) return;
@@ -375,6 +376,9 @@ async function mergeVerifiedWorld(data, peer, context, { local = false, worldMes
       if (index) renderer.applyMerge(target, index, changes);
       joined?.(target, priorTick, priorRevision, changes);
       if (worldMessage && delta) followVerifiedReplica(target, priorTick, priorRevision, changes);
+      if (worldMessage && peer?.node === worldMessage.from && worldMessage.from === leader()) {
+        ordered.appliedReplica(target, changes, incoming, archived);
+      }
     };
     let movement;
     if (worldMessage && worldMessage.from !== network.node) movement = replicaSwims.merge(target.data, worldMessage, apply);

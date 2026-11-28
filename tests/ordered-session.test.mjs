@@ -199,7 +199,19 @@ test('起步到点仍缺签认时立即交还前一权威通道，重连后不�
   assert.deepEqual(a.calls, b.calls);
 });
 
-for (const diverged of [false, true]) test('历史基准验真跨过三个正常权威步，最新实际状态' + (diverged ? '不同时不能切换' : '相同时才接管下一步'), async () => {
+function publishOrdinary(a, b, due, beforeMerge) {
+  a.world.step(due);
+  // A directly executed World.step has no worker patch. Its changed rows
+  // must be discovered by comparing all rows against the captured anchor.
+  a.session.changed(a.world);
+  a.session.changed(a.world, { workerChanges: {}, values: { tick: due } });
+  const incoming = a.world.serialize();
+  beforeMerge?.();
+  const changes = b.world.merge(incoming, {}, 'replica', true);
+  b.session.changed(b.world, null, 'replica', changes);
+  b.session.appliedReplica(b.world, changes, incoming, {});
+}
+for (const diverged of [false, true]) test('每一份全态签认都跨过三个真实权威步，最新实际状态' + (diverged ? '不同时不能切换' : '相同时在同一会话接管下一步'), async () => {
   const now = Date.now(), { sides: [a,b], drain } = pair(now);
   let withheld;
   await a.session.probe();
@@ -213,27 +225,22 @@ for (const diverged of [false, true]) test('历史基准验真跨过三个正常
     const due = now + i * 500;
     assert.equal(a.session.run(due), false);
     assert.equal(b.session.run(due), false);
-    a.world.step(due);
-    a.session.changed(a.world, { values: { tick: due } });
-    b.world.merge(a.world.serialize(), {}, 'replica', true);
-    b.session.changed(b.world);
+    publishOrdinary(a,b,due, () => { if (diverged && i === 3) b.world.data.notices = ['未获同一基准签认的本地记录']; });
     await b.session.afterReplica();
     assert.equal(a.world.data.tick, due);
     assert.equal(b.world.data.tick, due);
   }
   await b.session.receive(b.peer, withheld);
   await drain();
-  assert.equal(a.session.current.nextCut, true);
   assert.deepEqual(a.calls, []);
-  if (diverged) b.world.data.notices = ['未获同一基准签认的本地记录'];
   await a.session.probe(); await drain();
   if (diverged) {
     assert.equal(a.session.current, null);
     assert.equal(b.session.run(now + 2000), false);
     assert.deepEqual(b.calls, []);
   } else {
-    assert.notEqual(a.session.current.epoch, anchor);
-    assert.equal(a.session.current.priorProof, withheld.proof);
+    assert.equal(a.session.current.epoch, anchor);
+    assert.notEqual(a.session.current.steps.proof, withheld.proof);
     for (const side of [a,b]) assert.equal(side.session.run(now + 2000), true);
     await drain();
     assert.deepEqual(a.calls, [now + 2000]);
@@ -253,6 +260,46 @@ test('缺少起始步的接收端能释放旧会话，成员更换后没有旧�
   assert.equal(a.session.valid(past), false);
 });
 
+for (const conflict of [false, true]) test('慢入场遇到真实签名归档和名册换序后，' + (conflict ? '不同的本地归档索引阻止接管' : '归档已落盘的同一世界继续接管'), async () => {
+  const now = Date.now(), { sides: [a,b], drain } = pair(now);
+  const signed = await earn(a.world, 9);
+  for (const side of [a,b]) {
+    side.world.data.ops[signed.body.id] = { ...signed.body, proof: signed };
+    side.world.data.participants = side === a ? { first: '一', second: '二' } : { second: '二', first: '一' };
+  }
+  const chunks = await archiveChunks(archivePlan(a.world.data, now), a.world.data.roots);
+  assert.equal(chunks.length, 1);
+  let anchor;
+  await a.session.probe();
+  await drain(message => { if (message.action === 'open') { anchor = message; return true; } });
+  const epoch = anchor.epoch;
+  for (const side of [a,b]) {
+    side.session.archiveChanging('归档');
+    for (const chunk of chunks) {
+      await side.store.ingest(chunk);
+      side.world.data.archives.chunks[chunk.manifest.id] = chunk.manifest;
+    }
+    side.world.data.archives.at = now + 1;
+    delete side.world.data.ops[signed.body.id];
+    if (side === b && conflict) side.store.summary.serials[signed.actor]++;
+  }
+  publishOrdinary(a,b,now + 500);
+  await b.session.receive(b.peer,anchor);
+  await drain();
+  if (conflict) {
+    assert.ok(a.stops.includes('双方实际提交的增量结果不同'));
+    assert.equal(b.session.run(now + 1000), false);
+  } else {
+    for (const side of [a,b]) {
+      assert.equal(side.session.current?.epoch, epoch);
+      assert.ok(await side.store.get('ops', signed.body.id));
+      assert.equal(side.session.run(now + 1000), true);
+    }
+    await drain();
+    assert.deepEqual(a.calls, b.calls);
+  }
+});
+
 test('跟随端同一基准装载跨过半秒，旧端当步照常提交、下一步在追到的新基准共同结算', async () => {
   const now = Date.now(), { sides: [a,b], drain } = pair(now);
   let loaded, installing;
@@ -268,13 +315,10 @@ test('跟随端同一基准装载跨过半秒，旧端当步照常提交、下�
   const late = now + 500;
   assert.equal(a.session.run(late), false);
   assert.equal(b.session.run(late), false);
-  a.world.step(late);
-  a.session.changed(a.world, { values: { tick: late } });
-  b.world.merge(a.world.serialize(), {}, 'replica', true);
-  b.session.changed(b.world);
+  publishOrdinary(a,b,late);
   loaded();
   await messages;
-  assert.equal(a.session.current.nextCut, true);
+  assert.equal(a.session.current.followAnchor, true);
   await a.session.probe(); await drain();
   for (const side of [a,b]) assert.equal(side.session.run(late + 500), true);
   await drain();

@@ -3,6 +3,7 @@ import { OrderedSteps, stepDigest } from './ordered-steps.js';
 import { jsonDigest } from './step-digest.js';
 import { characterRevision, worldTables } from './simulation-changes.js';
 import { capturedCharacterProof, prepareCharacterProof } from './ordered-characters.js';
+import { AdmissionJournal } from './admission-journal.js';
 
 const orderedTables = [...worldTables, 'life.events', 'life.bonds', 'life.stories',
   'life.places', 'life.haunts', 'life.bloomThrough', 'life.eventThrough'];
@@ -162,8 +163,8 @@ export class OrderedSession {
 
   valid(s) {
     return this.current === s && this.io.peer() === s.peer && this.io.world() === s.world &&
-      this.io.leader() === s.leader && this.io.store() === s.store && s.store.revision === s.revision &&
-      s.world.data.archives?.at === s.archiveAt;
+      this.io.leader() === s.leader && this.io.store() === s.store && (s.snapshot && !s.steps ||
+      s.store.revision === s.revision && s.world.data.archives?.at === s.archiveAt);
   }
   send(s, message) {
     if (!this.valid(s)) return;
@@ -183,10 +184,15 @@ export class OrderedSession {
     if (inform) this.io.send(s.peer, { action: 'stop', epoch: s.epoch }).catch(() => {});
     this.io.stopped(s, reason);
   }
-  changed(world, patch) {
+  changed(world, patch, origin, merge) {
     const s = this.current;
     if (!s || world !== s.world || s.applying) return;
-    if (s.snapshot && !s.steps) { s.changedAfterCut = true; return; }
+    if (s.snapshot && !s.steps) {
+      s.changedAfterCut = true;
+      s.journal.changed(patch, origin, merge);
+      if (s.owner && patch?.workerChanges && patch.values?.tick === world.data.tick) s.journal.capture(world);
+      return;
+    }
     if (s.running && patch?.workerChanges && patch.values?.tick === s.steps.next?.tick) {
       this.committed(s);
       return;
@@ -194,10 +200,16 @@ export class OrderedSession {
     if (s.waiting && !s.checking) return;
     this.stop('世界在共同基准之外有新变更');
   }
+  archiveChanging(reason) {
+    const s = this.current;
+    if (s?.snapshot && !s.steps) this.changed(s.world);
+    else this.stop(reason);
+  }
   committed(s) {
     if (s.executed) return;
     s.executed = true;
     s.snapshot = undefined;
+    s.journal = undefined;
     this.io.firstCommit?.(s.world);
   }
   begin(peer, epoch, base) {
@@ -235,7 +247,7 @@ export class OrderedSession {
     return this.openCheckpoint(s);
   }
   async openCheckpoint(s) {
-    s.snapshot = captureOrderedWorld(s.world, s.store);
+    this.capture(s);
     const data = s.snapshot.world.data;
     const order = { ...checkpointOrder(data), ...(s.orderFields && checkpointOrder(data, s.orderFields)) };
     await this.send(s, { action: 'opening', base: s.base, order, previous: s.priorProof });
@@ -245,11 +257,27 @@ export class OrderedSession {
     s.proof = proof;
     await this.send(s, { action: 'open', base: s.base, proof, exceptBonds: s.cut.exceptBonds, bondOrder: s.cut.bondOrder, previous: s.priorProof });
   }
+  capture(s) {
+    if (s.snapshot) return;
+    s.snapshot = captureOrderedWorld(s.world, s.store);
+    const data = s.snapshot.world.data;
+    s.journal = new AdmissionJournal(data, capturedOrderedRows(data, 'chars'), capturedOrderedRows(data, 'ops'));
+  }
+  appliedReplica(world, changes, incoming, archived) {
+    const s = this.current;
+    if (!s || s.world !== world || s.owner || !s.journal || s.steps) return;
+    s.journal.merged(changes, incoming, archived);
+    s.journal.capture(world);
+  }
   async afterReplica() {
     const s = this.current;
+    if (s?.followAnchor && !s.owner && !s.steps) {
+      if (s.journal.broken) return this.send(s, { action: 'pastJoined', base: s.base, proof: s.proof, follow: false });
+      return this.offerTip(s);
+    }
     if (!s?.waiting || !s.order || s.checking || s.world.data.tick < s.base) return;
     if (!this.valid(s) || !s.snapshot && s.world.data.tick !== s.base) { this.stop('已错过共同检查点'); return; }
-    s.snapshot ??= captureOrderedWorld(s.world, s.store);
+    this.capture(s);
     s.checking = true;
     // Loading the independently verified local replica executes no ecological
     // step. The final preparation below rechecks inputs, revision and tick.
@@ -280,20 +308,59 @@ export class OrderedSession {
       return;
     }
     s.checkedProof = proof;
-    if (!s.changedAfterCut && s.world.data.tick === s.base && Object.keys(changes).length) await this.installChecked(s, changes);
+    const atCut = () => this.valid(s) && !s.changedAfterCut && s.world.data.tick === s.base &&
+      s.revision === s.store.revision && s.archiveAt === s.world.data.archives?.at && this.io.archiveStable?.() !== false;
+    if (atCut() && Object.keys(changes).length) await this.installChecked(s, changes);
     if (!this.valid(s)) return;
-    const atCut = () => this.valid(s) && !s.changedAfterCut && s.world.data.tick === s.base;
     if (atCut()) await this.preload(s, s.cut.characterPages);
     const handle = atCut() && await this.io.prepare(s.world, atCut, s.cut.characterPages);
     if (!this.valid(s)) return;
     if (!handle || !atCut()) {
       if (s.pastBonds) await this.mergePastHistory(s);
-      if (this.valid(s)) await this.send(s, { action: 'pastJoined', base: s.base, proof });
+      await this.alignPast(s);
+      if (this.valid(s)) await this.send(s, { action: 'pastJoined', base: s.base, proof, follow: !changes.chars && !changes.ops && !s.journal.broken });
       return;
     }
     s.waiting = false;
     s.localJoined = true;
-    await this.send(s, { action: 'joined', base: s.base, proof });
+    await this.send(s, { action: 'joined', base: s.base, proof, follow: !changes.chars && !changes.ops });
+  }
+  async alignPast(s) {
+    for (const name of Object.keys(s.order || {})) {
+      if (!Object.hasOwn(s.cut.changes, name.split('.')[0])) continue;
+      const current = s.world.data, rows = tableAt(current, name), order = s.order[name];
+      const keys = Object.keys(rows || {});
+      if (keys.length !== order.length || order.some(id => !Object.hasOwn(rows, id)) || keys.every((id, i) => id === order[i])) continue;
+      const table = Object.fromEntries(order.map(id => [id, rows[id]]));
+      const nested = name.startsWith('life.');
+      const changes = nested ? { life: { ...current.life, [name.slice(5)]: table } } : { [name]: table };
+      const version = s.journal.version;
+      await this.io.install(s.world, changes, () => this.valid(s) && s.journal.version === version, fn => {
+        s.applying = true;
+        try { fn(); } finally { s.applying = false; }
+      });
+    }
+  }
+  async offerTip(s) {
+    const { tick, version } = s.journal, revision = s.store.revision;
+    const current = () => this.valid(s) && !s.steps && s.world.data.tick === tick && s.journal.version === version &&
+      s.store.revision === revision && this.io.archiveStable?.() !== false;
+    if (s.offeredTip?.version === version || !current()) return;
+    const proof = await s.journal.proof(s.world, s.store, s.proof);
+    if (!proof || !current()) return;
+    const handle = await this.io.prepare(s.world, current);
+    if (!handle || !current()) return;
+    s.offeredTip = { tick, version, proof, revision };
+    await this.send(s, { action: 'tipReady', base: tick, anchor: s.proof, proof, parts: s.journal.tip.parts });
+  }
+  startTip(s, tick, proof) {
+    s.revision = s.store.revision;
+    s.archiveAt = s.world.data.archives?.at;
+    s.base = tick;
+    s.proof = proof;
+    s.preload = undefined;
+    s.waiting = s.changedAfterCut = false;
+    this.start(s);
   }
   async mergePastHistory(s) {
     const life = s.world.data.life, previous = life.bonds;
@@ -306,7 +373,8 @@ export class OrderedSession {
       });
   }
   installChecked(s, changes) {
-    return this.io.install(s.world, changes, () => this.valid(s) && !s.changedAfterCut && s.world.data.tick === s.base, action => {
+    return this.io.install(s.world, changes, () => this.valid(s) && !s.changedAfterCut && s.world.data.tick === s.base &&
+      s.revision === s.store.revision && s.archiveAt === s.world.data.archives?.at && this.io.archiveStable?.() !== false, action => {
       const pages = s.cut?.characterPages;
       const current = pages && characterRevision(s.world) === pages.revision;
       s.applying = true;
@@ -323,7 +391,7 @@ export class OrderedSession {
   }
   start(s) {
     s.joined?.(true);
-    if (!s.owner) this.preload(s, s.cut.characterPages);
+    if (!s.owner) this.preload(s, s.followAnchor ? undefined : s.cut?.characterPages);
     s.cut = undefined;
     s.steps = new OrderedSteps({ epoch: s.epoch, tick: s.base, proof: s.proof, leader: s.owner,
       send: body => this.send(s, body), validOp: async op => {
@@ -461,20 +529,50 @@ export class OrderedSession {
     if (b.action === 'pastJoined' && s.owner && !s.executed && !s.steps?.next?.sealed && b.base === s.base && b.proof === s.proof) {
       s.steps?.close();
       s.steps = undefined;
+      if (b.follow === true && !s.journal.broken) {
+        s.followAnchor = true;
+        return this.send(s, { action: 'followAnchor', base: s.base, proof: s.proof });
+      }
       s.nextCut = true;
       return;
     }
     if (b.action === 'joined' && s.owner && !s.steps && b.base === s.base && b.proof === s.proof) {
-      if (s.changedAfterCut || s.world.data.tick !== s.base) {
-        s.nextCut = true;
-        return;
+      if (s.changedAfterCut || s.world.data.tick !== s.base || s.store.revision !== s.revision ||
+          s.world.data.archives?.at !== s.archiveAt || this.io.archiveStable?.() === false) {
+        if (b.follow !== true || s.journal.broken) { s.nextCut = true; return; }
+        s.followAnchor = true;
+        return this.send(s, { action: 'followAnchor', base: s.base, proof: s.proof });
       }
       this.start(s);
       return this.offer(s);
     }
+    if (b.action === 'followAnchor' && !s.owner && !s.steps && b.base === s.base && b.proof === s.checkedProof) {
+      if (s.cut?.changes.chars || s.cut?.changes.ops || s.journal.broken) {
+        return this.send(s, { action: 'pastJoined', base: s.base, proof: s.proof, follow: false });
+      }
+      s.followAnchor = true;
+      return this.offerTip(s);
+    }
+    if (b.action === 'tipReady' && s.owner && s.followAnchor && !s.steps && b.base === s.world.data.tick && b.anchor === s.proof && /^[0-9a-f]{64}$/.test(b.proof)) {
+      if (s.journal.broken) { s.nextCut = true; return; }
+      const version = s.journal.version, revision = s.store.revision, proof = await s.journal.proof(s.world, s.store, s.proof);
+      if (!proof || !this.valid(s) || s.steps || s.world.data.tick !== b.base || s.journal.version !== version ||
+          s.store.revision !== revision || this.io.archiveStable?.() === false) return;
+      if (proof !== b.proof) {
+        s.differences = { fields: ['chars/ops', 'world', 'archive'].filter((name, i) => s.journal.tip.parts[i] !== b.parts?.[i]), tick: b.base };
+        this.stop('双方实际提交的增量结果不同'); return;
+      }
+      this.startTip(s, b.base, proof);
+      return this.offer(s);
+    }
+    if (b.action === 'offer' && !s.owner && !s.steps && s.followAnchor && s.offeredTip?.proof === b.previous &&
+        s.offeredTip.tick === b.base && s.offeredTip.version === s.journal.version && s.offeredTip.revision === s.store.revision &&
+        this.io.archiveStable?.() !== false && s.world.data.tick === b.base) {
+      this.startTip(s, b.base, b.previous);
+    }
     if (b.action === 'offer' && !s.owner && !s.steps && s.localJoined && b.base === s.base && b.previous === s.proof) {
-      if (s.changedAfterCut || s.world.data.tick !== s.base) {
-        await this.send(s, { action: 'pastJoined', base: s.base, proof: s.proof });
+      if (s.changedAfterCut || s.world.data.tick !== s.base || s.revision !== s.store.revision || s.archiveAt !== s.world.data.archives?.at) {
+        await this.send(s, { action: 'pastJoined', base: s.base, proof: s.proof, follow: !s.cut?.changes.chars && !s.cut?.changes.ops });
         return;
       }
       this.start(s);
