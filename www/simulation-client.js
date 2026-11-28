@@ -1,6 +1,6 @@
 import { CONFIG } from './engine.js';
 import { fishOrigin, writeBreedingRecord } from './breeding.js';
-import { replaceLifeHistory, simulationWillApply, simulationApplied, subscribeSimulationChanges, worldRevision, worldTables } from './simulation-changes.js';
+import { characterRevision, replaceLifeHistory, simulationWillApply, simulationApplied, subscribeSimulationChanges, worldRevision, worldTables } from './simulation-changes.js';
 import { expandSimulationPatch, rowId } from './simulation-delta.js';
 import { SimulationRows } from './simulation-rows.js';
 export { subscribeSimulationChanges } from './simulation-changes.js';
@@ -26,11 +26,15 @@ export function startSimulationClock(readTick, update) {
   schedule(Date.now());
 }
 
-function* initialRows(world) {
+function* initialRows(world, missingCharacters) {
   let scanned = 0;
   for (const field of worldTables) {
     const table = world.data[field];
     if (field === 'chats') continue;
+    if (field === 'chars' && missingCharacters) {
+      for (const id of missingCharacters) yield [field, id, table[id]];
+      continue;
+    }
     for (const id in table) {
       if (++scanned % 1024 === 0) yield null;
       const row = table[id];
@@ -101,6 +105,7 @@ export class SimulationClient {
     this.owner = null;
     this.knownFish = null;
     this.historyParts = null;
+    this.savedCharacters = undefined;
     this.failure = null;
     const pending = this.pending;
     this.pending = null;
@@ -146,9 +151,33 @@ export class SimulationClient {
   finishBoundary() {
     for (const apply of this.boundaries?.splice(0) || []) apply();
   }
-  async open(world, valid) {
+  async checkRetained(world) {
+    if (this.task) await this.task;
+    if (!this.worker || this.owner !== world || this.task || this.savedCharacters) return;
+    const worker = this.worker;
+    await this.startTask(world, async () => {
+      const hashes = await this.request({ kind: 'characterWitness' });
+      if (this.worker === worker && hashes) this.savedCharacters = new Map(hashes.map((hash, i) => [hash, i]));
+    });
+  }
+  async open(world, valid, characterPages) {
+    let characters, missingCharacters;
+    const retainedWorker = characterPages?.table === world.data.chars && characterPages.revision === characterRevision(world) &&
+      this.savedCharacters && this.owner === world && this.worker;
+    if (retainedWorker) {
+      const ids = Object.keys(world.data.chars);
+      missingCharacters = [];
+      characters = characterPages.hashes.map((hash, i) => {
+        const old = this.savedCharacters.get(hash);
+        if (old !== undefined) return old;
+        const changed = ids.slice(i * 128, (i + 1) * 128);
+        missingCharacters.push(...changed);
+        return changed;
+      });
+      this.worker = null;
+    }
     this.close();
-    const worker = this.worker = this.makeWorker();
+    const worker = this.worker = retainedWorker || this.makeWorker();
     this.knownFish = Object.keys(world.data.fishes);
     SimulationRows.for(world.data.fishes, this.knownFish);
     SimulationRows.for(world.data.travel, this.knownFish);
@@ -180,12 +209,12 @@ export class SimulationClient {
     for (const field of Object.keys(world.data)) {
       if (worldTables.has(field)) tables.push(field); else values[field] = world.data[field];
     }
-    await this.request({ kind: 'open', values, tables, ambient: world.ambient });
+    await this.request({ kind: 'open', values, tables, ambient: world.ambient, characters });
     if (!valid() || this.worker !== worker) return false;
     // Gather the next page while the worker installs the previous one. A single
     // outstanding acknowledgement preserves cancellation and message ordering.
     let rows = [], prior, slice = performance.now();
-    for (const row of initialRows(world)) {
+    for (const row of initialRows(world, missingCharacters)) {
       if (row) rows.push(row);
       if (rows.length < 1024 && (row && rows.length % 64 || performance.now() - slice < 2)) continue;
       if (prior) await prior;
@@ -251,13 +280,13 @@ export class SimulationClient {
     }).finally(() => { this.task = null; this.finishBoundary(); });
     return this.task;
   }
-  async prepareAgreed(world, stillValid) {
+  async prepareAgreed(world, stillValid, characterPages) {
     if (this.task) await this.task;
     if (this.task || !stillValid()) return null;
     const base = world.data.tick, revision = worldRevision(world);
     const valid = () => stillValid() && world.data.tick === base && worldRevision(world) === revision;
     if (this.owner !== world || this.revision !== revision || this.tick !== base) {
-      if (!await this.startTask(world, () => this.open(world, valid))) return null;
+      if (!await this.startTask(world, () => this.open(world, valid, characterPages))) return null;
     }
     if (this.historyParts && !await this.startTask(world, () => this.syncHistory(valid))) return null;
     return valid() ? { world, base, revision, worker: this.worker } : null;

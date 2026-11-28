@@ -114,6 +114,11 @@ function orderedPeer() {
   if (other?.orderedSteps === 1 && other.build === meta.version && peer.replicaLive && peer.sentHello && peer.confirmedReplica && other.peers <= 1 &&
       !peer.replicaCatchingUp && (!amLeader() || !geometryRepair && !world.data.pendingChatGlyphs)) return peer;
 }
+function mayRetainWorker() {
+  const peers = network.live(), winner = leader(), other = members.get(winner);
+  return peers.length === 1 && active().length === 2 && peers[0].node === winner && peers[0].replicaLive &&
+    other?.orderedSteps === 1 && other.build === meta.version && other.peers <= 1;
+}
 function orderedInputs(limit = 64) {
   return [...inbox.values()].filter(op => !rejectedOps.has(op.body.id) && (op.body.kind === 'referral' || !world.data.ops[op.body.id] && !archiveStore.ids.ops.has(op.body.id)))
     .sort((a, b) => a.body.t - b.body.t || a.body.id.localeCompare(b.body.id)).slice(0, limit);
@@ -164,7 +169,9 @@ const ordered = new OrderedSession({
   archiveBoundary: (target, commit) => atCheckpointBoundary(target.data, () => simulation.archiveAtStepBoundary(target, commit)),
   archiveConfirmed: () => { renderChat(); save({ reusePicture: true }).catch(error => diagnostics.record('warn', 'archive', error.message)); },
   firstCommit: () => worldBroadcast.reset(),
-  prepare: (target, valid) => simulation.prepareAgreed(target, valid),
+  checkRetained: target => simulation.checkRetained(target),
+  hasSavedCharacters: target => simulation.owner === target && !!simulation.savedCharacters,
+  prepare: (target, valid, pages) => simulation.prepareAgreed(target, valid, pages),
   advance: (target, nextTick, valid, handle) => simulation.advanceAgreed(target, nextTick, valid, handle),
   stopped(session, reason) {
     diagnostics.record('info', 'ordered-steps', reason);
@@ -1062,7 +1069,7 @@ async function tick() {
   if (replacingCheckpoint) return;
   if (!updateFrozen && identity.remainder >= 3600) { identity.remainder -= 3600; identity.serial = (identity.serial || 0) + 1; await submit({ kind: 'earn', cost: 0, serial: identity.serial }); }
   members.set(network.node, member());
-  const currentLeader = leader(); if (currentLeader !== lastLeader) { ordered.stop('权威成员已更换'); simulation.close(); lastLeader = currentLeader; worldBroadcast.reset(); replicaSwims.reset(); renderer.presentSwims(world); if (amLeader()) { geometryRepair = true; world.data.tick = Math.max(world.data.tick, now - 2000); for (const envelope of [...inbox.values()].sort((a, b) => a.body.t - b.body.t || a.body.id.localeCompare(b.body.id))) { if (!world.data.ops[envelope.body.id]) { const result = world.apply({ ...clone(envelope.body), proof: clone(envelope) }); if (!result.ok) rejectOperation(envelope.body.id); network.broadcast('ack', { id: envelope.body.id, result }).catch(() => {}); } } for (const id of pending.keys()) if (world.data.ops[id]) pending.delete(id); } }
+  const currentLeader = leader(); if (currentLeader !== lastLeader) { ordered.stop('权威成员已更换'); if (!mayRetainWorker()) simulation.close(); lastLeader = currentLeader; worldBroadcast.reset(); replicaSwims.reset(); renderer.presentSwims(world); if (amLeader()) { geometryRepair = true; world.data.tick = Math.max(world.data.tick, now - 2000); for (const envelope of [...inbox.values()].sort((a, b) => a.body.t - b.body.t || a.body.id.localeCompare(b.body.id))) { if (!world.data.ops[envelope.body.id]) { const result = world.apply({ ...clone(envelope.body), proof: clone(envelope) }); if (!result.ok) rejectOperation(envelope.body.id); network.broadcast('ack', { id: envelope.body.id, result }).catch(() => {}); } } for (const id of pending.keys()) if (world.data.ops[id]) pending.delete(id); } }
   if (amLeader() && fishRepairWaiting && now - lastSave > 5000) geometryRepair = true;
   if (ordered.run(now)) return;
   if (amLeader() && !updateFrozen && !replacingCheckpoint) {
@@ -1079,7 +1086,7 @@ async function tick() {
         status = '后台模拟已暂停，刷新页面可重试。' + error.message;
         toast(status);
       });
-  } else if (!ordered.current) simulation.close();
+  } else if (!ordered.current && !mayRetainWorker()) simulation.close();
 }
 // Start periodic storage, presence and HUD work between ecology deadlines.
 // Foreground edits, pagehide and explicit archive requests keep their own cuts.

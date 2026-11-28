@@ -460,6 +460,7 @@ function trackWorld(source) {
     data: watch(source, { root: true }),
     // Callers enumerate this read-only list. Its rows still carry tracked writes.
     charValues,
+    copyCharacter: id => plain(source.chars[id]),
     illnessSchedule,
     readBonds: () => materializeBonds(raw(source.life.bonds)),
     readStories: () => raw(source.life.stories),
@@ -572,10 +573,25 @@ export class WorkerSimulation {
       return jsonDigest(this.tracker.logicalChanges(patch));
     }
     this.agreedPatch = undefined;
+    if (message.kind === 'characterWitness') {
+      const ids = Object.keys(this.world.data.chars);
+      this.characterPages = [];
+      for (let start = 0; start < ids.length; start += 128) {
+        this.characterPages.push(ids.slice(start, start + 128).map(id => [id, this.tracker.copyCharacter(id)]));
+      }
+      return Promise.all(this.characterPages.map(jsonDigest));
+    }
     if (message.kind === 'open') {
       this.world = new World(message.values.tick, 'worker', { populate: false, ambient: message.ambient });
       this.world.data = message.values;
       for (const field of message.tables) this.world.data[field] = {};
+      if (message.characters) {
+        for (const page of message.characters) {
+          if (typeof page === 'number') for (const [id, record] of this.characterPages[page]) this.world.data.chars[id] = record;
+          else for (const id of page) this.world.data.chars[id] = null;
+        }
+      }
+      this.characterPages = undefined;
       const fishes = this.world.data.fishes;
       // Live fish usually carry their original actor and gender. Only legacy
       // discrepancies need separate entries in the simulation's origin lookup.

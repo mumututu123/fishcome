@@ -9,6 +9,7 @@ import { applyBondIntervals } from '../www/bond-interval.js';
 import { LIFE, lifeContext, updateLife } from '../www/life.js';
 import { applyInputRows, setParticipantName, subscribeBeforeSimulationPatch, worldEdited } from '../www/simulation-changes.js';
 import { CONTACT_TIME, updateContacts } from '../www/breeding.js';
+import { orderedCheckpoint } from '../www/ordered-session.js';
 
 const start = Date.UTC(2025, 5, 15, 12, 17);
 const root = '00000000-0000-4000-8000-000000000012';
@@ -72,6 +73,50 @@ function localWorker(beforeReceive = () => {}, simulation = new WorkerSimulation
     }
   };
 }
+
+test('旧伙伴线程只复用逐页一致的鱼元，补齐换序、增删和未知字段，过期检查点重装', async () => {
+  const world = new World(start, root, { populate: false, ambient: false });
+  const store = new ArchiveStore();
+  world.attachArchives(store);
+  const make = id => ({ id, payer: 'a', kind: 'burn', entity: '', x: 1, y: 1, path: [], created: start, old: { nested: [id] } });
+  const ids = Array.from({ length: 300 }, (_,i) => 'c' + i);
+  world.data.chars = Object.fromEntries(ids.map(id => [id, make(id)]));
+  const simulations = [], opens = [], sent = [];
+  const client = new SimulationClient(() => {
+    const worker = new WorkerSimulation();
+    simulations.push(worker);
+    return localWorker(message => {
+      if (message.kind === 'open') opens.push(message);
+      if (message.kind === 'rows') for (const [field, id] of message.rows) if (field === 'chars') sent.push(id);
+    }, worker);
+  });
+  try {
+    await client.prepareAgreed(world, () => true);
+    await client.checkRetained(world);
+    // The middle page is unchanged but now comes first. A revised legacy field
+    // and a removed/replaced record require sending the two other pages.
+    const reordered = [...ids.slice(128, 256), ...ids.slice(0,128), ...ids.slice(256, 299), 'new'];
+    worldEdited(world);
+    world.data.chars = Object.fromEntries(reordered.map(id => [id, world.data.chars[id] || make(id)]));
+    world.data.chars.c3.old.nested.push('变更');
+    const before = sent.length;
+    const cut = await orderedCheckpoint(world, store);
+    await client.prepareAgreed(world, () => true, cut.characterPages);
+    assert.equal(simulations.length, 1);
+    assert.equal(opens.at(-1).characters[0], 1);
+    assert.deepEqual(sent.slice(before), reordered.slice(128));
+    assert.equal(JSON.stringify(simulations[0].world.data.chars), JSON.stringify(world.data.chars));
+
+    await client.checkRetained(world);
+    worldEdited(world);
+    const stale = await orderedCheckpoint(world, store);
+    applyInputRows(world, [['chars', 'added', make('added')]]);
+    await client.prepareAgreed(world, () => true, stale.characterPages);
+    assert.equal(simulations.length, 2);
+    assert.equal(opens.at(-1).characters, undefined);
+    assert.equal(JSON.stringify(simulations[1].world.data.chars), JSON.stringify(world.data.chars));
+  } finally { client.close(); }
+});
 
 test('确认输入只装载基准，到点双方各提交一个相同的生态步，过期约定无法再用', async () => {
   const makeWorld = () => new World(start, root, { populate: false, ambient: false });

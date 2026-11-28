@@ -1,7 +1,7 @@
 import { CONFIG } from './engine.js';
 import { OrderedSteps, stepDigest } from './ordered-steps.js';
 import { jsonDigest } from './step-digest.js';
-import { worldTables } from './simulation-changes.js';
+import { characterRevision, worldTables } from './simulation-changes.js';
 
 const orderedTables = [...worldTables, 'life.events', 'life.bonds', 'life.stories',
   'life.places', 'life.haunts', 'life.bloomThrough', 'life.eventThrough'];
@@ -17,6 +17,7 @@ export function checkpointOrder(data, requested) {
 // State that determines traversal order is part of the commitment. Hash small
 // numbered pages in order so encoding a real sea can yield to the renderer.
 async function checkpointProof(world, store, data, valid) {
+  const revision = characterRevision(world);
   let yieldAt = performance.now() + 2;
   async function table(rows) {
     const keys = Object.keys(rows), pages = [];
@@ -36,6 +37,7 @@ async function checkpointProof(world, store, data, valid) {
     return Promise.all(pages);
   }
   const fields = [], tableProofs = {};
+  let characterPages;
   let bondEntry;
   for (const name of Object.keys(data)) {
     if (!valid()) return;
@@ -49,6 +51,7 @@ async function checkpointProof(world, store, data, valid) {
     } else if (field && typeof field === 'object' && !Array.isArray(field)) {
       const pages = await table(field);
       fields.push([name, 'pages', pages]);
+      if (name === 'chars') characterPages = { table: field, hashes: pages, revision };
       if (largeTables.has(name) && valid()) tableProofs[name] = await stepDigest(pages);
     }
     else fields.push([name, 'value', field]);
@@ -66,7 +69,7 @@ async function checkpointProof(world, store, data, valid) {
     bondEntry[1] = ['pages', await table(bonds)];
     return valid() ? whole() : undefined;
   }
-  return { proof, exceptBonds, withBonds, tableProofs };
+  return { proof, exceptBonds, withBonds, tableProofs, characterPages };
 }
 
 // Merging can preserve every record but reorder a dictionary. The leader's
@@ -174,12 +177,14 @@ export class OrderedSession {
     s.checking = true;
     // Loading the independently verified local replica executes no ecological
     // step. The final preparation below rechecks inputs, revision and tick.
-    s.preload ??= this.io.prepare(s.world, () => this.valid(s) && s.world.data.tick === s.base).catch(error => {
-      if (this.current === s) this.stop(error.message);
-      return null;
-    });
+    if (!this.io.hasSavedCharacters?.(s.world)) this.preload(s);
     s.cut = await orderedCheckpoint(s.world, s.store, s.order, () => this.valid(s));
+    if (this.valid(s) && !Object.keys(s.cut.changes).length) this.preload(s, s.cut.characterPages);
     await this.finishCheckpoint(s);
+  }
+  preload(s, pages) {
+    s.preload ??= this.io.prepare(s.world, () => this.valid(s) && s.world.data.tick === s.base, pages)
+      .catch(error => { if (this.current === s) this.stop(error.message); return null; });
   }
   async finishCheckpoint(s) {
     if (!this.valid(s) || !s.cut?.proof || !s.proof || s.joining) return;
@@ -201,8 +206,13 @@ export class OrderedSession {
   }
   installChecked(s, changes) {
     return this.io.install(s.world, changes, () => this.valid(s), action => {
+      const pages = s.cut?.characterPages;
+      const current = pages && characterRevision(s.world) === pages.revision;
       s.applying = true;
-      try { action(); } finally { s.applying = false; }
+      try {
+        action();
+        if (current && pages.table === s.world.data.chars) pages.revision = characterRevision(s.world);
+      } finally { s.applying = false; }
     });
   }
   whenJoined(s) {
@@ -212,6 +222,7 @@ export class OrderedSession {
   }
   start(s) {
     s.joined?.(true);
+    if (!s.owner) this.preload(s, s.cut.characterPages);
     s.cut = undefined;
     s.steps = new OrderedSteps({ epoch: s.epoch, tick: s.base, proof: s.proof, leader: s.owner,
       send: body => this.send(s, body), validOp: async op => {
@@ -256,7 +267,10 @@ export class OrderedSession {
     let s = this.current;
     if (b.action === 'available?') {
       if (!s && !this.io.isLeader() && b.leader === this.io.leader() && typeof b.id === 'string' && b.id.length === 36) {
-        await this.io.send(peer, { action: 'available', id: b.id, leader: b.leader });
+        await this.io.checkRetained?.(this.io.world());
+        if (!this.current && this.io.peer() === peer && !this.io.isLeader() && b.leader === this.io.leader()) {
+          await this.io.send(peer, { action: 'available', id: b.id, leader: b.leader });
+        }
       }
       return;
     }
