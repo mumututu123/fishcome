@@ -341,6 +341,16 @@ window.denseArchiveRound = async (serial, dropStep) => {
 };
 window.denseHasArchive = id => Boolean(world.data.archives.chunks[id] && archiveStore.manifests[id]);
 window.denseForgetLiveBase = () => { window.denseForgetArmed = true; return true; };
+window.denseSendPendingReward = async () => {
+  if (!amLeader()) throw new Error('待交接操作须由原协调端签名');
+  const serial = 200001;
+  const body = { id: identity.actor + ':hour:' + serial, actor: identity.actor, nick: identity.nick,
+    roots: world.roots, kind: 'earn', t: Date.now(), cost: 0, serial };
+  const envelope = await network.broadcast('op', body);
+  return { id: body.id, proof: envelope.id };
+};
+window.densePendingReward = id => inbox.has(id) && !world.data.ops[id];
+window.denseAcceptedProof = id => world.data.ops[id]?.proof?.id;
 window.denseReplaceLeaderVisibility = id => {
   const previous = members.get(id);
   if (!previous) throw new Error('找不到原协调端');
@@ -861,13 +871,19 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
 }
 
 async function switchLeader(pages, oldLeader, newLeader) {
+  const actors = await Promise.all(pages.map(page => page.evaluate(() => denseSurvey().node)));
+  const source = pages[actors.indexOf(oldLeader)], next = pages[actors.indexOf(newLeader)];
+  const reward = await source.evaluate(() => denseSendPendingReward());
+  await next.waitForFunction(id => densePendingReward(id), reward.id, { polling: 25, timeout: 5000 });
   const before = await Promise.all(pages.map(page => page.evaluate(() => denseSurvey().tick)));
   await Promise.all(pages.map(page => page.evaluate(old => denseReplaceLeaderVisibility(old), oldLeader)));
   await Promise.all(pages.map(page => page.waitForFunction(({ newLeader, tick }) => {
     const state = denseSurvey();
     return state.leader === newLeader && state.tick >= tick + 1500 && state.peers === 1;
   }, { newLeader, tick: Math.max(...before) }, { polling: 100, timeout: 15000 })));
-  return { progressed: await Promise.all(pages.map(page => page.evaluate(() => denseSurvey().tick))).then(ticks => ticks.map((tick, i) => tick - before[i])) };
+  await Promise.all(pages.map(page => page.waitForFunction(({ id, proof }) => denseAcceptedProof(id) === proof,
+    reward, { polling: 50, timeout: 10000 })));
+  return { pendingOperation: reward.id, progressed: await Promise.all(pages.map(page => page.evaluate(() => denseSurvey().tick))).then(ticks => ticks.map((tick, i) => tick - before[i])) };
 }
 
 async function runArchiveRounds(count, leader, follower, known) {

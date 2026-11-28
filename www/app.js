@@ -106,8 +106,9 @@ function member() { return { replicaPages: 1, orderedSteps: 1, build: meta.versi
 function active() { return [...members.values()].filter(m => Date.now() - m.at < 120000); }
 function leader() { return active().sort((a, b) => +b.visible - +a.visible || a.id.localeCompare(b.id))[0]?.id || network.node; }
 function amLeader() { return !!network && leader() === network.node; }
+let resumingInputs;
 function orderedPeer() {
-  if (!started || updateFrozen || replacingCheckpoint || archiveImports || archiveBusy || !meta.version || !network) return;
+  if (resumingInputs || !started || updateFrozen || replacingCheckpoint || archiveImports || archiveBusy || !meta.version || !network) return;
   const peers = network.live(), people = active();
   if (peers.length !== 1 || people.length !== 2 || network.hasRelayedWorldPeer(peers)) return;
   const peer = peers[0], other = members.get(peer.node);
@@ -123,14 +124,28 @@ function orderedInputs(limit = 64) {
   return [...inbox.values()].filter(op => !rejectedOps.has(op.body.id) && (op.body.kind === 'referral' || !world.data.ops[op.body.id] && !archiveStore.ids.ops.has(op.body.id)))
     .sort((a, b) => a.body.t - b.body.t || a.body.id.localeCompare(b.body.id)).slice(0, limit);
 }
-async function resumeOrderedInputs() {
-  for (const op of orderedInputs(Infinity)) {
-    if (!amLeader() || ordered.current?.steps) return;
-    const result = await applyAtBoundary(op, true);
-    if (!result) return;
-    if (result.ok) await save({ reusePicture: true }); else rejectOperation(op.body.id);
-    await network.broadcast('ack', { id: op.body.id, result });
-  }
+function resumeOrderedInputs() {
+  if (resumingInputs) return resumingInputs;
+  const ops = orderedInputs(Infinity);
+  if (!ops.length) return Promise.resolve();
+  const target = world;
+  resumingInputs = (async () => {
+    const receipts = [];
+    for (const op of ops) {
+      if (!amLeader() || world !== target || ordered.current) break;
+      const result = await applyAtBoundary(op, true);
+      if (!result) break;
+      if (!result.ok) rejectOperation(op.body.id);
+      if (inbox.get(op.body.id)?.id === op.id) inbox.delete(op.body.id);
+      if (pending.delete(op.body.id) && !result.ok) toast(result.error);
+      receipts.push({ id: op.body.id, result });
+    }
+    if (receipts.some(({ result }) => result.ok)) await save({ reusePicture: true });
+    if (world === target && amLeader()) {
+      for (const receipt of receipts) await network.broadcast('ack', receipt);
+    }
+  })().finally(() => { resumingInputs = undefined; });
+  return resumingInputs;
 }
 const ordered = new OrderedSession({
   world: () => world, store: () => archiveStore, peer: orderedPeer, leader, isLeader: amLeader, inputs: orderedInputs,
@@ -1069,7 +1084,19 @@ async function tick() {
   if (replacingCheckpoint) return;
   if (!updateFrozen && identity.remainder >= 3600) { identity.remainder -= 3600; identity.serial = (identity.serial || 0) + 1; await submit({ kind: 'earn', cost: 0, serial: identity.serial }); }
   members.set(network.node, member());
-  const currentLeader = leader(); if (currentLeader !== lastLeader) { ordered.stop('权威成员已更换'); if (!mayRetainWorker()) simulation.close(); lastLeader = currentLeader; worldBroadcast.reset(); replicaSwims.reset(); renderer.presentSwims(world); if (amLeader()) { geometryRepair = true; world.data.tick = Math.max(world.data.tick, now - 2000); for (const envelope of [...inbox.values()].sort((a, b) => a.body.t - b.body.t || a.body.id.localeCompare(b.body.id))) { if (!world.data.ops[envelope.body.id]) { const result = world.apply({ ...clone(envelope.body), proof: clone(envelope) }); if (!result.ok) rejectOperation(envelope.body.id); network.broadcast('ack', { id: envelope.body.id, result }).catch(() => {}); } } for (const id of pending.keys()) if (world.data.ops[id]) pending.delete(id); } }
+  const currentLeader = leader();
+  if (currentLeader !== lastLeader) {
+    ordered.stop('权威成员已更换');
+    if (!mayRetainWorker()) simulation.close();
+    lastLeader = currentLeader;
+    worldBroadcast.reset(); replicaSwims.reset(); renderer.presentSwims(world);
+    if (amLeader()) {
+      geometryRepair = true;
+      world.data.tick = Math.max(world.data.tick, now - 2000);
+      await resumeOrderedInputs();
+      for (const id of pending.keys()) if (world.data.ops[id] || archiveStore.ids.ops.has(id)) pending.delete(id);
+    }
+  }
   if (amLeader() && fishRepairWaiting && now - lastSave > 5000) geometryRepair = true;
   if (ordered.run(now)) return;
   if (amLeader() && !updateFrozen && !replacingCheckpoint) {
