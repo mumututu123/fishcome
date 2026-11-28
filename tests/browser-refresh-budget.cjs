@@ -6,8 +6,7 @@ function recordDraw(renderer, frames, page, trace) {
   renderer.draw = (...args) => {
     const sequence = frames.length;
     const prefix = `tide.refresh.${page}.${sequence}`;
-    if (trace) performance.mark(prefix + '.start');
-    const start = performance.now();
+    const start = trace ? performance.mark(prefix + '.start').startTime : performance.now();
     draw(...args);
     const drawMs = performance.now() - start;
     if (trace) {
@@ -75,10 +74,12 @@ function readPresentations(events, page, start, end) {
     }
   }
   const drawn = [];
+  const clockOffsets = [];
   const displayed = new Map();
   for (const frame of page.frames) {
     const mark = startMarks.get(frame.sequence);
     if (!mark?.endTs) continue;
+    clockOffsets.push(frame.at - mark.ts / 1000);
     const drawCpu = (mark.endTts - mark.tts) / 1000;
     if (Number.isFinite(drawCpu)) drawn.push({ at: frame.at, drawCpu });
     const presented = presentation.get(mark.frame);
@@ -119,7 +120,10 @@ function readPresentations(events, page, start, end) {
       .sort((a, b) => b.dur - a.dur).slice(0, 5)
       .map(task => ({ name: task.name, wallMs: task.dur / 1000, cpuMs: task.tdur / 1000 }))
   }));
-  return { drawn, rows, moving, longestGaps };
+  // Both independent browser processes run on the same machine. Check the
+  // mapping from trace ticks to the page clock before comparing their events.
+  clockOffsets.sort((a, b) => a - b);
+  return { drawn, rows, moving, longestGaps, clockOffsetMs: clockOffsets[Math.floor(clockOffsets.length / 2)] };
 }
 
 function distribution(values) {
@@ -185,14 +189,17 @@ function frameSummary(page, presentations, start, end, authority = page.steps, r
 
 function bothDisplays(requests) {
   const completed = [];
+  const drawToPresent = { host: [], peer: [] };
   let slowest;
   for (const { tick, display } of requests) {
     if (!display?.host || !display.peer) continue;
     const ms = Math.max(display.host.presented, display.peer.presented);
+    for (const side of ['host', 'peer']) drawToPresent[side].push(display[side].presented - display[side].drawEnd);
     completed.push(ms);
     if (!slowest || slowest.ms < ms) slowest = { tick, ms, ...display };
   }
-  return { ...distribution(completed), requested: requests.length, missing: requests.length - completed.length, slowest };
+  return { ...distribution(completed), requested: requests.length, missing: requests.length - completed.length, slowest,
+    afterFirstDraw: { host: distribution(drawToPresent.host), peer: distribution(drawToPresent.peer) } };
 }
 
 function scheduledSteps(requests, phase, step, start, end) {

@@ -78,4 +78,6 @@ test('同一步取较迟呈现的一端，任一端缺帧都算缺失', () => {
   assert.equal(result.max, 28);
   assert.equal(result.slowest.tick, 1000);
   assert.deepEqual(result.slowest.host, { drawStart: 6, drawEnd: 8, presented: 28 });
+  assert.equal(result.afterFirstDraw.host.max, 20);
+  assert.equal(result.afterFirstDraw.peer.max, 16);
 });

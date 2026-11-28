@@ -23,7 +23,7 @@ if (values.help) {
   console.log('默认使用仓库发行构建工具，临时构建两套启动器。也可用 TIDE_DENSE_LAUNCHER_A 和 TIDE_DENSE_LAUNCHER_B 指定两套隔离的启动器，另以 --source=对照工作区指定网页来源。');
   console.log('--drop 蓄意漏发一个已提交的半秒更新，检查后续能否继续同步。');
   console.log('--drop --drop-steps=3 连续漏发三步，检查下一次更新能否一起补全。');
-  console.log('--backup=本地存档 使用真实存档和归档；--trace=本地跟踪文件 记录浏览器呈现；--report=汇总文件 保存验收数据；--refresh-budget 严格检查每次刷新不超过 20 毫秒（需 --trace）。');
+  console.log('--backup=本地存档 使用真实存档和归档；--trace=本地跟踪文件 记录第一端呈现，第二端写入同名的 .B 文件；--report=汇总文件 保存验收数据；--refresh-budget 严格检查每次刷新不超过 20 毫秒（需 --trace）。');
   console.log('--archive-rounds=3 在观测期间连续生成并同步 3 个新归档包（需 --backup）。');
   console.log('--plain-live=A|B|both 模拟不支持紧凑发送的端；--forget-live-base 模拟跟随端遗失上一版本；--switch-leader 在观测后切换协调端。');
   console.log('--rebuild-viewport 用接收端旧的整表画面索引方式对照。');
@@ -438,9 +438,8 @@ function assertProgress(result, elapsed, label) {
 }
 
 async function main([urlA, urlB], assets) {
-  const browser = await chromium.launch({ headless: true });
-  browsers.push(browser);
-  const [a, b] = await Promise.all([openPage(browser, urlA, 'A', assets), openPage(browser, urlB, 'B', assets)]);
+  for (const _ of [urlA, urlB]) browsers.push(await chromium.launch({ headless: true }));
+  const [a, b] = await Promise.all([openPage(browsers[0], urlA, 'A', assets), openPage(browsers[1], urlB, 'B', assets)]);
   const fixture = backup ? await seedBackup([a, b]) : await seedSynthetic(a, b);
   console.log(`fixture ready ${count}`);
   const began = Date.now();
@@ -465,10 +464,10 @@ async function main([urlA, urlB], assets) {
   }, { count, real: Boolean(backup) }, { polling: 100, timeout: count < 200 ? 20000 : 95000 })));
   const joined = Date.now();
   await Promise.all([a, b].map(page => page.waitForFunction(() => denseJoinSettled(), null, { polling: 125, timeout: 45000 })));
-  const stopTrace = values.trace && await startTrace(browser, values['step-boundaries-only']);
+  const stopTrace = values.trace && await Promise.all(browsers.map(browser => startTrace(browser, values['step-boundaries-only'])));
   if (stopTrace) await pause(300);
   const recent = Date.now();
-  await survey({ a, b, fixture, cold, joining, joined, recent, stopTrace, browserVersion: browser.version() });
+  await survey({ a, b, fixture, cold, joining, joined, recent, stopTrace, browserVersion: browsers[0].version() });
 }
 
 async function seedBackup(pages) {
@@ -567,7 +566,10 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
   const ended = Date.now(), sampled = event => event.at >= recent && event.at <= ended;
   await Promise.all([a, b].map(page => page.waitForFunction(end => denseSurvey().frames.at(-1)?.at >= end, ended, { polling: 50, timeout: 10000 })));
   if (stopTrace) await pause(step);
-  const trace = stopTrace && await stopTrace(values.trace);
+  const traces = stopTrace && await Promise.all(stopTrace.map((stop, i) => {
+    const { dir, name, ext } = path.parse(values.trace);
+    return stop(i ? path.join(dir, name + '.B' + ext) : values.trace);
+  }));
   const { rounds = [], error: archiveError } = await archiveResult;
   let profileSummary;
   if (profiler) {
@@ -601,9 +603,9 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
   const leaderProgress = progress(leaderSteps, recent, ended), followerProgress = progress(actualSteps, recent, ended);
   const requests = coordinator.stepRequests.filter(row => row.startAt >= recent && row.startAt < ended ||
     row.tick >= recent && row.tick < ended);
-  if (trace) {
+  if (traces) {
     const prefix = 'tide.request.' + coordinator.page + '.';
-    const stamps = new Map(trace.traceEvents.filter(event => event.name.startsWith(prefix))
+    const stamps = new Map(traces[pages.indexOf(coordinator)].traceEvents.filter(event => event.name.startsWith(prefix))
       .map(event => [Number(event.name.slice(prefix.length)), event.args.data.callTime]));
     for (const request of requests) request.traceAt = stamps.get(request.sequence);
   }
@@ -628,20 +630,22 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
     const request = stepsByTick.get(phase.context);
     if (request && phase.at >= request.startAt && !Object.hasOwn(request.phases ??= {}, phase.phase)) request.phases[phase.phase] = phase.sync;
   }
-  const summaries = pages.map(page => {
+  const summaries = pages.map((page, i) => {
     const frames = page.frames.filter(sampled), noFish = frames.filter(frame => !frame.visible).length;
     const phases = {};
     for (const row of page.phases.filter(sampled)) (phases[row.phase] ||= []).push(row);
-    const presentations = trace && readPresentations(trace.traceEvents, page, recent, ended);
+    const presentations = traces && readPresentations(traces[i].traceEvents, page, recent, ended);
     return { leader: page.node === page.leader, fish: page.fish, simulationFailure: page.simulationFailure,
+      traceClockOffset: presentations?.clockOffsetMs,
       ...frameSummary(page, presentations, recent, ended, coordinator.steps, requests),
       visible: stats(frames.map(event => event.visible)), noFish, rejected: page.rejected, saves: stats(page.saves.filter(sampled).map(event => event.ms)),
       phases: Object.fromEntries(Object.entries(phases).map(([name, rows]) => [name, { sync: stats(rows.map(row => row.sync)), total: stats(rows.map(row => row.total)) }])),
       longestTasks: page.longTasks.filter(sampled).sort((a, b) => b.ms - a.ms).slice(0, 8),
       failed: page.receives.filter(event => event.failed), replicaFailures: page.replicaFailures, logs: page.logs };
   });
-  const confirmed = trace && bothDisplays(requests);
-  const schedule = trace && scheduledSteps(requests, clockPhase, step, recent, ended);
+  const traceClockSkewMs = traces && Math.abs(summaries[0].traceClockOffset - summaries[1].traceClockOffset);
+  const confirmed = traces && bothDisplays(requests);
+  const schedule = traces && scheduledSteps(requests, clockPhase, step, recent, ended);
   const dropped = coordinator.sends.filter(event => event.dropped && sampled(event));
   const droppedTicks = new Set(dropped.map(event => event.tick));
   const resumedTick = dropped.at(-1)?.tick + 500;
@@ -660,7 +664,7 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
   const replicaRows = Object.fromEntries(['fishes', 'chars', 'breeding', 'contacts', 'travel', 'ops', 'scenes']
     .map(field => [field, stats(received.flatMap(row => row.rows ? [row.rows[field]] : []))]));
   const report = JSON.stringify({ count, realBackup: Boolean(backup), browserVersion, cold, joinedMs: joined - joining, settledMs: recent - joining, steadyMs: ended - recent,
-    saved, liveWire, ...(switched ? { switched } : {}),
+    saved, liveWire, browserProcesses: browsers.length, traceClockSkewMs, ...(switched ? { switched } : {}),
     repairs: pages.map(page => ({ leader: page.node === page.leader,
       requested: page.repairs.filter(sampled).map(row => ({ afterMs: row.at - recent, correlated: row.correlated })),
       incoming: page.receives.filter(row => row.kind === 'merge' && sampled(row)).map(row => ({ afterMs: row.startAt - recent, ms: row.ms })) })),
@@ -680,6 +684,7 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
     summaries, profileStartedAt, profileSummary, errors }, null, 2);
   if (values.report) await writeFile(values.report, report + '\n');
   console.log(report);
+  if (traces) assert(traceClockSkewMs < 1, '两端跟踪时钟的映射差达到 1 毫秒，本次跨端耗时不可用');
   assertProgress(leaderProgress, ended - recent, '主端');
   if (dropSteps > 1 && resumed && resumeSent) {
     // Keep the full physical gap in the report. Check normal continuity up to
