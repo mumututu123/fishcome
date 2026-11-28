@@ -38,10 +38,11 @@ function recordDraw(renderer, frames, page, trace) {
   };
 }
 
-async function startTrace(browser, boundariesOnly) {
+async function startTrace(browser, boundariesOnly, profileRules = false) {
   const client = await browser.newBrowserCDPSession();
   const complete = once(client, 'Tracing.tracingComplete');
   const categories = ['devtools.timeline', 'blink.user_timing'];
+  if (profileRules) categories.push('disabled-by-default-v8.cpu_profiler');
   if (!boundariesOnly) categories.push('toplevel');
   await client.send('Tracing.start', { categories: categories.join(','), transferMode: 'ReturnAsStream' });
   return async filename => {

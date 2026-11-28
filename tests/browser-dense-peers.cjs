@@ -16,7 +16,8 @@ const { positionals, values } = parseArgs({ allowPositionals: true, options: {
   backup: { type: 'string' }, trace: { type: 'string' }, report: { type: 'string' }, 'refresh-budget': { type: 'boolean' },
   'archive-rounds': { type: 'string', default: '0' }, 'plain-live': { type: 'string' },
   'forget-live-base': { type: 'boolean' }, 'switch-leader': { type: 'boolean' }, 'rebuild-viewport': { type: 'boolean' },
-  'step-boundaries-only': { type: 'boolean' }, 'world-start': { type: 'string' }, 'headless-shell': { type: 'boolean' }
+  'step-boundaries-only': { type: 'boolean' }, 'world-start': { type: 'string' }, 'headless-shell': { type: 'boolean' },
+  'trace-cpu': { type: 'boolean' }
 } });
 if (values.help) {
   console.log('用法：node tests/browser-dense-peers.cjs [鱼数] [--seconds=35] [--full-updates=0|1] [--drop] [--profile=跟随端.cpuprofile]');
@@ -28,6 +29,7 @@ if (values.help) {
   console.log('--plain-live=A|B|both 模拟不支持紧凑发送的端；--forget-live-base 模拟跟随端遗失上一版本；--switch-leader 在观测后切换协调端。');
   console.log('--rebuild-viewport 用接收端旧的整表画面索引方式对照。');
   console.log('--step-boundaries-only 关闭各阶段的细分计时，保留请求、提交和呈现时间，用于对照观测开销。');
+  console.log('--trace-cpu 配合 --trace 在两端记录生态线程的实际调用栈和每步的起止，用于定位慢步。');
   console.log('--world-start=含时区的日期 用同一存档复现指定的游戏时刻，浏览器动画、网络和性能计时照常运行。');
   console.log('默认使用完整版 Chromium 的无界面模式；--headless-shell 用精简无界面浏览器复现软件合成对照。');
   process.exit(0);
@@ -56,6 +58,7 @@ assert(Number.isSafeInteger(seconds) && seconds >= 6 && seconds <= 90);
 assert(expectedFull === undefined || Number.isSafeInteger(expectedFull) && expectedFull >= 0);
 assert(!backup || !positionals.length, '使用真实存档时，鱼数从存档读取');
 assert(!values['refresh-budget'] || values.trace, '严格验收需要记录浏览器呈现');
+assert(!values['trace-cpu'] || values.trace, '采集生态线程调用栈需要指定 --trace');
 assert(Number.isSafeInteger(archiveRounds) && archiveRounds >= 0 && archiveRounds <= seconds / 2 && (!archiveRounds || backup), '归档轮次须为非负整数，每轮至少预留两秒，写新归档需要真实存档');
 assert(!values['plain-live'] || ['A', 'B', 'both'].includes(values['plain-live']), '--plain-live 应为 A、B 或 both');
 assert(!values['forget-live-base'] || !values['plain-live'], '遗失基准测试需要两端支持紧凑发送');
@@ -455,8 +458,10 @@ const timedStep = World.prototype.step;
 const timedReceive = WorkerSimulation.prototype.receive;
 let ruleTime;
 World.prototype.step = function (...args) {
+  ${values['trace-cpu'] ? "performance.mark('tide.ecology.' + args[0] + '.start');" : ''}
   const start = performance.now(), result = timedStep.apply(this, args);
   ruleTime = performance.now() - start;
+  ${values['trace-cpu'] ? "performance.mark('tide.ecology.' + args[0] + '.end');" : ''}
   return result;
 };
 WorkerSimulation.prototype.receive = function (message) {
@@ -575,7 +580,7 @@ async function main([urlA, urlB], assets) {
   }, { count, real: Boolean(backup) }, { polling: 100, timeout: count < 200 ? 20000 : 95000 })));
   const joined = observationNow();
   await Promise.all([a, b].map(page => page.waitForFunction(() => denseJoinSettled(), null, { polling: 125, timeout: 45000 })));
-  const stopTrace = values.trace && await Promise.all(browsers.map(browser => startTrace(browser, values['step-boundaries-only'])));
+  const stopTrace = values.trace && await Promise.all(browsers.map(browser => startTrace(browser, values['step-boundaries-only'], values['trace-cpu'])));
   if (stopTrace) await pause(300);
   const recent = observationNow();
   await survey({ a, b, fixture, cold, joining, joined, recent, stopTrace, browserVersion: browsers[0].version(), graphics });
