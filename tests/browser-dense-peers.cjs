@@ -587,10 +587,17 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
   }
   const pages = await Promise.all([a, b].map(page => page.evaluate(() => denseSurvey())));
   const archiveIds = [...fixture.archiveIds, ...rounds.map(round => round.id)];
+  assert.equal(new Set(archiveIds).size, archiveIds.length, '每轮应生成不同于历史记录的新归档');
   const saved = await Promise.all((backup ? [a, b] : [b]).map(page => page.evaluate(async ({ joinedFish, archiveIds }) => {
     const { get } = await import('/storage.js');
+    const { decodeArchive } = await import('/archive.js');
     const checkpoint = await get('checkpoint', { observeCheckpoint: false });
-    const payloads = await Promise.all(archiveIds.map(async id => checkpoint.world.archives.chunks[id] ? atob(await get('archive:' + id) || '').length : 0));
+    const payloads = await Promise.all(archiveIds.map(async id => {
+      const manifest = checkpoint.world.archives.chunks[id], encoded = await get('archive:' + id);
+      if (!encoded || manifest?.id !== id) return 0;
+      await decodeArchive(encoded, manifest);
+      return atob(encoded).length;
+    }));
     return { fish: joinedFish ? !!checkpoint.world.fishes[joinedFish] : Object.keys(checkpoint.world.fishes).length,
       archiveCount: payloads.filter(Boolean).length, archivedBytes: payloads.reduce((sum, n) => sum + n, 0), tick: checkpoint.world.tick };
   }, { joinedFish: fixture.joinedFish, archiveIds })));
