@@ -1,5 +1,5 @@
 import { bounds, hash } from './engine.js';
-import { fishNeighbors } from './life-neighbors.js';
+import { fishNeighbors, placeSchoolCenter, schoolBuckets } from './life-neighbors.js';
 import { schoolMembership } from './fish-school.js';
 import { advanceBond, bondLimit } from './bond-interval.js';
 import { WORLD_WIDTH, wrapX, deltaX, worldKey } from './geography.js';
@@ -125,8 +125,8 @@ function indexPoints(points) {
     return found;
   };
 }
-function schoolGeometry(world, layout, roster) {
-  const previous = layout.school, centerByBody = previous?.centerByBody ?? new WeakMap();
+function schoolGeometry(world, layout, roster, previous) {
+  const centerByBody = previous?.centerByBody ?? new WeakMap();
   if (layout.reshaped && previous?.roster === roster && previous.groups === layout.reshaped.before) {
     for (const id of layout.reshaped.ids) {
       const point = previous.points.get(id);
@@ -184,7 +184,7 @@ function schoolGeometry(world, layout, roster) {
 export function indexSchoolBodies(world, layout) {
   const roster = world.fishValues(), previous = layout.school;
   if (previous?.groups === layout.groups && previous.roster === roster) return previous;
-  return layout.school = schoolGeometry(world, layout, roster);
+  return layout.school = schoolGeometry(world, layout, roster, previous);
 }
 export function lifeContext(world, now, scenery, groups, sharedLayout) {
   const layout = sharedLayout || world.bodyLayout(groups);
@@ -214,9 +214,11 @@ export function lifeContext(world, now, scenery, groups, sharedLayout) {
   }
   const nearScenery = sceneryPoints.length ? indexPoints(sceneryPoints) : null;
   const nearObstacle = geometry.obstacles ??= new Uint8Array(ordered.length);
+  const buckets = schoolBuckets(geometry);
   for (const { fish, point: p, localX, localY } of geometry.centers) {
     p.x = wrapX(fish.x + fish.facing * localX);
     p.y = fish.y + localY;
+    placeSchoolCenter(buckets, p);
     nearObstacle[p.slot] = nearWalls[Math.floor(p.y / sectorSize)]?.[Math.floor(p.x / sectorSize)] || 0;
     if (!nearScenery || !nearObstacle[p.slot]) continue;
     const spots = nearScenery(p, 16);

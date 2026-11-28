@@ -1,24 +1,32 @@
 import { WORLD_WIDTH, MAX_FLOOR, deltaX } from './geography.js';
 
-export function fishNeighbors(geometry, canSeeLine) {
-  const { points, ordered, ranks } = geometry;
-  const n = ordered.length, stride = 2 ** Math.ceil(Math.log2(Math.max(1, n)));
-  const halfGrid = ordered.every(p => Number.isInteger(2 * p.x) && Number.isInteger(2 * p.y));
+export function schoolBuckets(geometry) {
+  const { ordered, ranks } = geometry, n = ordered.length;
   const uniqueRanks = n === 0 || ranks.get(ordered[n - 1]) === n - 1;
-  const size = uniqueRanks ? 5 : 10, columns = WORLD_WIDTH / size;
+  const size = uniqueRanks ? 5 : 10;
+  const buckets = geometry.buckets ??= { rows: [], bins: [], size, uniqueRanks };
+  for (const bin of buckets.bins) bin.length = 0;
+  buckets.halfGrid = true;
+  return buckets;
+}
+
+export function placeSchoolCenter(buckets, p) {
+  const row = buckets.rows[Math.floor(p.y / buckets.size)] ??= [];
+  const col = Math.floor(p.x / buckets.size);
+  if (!row[col]) { row[col] = []; buckets.bins.push(row[col]); }
+  row[col].push(p);
+  if (!Number.isInteger(2 * p.x) || !Number.isInteger(2 * p.y)) buckets.halfGrid = false;
+}
+
+export function fishNeighbors(geometry, canSeeLine) {
+  const { ordered, ranks, buckets: { rows, size, halfGrid, uniqueRanks } } = geometry;
+  const n = ordered.length, stride = 2 ** Math.ceil(Math.log2(Math.max(1, n))), columns = WORLD_WIDTH / size;
   // Twice the distance is exact on a half-cell grid. Unique ranks fit below the stride.
   const numericOrder = halfGrid && uniqueRanks && stride * 25 < 2 ** 32;
   const scratch = geometry.scratch ??= {
-    rows: [], bins: [], found: [], hits: new Uint32Array(n), distances: new Float64Array(n)
+    found: [], hits: new Uint32Array(n), distances: new Float64Array(n)
   };
-  const { rows, bins, found, hits, distances } = scratch;
-  for (const bin of bins) bin.length = 0;
-  for (const p of points.values()) {
-    const row = rows[Math.floor(p.y / size)] ??= [];
-    const col = Math.floor(p.x / size);
-    if (!row[col]) { row[col] = []; bins.push(row[col]); }
-    row[col].push(p);
-  }
+  const { found, hits, distances } = scratch;
   function collect(p, radius) {
     const extent = radius + Number.EPSILON * WORLD_WIDTH * 4;
     const lo = Math.floor((p.y - extent) / size), hi = Math.floor((p.y + extent) / size);
@@ -95,8 +103,7 @@ export function fishNeighbors(geometry, canSeeLine) {
     }
     return out;
   }
-  function crowded(p, radius, obstacle) {
-    const bins = collect(p, radius);
+  function crowded(p, radius, obstacle, bins = collect(p, radius)) {
     let best, bestGap = 2, bestRank = Infinity, bestDistance = Infinity;
     for (const bin of bins) for (const q of bin) {
       const j = q.slot;
@@ -181,5 +188,17 @@ export function fishNeighbors(geometry, canSeeLine) {
     return ordered[best];
   }
 
-  return { visitPairPartners, sorted, schoolSources, crowded: numericOrder ? crowdedHalfGrid : crowded };
+  let inspected = 0;
+  const wasDense = geometry.denseCrowd;
+  geometry.denseCrowd = false;
+  function nearestBody(p, radius, obstacle) {
+    if (!geometry.denseCrowd) {
+      const bins = collect(p, radius);
+      for (const bin of bins) inspected += bin.length;
+      if (inspected >= n) geometry.denseCrowd = true;
+      if (!wasDense && !geometry.denseCrowd) return crowded(p, radius, obstacle, bins);
+    }
+    return crowdedHalfGrid(p, radius, obstacle);
+  }
+  return { visitPairPartners, sorted, schoolSources, crowded: numericOrder ? nearestBody : crowded };
 }

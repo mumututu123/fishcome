@@ -138,6 +138,24 @@ test('避让时隔着环形边界的鱼与同侧鱼相距相同，按标识选�
   const blocked = lifeContext(w, t, w.sceneryMap(), groups);
   assert.equal(blocked.crowdedNeighbor(blocked.points.get('center')).id, 'second');
 });
+test('自然步移动和重建鱼群分区后，已打开的观察仍保留原来的鱼位与邻居', () => {
+  const w = world(), groups = new Map();
+  for (const [id, x] of [['center', 1], ['near', 999], ['far', 90]]) {
+    w.data.fishes[id] = { id, x, y: 20, facing: 1 };
+    groups.set(id, [cell(0, 0)]);
+  }
+  const layout = w.bodyLayout(groups), scenery = new Map();
+  lifeContext(w, t, scenery, groups, layout);
+  const observed = lifeContext(w, t, scenery, groups);
+  w.data.fishes.near.x = 98;
+  w.data.fishes.far.x = 2;
+  const working = lifeContext(w, t + 500, scenery, groups, layout);
+  for (const [ctx, id] of [[working, 'far'], [observed, 'near']]) {
+    for (let i = 0; i < 5; i++) assert.equal(ctx.crowdedNeighbor(ctx.points.get('center')).id, id);
+    assert.deepEqual(ctx.neighbors.get('center').map(p => p.id), [id]);
+  }
+  assert.equal(observed.points.get('near').x, 999);
+});
 test('旧存档的分数坐标保留距离边界上的单向视线', () => {
   const w = world(), a = fish(w, 7, 20), b = crypto.randomUUID();
   assert(w.apply({ id: b, actor: 'bob', t, kind: 'fish', x: 20, y: 9, cells: [cell(0, 0), cell(0, 1)], cost: 2 }).ok);
