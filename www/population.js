@@ -172,11 +172,16 @@ function updateVolcano(world, now, dt, transition, resume = false) {
     if (world.data.rocks[id]) { delete e.particles[id]; continue; }
     // Restoring a suspended world cools existing lava but never replays damage.
     const cooled = now >= c.born + POPULATION.cooling;
+    const moving = !resume && !cooled && !c.settled;
+    // Vertical particles have no horizontal progress. This also corrects the
+    // unused remainder left on stationary particles by older checkpoints.
+    if (c.drift === 0) c.cx = 0;
+    else if (moving) c.cx += dt * .25;
     if (!resume && !cooled) hit(c);
-    if (!resume && !cooled && !c.settled) {
+    if (moving) {
       const rising = c.rise > 0;
-      c.cy += dt * (rising ? 2 : .25); c.cx += dt * .25;
-      if (c.cx >= 1 && c.drift) { const x = wrapX(c.x + c.drift); if (world.waterAt(x, c.y) && !scenery.has(key(x, c.y)) && !hot.has(key(x, c.y))) { hot.delete(key(c.x, c.y)); c.x = x; hot.add(key(c.x, c.y)); hit(c); } c.cx = 0; }
+      c.cy += dt * (rising ? 2 : .25);
+      if (c.cx >= 1) { const x = wrapX(c.x + c.drift); if (world.waterAt(x, c.y) && !scenery.has(key(x, c.y)) && !hot.has(key(x, c.y))) { hot.delete(key(c.x, c.y)); c.x = x; hot.add(key(c.x, c.y)); hit(c); } c.cx = 0; }
       while (c.cy >= 1 && !c.settled) {
         const y = c.y + (c.rise > 0 ? -1 : 1);
         if (!world.waterAt(c.x, y) || scenery.has(key(c.x, y)) || hot.has(key(c.x, y))) { if (c.rise > 0) c.rise = 0; else c.settled = true; c.cy = 0; break; }

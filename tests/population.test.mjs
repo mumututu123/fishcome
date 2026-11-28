@@ -162,6 +162,32 @@ test('红色浆真实碰鱼致死；正好10分钟冷却不再伤鱼，岩石堆
   advance(w, cold.born + POPULATION.cooling); assert(w.data.fishes[coldFish]);
   assert(validRocks(w.data.rocks, w.data));
 });
+test('岩浆竖直移动超过四秒时，每一步仍可同步；恢复旧存档也能继续同步', async () => {
+  const w = world(), e = erupt(w), at = e.at + POPULATION.warning;
+  const c = particle(w, e, 0, e.x, 50, at);
+  c.settled = false;
+  c.rise = 4;
+  const peer = world();
+  peer.data = w.serialize();
+  for (let i = 0; i <= 10; i++) {
+    advance(w, at + i * 500);
+    const next = w.serialize();
+    await verifyReplica(next, {}, undefined, { current: peer.data });
+    peer.merge(next);
+    assert.equal(peer.data.population.eruption.particles[c.id].x, e.x);
+  }
+  assert(c.y < 50);
+  const legacy = w.serialize(), old = legacy.population.eruption.particles[c.id];
+  old.settled = true;
+  old.cx = 1.125;
+  await assert.rejects(verifyReplica(legacy, {}, undefined, { current: peer.data }), /生态控制/);
+  assert.throws(() => peer.merge(legacy), /生态控制/);
+  const recovered = restoreCheckpoint({ world: legacy, lastOnlineAt: legacy.tick }, legacy.tick + 500).world;
+  const saved = recovered.serialize(), corrected = saved.population.eruption.particles[c.id];
+  assert.deepEqual(corrected, { ...old, cx: 0 });
+  await verifyReplica(saved, {}, undefined, { current: peer.data });
+  peer.merge(saved);
+});
 test('岩石和康复合流顺序一致，旧快照不重新加热或重复沉积', () => {
   const w = world(), e = erupt(w), bornAt = e.at + POPULATION.warning, c = particle(w, e, 0, e.x, w.floorAt(e.x) - 1, bornAt), hot = w.serialize();
   advance(w, bornAt + POPULATION.cooling); w.merge(hot); w.merge(hot); assert.equal(Object.keys(w.data.rocks).length, 1); assert(!w.data.population.eruption.particles[c.id]);
