@@ -118,6 +118,16 @@ replicaPages = function* (body, frame) {
 `;
 const instrument = `
 const testData = { frames: [], steps: [], stepRequests: [], applied: [], sends: [], receives: [], merges: [], worldMerges: [], repairs: [], saves: [], liveBytes: [] };
+const stoppedSessions = [];
+const originalStop = ordered.stop;
+ordered.stop = function (reason, ...rest) {
+  const s = this.current;
+  if (s) stoppedSessions.push({ reason, at: Date.now(), base: s.base, tick: s.world.data.tick,
+    ms: Math.round(performance.now() - s.began), waiting: !!s.waiting, checking: !!s.checking, cut: !!s.cut?.proof,
+    history: !!s.reconciling, step: s.steps?.next?.tick, sealed: !!s.steps?.next?.sealed,
+    local: !!s.localReady, remote: !!s.remoteReady, running: !!s.running, stack: new Error().stack.split(String.fromCharCode(10)).slice(2, 10) });
+  return originalStop.call(this, reason, ...rest);
+};
 const stepRequests = new WeakMap();
 let activeStepMark, markNumber = 0;
 function markStep() {
@@ -279,7 +289,7 @@ window.denseSurvey = () => ({ ...testData, node: network?.node, leader: network 
   tick: world.data.tick, step: CONFIG.step, fish: Object.keys(world.data.fishes).length, rejected: network?.stats.rejected,
   phases: window.densePhases, longTasks: window.denseLongTasks, replicaFailures: window.denseReplicaFailures,
   liveTransfers: window.denseLiveTransfers,
-  orderedHistory: diagnostics.list().filter(log => log.source === 'ordered-steps').slice(-24),
+  orderedHistory: diagnostics.list().filter(log => log.source === 'ordered-steps').slice(-24), stoppedSessions,
   proofs: window.denseProofs || [], surface: renderer.ctx.getContextAttributes?.(),
   logs: diagnostics.list().filter(log => log.level === 'warn' || log.level === 'error').slice(-10) });
 window.denseCheckpointAt = tick => new Promise((resolve, reject) => {
@@ -744,7 +754,8 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
       visible: stats(frames.map(event => event.visible)), noFish, rejected: page.rejected, saves: stats(page.saves.filter(sampled).map(event => event.ms)),
       phases: Object.fromEntries(Object.entries(phases).map(([name, rows]) => [name, { sync: stats(rows.map(row => row.sync)), total: stats(rows.map(row => row.total)) }])),
       longestTasks: page.longTasks.filter(sampled).sort((a, b) => b.ms - a.ms).slice(0, 8),
-      failed: page.receives.filter(event => event.failed), replicaFailures: page.replicaFailures, logs: page.logs, orderedHistory: page.orderedHistory };
+      failed: page.receives.filter(event => event.failed), replicaFailures: page.replicaFailures, logs: page.logs,
+      orderedHistory: page.orderedHistory, stoppedSessions: page.stoppedSessions };
   });
   const offsets = traces && summaries.flatMap(page => page.traceClockOffsets ?? []);
   const traceClockSkewMs = offsets?.length === 4 ? Math.max(...offsets) - Math.min(...offsets) : undefined;
