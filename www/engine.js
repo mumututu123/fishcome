@@ -593,7 +593,14 @@ export class World {
     const ambient = this.ambient ? lifeContext(this, now, scenery, groups, fishOccupancy.layout) : null; if (ambient) updateLife(this, now, ambient);
     for (const c of looseFood) if (freshPlankton(c) && now - c.born >= LIFE.planktonLife) { transition(c, { kind: 'burn', entity: '' }, { id: `dissolve:${c.id}`, t: c.born + LIFE.planktonLife, reason: 'dissolve' }); this.dirty = true; }
     const foods = looseFood.filter(c => c.kind === 'food').sort((a, b) => a.born - b.born || a.id.localeCompare(b.id));
-    const foodCount = new Map(); for (const c of foods) foodCount.set(key(c.x, c.y), (foodCount.get(key(c.x, c.y)) || 0) + 1);
+    const foodPositions = new Map();
+    function enterFood(at) { foodPositions.set(at, (foodPositions.get(at) || 0) + 1); }
+    function leaveFood(at) {
+      const count = foodPositions.get(at);
+      if (count > 1) foodPositions.set(at, count - 1);
+      else foodPositions.delete(at);
+    }
+    for (const c of foods) enterFood(key(c.x, c.y));
     const contact = food => {
       const neighbors = fishOccupancy.foodContacts(food, scenery, canEat);
       if (neighbors) return neighbors;
@@ -606,34 +613,35 @@ export class World {
       return [...ids].filter(id => !fishOccupancy.get(food.x, food.y)?.has(id) && canEat(id) && touching(this.data.fishes[id], groups.get(id), food, scenery));
     };
     for (const c of foods) {
-      if (now - c.born >= CONFIG.foodLife && scenery.has(key(c.x, c.y))) {
+      const age = now - c.born;
+      if (age >= CONFIG.foodLife && scenery.has(key(c.x, c.y))) {
         // Stacked food may expire in the same cell. Preserve it in the nearest free supported slot.
         let slot;
         for (let r = 1; r <= CONFIG.depth + CONFIG.width && !slot; r++) for (let dx = -r; dx <= r && !slot; dx++) {
           const dy = r - Math.abs(dx); for (const sy of dy ? [-dy, dy] : [0]) {
             const x = wrapX(c.x + dx), y = c.y + sy, k = key(x, y);
-            if (this.waterAt(x, y) && !scenery.has(k) && !fishOccupancy.get(x, y) && !(foodCount.get(k) > 0) && (y === this.floorAt(x) - 1 || scenery.has(key(x, y + 1)))) { slot = [x, y]; break; }
+            if (this.waterAt(x, y) && !scenery.has(k) && !fishOccupancy.has(x, y) && !foodPositions.has(k) && (y === this.floorAt(x) - 1 || scenery.has(key(x, y + 1)))) { slot = [x, y]; break; }
           }
         }
-        if (slot) { const old = key(c.x, c.y); foodCount.set(old, Math.max(0, foodCount.get(old) - 1)); [c.x, c.y] = slot; foodCount.set(key(c.x, c.y), 1); c.moveAt = now; }
+        if (slot) { leaveFood(key(c.x, c.y)); [c.x, c.y] = slot; enterFood(key(c.x, c.y)); c.moveAt = now; }
       }
-      const blocked = c.y >= this.floorAt(c.x) - 1 || scenery.has(key(c.x, c.y + 1)), eatContact = now - c.born < CONFIG.foodLife && contact(c).length;
-      if (now - c.born >= CONFIG.foodLife && blocked && !fishOccupancy.get(c.x, c.y) && !scenery.has(key(c.x, c.y))) {
+      const x = c.x, floor = this.floorAt(x);
+      let y = c.y;
+      const below = key(x, y + 1);
+      const blocked = y >= floor - 1 || scenery.has(below), eatContact = age < CONFIG.foodLife && contact(c).length;
+      if (age >= CONFIG.foodLife && blocked && !fishOccupancy.has(x, y) && !scenery.has(key(x, y))) {
+        leaveFood(key(x, y));
         const support = scenery.get(key(c.x, c.y + 1)), id = this.data.scenes[support?.scene.id] ? support.scene.id : `deposit:${c.id}:${c.path.length}`;
         if (!this.data.scenes[id]) this.data.scenes[id] = { id, actor: c.payer, nick: this.data.participants[c.payer] || '自然沉积', x: c.x, y: c.y, posAt: now, poseId: id };
         const s = this.data.scenes[id], px = c.x, py = c.y; transition(c, { kind: 'scene', entity: id, x: deltaX(c.x, s.x), y: c.y - s.y }, { id: `settle:${c.id}:${c.path.length}`, t: c.born + CONFIG.foodLife, reason: 'expire' }); this.dirty = true; scenery.set(key(px, py), { scene: s, cell: c }); continue;
       }
-      let y = c.y;
-      let fall = blocked || eatContact || fishOccupancy.get(c.x, y + 1) || foodCount.get(key(c.x, y + 1)) > 0
+      let fall = blocked || eatContact || fishOccupancy.has(x, y + 1) || foodPositions.has(below)
         ? 0 : (c.fall || 0) + dt * CONFIG.depth / 300;
-      const floor = this.floorAt(c.x);
-      while (fall >= 1 && y + 1 < floor && !scenery.has(key(c.x, y + 1)) &&
-          !fishOccupancy.get(c.x, y + 1) && !(foodCount.get(key(c.x, y + 1)) > 0)) {
-        const old = key(c.x, y);
-        foodCount.set(old, Math.max(0, foodCount.get(old) - 1));
+      while (fall >= 1 && y + 1 < floor && !scenery.has(key(x, y + 1)) &&
+          !fishOccupancy.has(x, y + 1) && !foodPositions.has(key(x, y + 1))) {
+        leaveFood(key(x, y));
         y++; fall--;
-        const next = key(c.x, y);
-        foodCount.set(next, (foodCount.get(next) || 0) + 1);
+        enterFood(key(x, y));
       }
       this.setFoodMotion(c, y, fall, now);
     }
@@ -641,9 +649,7 @@ export class World {
     if (seaweed.length || edible.some(c => !Number.isFinite(c.born))) {
       edible.sort((a, b) => (a.born ?? a.created) - (b.born ?? b.created) || a.id.localeCompare(b.id));
     }
-    const foodPositions = new Set();
-    for (const c of foods) if (c.kind === 'food') foodPositions.add(key(c.x, c.y));
-    for (const c of seaweed) foodPositions.add(key(c.x, c.y));
+    for (const c of seaweed) enterFood(key(c.x, c.y));
     const turningObstacles = new Map(scenery); for (const cell of edible) if (cell.kind === 'seaweed') turningObstacles.set(key(cell.x, cell.y), {});
     const waitingToEat = new Set(); for (const food of edible) for (const id of contact(food)) waitingToEat.add(id);
     const foodsNear = foodSight(edible);

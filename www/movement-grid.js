@@ -67,6 +67,10 @@ export class MovementGrid {
     if (slot <= 0) return slot && this.overlaps.get(k) || undefined;
     return this.singles[slot] ??= new Set([this.owners[slot]]);
   }
+  has(x, y) {
+    const cell = this.index(x, y);
+    return typeof cell === 'number' ? this.cells[cell] !== 0 : this.fractional.has(cell);
+  }
   foodContacts(food, scenery, canEat) {
     const { x, y } = food;
     if (!this.integerCells || this.overlapped || this.unsafeHorizontal || !Number.isInteger(x) ||
