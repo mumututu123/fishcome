@@ -72,7 +72,7 @@ const sendLivePacket = ReplicaTransfers.prototype.sendLivePacket;
 ReplicaTransfers.prototype.sendLivePacket = async function (peer, lane, body) {
   const startAt = Date.now(), start = performance.now();
   const id = await sendLivePacket.call(this, peer, lane, body);
-  window.denseLiveTransfers.push({ tick: body.world.tick, compact: Boolean(body.rowBase), resent: !id, startAt,
+  window.denseLiveTransfers.push({ tick: body.world.tick, fromTick: body.fromTick, compact: Boolean(body.rowBase), resent: !id, startAt,
     at: Date.now(), ms: performance.now() - start });
   return id;
 };
@@ -649,6 +649,7 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
   const transfers = coordinator.liveTransfers.filter(sampled);
   const liveWire = { bytes: coordinator.liveBytes.filter(sampled).reduce((sum, row) => sum + row.bytes, 0),
     plain: transfers.filter(row => !row.compact).length, compact: transfers.filter(row => row.compact && !row.resent).length,
+    compactAcrossSteps: transfers.filter(row => row.compact && !row.resent && row.tick - row.fromTick > 500).length,
     missingBase: transfers.filter(row => row.resent).length, elapsed: stats(transfers.map(row => row.ms)) };
   const switched = values['switch-leader'] && await switchLeader([a, b], coordinator.node, follower.node);
   const replicaRows = Object.fromEntries(['fishes', 'chars', 'breeding', 'contacts', 'travel', 'ops', 'scenes']

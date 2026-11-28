@@ -5,14 +5,14 @@ import { supportsPoseBytes } from './replica-row-delta.js';
 const CHUNK = 16000, MAX_PEERS = 8, MAX_RAW = 32 * 1024 * 1024, encoder = new TextEncoder(), decoder = new TextDecoder();
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const replicaRowsVersion = 1;
-const replicaOffer = { replicaPages: 1, replicaLive: 1, replicaRows: replicaRowsVersion, replicaFrames: 1, replicaPoseBytes: Number(supportsPoseBytes), replicaJourneys: 1 };
+const replicaOffer = { replicaPages: 1, replicaLive: 1, replicaRows: replicaRowsVersion, replicaFrames: 1, replicaPoseBytes: Number(supportsPoseBytes), replicaTransitions: 1 };
 const signedPageBytes = new WeakMap();
 function replicaCapabilities(peer, signal) {
   peer.replicaPages = signal.replicaPages === 1;
   peer.replicaLive = peer.replicaPages && signal.replicaLive === 1;
   peer.replicaRows = peer.replicaLive && replicaRowsVersion === 1 && signal.replicaRows === 1;
   peer.replicaFrames = peer.replicaRows && signal.replicaFrames === 1;
-  peer.replicaJourneys = peer.replicaFrames && signal.replicaJourneys === 1;
+  peer.replicaTransitions = peer.replicaFrames && signal.replicaTransitions === 1;
   peer.replicaPoseBytes = peer.replicaFrames && supportsPoseBytes && signal.replicaPoseBytes === 1;
 }
 const DIRECT_ERROR = '入口可访问，但浏览器直连未建立，请检查双方网络及防火墙后重试';

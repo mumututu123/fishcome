@@ -244,8 +244,14 @@ function todayOnly(old, next, day) {
   return before.every((key, index) => key === after[index] && (key === day || old.days[key] === next.days[key]));
 }
 
-export function encodeReplicaRowDelta(body, base, frames = false, poseBytes = false, journeys = false) {
-  if (!base || body.delta !== true || body.world.tick !== base.tick + CONFIG.step) return body;
+function encodableRange(body, base, transitions) {
+  const elapsed = body.world.tick - base.tick;
+  return elapsed === CONFIG.step || transitions && body.fromTick === base.tick &&
+    Number.isSafeInteger(elapsed) && elapsed >= 0 && elapsed % CONFIG.step === 0;
+}
+
+export function encodeReplicaRowDelta(body, base, frames = false, poseBytes = false, transitions = false) {
+  if (!base || body.delta !== true || !encodableRange(body, base, frames && transitions)) return body;
   const compact = frames && !!base.travel;
   const day = compact ? shanghaiDay(body.world.tick) : null;
   const source = compact && committedStepFields.get(body.world);
@@ -272,7 +278,7 @@ export function encodeReplicaRowDelta(body, base, frames = false, poseBytes = fa
           ? candidate.day === day && candidate.follows(oldTravel) : todayOnly(travelRow(oldTravel), candidate, day))) {
         const ordinal = fishIndices.get(id);
         const distance = candidate instanceof DailyDistance ? candidate.distance : candidate.days[day];
-        if (journeys) {
+        if (transitions) {
           const before = oldTravel instanceof DailyDistance && oldTravel.day === day ? oldTravel.distance : travelRow(oldTravel).days[day] || 0;
           if (before + 1 === distance || before + Math.SQRT2 === distance) {
             rows[next++] = ordinal * 2 + Number(before + 1 !== distance);
@@ -343,10 +349,10 @@ function unpackPoses(encoded, base, tick) {
   return rows;
 }
 
-export function decodeReplicaRowDelta(body, base, frames = false, poseBytes = false, journeys = false) {
+export function decodeReplicaRowDelta(body, base, frames = false, poseBytes = false, transitions = false) {
   if (typeof body.rowBase !== 'string' || body.rowBase.length !== 36 || body.delta !== true) throw new Error('无效的实时变更版本');
   if (base?.id !== body.rowBase) return null;
-  if (body.world.tick !== base.tick + CONFIG.step) throw new Error('实时变更不连续');
+  if (!encodableRange(body, base, frames && body.frameRows === true && transitions)) throw new Error('实时变更不连续');
   const { rowBase, frameRows, ...message } = body;
   if (frameRows !== undefined && (frameRows !== true || !frames || !base.travel)) throw new Error('伙伴未确认实时帧格式');
   const day = frameRows ? shanghaiDay(message.world.tick) : null;
@@ -375,7 +381,7 @@ export function decodeReplicaRowDelta(body, base, frames = false, poseBytes = fa
         if (offset !== values.length || !values.every(Number.isFinite)) throw new Error('无效的实时鱼位置');
         fish.posAt = message.world.tick;
         row = [before[0], fish];
-      } else if (frameRows && journeys && rowsIndex === 2 && typeof entry === 'number') {
+      } else if (frameRows && transitions && rowsIndex === 2 && typeof entry === 'number') {
         const ordinal = Math.floor(entry / 2);
         const id = Number.isSafeInteger(entry) && entry >= 0 && base.fishIds[ordinal];
         const old = id && travelRow(base.travel.get(id));

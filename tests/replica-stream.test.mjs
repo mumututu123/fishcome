@@ -548,6 +548,28 @@ test('紧凑更新重建字段和鱼行顺序，切主或缺步原样发送', ()
   assert.equal(encodeReplicaRowDelta(takeover, base), takeover);
 });
 
+test('同一步归档和积压的多步更新都使用对方确认的行，前态有缺口或伙伴不支持时沿用原格式', () => {
+  const before = { tick: 500, fishes: { a: { x: 2 }, b: { x: 1 } }, chars: { c: { owner: 'a' } }, travel: {}, life: {} };
+  const base = replicaRowBase(crypto.randomUUID(), before, true);
+  const packet = (fromTick, tick, fishes, chars) => ({ fromTick, delta: true, world: { ...before, tick, fishes, chars } });
+  const first = packet(500, 1000, { a: { x: 3 } }, { c: { owner: 'b' } });
+  const second = packet(1000, 1500, { b: { x: 4 } }, {});
+  for (const edits of [packet(500, 500, {}, { c: { owner: 'b' } }), coalesceWorld(first, second)]) {
+    const wire = encodeReplicaRowDelta(edits, base, true, false, true);
+    assert.equal(wire.rowBase, base.id);
+    const reader = new ReplicaReader(true);
+    let received;
+    for (const page of replicaPages(wire, true)) received = reader.append(page.text, page.last);
+    assert.deepEqual(decodeReplicaRowDelta(received, base, true, false, true), edits);
+    assert.equal(decodeReplicaRowDelta(received, null, true, false, true), null);
+    assert.throws(() => decodeReplicaRowDelta(received, base, true), /不连续/);
+    assert.equal(encodeReplicaRowDelta(edits, base, true), edits);
+    for (const bad of [{ ...edits, fromTick: 1000 }, { ...edits, world: { ...edits.world, tick: 751 } }]) {
+      assert.equal(encodeReplicaRowDelta(bad, base, true, false, true), bad);
+    }
+  }
+});
+
 for (const frames of [false, true]) test(`一端遗失基准时原格式重发，随后恢复${frames ? '实时帧' : '旧伙伴格式'}`, async t => {
   const peer = { node: 'follower', replicaLive: true, replicaRows: true, replicaFrames: frames, confirmedReplica: 'joined' };
   const via = { node: 'leader', replicaLive: true, replicaRows: true, replicaFrames: frames };
