@@ -18,16 +18,10 @@ function plants(seaweed) {
   for (const cells of groups.values()) cells.sort((a, b) => a.wild.index - b.wild.index || a.id.localeCompare(b.id));
   return groups;
 }
-function occupied(world, scenery, monument) {
-  const blocked = new Set(scenery.keys());
-  for (const cell of world.charValues('fish', 'food', 'seaweed')) {
-    if (cell.kind === 'food' || cell.kind === 'seaweed') blocked.add(key(cell.x, cell.y));
-    else if (cell.kind === 'fish') {
-      const f = world.data.fishes[cell.entity];
-      if (f) blocked.add(key(f.x + f.facing * cell.x, f.y + cell.y));
-    }
-  }
-  monument.rows.forEach((row, dy) => Array.from(row).forEach((ch, dx) => { if (ch !== ' ') blocked.add(key(monument.x + dx, monument.y + dy)); }));
+function plantObstacles(world, monument) {
+  const blocked = new Map();
+  for (const cell of world.charValues('food', 'seaweed')) blocked.set(key(cell.x, cell.y), true);
+  monument.rows.forEach((row, dy) => Array.from(row).forEach((ch, dx) => { if (ch !== ' ') blocked.set(key(monument.x + dx, monument.y + dy), true); }));
   return blocked;
 }
 export function updateSeaweed(world, now, config, monument, hash, transition) {
@@ -36,10 +30,15 @@ export function updateSeaweed(world, now, config, monument, hash, transition) {
   const groups = plants(world.charValues('seaweed')), growing = world.data.seaweedHour < currentHour;
   if (!growing && !groups.size) return;
   const scenery = world.sceneryMap();
-  let blocked;
+  let blocked, grid;
+  const fishGrid = () => grid ??= world.movementGrid(world.fishGroups());
   const circular = config.width === WORLD_WIDTH, canonical = x => circular ? wrapX(x) : x, bottom = x => circular ? world.floorAt(x) : config.depth;
-  const fits = (x, y) => (circular || x >= 0 && x < config.width) && y >= 0 && y < bottom(x) && !blocked.has(key(x, y));
-  const density = world.ambient && growing ? densityField(world, scenery) : null;
+  const fits = (x, y) => {
+    if (!(circular || x >= 0 && x < config.width) || y < 0 || y >= bottom(x)) return false;
+    const at = key(x, y);
+    return !(blocked.get(at) ?? (scenery.has(at) || fishGrid().get(x, y)));
+  };
+  const density = world.ambient && growing ? densityField(world, scenery, fishGrid().integerCells ? grid.cells : undefined) : null;
   // A severed stem or removed support becomes loose, edible food.
   for (const cells of groups.values()) {
     const root = cells[0], source = root.wild.source, candidate = source.startsWith('cell:') ? world.data.chars[source.slice(5)] : null, support = candidate?.kind === 'scene' ? candidate : null;
@@ -52,7 +51,7 @@ export function updateSeaweed(world, now, config, monument, hash, transition) {
       if (!connected) { transition(cell, { kind: 'food', entity: '', born: now, fall: 0 }, { id: `uproot:${cell.id}`, t: now, reason: 'uproot' }); world.foodRevision++; world.dirty = true; }
     }
   }
-  if (growing) blocked = occupied(world, scenery, monument);
+  if (growing) blocked = plantObstacles(world, monument);
   // Use one reproducible trial per source and hour; replicas do not reroll.
   for (let hour = world.data.seaweedHour + 1; hour <= currentHour; hour++) {
     const at = hour * HOUR, sources = [];
@@ -69,7 +68,7 @@ export function updateSeaweed(world, now, config, monument, hash, transition) {
       if (!choices.length) continue;
       const p = choices[hash(`seaweed-place:${id}`) % choices.length], plant = source.plant || id;
       world.data.chars[id] = { id, payer: '', ch: '草', color: GREENS[hash(id) % GREENS.length], kind: 'seaweed', entity: plant, x: p.x, y: p.y, created: at, moveAt: now, path: [], wild: { source: source.id, hour, plant, index: source.index || 0, x: p.x, y: p.y } };
-      blocked.add(key(p.x, p.y)); world.dirty = true;
+      blocked.set(key(p.x, p.y), true); world.dirty = true;
     }
   }
   world.data.seaweedHour = Math.max(world.data.seaweedHour, currentHour);
@@ -78,8 +77,8 @@ export function updateSeaweed(world, now, config, monument, hash, transition) {
   for (const [id, original] of growing ? plants(world.charValues('seaweed')) : groups) {
     const cells = growing ? original : original.filter(cell => cell.kind === 'seaweed');
     if (cells.length <= 2) continue;
-    blocked ??= occupied(world, scenery, monument);
-    for (const cell of cells) blocked.delete(key(cell.x, cell.y));
+    blocked ??= plantObstacles(world, monument);
+    for (const cell of cells) blocked.set(key(cell.x, cell.y), false);
     const direction = hash(`seaweed-sway:${id}:${phase}`) % 3 - 1, proposed = [{ x: cells[0].x, y: cells[0].y }];
     let safe = fits(cells[0].x, cells[0].y);
     for (let index = 1; index < cells.length; index++) {
@@ -89,6 +88,6 @@ export function updateSeaweed(world, now, config, monument, hash, transition) {
       proposed.push({ x, y });
     }
     if (safe) for (const [index, cell] of cells.entries()) if (cell.x !== canonical(proposed[index].x)) { cell.swayFromX = cell.x; cell.swayAt = now; cell.x = canonical(proposed[index].x); cell.moveAt = now; world.dirty = true; }
-    for (const cell of cells) blocked.add(key(cell.x, cell.y));
+    for (const cell of cells) blocked.set(key(cell.x, cell.y), true);
   }
 }
