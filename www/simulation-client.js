@@ -311,7 +311,7 @@ export class SimulationClient {
     }
     // A seed or an interrupted first load has no exact previous generation.
     // Keep its pages for the ordinary authenticated admission.
-    if (changes && !rebase && (!this.owner || this.hasSavedCharacters(world))) return;
+    if (changes && !rebase) return;
     this.followed = await this.startTask(world, () => this.open(world, valid, undefined, rebase));
   }
   async compute(world, message, valid) {

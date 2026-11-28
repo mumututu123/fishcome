@@ -169,6 +169,8 @@ test('连续两次已核合流只更新热线程里变过的鱼元，保留旧�
     const revision = worldRevision(replica), prior = replica.data.tick;
     worldEdited(replica);
     await client.followVerifiedReplica(replica, prior - CONFIG.step, revision, { chars: new Set() }, () => true);
+    assert.equal(workers.length, 1);
+    await client.prepareAgreed(replica, () => true);
     assert.equal(workers.length, 2);
     assert.equal(sent.findLast(message => message.kind === 'open').rebase, undefined);
   } finally { client.close(); cold.close(); }
