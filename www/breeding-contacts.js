@@ -102,10 +102,7 @@ function waitingTime(density, grid, father, mother, scenery) {
   return Infinity;
 }
 
-// Every adjacent pair on an integer grid belongs to exactly one rounded midpoint.
-// Visit the horizontal, vertical and two diagonal edges at that midpoint. A pair
-// with several edges still takes its waiting time from its canonical touching glyphs.
-export function collectGridPairs(world, grid, scenery, roster, taken, captured, pairs) {
+export function indexContactBodies(grid, roster) {
   const { males, females, probeCount } = roster;
   if (!males.length || !females.size || !grid?.integerCells || !grid.cells || grid.overlapped ||
       grid.fractional?.size || probeCount < grid.cells.length || !gridBodies(grid.layout)) return false;
@@ -115,6 +112,14 @@ export function collectGridPairs(world, grid, scenery, roster, taken, captured, 
     for (const fish of males) roster.sex[grid.slots.get(fish.id)] = 1;
     for (const id of females) roster.sex[grid.slots.get(id)] = 2;
   }
+  return true;
+}
+
+// Every adjacent pair on an integer grid belongs to exactly one rounded midpoint.
+// Visit the horizontal, vertical and two diagonal edges at that midpoint. A pair
+// with several edges still takes its waiting time from its canonical touching glyphs.
+export function collectGridPairs(world, grid, scenery, roster, taken, captured, pairs) {
+  if (!indexContactBodies(grid, roster)) return false;
   const sex = taken.size || captured.size ? roster.sex.slice() : roster.sex, count = sex.length;
   for (const id of taken) sex[grid.slots.get(id)] = 0;
   for (const id of captured) sex[grid.slots.get(id)] = 0;

@@ -181,12 +181,16 @@ function schoolGeometry(world, layout, roster) {
   return { groups: layout.groups, roster, points, centers, centerByBody, ordered, ranks, orderedPairs, ordinalIds, maxRadius };
 }
 
+export function indexSchoolBodies(world, layout) {
+  const roster = world.fishValues(), previous = layout.school;
+  if (previous?.groups === layout.groups && previous.roster === roster) return previous;
+  return layout.school = schoolGeometry(world, layout, roster);
+}
 export function lifeContext(world, now, scenery, groups, sharedLayout) {
-  const layout = sharedLayout || world.bodyLayout(groups), roster = world.fishValues();
+  const layout = sharedLayout || world.bodyLayout(groups);
   // Only the simulation loop lends its workspace to the next tick. Public
   // contexts requested by tools and the renderer retain their own positions.
-  const geometry = sharedLayout?.school?.groups === groups && sharedLayout.school.roster === roster ? sharedLayout.school : schoolGeometry(world, layout, roster);
-  if (sharedLayout) sharedLayout.school = geometry;
+  const geometry = sharedLayout ? indexSchoolBodies(world, layout) : schoolGeometry(world, layout, world.fishValues());
   const { points, ordered, maxRadius } = geometry;
   const sortedNeighbors = new Map(), scenes = new Map();
   const sceneryPoints = [], blockedRows = [], nearWalls = [], wallSectors = new Set();

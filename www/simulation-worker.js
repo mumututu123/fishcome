@@ -1,5 +1,8 @@
 import { BodyMembership } from './body-membership.js';
 import { BodyLayout } from './motion-hull.js';
+import { contactRoster } from './breeding.js';
+import { indexContactBodies } from './breeding-contacts.js';
+import { indexSchoolBodies } from './life.js';
 import { World, CONFIG, indexEcologyCharacters } from './engine.js';
 import { shanghaiDay } from './fish-status.js';
 import { worldTables } from './simulation-changes.js';
@@ -625,7 +628,10 @@ export class WorkerSimulation {
       // Index the checkpoint's existing bodies while loading it. Building
       // these lookups needs no future time, input, or simulated movement.
       const groups = this.world.ecologyCharacters().groups;
-      this.world.movementGrid(groups).swimmers(this.world, CONFIG.speed);
+      const grid = this.world.movementGrid(groups);
+      grid.swimmers(this.world, CONFIG.speed);
+      indexContactBodies(grid, contactRoster(this.world, groups));
+      if (this.world.ambient) indexSchoolBodies(this.world, grid.layout);
     } else if (message.kind === 'history') {
       Object.assign(this.world.data.life, message.parts);
       this.tracker.reset();

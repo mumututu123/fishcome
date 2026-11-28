@@ -164,7 +164,7 @@ function contactWait(density, father, fatherCells, mother, motherCells, scenery,
   return contactTime(density((p.x + nearX(q.x, p.x)) / 2, (p.y + q.y) / 2));
 }
 const contactRosters = new WeakMap();
-function contactRoster(world, groups) {
+export function contactRoster(world, groups) {
   const revision = world.originRevision?.(), previous = contactRosters.get(world);
   if (previous && previous.revision === revision && previous.groups === groups) return previous;
   const changed = previous && previous.revision === revision && world.bodyEdits?.(previous.groups, groups);
