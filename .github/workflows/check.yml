@@ -54,6 +54,9 @@ jobs:
       - name: Verify interrupted first join in Chromium
         working-directory: source
         run: node tests/browser-replica-scale.cjs 10000
+      - name: Verify continuous play across a missed update and a checkpoint cycle
+        working-directory: source
+        run: node tests/browser-dense-peers.cjs 120 --seconds=35 --full-updates=0 --drop
       - name: Verify feeding, camera input and background steps in Chromium
         working-directory: source
         run: node tests/browser-fish-capacity.cjs 1000 15

@@ -24,13 +24,21 @@ export function activeLegend(data, now = data.tick) {
   for (const e of Object.values(data.legends?.events || {})) { if (now < e.at || now >= e.slot * LEGENDS.period + 3600000) continue; const s = legendSchedule(data.roots, e.seed, e.slot); if (s && now < s.ends) candidates.push({ ...e, ...s }); }
   return candidates.sort((a, b) => a.started - b.started || a.id.localeCompare(b.id))[0] || null;
 }
-export function capturedFish(data, fish, now = data.tick) {
+function* currentCaptures(data, now) {
   for (const e of Object.values(data.legends?.events || {}).sort((a, b) => a.at - b.at || a.seed.localeCompare(b.seed))) {
     if (now >= e.slot * LEGENDS.period + 600000 || !Object.keys(e.arms).length) continue;
     const s = legendSchedule(data.roots, e.seed, e.slot); if (s?.kind !== 'cthulhu' || now >= s.ends) continue;
-    for (const [arm, capture] of Object.entries(e.arms)) if (capture.fish === fish && capture.at <= now) return { ...capture, arm: +arm, event: e, schedule: s };
+    for (const [arm, capture] of Object.entries(e.arms)) if (capture.at <= now) yield { ...capture, arm: +arm, event: e, schedule: s };
   }
+}
+export function capturedFish(data, fish, now = data.tick) {
+  for (const capture of currentCaptures(data, now)) if (capture.fish === fish) return capture;
   return null;
+}
+export function capturedFishIds(data, now = data.tick) {
+  const fish = new Set();
+  for (const capture of currentCaptures(data, now)) fish.add(capture.fish);
+  return fish;
 }
 export function retargetCapture(data, fish, now) {
   const held = capturedFish(data, fish, now), f = data.fishes[fish]; if (!held || !f) return;

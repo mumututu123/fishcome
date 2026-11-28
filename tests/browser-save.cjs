@@ -144,13 +144,13 @@ async function concurrentCheckpoints(context) {
   const writer = await context.newPage(), other = await context.newPage();
   await Promise.all([writer.goto(origin + '/welcome.html'), other.goto(origin + '/welcome.html')]);
   const snapshot = await writer.evaluate(async () => {
-    const { putMany } = await import('./storage.js');
+    const { atCheckpointBoundary, putMany } = await import('./storage.js');
     const { beforeCheckpointPatch, noteCheckpointChanges } = await import('./checkpoint-pages.js');
     const world = { tick: 1, fishes: {} };
     for (let i = 0; i < 16384; i++) world.fishes['f' + i] = { x: i };
     const save = (captureCheckpoint = true) => putMany(() => [['known', ['local']], ['checkpoint', { world, at: world.tick }]], { simulationChanges: true, captureCheckpoint });
     const original = IDBObjectStore.prototype.put;
-    let edited = false;
+    let edited = false, merged;
     IDBObjectStore.prototype.put = function(value, key) {
       if (!edited && Array.isArray(key)) {
         edited = true;
@@ -161,18 +161,26 @@ async function concurrentCheckpoints(context) {
           for (const [id, row] of patch.tables.fishes.set) world.fishes[id] = row;
           world.tick++;
           noteCheckpointChanges(world, patch);
+          merged = atCheckpointBoundary(world, () => {
+            world.fishes.f10000.x = -10;
+            noteCheckpointChanges(world, null);
+          });
+          if (world.fishes.f10000.x !== 10000) throw new Error('原地合流覆盖了正在读取的存档');
         });
       }
       return original.call(this, value, key);
     };
     try {
-      const before = await save(), after = await save();
+      const before = await save();
+      await merged;
+      const after = await save();
       window.persistWorld = save;
       return [before.at, before.world.fishes.f12000.x, before.world.fishes.f15000.x, !!before.world.fishes.new,
-        after.at, after.world.fishes.f12000.x, !!after.world.fishes.f15000, after.world.fishes.new.x];
+        after.at, after.world.fishes.f12000.x, !!after.world.fishes.f15000, after.world.fishes.new.x,
+        before.world.fishes.f10000.x, after.world.fishes.f10000.x];
     } finally { IDBObjectStore.prototype.put = original; }
   });
-  assert.deepEqual(snapshot, [1, 12000, 15000, false, 2, -3, false, -1]);
+  assert.deepEqual(snapshot, [1, 12000, 15000, false, 2, -3, false, -1, 10000, -10]);
   await other.evaluate(async () => {
     const { putMany } = await import('./storage.js');
     await putMany([['known', ['newer']], ['checkpoint', { at: 12, world: { tick: 12, fishes: { alien: { x: 9 } }, scenes: { scene: {} } } }]]);

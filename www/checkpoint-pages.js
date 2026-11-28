@@ -14,6 +14,14 @@ let observedRevision;
 export const pagedRevision = head => head?.format === FORMAT ? head.revision : undefined;
 const revisionOf = head => pagedRevision(head) ?? (head ? compatibilityMark(head).stamp : 'empty');
 
+// A replica merge can normalize rows outside the incoming packet. Give a save
+// already reading those rows its cut before running that synchronous mutation.
+export async function atCheckpointBoundary(data, apply) {
+  let capture;
+  while ((capture = captures.get(data))) await capture.read;
+  return apply();
+}
+
 export function beforeCheckpointPatch(data, patch) {
   const capture = captures.get(data);
   if (!capture) return;
@@ -209,7 +217,13 @@ export function beginCheckpoint(store, prior, checkpoint, options, done, fail) {
   const dirty = pending.get(data);
   if (!stale) pending.delete(data);
   const incremental = reuse && options.simulationChanges && committed.data.deref() === data && !dirty?.scan;
-  const capture = { sources, keys: new Map(), before: new Map(), abort(error) { captures.delete(data); fail(error); } };
+  let release;
+  const read = new Promise(resolve => { release = resolve; });
+  const finishRead = () => {
+    if (captures.get(data) === capture) captures.delete(data);
+    release();
+  };
+  const capture = { sources, keys: new Map(), before: new Map(), read, abort(error) { finishRead(); fail(error); } };
   if (options.simulationChanges) captures.set(data, capture);
   // A stale tab may still send its own signed replica. It cannot replace the
   // version that another tab saved, including identity/metadata in this batch.
@@ -222,7 +236,7 @@ export function beginCheckpoint(store, prior, checkpoint, options, done, fail) {
         const next = plan.next(previous);
         previous = undefined;
         if (next.done) {
-          captures.delete(data);
+          finishRead();
           if (stale) { done(null, head.checkpoint, true); return; }
           const cache = { revision: head.revision, data: new WeakRef(data), tables: next.value };
           if (options.captureCheckpoint || mirror) readCheckpoint(store, head, snapshot => {
@@ -243,7 +257,7 @@ export function beginCheckpoint(store, prior, checkpoint, options, done, fail) {
       }
     } catch (error) { capture.abort(error); }
   };
-  store.transaction.addEventListener('abort', () => captures.delete(data), { once: true });
+  store.transaction.addEventListener('abort', finishRead, { once: true });
   advance();
 }
 

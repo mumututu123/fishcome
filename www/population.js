@@ -40,6 +40,7 @@ export function killFish(world, id, now, cause, transition, groups = world.fishG
 }
 function settleIllness(world, now) {
   const state = world.data.population;
+  let groups;
   for (const [id, r] of Object.entries(state.illnesses)) {
     if (!world.data.fishes[id]) delete state.illnesses[id];
     else if (!r.curedAt) {
@@ -47,7 +48,9 @@ function settleIllness(world, now) {
       delete r.deadline;
       while (world.data.fishes[id] && now >= r.nextLossAt) {
         const at = r.nextLossAt;
-        world.starve(id, at, null, { illness: true });
+        groups ??= world.fishGroups();
+        const cells = (groups.get(id) || []).filter(cell => cell.kind === 'fish');
+        world.starve(id, at, null, { illness: true, cells });
         r.nextLossAt = at + POPULATION.dissolveEvery;
       }
       if (!world.data.fishes[id]) delete state.illnesses[id];
@@ -63,10 +66,12 @@ function checkIllness(world, now) {
   if (fishes.length < POPULATION.threshold) return;
   const active = fishes.filter(f => illnessOf(world.data, f.id)).length;
   const quota = Math.max(0, Math.ceil(fishes.length * POPULATION.sickRatio) - active);
+  if (!quota) return;
   const eligible = fishes.filter(f => now - f.created >= POPULATION.juvenile && !illnessOf(world.data, f.id)
     && (!state.illnesses[f.id]?.curedAt || now - state.illnesses[f.id].curedAt >= POPULATION.immunity));
-  eligible.sort((a, b) => hash(`crowding:${slot}:${a.id}`) - hash(`crowding:${slot}:${b.id}`) || a.id.localeCompare(b.id));
-  for (const f of eligible.slice(0, quota)) {
+  const ranked = eligible.map(fish => ({ fish, rank: hash(`crowding:${slot}:${fish.id}`) }));
+  ranked.sort((a, b) => a.rank - b.rank || a.fish.id.localeCompare(b.fish.id));
+  for (const { fish: f } of ranked.slice(0, quota)) {
     state.illnesses[f.id] = { at: now, nextLossAt: now + POPULATION.dissolveEvery, curedAt: 0 };
     recordStory(world, 'depressed', f.id, now, { visit: now }); world.dirty = true;
   }
@@ -76,13 +81,15 @@ function lineClear(world, a, b, scenery) {
   for (let i = 1; i <= n; i++) { const x = Math.round(a.x + dx * i / n), y = Math.round(a.y + dy * i / n); if (!world.waterAt(x, y) || scenery.has(key(x, y))) return false; }
   return true;
 }
-function updatePredators(world, now, dt, groups, transition) {
+function updatePredators(world, now, dt, transition) {
   const state = world.data.population, count = Object.keys(world.data.fishes).length;
   const wanted = Math.min(POPULATION.predators, Math.max(0, Math.ceil((count - POPULATION.predatorThreshold) / 100)));
-  const scenery = populationScenery(world.data, world.sceneryMap(false), { predators: false });
-  const occupants = world.fishOccupants(groups);
-  const fits = p => predatorCells(p).every(c => world.waterAt(c.x, c.y) && !scenery.has(key(c.x, c.y)) && !occupants.has(key(c.x, c.y)));
   for (const id of Object.keys(state.predators)) if (+id >= wanted) delete state.predators[id];
+  if (!wanted && !Object.keys(state.predators).length) return;
+  const groups = world.fishGroups();
+  const scenery = populationScenery(world.data, world.sceneryMap(false), { predators: false });
+  const occupants = world.fishMap(groups);
+  const fits = p => predatorCells(p).every(c => world.waterAt(c.x, c.y) && !scenery.has(key(c.x, c.y)) && !occupants.has(key(c.x, c.y)));
   for (let i = 0; i < wanted; i++) if (!state.predators[i]) {
     for (let attempt = 0; attempt < 32; attempt++) {
       const x = hash(`predator:${world.id}:${i}:${attempt}`) % 1000;
@@ -90,13 +97,22 @@ function updatePredators(world, now, dt, groups, transition) {
       if (fits(p) && !Object.values(state.predators).some(other => predatorCells(other).some(c => predatorCells(p).some(d => key(c.x, c.y) === key(d.x, d.y))))) { state.predators[i] = p; break; }
     }
   }
-  const prey = Object.values(world.data.fishes).filter(f => now - f.created >= POPULATION.juvenile && (groups.get(f.id)?.length || Infinity) <= POPULATION.preySize);
+  let prey;
   for (const p of Object.values(state.predators).sort((a, b) => a.id.localeCompare(b.id))) {
     if (now < p.created) continue;
     if (!fits(p)) { delete state.predators[p.id]; continue; }
     const mouth = predatorCells(p)[0], ready = now - p.lastBite >= POPULATION.biteCooldown && now - state.huntAt >= POPULATION.huntCooldown;
-    const targets = ready ? prey.filter(f => world.data.fishes[f.id]).flatMap(f => (groups.get(f.id) || []).map(c => ({ fish: f, ...cellPosition(f, c) })))
-      .filter(c => Math.max(Math.abs(deltaX(c.x, mouth.x)), Math.abs(c.y - mouth.y)) <= POPULATION.sight && lineClear(world, mouth, c, scenery)) : [];
+    const targets = [];
+    if (ready) {
+      prey ??= Object.values(world.data.fishes).filter(f => now - f.created >= POPULATION.juvenile && (groups.get(f.id)?.length || Infinity) <= POPULATION.preySize);
+      for (const f of prey) {
+        if (!world.data.fishes[f.id]) continue;
+        for (const cell of groups.get(f.id) || []) {
+          const at = cellPosition(f, cell);
+          if (Math.max(Math.abs(deltaX(at.x, mouth.x)), Math.abs(at.y - mouth.y)) <= POPULATION.sight && lineClear(world, mouth, at, scenery)) targets.push({ fish: f, ...at });
+        }
+      }
+    }
     targets.sort((a, b) => Number(!!illnessOf(world.data, b.fish.id)) - Number(!!illnessOf(world.data, a.fish.id))
       || Math.abs(deltaX(a.x, mouth.x)) + Math.abs(a.y - mouth.y) - Math.abs(deltaX(b.x, mouth.x)) - Math.abs(b.y - mouth.y) || a.fish.id.localeCompare(b.fish.id));
     let target = targets[0];
@@ -128,7 +144,7 @@ export function volcanoPlan(data, slot) {
   if (!Object.hasOwn(data.roots, seed) || !Number.isInteger(slot) || slot < 0 || slot * POPULATION.volcanoPeriod < data.roots[seed] || hash(id) % 10000 >= POPULATION.volcanoChance * 10000) return null;
   return { id, seed, slot, x: hash(`vent:${id}`) % 1000 };
 }
-function updateVolcano(world, now, dt, groups, transition, resume = false) {
+function updateVolcano(world, now, dt, transition, resume = false) {
   const state = world.data.population, slot = Math.floor(now / POPULATION.volcanoPeriod);
   if (!resume && world.ambient && slot > state.volcanoSlot) {
     state.volcanoSlot = slot;
@@ -139,7 +155,7 @@ function updateVolcano(world, now, dt, groups, transition, resume = false) {
     }
   }
   const e = state.eruption; if (!e) return;
-  const scenery = world.sceneryMap(), occupancy = world.fishOccupants(groups);
+  const groups = world.fishGroups(), scenery = world.sceneryMap(), occupancy = world.fishOccupants(groups);
   const hit = c => { for (const id of occupancy.get(key(c.x, c.y)) || []) if (world.data.fishes[id]) killFish(world, id, now, 'magma', transition, groups); };
   if (!resume && now >= e.nextAt && e.emitted < POPULATION.magmaLimit && now - e.at <= POPULATION.warning + POPULATION.emission * POPULATION.magmaLimit + 2000) {
     const index = e.emitted++, r = hash(`${e.id}:${index}`), x = wrapX(e.x + r % 5 - 2), y = world.floorAt(x) - 1;
@@ -183,8 +199,8 @@ export function updatePopulation(world, now, transition, { resume = false } = {}
   if (resume) {
     state.illnessSlot = Math.max(state.illnessSlot, Math.floor(now / POPULATION.check));
     state.volcanoSlot = Math.max(state.volcanoSlot, Math.floor(now / POPULATION.volcanoPeriod));
-  } else { checkIllness(world, now); if (world.ambient) updatePredators(world, now, dt, world.fishGroups(), transition); }
-  updateVolcano(world, now, dt, world.fishGroups(), transition, resume);
+  } else { checkIllness(world, now); if (world.ambient) updatePredators(world, now, dt, transition); }
+  updateVolcano(world, now, dt, transition, resume);
   state.at = Math.max(state.at, now);
 }
 export function mergePopulation(a, b, now) {

@@ -30,6 +30,34 @@ test('20%延长配对至20秒，40%暂停并清空计时，稀疏区仍为5秒',
     if (seconds === Infinity) { assert.equal(Object.keys(w.data.contacts).length, 0); for (const [id, c] of Object.entries(w.data.chars)) if (c.kind === 'scene') delete w.data.chars[id]; updateContacts(w, now + 20000, w.fishGroups(), w.sceneryMap()); assert(!w.breedingState(male)); }
   }
 });
+test('繁殖密度按公鱼编号和母鱼本地化编号取接触点，兼容旧存档小数坐标', () => {
+  for (const left of [19, 19.5]) {
+    const w = sea(), male = fish(w, 'male', 20), female = fish(w, 'female', 23);
+    const [m1, m2, m3] = w.fishCells(male), [f1, f2, f3] = w.fishCells(female);
+    Object.assign(m1, { x: 4, id: 'a-male' });
+    Object.assign(m2, { x: 0, id: 'Z-male' });
+    Object.assign(m3, { x: 8, id: 'spare-male' });
+    Object.assign(f1, { x: -2, id: 'Z-female' });
+    Object.assign(f2, { x: left - 23, id: 'a-female' });
+    Object.assign(f3, { x: 2, id: 'extra-female' });
+    fill(w, 20, 20, 189);
+    const density = densityField(w);
+    assert.equal(contactTime(density(20, 20)), 20000);
+    assert.equal(contactTime(density(21, 20)), 5000);
+    assert.equal(contactTime(density(25, 20)), 5000);
+
+    const groups = w.fishGroups(), scenery = w.sceneryMap();
+    for (let elapsed = 0; elapsed < 20000; elapsed += 500) {
+      updateContacts(w, now + elapsed, groups, scenery);
+      assert.equal(w.breedingState(male), undefined);
+    }
+    updateContacts(w, now + 20000, groups, scenery);
+    assert.deepEqual(w.breedingState(male)?.contact, {
+      male: ['Z-male', 'a-male'],
+      female: left === 19 ? ['Z-female', 'a-female', 'extra-female'] : ['Z-female', 'extra-female']
+    });
+  }
+});
 test('已经开始的繁殖不因后来的拥挤被取消，出生不增加鱼元', () => {
   const w = sea(), male = fish(w, 'male', 20); fish(w, 'female', 23); for (let e = 0; e <= 5000; e += 500) updateContacts(w, now + e, w.fishGroups(), w.sceneryMap()); const r = w.breedingState(male); fill(w, 22, 20, 400); const count = Object.keys(w.data.chars).length;
   finishBreeding(w, r.ends, transition); assert.equal(r.status, 'born'); assert.equal(Object.keys(w.data.chars).length, count);

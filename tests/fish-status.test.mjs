@@ -66,3 +66,11 @@ test('无效运动日期、负数和无穷值被拒绝，合并不修改原始�
   assert.deepEqual(mergeTravel(original, other).days, { '2026-11-23': 3, '2026-11-24': 4 }); assert.equal(Object.keys(original.days).length, 1);
   for (const record of [{ since: t, days: 1 }, { since: t, days: { '2026-02-31': 1 } }, { since: t, days: { '2026-11-23': -1 } }, { since: t, days: { '2026-11-23': Infinity } }]) assert.equal(!!validTravel(record), false);
 });
+test('运动日期按公历校验闰年、月和日', () => {
+  for (const day of ['0000-02-29', '2000-02-29', '2024-02-29', '2026-04-30', '9999-12-31']) {
+    assert(validTravel({ since: t, days: { [day]: 1 } }), day);
+  }
+  for (const day of ['1900-02-29', '2026-02-29', '2026-04-31', '2026-00-10', '2026-01-00', '2026-13-01', '2026-01-01\n']) {
+    assert(!validTravel({ since: t, days: { [day]: 1 } }), day);
+  }
+});

@@ -40,9 +40,15 @@ export function recordStory(world, kind, fish, at, extra = {}) {
   life.stories[id] = choose(life.stories[id], story);
   if (Object.keys(life.stories).length > LIFE.storyLimit) life.stories = trim(life.stories, LIFE.storyLimit); world.dirty = true;
 }
-function clearLine(a, b, scenery) {
+function clearLine(a, b, blockedRows) {
   const dx = deltaX(b.x, a.x), dy = b.y - a.y, steps = Math.ceil(Math.max(Math.abs(dx), Math.abs(dy)));
-  for (let i = 1; i < steps; i++) if (scenery.has(worldKey(Math.round(a.x + dx * i / steps), Math.round(a.y + dy * i / steps)))) return false;
+  for (let i = 1; i < steps; i++) {
+    const row = blockedRows[Math.round(a.y + dy * i / steps)];
+    if (!row) continue;
+    const x = Math.round(a.x + dx * i / steps);
+    const column = x < 0 ? x + WORLD_WIDTH : x >= WORLD_WIDTH ? x - WORLD_WIDTH : x;
+    if (row[column]) return false;
+  }
   return true;
 }
 function indexPoints(points) {
@@ -84,16 +90,27 @@ export function lifeContext(world, now, scenery, groups) {
     points.set(id, { id, x: wrapX(f.x + f.facing * (minX + maxX) / 2), y: f.y + (minY + maxY) / 2, halfWidth: (maxX - minX) / 2, halfHeight: (maxY - minY) / 2 });
   }
   const nearby = indexPoints(points.values()), neighbors = new Map(), scenes = new Map();
-  const sceneryPoints = [...scenery.values()].map(({ scene, cell }) => ({ id: scene.id, x: wrapX(scene.x + cell.x), y: scene.y + cell.y }));
+  const ordered = [...points.values()].sort((a, b) => a.id.localeCompare(b.id)), ranks = new Map();
+  let rank = 0;
+  for (let i = 0; i < ordered.length; i++) {
+    if (i && ordered[i - 1].id.localeCompare(ordered[i].id)) rank++;
+    ranks.set(ordered[i], rank);
+  }
+  const sceneryPoints = [], blockedRows = [];
+  for (const [key, { scene, cell }] of scenery) {
+    sceneryPoints.push({ id: scene.id, x: wrapX(scene.x + cell.x), y: scene.y + cell.y });
+    const comma = key.indexOf(','), x = Number(key.slice(0, comma)), y = Number(key.slice(comma + 1));
+    if (Number.isInteger(x) && Number.isInteger(y)) (blockedRows[y] ??= new Uint8Array(WORLD_WIDTH))[x] = 1;
+  }
   const nearScenery = sceneryPoints.length ? indexPoints(sceneryPoints) : null;
   for (const p of points.values()) {
     const spots = nearScenery?.(p, 16) || [], visible = [];
     for (const q of nearby(p, 12)) {
       if (q === p) continue;
       const separation = distance(p, q);
-      if (separation <= 12 && (!spots.length || clearLine(p, q, scenery))) visible.push({ point: q, separation });
+      if (separation <= 12 && (!spots.length || clearLine(p, q, blockedRows))) visible.push({ point: q, separation, rank: ranks.get(q) });
     }
-    visible.sort((a, b) => a.separation - b.separation || a.point.id.localeCompare(b.point.id));
+    visible.sort((a, b) => a.separation - b.separation || a.rank - b.rank);
     neighbors.set(p.id, visible.map(({ point }) => point));
 
     let closest, closestDistance = 16;
@@ -108,9 +125,14 @@ export function lifeContext(world, now, scenery, groups) {
     if (closest) scenes.set(p.id, closest);
   }
   const school = new Map(), taken = new Set(), slot = Math.floor(now / 60000);
-  if (now % 60000 < 18000) for (const p of [...points.values()].sort((a, b) => a.id.localeCompare(b.id))) {
+  if (now % 60000 < 18000) for (const p of ordered) {
     if (taken.has(p.id) || world.breedingState(p.id)) continue;
-    const group = [p, ...neighbors.get(p.id).filter(q => !taken.has(q.id) && !world.breedingState(q.id))].slice(0, 5);
+    const group = [p];
+    for (const q of neighbors.get(p.id)) {
+      if (taken.has(q.id) || world.breedingState(q.id)) continue;
+      group.push(q);
+      if (group.length === 5) break;
+    }
     if (group.length < 3) continue;
     const r = hash(`school:${p.id}:${slot}`), motion = { dx: r % 2 ? 1 : -1, dy: [0, 0, -1, 1][Math.floor(r / 2) % 4], leader: p.id };
     for (const q of group) { taken.add(q.id); school.set(q.id, motion); }
@@ -138,28 +160,30 @@ export function updateLife(world, now, context) {
   if (elapsed < 1000 && elapsed >= 0) return;
   const dt = elapsed > 0 && elapsed <= 2500 ? Math.min(1, elapsed / 1000) : 0;
   const updated = new Set();
-  let fresh = {}, freshCount = 0, lastKey;
+  let fresh = new Map(), lastKey;
   for (const [id, others] of context.neighbors) for (const other of others) {
     const a = id < other.id ? id : other.id, b = id < other.id ? other.id : id;
     const key = a + '|' + b, old = life.bonds[key];
-    if (old ? updated.has(key) : fresh[key] || lastKey && key.localeCompare(lastKey) > 0) continue;
-    const continuous = old && now - old.lastNear <= 2500;
-    const seconds = Math.min(3600, (old?.seconds || 0) + dt);
-    if ((old?.seconds || 0) < LIFE.familiar && seconds >= LIFE.familiar) recordStory(world, 'friend', a, now, { other: b });
-    if (dt > 0 && old?.seconds >= LIFE.familiar && now - old.lastNear >= LIFE.reunion) recordStory(world, 'reunion', a, now, { other: b });
-    const bond = { a, b, seconds, at: now, lastNear: now, run: continuous ? Math.min(120, old.run + dt) : 0 };
-    if (old) { life.bonds[key] = bond; updated.add(key); continue; }
-    fresh[key] = bond;
-    // New contacts all have the same timestamp and at most one second of
-    // familiarity. Only the first bondLimit keys can survive the final trim.
-    if (++freshCount === LIFE.bondLimit * 2) {
-      const keys = Object.keys(fresh).sort((x, y) => x.localeCompare(y)).slice(0, LIFE.bondLimit);
+    if (old) {
+      if (updated.has(key)) continue;
+      const continuous = now - old.lastNear <= 2500;
+      const previousSeconds = old.seconds || 0, seconds = Math.min(3600, previousSeconds + dt);
+      if (previousSeconds < LIFE.familiar && seconds >= LIFE.familiar) recordStory(world, 'friend', a, now, { other: b });
+      if (dt > 0 && old.seconds >= LIFE.familiar && now - old.lastNear >= LIFE.reunion) recordStory(world, 'reunion', a, now, { other: b });
+      life.bonds[key] = { a, b, seconds, at: now, lastNear: now, run: continuous ? Math.min(120, old.run + dt) : 0 };
+      updated.add(key);
+      continue;
+    }
+    if (fresh.has(key) || lastKey && key.localeCompare(lastKey) > 0) continue;
+    fresh.set(key, a);
+    // All fresh contacts have the same timestamp, so only the first bondLimit keys can survive the final trim.
+    if (fresh.size === LIFE.bondLimit * 2) {
+      const keys = [...fresh.keys()].sort((x, y) => x.localeCompare(y)).slice(0, LIFE.bondLimit);
       lastKey = keys.at(-1);
-      fresh = Object.fromEntries(keys.map(key => [key, fresh[key]]));
-      freshCount = keys.length;
+      fresh = new Map(keys.map(key => [key, fresh.get(key)]));
     }
   }
-  Object.assign(life.bonds, fresh);
+  for (const [key, a] of fresh) life.bonds[key] = { a, b: key.slice(a.length + 1), seconds: dt, at: now, lastNear: now, run: 0 };
   for (const [id, spot] of context.scenes) {
     if (distance(context.points.get(id), spot) > 7) continue;
     const old = life.places[id], seconds = Math.min(3600, (old?.scene === spot.id ? old.seconds : 0) + dt);
@@ -191,17 +215,26 @@ export function idleMotion(world, fish, now, context, center) {
   const life = state(world, now), neighbors = context.neighbors.get(fish.id) || [], phase = Math.floor((now - fish.created) / 12000), r = hash(`${fish.id}:${phase}`);
   let dx = [-1, 0, 1][r % 3], dy = [-1, 0, 1][Math.floor(r / 3) % 3];
   if (now - fish.lastFed >= 86400000) return { dx, dy };
-  if (!world.breedingState(fish.id)) { const motion = eventMotion(world.data, fish.id, now, context); if (motion) return motion; }
+  const breeding = world.breedingState(fish.id);
+  if (!breeding) { const motion = eventMotion(world.data, fish.id, now, context); if (motion) return motion; }
   const point = context.points.get(fish.id) || center;
   // Leave water between bodies before following friends or a school. Center
   // distance alone makes larger fish keep trying to swim into each other.
   const gap = q => Math.max(Math.abs(deltaX(q.x, point.x)) - (point.halfWidth || 0) - (q.halfWidth || 0), Math.abs(q.y - point.y) - (point.halfHeight || 0) - (q.halfHeight || 0));
-  const crowded = !world.breedingState(fish.id) && neighbors.filter(q => gap(q) <= 2).sort((a, b) => gap(a) - gap(b) || a.id.localeCompare(b.id))[0];
+  let crowded, closestGap = 2;
+  if (!breeding) for (const q of neighbors) {
+    const separation = gap(q);
+    if (separation <= closestGap && (!crowded || separation < closestGap || q.id.localeCompare(crowded.id) < 0)) {
+      crowded = q;
+      closestGap = separation;
+    }
+  }
   if (crowded) return { dx: Math.sign(deltaX(point.x, crowded.x)), dy: Math.sign(point.y - crowded.y) };
   const school = context.school.get(fish.id); if (school) return school;
-  const familiar = neighbors.find(q => life.bonds[pairKey(fish.id, q.id)]?.seconds >= LIFE.familiar);
-  if (familiar && now % 180000 < 45000) {
-    const pair = pairKey(fish.id, familiar.id), motion = hash(`companion:${pair}:${Math.floor(now / 12000)}`);
+  if (now % 180000 < 45000) for (const q of neighbors) {
+    const pair = fish.id < q.id ? fish.id + '|' + q.id : q.id + '|' + fish.id;
+    if (!(life.bonds[pair]?.seconds >= LIFE.familiar)) continue;
+    const motion = hash(`companion:${pair}:${Math.floor(now / 12000)}`);
     return { dx: motion % 2 ? 1 : -1, dy: [0, 0, -1, 1][Math.floor(motion / 2) % 4] };
   }
   const trait = personality(fish.id), spot = context.scenes.get(fish.id);

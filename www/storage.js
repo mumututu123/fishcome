@@ -1,4 +1,5 @@
 import { beginCheckpoint, checkpointChanged, checkpointCommitted, pagedRevision, readCheckpoint } from './checkpoint-pages.js';
+export { atCheckpointBoundary } from './checkpoint-pages.js';
 import { PAGE_HEAD, currentKey, migrateOldMetadata, readOldBundle, oldBranch } from './legacy-checkpoint.js';
 
 const DATABASE = 'tide-world-v1';

@@ -1,11 +1,12 @@
 import { worldTables } from './simulation-changes.js';
+import { DAY, shanghaiDay } from './fish-status.js';
 
 // One record per line lets the receiver assemble tables without retaining the wire text.
 // A record may span several signed pages, including in the middle of a surrogate pair.
 export const PAGE_UNITS = 64 * 1024;
 export const MAX_RECORD_UNITS = 32 * 1024 * 1024;
 export const MAX_STREAM_UNITS = 256 * 1024 * 1024;
-const REPLICA_KINDS = new Set(['hello', 'catchup', 'merge', 'world']);
+const REPLICA_KINDS = new Set(['hello', 'catchup', 'merge', 'world', 'live']);
 const line = row => JSON.stringify(row) + '\n';
 const safeKey = key => typeof key === 'string' && !['__proto__', 'prototype', 'constructor'].includes(key);
 
@@ -70,10 +71,30 @@ const RESUME_MS = 120000;
 const ACK_MS = 30000;
 const delay = () => new Promise(resolve => setTimeout(resolve, 0));
 
+export function replicaRowEquality(tick) {
+  const day = Number.isFinite(tick) && Math.abs(tick) < 8.64e15 - DAY ? shanghaiDay(tick) : undefined;
+  return (field, before, after) => {
+    if (before === after) return true;
+    let left, right;
+    if (field === 'fishes') {
+      left = before?.posAt;
+      right = after?.posAt;
+    } else if (field === 'travel' && day !== undefined) {
+      left = before?.days?.[day];
+      right = after?.days?.[day];
+    }
+    // A changed clock or distance proves these JSON records differ. In
+    // particular, equal clocks do not imply equal positions or other fields.
+    if (left !== right && Number.isFinite(left) && Number.isFinite(right)) return false;
+    return JSON.stringify(before) === JSON.stringify(after);
+  };
+}
+
 // Both inputs are immutable, committed checkpoints. Keep roots and world-level
 // clocks for merge/validation. Existing record conflict rules handle the rows.
 export async function changesSince(baseline, current) {
   const delta = { ...current };
+  const sameRow = replicaRowEquality(current.tick);
   let rows = 0, slice = performance.now();
   for (const field of worldTables) {
     // mergeBreeding replaces the complete contact map when contactAt advances.
@@ -81,7 +102,7 @@ export async function changesSince(baseline, current) {
     const changed = {}, old = baseline[field] || {};
     for (const id in current[field]) if (Object.hasOwn(current[field], id)) {
       const value = current[field][id], before = old[id];
-      if (!Object.hasOwn(old, id) || value !== before && JSON.stringify(value) !== JSON.stringify(before)) changed[id] = value;
+      if (!Object.hasOwn(old, id) || !sameRow(field, before, value)) changed[id] = value;
       if (++rows % 128 === 0 && performance.now() - slice >= 5) { await delay(); slice = performance.now(); }
     }
     delta[field] = changed;
@@ -115,12 +136,63 @@ export async function fitsLegacyEnvelope(body, budget) {
   return total <= budget;
 }
 
+export function coalesceWorld(pending, next) {
+  if (!pending || !next.delta) return next;
+  const { swims, ...header } = next;
+  const world = { ...next.world };
+  for (const field of worldTables) {
+    if (field === 'roots' || field === 'bubbles' || field === 'contacts' || !pending.world[field]) continue;
+    world[field] = { ...pending.world[field], ...world[field] };
+  }
+  return { ...header, delta: pending.delta, world };
+}
+
 export class ReplicaTransfers {
   constructor(network) {
     this.network = network;
     this.outgoing = new Map();
     this.incoming = new Map();
     this.completed = new Map();
+    this.live = new Map();
+  }
+  publishLive(body, peers) {
+    for (const peer of peers) {
+      const current = this.live.get(peer);
+      if (current) current.pending = coalesceWorld(current.pending, body);
+      else this.live.set(peer, { pending: body, receipt: null, running: false });
+      this.resumeLive(peer);
+    }
+  }
+  resumeLive(peer) {
+    const lane = this.live.get(peer);
+    if (!lane || lane.running || peer.replicaCatchingUp || !peer.confirmedReplica) return;
+    lane.running = true;
+    this.sendLive(peer, lane).catch(error => this.network.close(peer, error));
+  }
+  async sendLive(peer, lane) {
+    try {
+      while (lane.pending) {
+        const body = lane.pending, id = crypto.randomUUID();
+        lane.pending = null;
+        let index = 0;
+        for (const page of replicaPages(body)) {
+          const packet = { id, kind: 'live', index: index++, ...page };
+          if (!page.last) { await this.network.directControl(peer, 'replicaPage', packet); continue; }
+          const applied = new Promise((resolve, reject) => { lane.receipt = { id, index: packet.index, resolve, reject }; });
+          const timeout = setTimeout(() => lane.receipt?.reject(new Error('伙伴应用世界增量超时')), body.delta ? ACK_MS : RESUME_MS);
+          try {
+            const [, next] = await Promise.all([this.network.directControl(peer, 'replicaPage', packet), applied]);
+            if (next !== index) throw new Error('伙伴拒绝世界增量');
+          } finally { clearTimeout(timeout); lane.receipt = null; }
+        }
+      }
+    } finally { if (this.live.get(peer) === lane) this.live.delete(peer); }
+  }
+  discardPendingLive() {
+    for (const [peer, lane] of this.live) {
+      if (lane.running) lane.pending = null;
+      else this.live.delete(peer);
+    }
   }
   async broadcast(kind, body, peers) {
     const id = crypto.randomUUID();
@@ -182,19 +254,21 @@ export class ReplicaTransfers {
   async receive(message, peer) {
     const { kind, id, index, text, last } = message.body;
     if (message.kind === 'replicaReceipt') {
-      const ack = peer.replicaAck;
+      const live = this.live.get(peer)?.receipt;
+      const ack = live?.id === id ? live : peer.replicaAck;
       if (ack?.id === id && ack.index === index && message.from === peer.node) ack.resolve(message.body.next);
       return false;
     }
-    const direct = kind === 'hello' || kind === 'catchup';
+    const direct = kind === 'hello' || kind === 'catchup', live = kind === 'live';
     if (!REPLICA_KINDS.has(kind) || typeof id !== 'string' || id.length !== 36 ||
         !Number.isSafeInteger(index) || index < 0 || index > Math.ceil(MAX_STREAM_UNITS / PAGE_UNITS) ||
         typeof last !== 'boolean' || typeof text !== 'string' || text.length > PAGE_UNITS ||
-        (!last && text.length !== PAGE_UNITS) || (direct && message.from !== peer.node)) throw new Error('无效的世界分块');
+        (!last && text.length !== PAGE_UNITS) || ((direct || live) && message.from !== peer.node) ||
+        (live && !peer.replicaLive)) throw new Error('无效的世界分块');
     const key = message.from + ':' + id;
     const acknowledge = next => direct && this.network.directControl(peer, 'replicaReceipt', { id, index, next });
     const done = this.completed.get(key);
-    if (done) { if (kind === 'hello') peer.confirmedReplica = id; await acknowledge(done.next); return false; }
+    if (done) { if (kind === 'hello') { peer.confirmedReplica = id; this.resumeLive(peer); } await acknowledge(done.next); return false; }
     let state = this.incoming.get(key);
     if (!state) {
       if (direct && index > 0) { await acknowledge(0); return false; }
@@ -222,27 +296,35 @@ export class ReplicaTransfers {
         if (!body) continue;
         if (state.pending.size) throw new Error('世界分块结束位置无效');
         if (kind === 'catchup' && body.base !== peer.confirmedReplica) throw new Error('分块变更引用了未确认的世界版本');
-        state.applying = this.network.onMessage({ id, kind: kind === 'catchup' ? 'merge' : kind, actor: message.actor, from: message.from, key: message.key, body }, peer);
+        state.applying = this.network.onMessage({ id, kind: kind === 'catchup' ? 'merge' : live ? 'world' : kind, actor: message.actor, from: message.from, key: message.key, body }, peer);
         await state.applying;
-        if (kind === 'hello') peer.confirmedReplica = id;
+        if (kind === 'hello') { peer.confirmedReplica = id; this.resumeLive(peer); }
         clearTimeout(state.timer); this.incoming.delete(key);
         const timer = setTimeout(() => this.completed.delete(key), RESUME_MS);
         this.completed.set(key, { next: state.next, timer });
+        if (live) await this.network.directControl(peer, 'replicaReceipt', { id, index: state.endIndex, next: state.next });
         break;
       }
       await acknowledge(state.next);
     } catch (error) {
       clearTimeout(state.timer); this.incoming.delete(key);
-      await acknowledge(-1);
+      if (live && state.endIndex !== undefined) {
+        await this.network.directControl(peer, 'replicaReceipt', { id, index: state.endIndex, next: -1 }).catch(() => {});
+      } else await acknowledge(-1);
       throw error;
     }
-    return !direct;
+    return !direct && !live;
   }
-  close(peer, error) { peer.replicaAck?.reject(error); }
+  close(peer, error) {
+    peer.replicaAck?.reject(error);
+    const lane = this.live.get(peer);
+    if (lane) { lane.pending = null; lane.receipt?.reject(error); this.live.delete(peer); }
+  }
   stop() {
     for (const s of this.incoming.values()) clearTimeout(s.timer);
     for (const s of this.completed.values()) clearTimeout(s.timer);
     for (const s of this.outgoing.values()) clearTimeout(s.expiration);
+    for (const peer of this.live.keys()) this.close(peer, new Error('世界分块连接已关闭'));
     this.incoming.clear(); this.completed.clear(); this.outgoing.clear();
   }
 }

@@ -77,6 +77,35 @@ test('持续自然步进只编码一次，统计跟随出生、移除、食物�
   assert.deepEqual(pictures.atCut(prepared).counts, world.counts());
 });
 
+test('接收例行增量不打断合照，需立即存档时可先复用已有图像', async () => {
+  let world = makeWorld('A');
+  const started = gate(), finish = gate();
+  const old = 'data:image/webp;base64,AAA=';
+  let renders = 0;
+  const pictures = new CheckpointPictures(() => world, async () => {
+    renders++;
+    started.release(); await finish.promise;
+    return 'new image';
+  });
+  pictures.reuse({ id: 'A', roots: ['A'], image: old, counts: world.counts() });
+  const pending = pictures.prepare(true);
+  await started.promise;
+  for (let tick = 1; tick <= 4; tick++) {
+    pictures.changed(world, null, 'replica');
+    world.data.tick = CONFIG.step * tick;
+    world.data.fishes.one = { x: tick, y: 10 };
+  }
+  assert.equal(pictures.recent().image, old);
+  assert.deepEqual(pictures.recent().counts, world.counts());
+  finish.release();
+  const photo = pictures.atCut(await pending);
+  assert.equal(photo.image, 'new image');
+  assert.deepEqual(photo.counts, world.counts());
+  assert.equal(renders, 1);
+  world = makeWorld('B');
+  assert.equal(pictures.recent(), undefined);
+});
+
 test('分批统计期间删除已读和未读字符，同时补入食物，最后数量准确', async t => {
   let timer = 0;
   t.mock.method(performance, 'now', () => { timer += 6; return timer; });

@@ -11,7 +11,7 @@ import { LIFE, newLife, lifeContext, updateLife, idleMotion, spawnPlankton, reco
 import { REFERRAL_REWARD, referralError, chooseReferral } from './referral.js';
 import { WORLD_WIDTH, MAX_FLOOR, wrapX, worldKey, deltaX, nearX, makeTerrain, terrainOf, validTerrain, chooseTerrain, floorAt, waterAt } from './geography.js';
 import { canonicalBirthFish, canonicalBirthPath, fishOrigin, activeBreeding, finishBreeding, updateContacts, motionUnits, commitUnit, mergeBreeding, normalizeBreeding, normalizeBirthCells, writeBreedingRecord } from './breeding.js';
-import { newLegends, processLegends, capturedFish, retargetCapture, mergeLegends, settleLegendary, validLegends, legendSchedule } from './legends.js';
+import { newLegends, processLegends, capturedFishIds, retargetCapture, mergeLegends, settleLegendary, validLegends, legendSchedule } from './legends.js';
 import { POPULATION, newPopulation, updatePopulation, mergePopulation, populationScenery, validPopulation, validRocks, mergeRocks, illnessOf, cureFish, killFish } from './population.js';
 import { cancelBreeding } from './breeding.js';
 export const CONFIG = Object.freeze({ width: WORLD_WIDTH, depth: MAX_FLOOR + 1, shallow: 60, sightShallow: 20, sightDeep: 10, step: 500, speed: 2, foodLife: 300000, hunger: 86400000, initial: 20, offlineLife: 240 * 60 * 60 * 1000 });
@@ -26,7 +26,15 @@ const localKey = (x, y) => `${x},${y}`;
 export const ordinal = (a, b) => a === b ? 0 : a > b ? 1 : -1;
 export function hash(text) { let n = 2166136261; for (const c of text) n = Math.imul(n ^ c.codePointAt(0), 16777619); return n >>> 0; }
 export function validGlyph(ch) { return typeof ch === 'string' && Array.from(ch).length === 1 && !/\s/u.test(ch) && (/^[\x21-\x7e]$/.test(ch) || /\p{Script=Han}/u.test(ch) || /^[\u3001-\u303f\uff01-\uff65]$/u.test(ch)); }
-export function bounds(cells) { if (!cells.length) return { minX: 0, minY: 0, maxX: 0, maxY: 0, width: 0, height: 0 }; const xs = cells.map(c => c.x), ys = cells.map(c => c.y); const minX = Math.min(...xs), minY = Math.min(...ys), maxX = Math.max(...xs), maxY = Math.max(...ys); return { minX, minY, maxX, maxY, width: maxX - minX + 1, height: maxY - minY + 1 }; }
+export function bounds(cells) {
+  if (!cells.length) return { minX: 0, minY: 0, maxX: 0, maxY: 0, width: 0, height: 0 };
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const { x, y } of cells) {
+    minX = Math.min(minX, x); maxX = Math.max(maxX, x);
+    minY = Math.min(minY, y); maxY = Math.max(maxY, y);
+  }
+  return { minX, minY, maxX, maxY, width: maxX - minX + 1, height: maxY - minY + 1 };
+}
 export function components(cells) {
   const remaining = new Map(cells.map(c => [key(c.x, c.y), c])), groups = [];
   while (remaining.size) { const start = remaining.values().next().value, queue = [start], group = []; remaining.delete(key(start.x, start.y));
@@ -54,7 +62,57 @@ export function validateDrawing(cells, kind, balance = Infinity) {
   return '';
 }
 export function cellPosition(fish, cell) { return { x: fish.x + fish.facing * cell.x, y: fish.y + cell.y }; }
-export function velocities(cells) { const b = bounds(cells); return { x: CONFIG.speed * b.width / Math.max(1, cells.length), y: CONFIG.speed * b.height / Math.max(1, cells.length) }; }
+// The moving population probes an integer sea. Most occupied cells have one
+// owner, so the cells of one fish can share a read-only singleton.
+class MovementGrid {
+  cells = new Array(WORLD_WIDTH * CONFIG.depth);
+  owners = new Map();
+  integerCells = true;
+  index(x, y) {
+    if (!Number.isInteger(x) || !Number.isInteger(y) || y < 0 || y >= CONFIG.depth) return key(x, y);
+    return y * WORLD_WIDTH + (x >= 0 && x < WORLD_WIDTH ? x : wrapX(x));
+  }
+  get(x, y) { return this.cells[this.index(x, y)]; }
+  add(x, y, id) {
+    if (!Number.isInteger(x) || !Number.isInteger(y)) this.integerCells = false;
+    const k = this.index(x, y), owners = this.cells[k];
+    if (!owners) {
+      let single = this.owners.get(id);
+      if (!single) this.owners.set(id, single = new Set([id]));
+      this.cells[k] = single;
+    } else if (!owners.has(id)) {
+      if (owners.size === 1) this.cells[k] = new Set([...owners, id]);
+      else owners.add(id);
+    }
+  }
+  update(fish, cells, remove = false) {
+    for (const cell of cells) {
+      const x = fish.x + fish.facing * cell.x, y = fish.y + cell.y;
+      if (!remove) { this.add(x, y, fish.id); continue; }
+      const k = this.index(x, y), owners = this.cells[k];
+      if (owners?.size === 1 && owners.has(fish.id)) this.cells[k] = undefined;
+      else if (owners?.size > 1) owners.delete(fish.id);
+    }
+  }
+}
+function ownersAt(occupants, x, y) {
+  return occupants instanceof MovementGrid ? occupants.get(x, y) : occupants.get(key(x, y));
+}
+function foreignOwner(owners, id, pair) {
+  if (owners) for (const owner of owners) {
+    if (pair?.status === 'active' ? owner !== pair.male && owner !== pair.female : owner !== id) return true;
+  }
+  return false;
+}
+function groupFishCell(groups, cell) {
+  const body = groups.get(cell.entity);
+  if (body) body.push(cell); else groups.set(cell.entity, [cell]);
+}
+function indexSceneCell(map, scenes, cell) {
+  const scene = scenes[cell.entity];
+  if (scene) map.set(key(scene.x + cell.x, scene.y + cell.y), { scene, cell });
+}
+export function velocities(cells, b = bounds(cells)) { return { x: CONFIG.speed * b.width / Math.max(1, cells.length), y: CONFIG.speed * b.height / Math.max(1, cells.length) }; }
 export const sightRadius = depth => depth < CONFIG.shallow ? CONFIG.sightShallow : CONFIG.sightDeep;
 export function canSee(fish, cells, food) { return cells.some(c => { if (!EYES.has(c.ch)) return false; const p = cellPosition(fish, c); return Math.max(Math.abs(deltaX(food.x, p.x)), Math.abs(p.y - food.y)) <= sightRadius(p.y); }); }
 export function touching(fish, cells, food, scenery = new Map()) { return cells.some(c => { const p = cellPosition(fish, c), dx = Math.abs(deltaX(food.x, p.x)), dy = Math.abs(p.y - food.y); return dx <= 1 && dy <= 1 && (dx || dy) && !(dx && dy && (scenery.has(key(p.x, food.y)) || scenery.has(key(food.x, p.y)))); }); }
@@ -124,9 +182,10 @@ export class World {
     this.data.travel ||= {};
     for (const fish of Object.values(this.data.fishes)) this.data.travel[fish.id] ||= { since: Math.max(fish.created, now), days: {} };
   }
-  recordMovement(id, distance, now) {
+  recordMovement(id, distance, now, day) {
     if (!Number.isFinite(distance) || !(distance > 0) || !this.data.fishes[id]) return;
-    const record = this.data.travel[id] ||= { since: now, days: {} }, day = shanghaiDay(now);
+    day ??= shanghaiDay(now);
+    const record = this.data.travel[id] ||= { since: now, days: {} };
     record.days[day] = (record.days[day] || 0) + distance;
   }
   fishStatus(id, now = Date.now()) {
@@ -173,9 +232,14 @@ export class World {
     else delete this.data.scenes[CHAT_FLOOR];
     this.data.pendingChatGlyphs = result.waiting; this.dirty = true; return result;
   }
-  fishCells(id) { return Object.values(this.data.chars).filter(c => c.kind === 'fish' && c.entity === id); }
-  sceneCells(id) { return Object.values(this.data.chars).filter(c => c.kind === 'scene' && c.entity === id); }
-  fishGroups() { const map = new Map(); for (const c of Object.values(this.data.chars)) if (c.kind === 'fish') { if (!map.has(c.entity)) map.set(c.entity, []); map.get(c.entity).push(c); } return map; }
+  // Simulation callers iterate this snapshot of row references without mutating the array.
+  charValues(...kinds) {
+    const cells = Object.values(this.data.chars);
+    return kinds[0] === undefined ? cells : cells.filter(cell => kinds.includes(cell.kind));
+  }
+  fishCells(id) { return this.charValues('fish').filter(c => c.entity === id); }
+  sceneCells(id) { return this.charValues('scene').filter(c => c.entity === id); }
+  fishGroups() { const map = new Map(); for (const c of this.charValues('fish')) groupFishCell(map, c); return map; }
   wallet(actor) {
     const ops = this.data.ops, revision = worldRevision(this), archiveRevision = this.archives?.revision;
     const cache = this.walletCache;
@@ -203,12 +267,27 @@ export class World {
     return false;
   }
   sceneryMap(natural = true) {
-    const map = new Map(); for (const c of Object.values(this.data.chars)) if (c.kind === 'scene') { const s = this.data.scenes[c.entity]; if (s) map.set(key(s.x + c.x, s.y + c.y), { scene: s, cell: c }); } return natural ? populationScenery(this.data, map) : map;
+    const map = new Map();
+    for (const c of this.charValues('scene')) indexSceneCell(map, this.data.scenes, c);
+    return natural ? populationScenery(this.data, map) : map;
   }
-  fishMap() { const map = new Map(); for (const [id, cells] of this.fishGroups()) { const f = this.data.fishes[id]; if (f) for (const c of cells) { const p = cellPosition(f, c); map.set(key(p.x, p.y), id); } } return map; }
+  fishMap(groups = this.fishGroups()) { const map = new Map(); for (const [id, cells] of groups) { const f = this.data.fishes[id]; if (f) for (const c of cells) { const p = cellPosition(f, c); map.set(key(p.x, p.y), id); } } return map; }
   fishOccupants(groups = this.fishGroups()) { const map = new Map(); for (const [id, cells] of groups) { const fish = this.data.fishes[id]; if (!fish) continue; for (const cell of cells) { const p = cellPosition(fish, cell), k = key(p.x, p.y); if (!map.has(k)) map.set(k, new Set()); map.get(k).add(id); } } return map; }
-  collisionIds(f) { const pair = this.data.breeding[f.id]; return new Set(pair?.status === 'active' ? [pair.male, pair.female] : [f.id]); }
-  canOccupy(f, cells, scenery = this.sceneryMap(), occupants = this.fishOccupants()) { const ignored = this.collisionIds(f), positions = cells.map(c => cellPosition(f, c)); return new Set(positions.map(p => key(p.x, p.y))).size === cells.length && positions.every(p => { const k = key(p.x, p.y); return this.waterAt(p.x, p.y) && !scenery.has(k) && ![...(occupants.get(k) || [])].some(id => !ignored.has(id)); }); }
+  movementGrid(groups) {
+    const grid = new MovementGrid();
+    for (const [id, body] of groups) if (this.data.fishes[id]) grid.update(this.data.fishes[id], body);
+    return grid;
+  }
+  canOccupy(f, cells, scenery = this.sceneryMap(), occupants = this.fishOccupants(), blocked) {
+    const seen = new Set(), pair = this.data.breeding[f.id];
+    for (const cell of cells) {
+      const { x, y } = cellPosition(f, cell), k = key(x, y);
+      if (!this.waterAt(x, y) || scenery.has(k) || blocked?.has(k) || seen.has(k)) return false;
+      seen.add(k);
+      if (foreignOwner(ownersAt(occupants, x, y), f.id, pair)) return false;
+    }
+    return true;
+  }
   updateFishOccupants(occupants, members, groups, remove = false) { for (const fish of members) for (const cell of groups.get(fish.id) || []) { const p = cellPosition(fish, cell), k = key(p.x, p.y); if (remove) { occupants.get(k)?.delete(fish.id); if (!occupants.get(k)?.size) occupants.delete(k); } else { if (!occupants.has(k)) occupants.set(k, new Set()); occupants.get(k).add(fish.id); } } }
   separateFish(now = this.data.tick) {
     normalizeBreeding(this, now);
@@ -345,7 +424,7 @@ export class World {
     if (op.kind === 'fish' && op.genesis === undefined) recordStory(this, 'arrive', op.id, op.t);
     this.dirty = true; return { ok: true };
   }
-  step(now) {
+  step(now, swims) {
     this.initializeTracking(now);
     processLegends(this, now, transition);
     updatePopulation(this, now, transition);
@@ -355,25 +434,36 @@ export class World {
     updateBubbles(this, now);
     if (this.ambient) spawnPlankton(this, now);
     const dt = Math.min(1, Math.max(0, (now - this.data.tick) / 1000)); this.data.tick = now;
-    const scenery = this.sceneryMap(), groups = this.fishGroups();
     const magma = new Set(Object.values(this.data.population.eruption?.particles || {}).filter(c => now < c.born + POPULATION.cooling).map(c => key(c.x, c.y))), magmaVictims = new Set();
-    const fishOccupancy = this.fishOccupants(groups);
+    const scenery = new Map(), groups = new Map(), looseFood = [], seaweed = [];
     const pastMeals = new Set(), pastGrass = new Set(), latestMeals = new Map();
-    for (const c of Object.values(this.data.chars)) for (const event of c.path) if (event.reason === 'eat') { pastMeals.add(event.target); if (c.wild) pastGrass.add(event.target); if (Number.isFinite(event.t)) latestMeals.set(event.target, Math.max(latestMeals.get(event.target) ?? -Infinity, event.t)); }
+    for (const c of this.charValues()) {
+      if (c.kind === 'fish') groupFishCell(groups, c);
+      else if (c.kind === 'scene') indexSceneCell(scenery, this.data.scenes, c);
+      else if (c.kind === 'food') looseFood.push(c);
+      else if (c.kind === 'seaweed') seaweed.push(c);
+      for (const event of c.path) if (event.reason === 'eat') {
+        pastMeals.add(event.target);
+        if (c.wild) pastGrass.add(event.target);
+        if (Number.isFinite(event.t)) latestMeals.set(event.target, Math.max(latestMeals.get(event.target) ?? -Infinity, event.t));
+      }
+    }
+    populationScenery(this.data, scenery);
+    const fishOccupancy = this.movementGrid(groups), captured = capturedFishIds(this.data, now);
     for (const f of Object.values(this.data.fishes)) { const recorded = Math.max(latestMeals.get(f.id) ?? -Infinity, this.archives?.summary.lastMeals.get(f.id) ?? -Infinity), at = lastMealAt(f, recorded); if (at !== undefined) f.lastMealAt = at; }
-    const canEat = id => !!this.data.fishes[id] && !capturedFish(this.data, id, now) && feedingStatus(this.data.fishes[id], now).canEat;
+    const canEat = id => !!this.data.fishes[id] && !captured.has(id) && feedingStatus(this.data.fishes[id], now).canEat;
     const ambient = this.ambient ? lifeContext(this, now, scenery, groups) : null; if (ambient) updateLife(this, now, ambient);
-    for (const c of Object.values(this.data.chars)) if (freshPlankton(c) && c.kind === 'food' && now - c.born >= LIFE.planktonLife) { transition(c, { kind: 'burn', entity: '' }, { id: `dissolve:${c.id}`, t: c.born + LIFE.planktonLife, reason: 'dissolve' }); this.dirty = true; }
-    const foods = Object.values(this.data.chars).filter(c => c.kind === 'food').sort((a, b) => a.born - b.born || a.id.localeCompare(b.id));
+    for (const c of looseFood) if (freshPlankton(c) && now - c.born >= LIFE.planktonLife) { transition(c, { kind: 'burn', entity: '' }, { id: `dissolve:${c.id}`, t: c.born + LIFE.planktonLife, reason: 'dissolve' }); this.dirty = true; }
+    const foods = looseFood.filter(c => c.kind === 'food').sort((a, b) => a.born - b.born || a.id.localeCompare(b.id));
     const foodCount = new Map(); for (const c of foods) foodCount.set(key(c.x, c.y), (foodCount.get(key(c.x, c.y)) || 0) + 1);
     const contact = food => {
       const at = key(food.x, food.y);
       if (scenery.has(at)) return [];
       const ids = new Set();
       for (const [dx, dy] of NEIGHBORS) {
-        for (const id of fishOccupancy.get(key(food.x + dx, food.y + dy)) || []) ids.add(id);
+        for (const id of fishOccupancy.get(food.x + dx, food.y + dy) || []) ids.add(id);
       }
-      return [...ids].filter(id => !fishOccupancy.get(at)?.has(id) && canEat(id) && touching(this.data.fishes[id], groups.get(id), food, scenery));
+      return [...ids].filter(id => !fishOccupancy.get(food.x, food.y)?.has(id) && canEat(id) && touching(this.data.fishes[id], groups.get(id), food, scenery));
     };
     for (const c of foods) {
       if (now - c.born >= CONFIG.foodLife && scenery.has(key(c.x, c.y))) {
@@ -382,51 +472,59 @@ export class World {
         for (let r = 1; r <= CONFIG.depth + CONFIG.width && !slot; r++) for (let dx = -r; dx <= r && !slot; dx++) {
           const dy = r - Math.abs(dx); for (const sy of dy ? [-dy, dy] : [0]) {
             const x = wrapX(c.x + dx), y = c.y + sy, k = key(x, y);
-            if (this.waterAt(x, y) && !scenery.has(k) && !fishOccupancy.has(k) && !(foodCount.get(k) > 0) && (y === this.floorAt(x) - 1 || scenery.has(key(x, y + 1)))) { slot = [x, y]; break; }
+            if (this.waterAt(x, y) && !scenery.has(k) && !fishOccupancy.get(x, y) && !(foodCount.get(k) > 0) && (y === this.floorAt(x) - 1 || scenery.has(key(x, y + 1)))) { slot = [x, y]; break; }
           }
         }
         if (slot) { const old = key(c.x, c.y); foodCount.set(old, Math.max(0, foodCount.get(old) - 1)); [c.x, c.y] = slot; foodCount.set(key(c.x, c.y), 1); c.moveAt = now; }
       }
       const blocked = c.y >= this.floorAt(c.x) - 1 || scenery.has(key(c.x, c.y + 1)), eatContact = now - c.born < CONFIG.foodLife && contact(c).length;
-      if (now - c.born >= CONFIG.foodLife && blocked && !fishOccupancy.has(key(c.x, c.y)) && !scenery.has(key(c.x, c.y))) {
+      if (now - c.born >= CONFIG.foodLife && blocked && !fishOccupancy.get(c.x, c.y) && !scenery.has(key(c.x, c.y))) {
         const support = scenery.get(key(c.x, c.y + 1)), id = this.data.scenes[support?.scene.id] ? support.scene.id : `deposit:${c.id}:${c.path.length}`;
         if (!this.data.scenes[id]) this.data.scenes[id] = { id, actor: c.payer, nick: this.data.participants[c.payer] || '自然沉积', x: c.x, y: c.y, posAt: now, poseId: id };
         const s = this.data.scenes[id], px = c.x, py = c.y; transition(c, { kind: 'scene', entity: id, x: deltaX(c.x, s.x), y: c.y - s.y }, { id: `settle:${c.id}:${c.path.length}`, t: c.born + CONFIG.foodLife, reason: 'expire' }); this.dirty = true; scenery.set(key(px, py), { scene: s, cell: c }); continue;
       }
-      c.fall = blocked || eatContact || fishOccupancy.has(key(c.x, c.y + 1)) || (foodCount.get(key(c.x, c.y + 1)) > 0) ? 0 : (c.fall || 0) + dt * CONFIG.depth / 300;
-      while (c.fall >= 1 && c.y + 1 < this.floorAt(c.x) && !scenery.has(key(c.x, c.y + 1)) && !fishOccupancy.has(key(c.x, c.y + 1)) && !(foodCount.get(key(c.x, c.y + 1)) > 0)) { const old = key(c.x, c.y); foodCount.set(old, Math.max(0, foodCount.get(old) - 1)); c.y++; c.fall--; foodCount.set(key(c.x, c.y), (foodCount.get(key(c.x, c.y)) || 0) + 1); }
+      c.fall = blocked || eatContact || fishOccupancy.get(c.x, c.y + 1) || (foodCount.get(key(c.x, c.y + 1)) > 0) ? 0 : (c.fall || 0) + dt * CONFIG.depth / 300;
+      while (c.fall >= 1 && c.y + 1 < this.floorAt(c.x) && !scenery.has(key(c.x, c.y + 1)) && !fishOccupancy.get(c.x, c.y + 1) && !(foodCount.get(key(c.x, c.y + 1)) > 0)) { const old = key(c.x, c.y); foodCount.set(old, Math.max(0, foodCount.get(old) - 1)); c.y++; c.fall--; foodCount.set(key(c.x, c.y), (foodCount.get(key(c.x, c.y)) || 0) + 1); }
       c.moveAt = now;
     }
-    const edible = [...foods.filter(c => c.kind === 'food' && now - c.born < CONFIG.foodLife), ...Object.values(this.data.chars).filter(c => c.kind === 'seaweed')].sort((a, b) => (a.born ?? a.created) - (b.born ?? b.created) || a.id.localeCompare(b.id)), foodPositions = new Set([...foods.filter(c => c.kind === 'food'), ...edible].map(c => key(c.x, c.y)));
+    const edible = [...foods.filter(c => c.kind === 'food' && now - c.born < CONFIG.foodLife), ...seaweed].sort((a, b) => (a.born ?? a.created) - (b.born ?? b.created) || a.id.localeCompare(b.id)), foodPositions = new Set([...foods.filter(c => c.kind === 'food'), ...edible].map(c => key(c.x, c.y)));
     const turningObstacles = new Map(scenery); for (const cell of edible) if (cell.kind === 'seaweed') turningObstacles.set(key(cell.x, cell.y), {});
     const waitingToEat = new Set(); for (const food of edible) for (const id of contact(food)) waitingToEat.add(id);
     const bins = new Map();
     for (const food of edible) { const bin = key(Math.floor(wrapX(food.x) / 10), Math.floor(food.y / 10)); if (!bins.has(bin)) bins.set(bin, []); bins.get(bin).push(food); }
+    let travelDay;
     for (const unit of motionUnits(this, groups).sort((a, b) => a.id.localeCompare(b.id))) {
       const { id, cells, fish: f } = unit; if (!cells.length) continue;
-      if (unit.members.some(member => capturedFish(this.data, member.id, now))) continue;
+      if (unit.members.some(member => captured.has(member.id))) continue;
       if (unit.members.some(member => waitingToEat.has(member.id))) { commitUnit(unit, now); continue; }
-      const found = new Map();
-      const seeking = bins.size && unit.members.some(member => canEat(member.id));
-      for (const eye of cells) if (EYES.has(eye.ch) && seeking) {
+      const found = bins.size && unit.members.some(member => canEat(member.id)) ? new Map() : null;
+      if (found) for (const eye of cells) if (EYES.has(eye.ch)) {
         const p = cellPosition(f, eye), r = sightRadius(p.y), binWidth = CONFIG.width / 10;
         for (let bx = Math.floor((p.x - r) / 10); bx <= Math.floor((p.x + r) / 10); bx++) for (let by = Math.floor((p.y - r) / 10); by <= Math.floor((p.y + r) / 10); by++) {
           for (const food of bins.get(key((bx % binWidth + binWidth) % binWidth, by)) || []) if (Math.max(Math.abs(deltaX(food.x, p.x)), Math.abs(food.y - p.y)) <= r) found.set(food.id, food);
         }
       }
-      const visible = [...found.values()];
+      const visible = found?.size ? [...found.values()] : null;
       const center = bounds(cells), midX = f.x + f.facing * (center.minX + center.maxX) / 2, midY = f.y + (center.minY + center.maxY) / 2;
-      const needsRemedy = unit.members.some(member => illnessOf(this.data, member.id));
-      visible.sort((a, b) => (needsRemedy ? Number(b.ch === POPULATION.remedy) - Number(a.ch === POPULATION.remedy) : 0) || (Math.abs(deltaX(a.x, midX)) + Math.abs(a.y - midY)) - (Math.abs(deltaX(b.x, midX)) + Math.abs(b.y - midY)) || a.id.localeCompare(b.id));
-      let dx, dy; if (visible.length) { dx = Math.sign(deltaX(visible[0].x, midX)); dy = Math.sign(visible[0].y - midY); }
+      let dx, dy; if (visible) {
+        const needsRemedy = visible.length > 1 && unit.members.some(member => illnessOf(this.data, member.id));
+        visible.sort((a, b) => (needsRemedy ? Number(b.ch === POPULATION.remedy) - Number(a.ch === POPULATION.remedy) : 0) || (Math.abs(deltaX(a.x, midX)) + Math.abs(a.y - midY)) - (Math.abs(deltaX(b.x, midX)) + Math.abs(b.y - midY)) || a.id.localeCompare(b.id));
+        dx = Math.sign(deltaX(visible[0].x, midX)); dy = Math.sign(visible[0].y - midY);
+      }
       else if (ambient) { const motion = idleMotion(this, f, now, ambient, { x: midX, y: midY }); dx = motion.dx; dy = motion.dy; }
       else { const phase = Math.floor((now - f.created) / 12000), r = hash(`${id}:${phase}`); dx = [-1, 0, 1][r % 3]; dy = [-1, 0, 1][Math.floor(r / 3) % 3]; }
-      this.updateFishOccupants(fishOccupancy, unit.members, groups, true);
+      const before = { id: f.id, x: f.x, y: f.y, facing: f.facing };
+      if (unit.record) for (const member of unit.members) fishOccupancy.update(member, groups.get(member.id) || [], true);
       // A blocked ambient direction needs a way out, especially when several
       // friends select different companions in a packed group. Probe real cells
       // against the live occupancy map; normal velocity and collision rules still apply.
       if (ambient && unit.members.length === 1 && (dx || dy)) {
-        const free = (x, y) => { const next = { ...f }; if (x && x !== next.facing) this.turn(next, cells, turningObstacles, fishOccupancy); next.x += x; next.y += y; return this.canOccupy(next, cells, scenery, fishOccupancy) && cells.every(c => { const p = cellPosition(next, c); return !foodPositions.has(key(p.x, p.y)); }); };
+        const free = (x, y) => {
+          const next = { id, x: f.x, y: f.y, facing: f.facing };
+          if (x && x !== next.facing) this.turn(next, cells, turningObstacles, fishOccupancy, center);
+          next.x += x; next.y += y;
+          return this.canOccupy(next, cells, scenery, fishOccupancy, foodPositions);
+        };
         if (!(dx && free(dx, 0)) && !(dy && free(0, dy))) {
           const choices = [[0, -1], [0, 1], [-1, 0], [1, 0]], offset = hash(`avoid:${id}:${Math.floor(now / 12000)}`) % choices.length;
           for (let i = 0; i < choices.length; i++) { const [x, y] = choices[(offset + i) % choices.length]; if (free(x, y)) { dx = x; dy = y; break; } }
@@ -440,47 +538,78 @@ export class World {
           for (const cell of groups.get(member.id) || []) { const p = cellPosition(pose, cell); if (magma.has(key(p.x, p.y))) magmaVictims.add(member.id); }
         }
       };
-      if (dx && dx !== f.facing) { this.turn(f, cells, turningObstacles, fishOccupancy); noteMagmaContact(); }
+      if (dx && dx !== f.facing) { this.turn(f, cells, turningObstacles, fishOccupancy, center); noteMagmaContact(); }
       let movedX = 0, movedY = 0;
-      const v = velocities(cells); f.cx = dx ? Math.min(2, (f.cx || 0) + v.x * dt) : 0; f.cy = dy ? Math.min(2, (f.cy || 0) + v.y * dt) : 0;
-      if (f.cx >= 1 && dx) { const next = { ...f, x: f.x + dx }; if (this.canOccupy(next, cells, scenery, fishOccupancy) && cells.every(c => { const p = cellPosition(next, c); return !foodPositions.has(key(p.x, p.y)); })) { f.x += dx; movedX = dx; } f.cx--; }
+      const v = velocities(cells, center); f.cx = dx ? Math.min(2, (f.cx || 0) + v.x * dt) : 0; f.cy = dy ? Math.min(2, (f.cy || 0) + v.y * dt) : 0;
+      if (f.cx >= 1 && dx) { const next = { id, x: f.x + dx, y: f.y, facing: f.facing }; if (this.canOccupy(next, cells, scenery, fishOccupancy, foodPositions)) { f.x += dx; movedX = dx; } f.cx--; }
       if (movedX) noteMagmaContact();
-      if (f.cy >= 1 && dy) { const next = { ...f, y: f.y + dy }; if (this.canOccupy(next, cells, scenery, fishOccupancy) && cells.every(c => { const p = cellPosition(next, c); return !foodPositions.has(key(p.x, p.y)); })) { f.y += dy; movedY = dy; } f.cy--; }
+      if (f.cy >= 1 && dy) { const next = { id, x: f.x, y: f.y + dy, facing: f.facing }; if (this.canOccupy(next, cells, scenery, fishOccupancy, foodPositions)) { f.y += dy; movedY = dy; } f.cy--; }
       commitUnit(unit, now);
-      this.updateFishOccupants(fishOccupancy, unit.members, groups);
+      if (unit.record) {
+        for (const member of unit.members) fishOccupancy.update(member, groups.get(member.id) || []);
+      } else if (before.x !== f.x || before.y !== f.y || before.facing !== f.facing) {
+        fishOccupancy.update(before, cells, true);
+        fishOccupancy.update(f, cells);
+        if (swims && before.facing === f.facing && (movedX || movedY)) {
+          (swims[(movedY + 1) * 3 + movedX + 1] ||= []).push(id);
+        }
+      }
       noteMagmaContact();
-      for (const member of unit.members) this.recordMovement(member.id, Math.hypot(movedX, movedY), now);
+      if (movedX || movedY) {
+        travelDay ??= shanghaiDay(now);
+        const distance = Math.hypot(movedX, movedY);
+        for (const member of unit.members) this.recordMovement(member.id, distance, now, travelDay);
+      }
     }
+    let bodyChanged = magmaVictims.size > 0;
     for (const id of magmaVictims) killFish(this, id, now, 'magma', transition, groups);
     for (const food of edible) {
-      if (!['food', 'seaweed'].includes(food.kind) || !this.waterAt(food.x, food.y) || fishOccupancy.has(key(food.x, food.y))) continue;
+      if (!['food', 'seaweed'].includes(food.kind) || !this.waterAt(food.x, food.y) || fishOccupancy.get(food.x, food.y)) continue;
       const candidates = contact(food);
       // A winner becomes ineligible for an hour, so every remaining candidate still has its pre-meal size.
       candidates.sort((a, b) => groups.get(b).length - groups.get(a).length || hash(`${food.id}:${b}`) - hash(`${food.id}:${a}`) || a.localeCompare(b));
       if (candidates.length) {
+        bodyChanged = true;
         const winner = candidates[0], grass = food.kind === 'seaweed';
         const previouslyAte = (grass ? pastGrass : pastMeals).has(winner) || (grass ? this.archives?.summary.grassMeals.has(winner) : this.archives?.summary.lastMeals.has(winner));
-        const id = winner, cs = groups.get(id), f = this.data.fishes[id]; fishOccupancy.set(key(food.x, food.y), new Set([id])); transition(food, { kind: 'fish', entity: id, x: deltaX(food.x, f.x) * f.facing, y: food.y - f.y }, { id: `eat:${food.id}:${food.path.length}`, t: now, reason: 'eat', rank: cs.length }); cs.push(food); f.lastFed = now; f.hungerAt = now + CONFIG.hunger; this.foodRevision++; this.dirty = true;
+        const id = winner, cs = groups.get(id), f = this.data.fishes[id]; fishOccupancy.add(food.x, food.y, id); transition(food, { kind: 'fish', entity: id, x: deltaX(food.x, f.x) * f.facing, y: food.y - f.y }, { id: `eat:${food.id}:${food.path.length}`, t: now, reason: 'eat', rank: cs.length }); cs.push(food); f.lastFed = now; f.hungerAt = now + CONFIG.hunger; this.foodRevision++; this.dirty = true;
         if (!previouslyAte) recordStory(this, grass ? 'grass' : 'meal', id, now);
         f.lastMealAt = now; pastMeals.add(id); if (grass) pastGrass.add(id);
         cureFish(this, id, food, now);
         if (food.ghost) { const s = legendSchedule(this.data.roots, food.ghost.seed, food.ghost.slot); recordStory(this, 'shipMeal', id, now, { legendary: s.id, legendSeed: s.seed, legendSlot: s.slot }); }
       }
     }
-    for (const [id, cells] of groups) { const f = this.data.fishes[id]; if (f && now >= f.hungerAt) this.starve(id, f.hungerAt); }
-    normalizeBreeding(this, now); updateContacts(this, now, this.fishGroups(), scenery);
+    let hungryBodies = bodyChanged ? undefined : groups;
+    for (const id of groups.keys()) {
+      const f = this.data.fishes[id];
+      if (f && now >= f.hungerAt) {
+        hungryBodies ??= this.fishGroups();
+        this.starve(id, f.hungerAt, null, { cells: hungryBodies.get(id) });
+        bodyChanged = true;
+      }
+    }
+    normalizeBreeding(this, now);
+    updateContacts(this, now, bodyChanged ? this.fishGroups() : groups, scenery, captured, bodyChanged ? undefined : fishOccupancy);
+    if (swims && bodyChanged) swims.length = 0;
   }
-  turn(f, cells, scenery = this.sceneryMap(), occupants = this.fishOccupants()) {
-    const b = bounds(cells), next = { ...f, x: f.x + f.facing * (b.minX + b.maxX), facing: -f.facing };
-    const ignored = this.collisionIds(f);
-    for (const c of cells) { const a = cellPosition(f, c), z = cellPosition(next, c); for (let x = Math.min(a.x, z.x); x <= Math.max(a.x, z.x); x++) if (!this.waterAt(x, a.y) || scenery.has(key(x, a.y)) || [...(occupants.get(key(x, a.y)) || [])].some(id => !ignored.has(id))) return false; }
+  turn(f, cells, scenery = this.sceneryMap(), occupants = this.fishOccupants(), b = bounds(cells)) {
+    const next = { id: f.id, x: f.x + f.facing * (b.minX + b.maxX), y: f.y, facing: -f.facing };
+    const pair = this.data.breeding[f.id];
+    for (const c of cells) { const a = cellPosition(f, c), z = cellPosition(next, c); for (let x = Math.min(a.x, z.x); x <= Math.max(a.x, z.x); x++) if (!this.waterAt(x, a.y) || scenery.has(key(x, a.y)) || foreignOwner(ownersAt(occupants, x, a.y), f.id, pair)) return false; }
     if (!this.canOccupy(next, cells, scenery, occupants)) return false; f.x = next.x; f.facing = next.facing; return true;
   }
-  starve(id, at, selectedId = null, { illness = false } = {}) {
-    const f = this.data.fishes[id], cells = this.fishCells(id); if (!f || cells.length < 2) return;
+  starve(id, at, selectedId = null, { illness = false, cells = this.fishCells(id) } = {}) {
+    const f = this.data.fishes[id]; if (!f || cells.length < 2) return;
     const candidates = illness ? cells.filter(c => components(cells.filter(other => other !== c)).length === 1) : [];
     const rim = candidates.length ? candidates : exteriorContour(cells);
-    const removed = rim.find(c => c.id === selectedId) || [...rim].sort((a, b) => hash(`${id}:${at}:${a.id}`) - hash(`${id}:${at}:${b.id}`) || a.id.localeCompare(b.id))[0];
+    let removed = rim.find(c => c.id === selectedId);
+    if (!removed) {
+      let best = Infinity;
+      for (const cell of rim) {
+        const score = hash(`${id}:${at}:${cell.id}`);
+        if (score < best || score === best && cell.id.localeCompare(removed.id) < 0) { removed = cell; best = score; }
+      }
+    }
     const event = `${illness ? 'illness' : 'hunger'}:${id}:${at}`, loss = { id: event, t: at, reason: illness ? 'ecoDissolve' : 'starve', ...(illness ? { fish: id, cause: 'depression' } : {}) };
     if (illness) { const pair = this.breedingState(id); if (pair) cancelBreeding(this.data, pair, at, 'illness'); }
     transition(removed, { kind: 'burn', entity: '' }, loss);
@@ -490,17 +619,20 @@ export class World {
     if (!kept.size) { delete this.data.fishes[id]; recordStory(this, 'depart', id, at); } else if (!illness) f.hungerAt = at + CONFIG.hunger;
     this.foodRevision++; this.dirty = true;
   }
-  merge(other, archived = {}) {
-    worldEdited(this);
+  merge(other, archived = {}, origin) {
+    worldEdited(this, origin);
     if (!other || other.protocol !== 1 || !other.chars || !other.fishes || !other.scenes || !other.ops) throw new Error('世界协议不兼容');
     if (other.terrain && !validTerrain(other.terrain, other.roots)) throw new Error('固定海底地形被修改或无效');
     for (const [root, at] of Object.entries(other.roots || {})) if (this.data.roots[root] !== undefined && this.data.roots[root] !== at) throw new Error('世界起源时间不能修改');
     const initial = initialSources({ ...this.data.roots, ...other.roots });
     if (!validEcology(other.ecology, Math.max(Date.now() + 60000, other.tick))) throw new Error('生态更替时钟无效');
-    const populationSources = { roots: { ...this.data.roots, ...other.roots }, fishes: { ...this.data.fishes, ...other.fishes }, ops: { ...archived.ops, ...this.data.ops, ...other.ops }, breeding: { ...archived.breeding, ...this.data.breeding, ...other.breeding } };
-    if (!validPopulation(other.population, populationSources, Math.max(Date.now() + 60000, other.tick)) || !validRocks(other.rocks, populationSources, Math.max(Date.now() + 60000, other.tick))) throw new Error('生态控制记录无效');
-    if (!validateLife(other.life, { roots: { ...this.data.roots, ...other.roots }, ops: { ...archived.ops, ...this.data.ops, ...other.ops }, breeding: { ...archived.breeding, ...this.data.breeding, ...other.breeding }, chars: { ...archived.chars, ...this.data.chars, ...other.chars } }, Math.max(Date.now() + 60000, this.data.tick, other.tick))) throw new Error('鱼生记录无效');
-    if (!validLegends(other.legends, { roots: { ...this.data.roots, ...other.roots }, ops: { ...archived.ops, ...this.data.ops, ...other.ops }, breeding: { ...archived.breeding, ...this.data.breeding, ...other.breeding } }, Math.max(Date.now() + 60000, this.data.tick, other.tick))) throw new Error('稀有异象记录无效');
+    const sources = { roots: { ...this.data.roots, ...other.roots }, fishes: { ...this.data.fishes, ...other.fishes }, ops: { ...archived.ops, ...this.data.ops, ...other.ops }, breeding: { ...archived.breeding, ...this.data.breeding, ...other.breeding } };
+    if (!validPopulation(other.population, sources, Math.max(Date.now() + 60000, other.tick)) || !validRocks(other.rocks, sources, Math.max(Date.now() + 60000, other.tick))) throw new Error('生态控制记录无效');
+    const latest = Math.max(Date.now() + 60000, this.data.tick, other.tick);
+    sources.chars = Object.keys(other.chars).length || Object.keys(archived.chars || {}).length
+      ? { ...archived.chars, ...this.data.chars, ...other.chars } : this.data.chars;
+    if (!validateLife(other.life, sources, latest)) throw new Error('鱼生记录无效');
+    if (!validLegends(other.legends, sources, latest)) throw new Error('稀有异象记录无效');
     for (const op of Object.values(other.ops)) if (op.genesis !== undefined && !validInitialOp(op, initial)) throw new Error('初始鱼记录被修改或无效');
     this.data.terrain = clone(chooseTerrain(terrainOf(this.data), terrainOf(other)));
     Object.assign(this.data.roots, other.roots);
@@ -548,8 +680,9 @@ export class World {
       const obj = type === 'fishes' ? canonicalBirthFish(incoming, birthOf(id)) : incoming, old = this.data[type][id];
       if (!old || (obj.posAt || 0) > (old.posAt || 0) || ((obj.posAt || 0) === (old.posAt || 0) && JSON.stringify(obj).localeCompare(JSON.stringify(old)) > 0)) this.data[type][id] = clone(obj);
     }
-    const dependencies = archiveDependencies({ ...this.data, ops: { ...archived.ops, ...this.data.ops }, breeding: { ...archived.breeding, ...this.data.breeding } });
+    let dependencies;
     for (const field of ['ops', 'breeding']) for (const [id, record] of Object.entries(archived[field] || {})) {
+      dependencies ??= archiveDependencies({ ...this.data, ops: { ...archived.ops, ...this.data.ops }, breeding: { ...archived.breeding, ...this.data.breeding } });
       const current = this.data[field][id], keep = dependencies[field].has(id);
       if (keep && !current) {
         const next = clone(record);
@@ -561,8 +694,16 @@ export class World {
     this.data.population = mergePopulation(this.data.population, other.population, Math.max(this.data.tick, other.tick));
     this.data.rocks = mergeRocks(this.data.rocks, other.rocks);
     settleLegendary(this, Math.max(this.data.tick, other.tick), transition);
-    normalizeBirthCells(this); const groups = this.fishGroups();
-    const latestFeed = new Map(this.archives?.summary.lastMeals || []); for (const c of Object.values(this.data.chars)) for (const r of c.path) if (r.reason === 'eat') latestFeed.set(r.target, Math.max(latestFeed.get(r.target) || 0, r.t));
+    const cells = this.charValues(), groups = new Map();
+    normalizeBirthCells(this, cells);
+    const latestFeed = new Map(this.archives?.summary.lastMeals || []), occupiedScenes = new Set();
+    let chatGlyphCount = 0;
+    for (const c of cells) {
+      if (c.kind === 'fish') groupFishCell(groups, c);
+      if (c.kind === 'scene') occupiedScenes.add(c.entity);
+      if (c.chat) chatGlyphCount++;
+      for (const r of c.path) if (r.reason === 'eat') latestFeed.set(r.target, Math.max(latestFeed.get(r.target) || 0, r.t));
+    }
     for (const id of Object.keys(this.data.fishes)) {
       const f = this.data.fishes[id], cs = groups.get(id) || []; if (!cs.length) { delete this.data.fishes[id]; continue; }
       let fed = Math.max(f.created, latestFeed.get(id) || 0);
@@ -570,12 +711,22 @@ export class World {
       const mealAt = lastMealAt(f, latestFeed.get(id)); if (mealAt !== undefined) f.lastMealAt = mealAt;
       if (cs.length === 1) { const c = cs[0], p = cellPosition(f, c); transition(c, { kind: 'food', entity: '', x: wrapX(p.x), y: p.y, born: Math.max(this.data.tick, other.tick), fall: 0 }, { id: `normalize:${id}`, t: Math.max(this.data.tick, other.tick), reason: 'shed' }); delete this.data.fishes[id]; }
     }
-    for (const id of Object.keys(this.data.scenes)) if (!this.sceneCells(id).length) delete this.data.scenes[id];
+    for (const id of Object.keys(this.data.scenes)) if (!occupiedScenes.has(id)) delete this.data.scenes[id];
+    const localChatSources = new Set();
     for (const [id, message] of Object.entries(this.data.chatSources)) if (message.body.roots.some(root => this.data.roots[root] !== undefined)) {
-      delete this.data.chatSources[id]; for (const [cellId, c] of Object.entries(this.data.chars)) if (c.chat === id) delete this.data.chars[cellId];
+      delete this.data.chatSources[id];
+      localChatSources.add(id);
     }
-    if (!this.sceneCells(CHAT_FLOOR).length) delete this.data.scenes[CHAT_FLOOR];
-    this.data.pendingChatGlyphs = Math.max(0, Object.values(this.data.chatSources).reduce((sum, message) => sum + chatGlyphs(message.body.text).length, 0) - Object.values(this.data.chars).filter(c => c.chat).length);
+    let occupiedChatFloor = occupiedScenes.has(CHAT_FLOOR);
+    if (localChatSources.size) {
+      occupiedChatFloor = false;
+      for (const [id, c] of Object.entries(this.data.chars)) {
+        if (localChatSources.has(c.chat)) { delete this.data.chars[id]; if (c.chat) chatGlyphCount--; }
+        else if (c.kind === 'scene' && c.entity === CHAT_FLOOR) occupiedChatFloor = true;
+      }
+    }
+    if (!occupiedChatFloor) delete this.data.scenes[CHAT_FLOOR];
+    this.data.pendingChatGlyphs = Math.max(0, Object.values(this.data.chatSources).reduce((sum, message) => sum + chatGlyphs(message.body.text).length, 0) - chatGlyphCount);
     this.data.tick = Math.max(this.data.tick, other.tick);
     this.data.ecology = mergeEcology(this.data.ecology, other.ecology);
     this.data.archives = mergeArchiveState(this.data.archives, other.archives);
