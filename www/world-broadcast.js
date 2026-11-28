@@ -78,7 +78,7 @@ function captureStep(data, base, patch, breeding, pending) {
     for (const id of edits.remove) last.delete(id);
     const frame = edits.frame, length = frame ? frame.length : edits.set.length;
     for (let i = 0; i < length; i++) {
-      const id = frame ? frame.idAt(i) : edits.set[i][0], value = frame ? frame.records[i] : edits.set[i][1];
+      const id = frame ? frame.idAt(i) : edits.set[i][0];
       if (otherEdits?.has(id)) continue;
       const prior = last.get(id);
       const edit = worker.tables[field]?.set[i];
@@ -90,6 +90,7 @@ function captureStep(data, base, patch, breeding, pending) {
         if (before !== distance) rows.travel[id] = new DailyDistance(prior, day, distance);
         continue;
       }
+      const value = frame ? frame.recordAt(i) : edits.set[i][1];
       if (prior !== undefined && changed(field, travelRow(prior), value)) continue;
       if (prior && field === 'fishes' && edit !== undefined && !Array.isArray(edit)) {
         rows.fishes[id] = { ...prior, x: value.x, y: value.y, facing: value.facing,

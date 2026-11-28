@@ -1,4 +1,5 @@
 import { applyBondIntervals } from './bond-interval.js';
+import { SimulationRows } from './simulation-rows.js';
 
 // A standalone swimmer publishes one fixed-width row. Ordinary edits and
 // lifecycle changes retain their sparse record format.
@@ -59,33 +60,66 @@ export function applyStoryChanges(previous, changes, detach = false) {
 // The page and its observers share one committed set of complete, immutable
 // records. Only readers of the older [id, record] interface allocate tuples.
 class CommittedRows {
-  constructor(field, table, change, knownFish, tick) {
+  constructor(table, change, knownFish, tick, commitRows) {
     const { set, motion, distances } = change;
+    const slots = commitRows && SimulationRows.for(table, knownFish);
+    this.set = set;
+    this.knownFish = knownFish;
+    this.tick = tick;
+    this.motion = motion;
+    this.distances = distances;
+    this.day = change.day;
     this.length = set.length;
-    this.ids = new Array(set.length);
+    this.offsets = motion && new Int32Array(set.length);
+    this.bases = new Array(set.length);
     this.records = new Array(set.length);
+    this.pendingSlots = slots && new Array(set.length);
     this.added = [];
-    if (field === 'fishes') this.moved = [];
     for (let i = 0, offset = 0; i < set.length; i++) {
-      const row = set[i], id = this.ids[i] = rowId(row, knownFish), previous = table[id];
-      let record;
+      const row = set[i], id = this.idAt(i), slot = slots && slots.at(id, this.ordinalAt(i));
+      if (slots) this.pendingSlots[i] = slot;
+      const prior = slot?.frame, index = slot?.index;
+      if (!slot && !Object.hasOwn(table, id)) this.added.push(id);
       if (motion && !Array.isArray(row)) {
-        record = poseRecord(previous, motion, offset, tick);
+        this.offsets[i] = offset + 1;
+        this.bases[i] = prior ? prior.records[index] ?? prior.bases[index] : slot ? slot.value : table[id];
         offset += 5;
-      } else if (distances && typeof row === 'number') {
-        record = { ...previous, days: { ...previous.days, [change.day]: distances[offset++] } };
-      } else record = expandedRecord(table, row);
-      this.records[i] = record;
-      if (previous === undefined && !Object.hasOwn(table, id)) this.added.push(id);
-      if (this.moved && (!previous || previous.x !== record.x || previous.y !== record.y || previous.facing !== record.facing)) this.moved.push(i);
+      } else if (distances && i < distances.length) {
+        this.bases[i] = prior ? prior.records[index] ?? (prior.day === this.day ? prior.bases[index] : prior.recordAt(index)) : slot ? slot.value : table[id];
+      } else this.records[i] = expandedRecord(table, row);
     }
   }
-  idAt(i) { return this.ids[i]; }
+  get ids() { return this.keys ??= this.set.map(row => rowId(row, this.knownFish)); }
+  idAt(i) { return rowId(this.set[i], this.knownFish); }
+  ordinalAt(i) { return typeof this.set[i] === 'number' ? this.set[i] : undefined; }
+  recordAt(i) {
+    if (this.records[i]) return this.records[i];
+    const before = this.bases[i];
+    return this.records[i] = this.offsets?.[i] ? poseRecord(before, this.motion, this.offsets[i] - 1, this.tick)
+      : { ...before, days: { ...before.days, [this.day]: this.distances[i] } };
+  }
+  forEachPose(visit) {
+    for (let i = 0; i < this.length; i++) {
+      const offset = this.offsets?.[i];
+      if (offset) visit(this.idAt(i), this.motion[offset - 1], this.motion[offset], this.motion[offset + 1]);
+      else {
+        const { x, y, facing } = this.recordAt(i);
+        visit(this.idAt(i), x, y, facing);
+      }
+    }
+  }
   commit(table) {
-    for (let i = 0; i < this.length; i++) table[this.ids[i]] = this.records[i];
+    const slots = SimulationRows.for(table, this.knownFish);
+    for (let i = 0; i < this.length; i++) {
+      const slot = this.pendingSlots[i] ?? slots.add(table, this.idAt(i), undefined, this.ordinalAt(i));
+      slot.frame = this;
+      slot.index = i;
+      slot.value = undefined;
+    }
+    this.pendingSlots = null;
   }
   entries() {
-    return this.pairs ??= this.ids.map((id, i) => [id, this.records[i]]);
+    return this.pairs ??= this.ids.map((id, i) => [id, this.recordAt(i)]);
   }
 }
 
@@ -96,7 +130,7 @@ export function expandSimulationPatch(data, patch, knownFish, commitRows = false
     if (!change) continue;
     const table = data[field];
     if (field !== 'chars' && (commitRows || change.motion || change.distances)) {
-      const frame = new CommittedRows(field, table, change, knownFish, patch.values.tick);
+      const frame = new CommittedRows(table, change, knownFish, patch.values.tick, commitRows);
       tables[field] = commitRows ? { frame, remove: change.remove, get set() { return frame.entries(); } }
         : { set: frame.entries(), remove: change.remove };
     } else if (change.set.some(row => row.length > 2)) {

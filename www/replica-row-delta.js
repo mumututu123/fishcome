@@ -89,7 +89,7 @@ export class FishPoseFrame {
       if (!Array.isArray(edit)) {
         for (let k = 0; k < 5; k++) motion[at + k] = raw.motion[offset++];
       } else {
-        const row = frame ? frame.records[i] : edits.set[i][1];
+        const row = frame ? frame.recordAt(i) : edits.set[i][1];
         for (let k = 0; k < 5; k++) motion[at + k] = row[poseFields[k]];
         if (!poseEdit(edit, row, roster[ref][1], tick)) {
           const snapshot = structuredClone(row);

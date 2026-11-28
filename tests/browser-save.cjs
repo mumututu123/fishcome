@@ -159,7 +159,7 @@ async function motionCheckpoint(page) {
       for (let i = 0; i < indices.length; i++) { motion[i * 5] = tick; motion[i * 5 + 2] = 1; }
       const patch = expandSimulationPatch(world, { values: { tick }, tables: {
         fishes: { set: indices, motion, remove: [] },
-        travel: { set: indices.map(i => [ids[i], day, tick]), remove: [] }
+        travel: { set: indices, day, distances: Float64Array.from(indices, () => tick), remove: [] }
       } }, ids, true);
       beforeCheckpointPatch(world, patch);
       for (const [field, updates] of Object.entries(patch.tables)) updates.frame.commit(world[field]);

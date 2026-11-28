@@ -18,11 +18,15 @@ test('页面写入完整运动记录，视窗只处理改变占格的鱼，旧�
     frame.commit(fishes);
     viewport.update(patch.tables);
     assert.equal(frame.pairs, undefined);
-    assert.deepEqual(frame.moved, [1]);
+    assert.equal(viewport.owners.fish.get('a').x, 5);
+    assert.equal(viewport.owners.fish.get('b').x, x);
     return patch.tables.fishes;
   }
   const first = commit(500, 33);
+  const observed = fishes.b;
   commit(1000, 65);
+  assert.equal(observed.x, 33);
+  assert.equal(structuredClone(fishes).b.x, 65);
   assert.deepEqual(first.set.map(([id, f]) => [id, f.x, f.posAt]), [['a', 5, 500], ['b', 33, 500]]);
   assert.deepEqual(viewport.query(64, 66, 4, 6).map(cell => cell.id), ['b']);
   assert.equal(fishes.a.posAt, 1000);

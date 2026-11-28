@@ -1,4 +1,5 @@
 import { worldTables } from './simulation-changes.js';
+import { SimulationRows } from './simulation-rows.js';
 import { PAGE_HEAD, compatibilityMark, mirrorOldVersion, preserveOldBranch } from './legacy-checkpoint.js';
 
 const FORMAT = 'tide-checkpoint-pages-1';
@@ -32,15 +33,21 @@ export function beforeCheckpointPatch(data, patch) {
   for (const [field, changes] of Object.entries(patch.tables || {})) {
     const source = capture.sources.get(field);
     if (!source) continue;
-    if (capture.snapshots.has(field)) continue;
+    if (capture.snapshots.has(field) || capture.rowCuts.has(field)) continue;
     const frame = changes.frame;
     const prior = frame && committed?.tables?.get(field);
     if (prior?.source.deref() === source && frame.length >= PAGE_SIZE && frame.length * 2 >= prior.byId.size) {
       // Freeze table membership and references once during this active cut.
       // Prior sparse changes, if any, still win in lookup().
-      const saved = { ...source };
-      capture.snapshots.set(field, saved);
-      if (!capture.keys.has(field)) capture.keys.set(field, Object.keys(saved));
+      const cut = SimulationRows.snapshot(source);
+      if (cut) {
+        capture.rowCuts.set(field, cut);
+        if (!capture.keys.has(field)) capture.keys.set(field, cut.ids);
+      } else {
+        const saved = { ...source };
+        capture.snapshots.set(field, saved);
+        if (!capture.keys.has(field)) capture.keys.set(field, Object.keys(saved));
+      }
       continue;
     }
     let old = capture.before.get(field);
@@ -152,8 +159,11 @@ function lookup(capture, field, source, id) {
   const delta = capture.deltas?.get(field);
   if (delta) return delta.has(id) ? delta.get(id) : ABSENT;
   const old = capture.before.get(field);
+  if (old?.has(id)) return old.get(id);
+  const cut = capture.rowCuts.get(field);
+  if (cut) return cut.get(id, ABSENT);
   source = capture.snapshots.get(field) || source;
-  return old?.has(id) ? old.get(id) : Object.hasOwn(source, id) ? source[id] : ABSENT;
+  return Object.hasOwn(source, id) ? source[id] : ABSENT;
 }
 
 function fitsDenseChar(row) {
@@ -401,7 +411,7 @@ export function beginCheckpoint(store, prior, checkpoint, options, done, fail) {
     if (captures.get(data) === capture) captures.delete(data);
     release();
   };
-  const capture = { sources, keys: new Map(), before: new Map(), snapshots: new Map(), read, abort(error) { finishRead(); fail(error); } };
+  const capture = { sources, keys: new Map(), before: new Map(), snapshots: new Map(), rowCuts: new Map(), read, abort(error) { finishRead(); fail(error); } };
   if (incremental && !stale) detachReplicaCut(capture, dirty);
   if (options.simulationChanges) captures.set(data, capture);
   // A stale tab may still send its own signed replica. It cannot replace the

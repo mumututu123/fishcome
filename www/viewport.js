@@ -25,12 +25,11 @@ function sectorRange(group) {
   return { left, right, flippedLeft, flippedRight, top, bottom };
 }
 
-function staysInSector(group, pose) {
-  if (!Number.isInteger(pose?.x) || !Number.isInteger(pose.y) || Math.abs(pose.facing) !== 1) return false;
+function staysInSector(group, x, y, facing) {
+  if (!Number.isInteger(x) || !Number.isInteger(y) || Math.abs(facing) !== 1) return false;
   const range = group.range ??= sectorRange(group);
-  if (!range || pose.y < range.top || pose.y >= range.bottom) return false;
-  return pose.facing === 1 ? pose.x >= range.left && pose.x < range.right :
-    pose.x >= range.flippedLeft && pose.x < range.flippedRight;
+  if (!range || y < range.top || y >= range.bottom) return false;
+  return facing === 1 ? x >= range.left && x < range.right : x >= range.flippedLeft && x < range.flippedRight;
 }
 
 // Several cells can share an owner. Moving the owner changes their sectors
@@ -131,12 +130,16 @@ export class ViewportCells {
   }
 
   moveOwner(group, pose) {
-    if (!group || group.x === pose?.x && group.y === pose?.y && group.facing === pose?.facing) return;
-    const inside = Math.abs(group.facing) === 1 && Math.abs(pose?.facing) === 1 && staysInSector(group, pose);
-    group.x = pose?.x; group.y = pose?.y; group.facing = pose?.facing;
+    this.moveOwnerTo(group, pose?.x, pose?.y, pose?.facing);
+  }
+
+  moveOwnerTo(group, x, y, facing) {
+    if (!group || group.x === x && group.y === y && group.facing === facing) return;
+    const inside = Math.abs(group.facing) === 1 && staysInSector(group, x, y, facing);
+    group.x = x; group.y = y; group.facing = facing;
     if (!inside) {
       group.range = null;
-      for (const entry of group) this.place(entry);
+      for (const entry of group) this.move(entry, x === undefined ? undefined : sector(x + (entry.kind === 'fish' ? facing : 1) * entry.x, y + entry.y));
     }
   }
 
@@ -193,9 +196,8 @@ export class ViewportCells {
       if (!changes) continue;
       for (const id of changes.remove || []) this.moveOwner(owners.get(id));
       const frame = changes.frame;
-      if (frame?.moved) {
-        for (const i of frame.moved) this.moveOwner(owners.get(frame.idAt(i)), frame.records[i]);
-      } else for (const [id, pose] of changes.set || []) this.moveOwner(owners.get(id), pose);
+      if (frame) frame.forEachPose((id, x, y, facing) => this.moveOwnerTo(owners.get(id), x, y, facing));
+      else for (const [id, pose] of changes.set || []) this.moveOwner(owners.get(id), pose);
     }
   }
 

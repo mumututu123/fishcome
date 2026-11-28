@@ -2,6 +2,7 @@ import { CONFIG } from './engine.js';
 import { fishOrigin, writeBreedingRecord } from './breeding.js';
 import { simulationWillApply, simulationApplied, subscribeSimulationChanges, worldRevision, worldTables } from './simulation-changes.js';
 import { expandSimulationPatch, rowId } from './simulation-delta.js';
+import { SimulationRows } from './simulation-rows.js';
 export { subscribeSimulationChanges } from './simulation-changes.js';
 
 // The stored sea supplies the phase of the simulation clock. An independent
@@ -61,11 +62,13 @@ function applyResult(world, { patch: delta, foodRevision }, knownFish) {
   simulationWillApply(world, patch);
   for (const [field, changes] of Object.entries(patch.tables)) {
     const table = world.data[field] ||= {};
+    const slots = changes.frame && SimulationRows.for(table, knownFish);
     changes.addedCount = 0;
     changes.removedCount = 0;
     for (const id of changes.remove) if (Object.hasOwn(table, id)) {
       changes.removedCount++;
       delete table[id];
+      slots?.remove(id);
     }
     if (changes.frame) {
       changes.addedCount = changes.frame.added.length;
@@ -131,6 +134,8 @@ export class SimulationClient {
     this.close();
     const worker = this.worker = this.makeWorker();
     this.knownFish = Object.keys(world.data.fishes);
+    SimulationRows.for(world.data.fishes, this.knownFish);
+    SimulationRows.for(world.data.travel, this.knownFish);
     this.names = new Map();
     this.foods = new Map();
     this.archiveChanges = [];
