@@ -664,14 +664,15 @@ test('连续工作线程更新保留旧快照，将完整位置与稀疏字符�
   const sink = { live: () => [1], broadcast: (_, body) => body };
   data.fishes.a = { id: 'a', x: 1, y: 2, facing: 1, cx: 1, cy: 2, posAt: 100, parents: ['p'] };
   data.chars.c = { id: 'c', x: 1, path: ['north'], old: true };
+  const still = data.chars.still = { id: 'still', x: 4, path: ['east'] };
   const first = await sender.send(sink, data, 100);
   data.tick += CONFIG.step;
   const { a } = data.fishes, { c } = data.chars;
   a.x = a.cx = 2; a.posAt = data.tick;
   c.x = 2; c.new = { info: 'retained' }; delete c.old;
-  notify(world, { values: { tick: data.tick }, tables: { fishes: { set: [['a', a]], remove: [] }, chars: { set: [['c', c]], remove: [] } },
+  notify(world, { values: { tick: data.tick }, tables: { fishes: { set: [['a', a]], remove: [] }, chars: { set: [['c', c], ['still', still]], remove: [] } },
     workerChanges: { values: { tick: data.tick }, tables: { fishes: { set: [0], remove: [], motion: Float64Array.of(2, 2, 1, 2, 2) },
-      chars: { set: [['c', { x: 2, new: c.new }, ['old']]] } } } });
+      chars: { set: [['c', { x: 2, new: c.new }, ['old']], ['still', { x: 4, path: ['east'] }, ['absent']]] } } } });
   const next = await sender.send(sink, data, 200);
   const base = replicaRowBase(crypto.randomUUID(), first.world, true), encoded = encodeReplicaRowDelta(next, base, true);
   assert(encoded.world.fishes[0][1] < 0);
@@ -693,6 +694,7 @@ test('连续工作线程更新保留旧快照，将完整位置与稀疏字符�
   assert.deepEqual(first.world.fishes.a.parents, ['p']);
   assert.equal(first.world.fishes.a.x, 1);
   assert.deepEqual(next.world.fishes.a.parents, ['p']);
+  assert.deepEqual(Object.keys(next.world.chars), ['c']);
   assert.deepEqual(next.world.chars.c, { id: 'c', x: 2, path: ['north'], new: { info: 'retained' } });
   // A foreground correction at the same clock compares against the last actual
   // motion rather than the cold columns saved before the worker started.
