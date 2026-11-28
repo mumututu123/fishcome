@@ -163,7 +163,7 @@ function lookup(capture, field, source, id) {
   const cut = capture.rowCuts.get(field);
   if (cut) return cut.get(id, ABSENT);
   source = capture.snapshots.get(field) || source;
-  return Object.hasOwn(source, id) ? source[id] : ABSENT;
+  return Object.hasOwn(source, id) ? SimulationRows.readForCheckpoint(source, id) : ABSENT;
 }
 
 function fitsDenseChar(row) {

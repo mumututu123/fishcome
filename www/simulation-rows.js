@@ -12,14 +12,30 @@ export class SimulationRows {
     for (let i = 0; i < ids.length; i++) {
       const id = ids[i], slot = source.byId.get(id);
       positions.set(id, i);
-      if (slot?.frame) { frames[i] = slot.frame; slots[i] = slot.index; }
-      else values[i] = slot ? slot.value : table[id];
+      const ownsSlot = slot && Object.getOwnPropertyDescriptor(table, id).get === slot.read;
+      if (ownsSlot && slot.frame) { frames[i] = slot.frame; slots[i] = slot.index; }
+      else values[i] = ownsSlot ? slot.value : table[id];
     }
     return { ids, get(id, absent) {
       const i = positions.get(id);
       if (i === undefined) return absent;
-      return frames[i] ? frames[i].recordAt(slots[i]) : values[i];
+      return frames[i] ? frames[i].readForCheckpoint(slots[i]) : values[i];
     } };
+  }
+
+  static readForCheckpoint(table, id) {
+    const slot = tables.get(table)?.byId.get(id);
+    return slot?.frame && Object.getOwnPropertyDescriptor(table, id)?.get === slot.read ? slot.frame.readForCheckpoint(slot.index) : table[id];
+  }
+
+  static invalidate(table) {
+    const existing = tables.get(table);
+    if (existing) existing.knownFish = null;
+  }
+
+  static removed(table, ids) {
+    const existing = tables.get(table);
+    if (existing) for (const id of ids) existing.remove(id);
   }
 
   static for(table, knownFish) {

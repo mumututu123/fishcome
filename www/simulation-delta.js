@@ -44,6 +44,12 @@ function poseRecord(previous, motion, offset, tick) {
   return record;
 }
 
+function copyBase(record, travel) {
+  const copy = { ...record };
+  if (travel) copy.days = { ...record.days };
+  return copy;
+}
+
 export function rowId(row, knownFish) {
   if (Array.isArray(row)) return row[0];
   return typeof row === 'number' ? knownFish[row] : row;
@@ -57,8 +63,7 @@ export function applyStoryChanges(previous, changes, detach = false) {
     detach ? [row[0], structuredClone(row[1])] : row));
 }
 
-// The page and its observers share one committed set of complete, immutable
-// records. Only readers of the older [id, record] interface allocate tuples.
+// Retain the worker's numbers and the unchanged fields of each record.
 class CommittedRows {
   constructor(table, change, knownFish, tick, commitRows) {
     const { set, motion, distances } = change;
@@ -82,20 +87,28 @@ class CommittedRows {
       if (!slot && !Object.hasOwn(table, id)) this.added.push(id);
       if (motion && !Array.isArray(row)) {
         this.offsets[i] = offset + 1;
-        this.bases[i] = prior ? prior.records[index] ?? prior.bases[index] : slot ? slot.value : table[id];
+        this.bases[i] = prior ? prior.baseAt(index, false) : copyBase(slot ? slot.value : table[id], false);
         offset += 5;
       } else if (distances && i < distances.length) {
-        this.bases[i] = prior ? prior.records[index] ?? (prior.day === this.day ? prior.bases[index] : prior.recordAt(index)) : slot ? slot.value : table[id];
+        this.bases[i] = prior ? prior.baseAt(index, true, this.day) : copyBase(slot ? slot.value : table[id], true);
       } else this.records[i] = expandedRecord(table, row);
     }
   }
   get ids() { return this.keys ??= this.set.map(row => rowId(row, this.knownFish)); }
   idAt(i) { return rowId(this.set[i], this.knownFish); }
   ordinalAt(i) { return typeof this.set[i] === 'number' ? this.set[i] : undefined; }
+  baseAt(i, travel, day) {
+    const record = this.records[i];
+    if (record) return copyBase(record, travel);
+    return travel && this.day !== day ? this.readForCheckpoint(i) : this.bases[i];
+  }
   recordAt(i) {
+    return this.records[i] ??= this.readForCheckpoint(i);
+  }
+  readForCheckpoint(i) {
     if (this.records[i]) return this.records[i];
     const before = this.bases[i];
-    return this.records[i] = this.offsets?.[i] ? poseRecord(before, this.motion, this.offsets[i] - 1, this.tick)
+    return this.offsets?.[i] ? poseRecord(before, this.motion, this.offsets[i] - 1, this.tick)
       : { ...before, days: { ...before.days, [this.day]: this.distances[i] } };
   }
   forEachPose(visit) {

@@ -1,3 +1,5 @@
+import { SimulationRows } from './simulation-rows.js';
+
 const revisions = new WeakMap();
 const listeners = new Set();
 const beforePatch = new Set();
@@ -19,11 +21,19 @@ export function subscribeSimulationChanges(listener) {
 export function worldRevision(world) { return revisions.get(world) || 0; }
 
 export function worldEdited(world, origin, merge) {
+  SimulationRows.invalidate(world.data.fishes);
+  SimulationRows.invalidate(world.data.travel);
   revisions.set(world, worldRevision(world) + 1);
   for (const listener of listeners) listener(world, null, origin, merge);
 }
 
 export function simulationApplied(world, patch) {
+  if (!patch.workerChanges) {
+    for (const field of ['fishes', 'travel']) {
+      const remove = patch.tables[field]?.remove;
+      if (remove?.length) SimulationRows.removed(world.data[field], remove);
+    }
+  }
   for (const listener of listeners) listener(world, patch);
 }
 

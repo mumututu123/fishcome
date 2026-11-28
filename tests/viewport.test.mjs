@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { ViewportCells } from '../www/viewport.js';
 import { makeFishWorld } from './capacity-fish.mjs';
-import { subscribeSimulationChanges } from '../www/simulation-changes.js';
+import { simulationApplied, subscribeSimulationChanges, worldEdited } from '../www/simulation-changes.js';
 import { expandSimulationPatch } from '../www/simulation-delta.js';
 
 test('页面写入完整运动记录，视窗只处理改变占格的鱼，旧帧仍可读取', () => {
@@ -25,11 +25,43 @@ test('页面写入完整运动记录，视窗只处理改变占格的鱼，旧�
   const first = commit(500, 33);
   const observed = fishes.b;
   commit(1000, 65);
+  observed.nick = '旧改动';
   assert.equal(observed.x, 33);
   assert.equal(structuredClone(fishes).b.x, 65);
+  assert.equal(fishes.b.nick, undefined);
   assert.deepEqual(first.set.map(([id, f]) => [id, f.x, f.posAt]), [['a', 5, 500], ['b', 33, 500]]);
   assert.deepEqual(viewport.query(64, 66, 4, 6).map(cell => cell.id), ['b']);
   assert.equal(fishes.a.posAt, 1000);
+});
+
+test('归档或合流移除再写入同编号时，下一步沿用新鱼和新行程', () => {
+  const data = { fishes: { a: { x: 0, nick: '旧鱼' } }, travel: { a: { since: 50, days: { yesterday: 1 } } } };
+  const world = { data }, known = ['a'];
+  function move(tick, day, distance) {
+    const { tables } = expandSimulationPatch(data, { values: { tick }, tables: {
+      fishes: { set: [0], remove: [], motion: Float64Array.of(2, 3, 1, 0, 0) },
+      travel: { set: [0], remove: [], day, distances: Float64Array.of(distance) }
+    } }, known, true);
+    tables.fishes.frame.commit(data.fishes);
+    tables.travel.frame.commit(data.travel);
+  }
+  move(500, 'today', 3);
+  const oldTravel = data.travel.a;
+  move(1000, 'tomorrow', 1);
+  oldTravel.days.yesterday = 8;
+  assert.deepEqual(data.travel.a.days, { yesterday: 1, today: 3, tomorrow: 1 });
+
+  delete data.travel.a;
+  simulationApplied(world, { tables: { travel: { set: [], remove: ['a'] } } });
+  data.travel.a = { since: 1000, days: { tomorrow: 2 } };
+  move(1500, 'tomorrow', 4);
+  assert.deepEqual(data.travel.a, { since: 1000, days: { tomorrow: 4 } });
+
+  worldEdited(world, 'replica');
+  delete data.fishes.a;
+  data.fishes.a = { x: 12, nick: '新鱼' };
+  move(2000, 'tomorrow', 6);
+  assert.equal(data.fishes.a.nick, '新鱼');
 });
 
 test('跟随端连续合流时，五千条鱼的海域保留已绘制的鱼和点击位置', async () => {
