@@ -51,7 +51,7 @@ async function readGraphicsEvents(chunks) {
 const thread = e => `${e.pid}:${e.tid}`;
 
 function indexOffscreenPresentations(events) {
-  const swaps = new Map(), receives = new Map(), aggregates = new Map(), dispatches = new Map(), presentations = new Map();
+  const swaps = new Map(), receives = [], aggregates = new Map(), dispatches = new Map(), presentations = new Map();
   const begin = new Map(), displayed = new Set();
   const eventTime = e => e.args?.data?.callTime ?? e.ts;
   for (const e of events.slice().sort((a, b) => eventTime(a) - eventTime(b))) {
@@ -75,7 +75,7 @@ function indexOffscreenPresentations(events) {
     }
     const row = e.args?.chrome_graphics_pipeline;
     if (!row) continue;
-    if (row.step === 'STEP_RECEIVE_COMPOSITOR_FRAME') receives.set(row.surface_frame_trace_id, e);
+    if (row.step === 'STEP_RECEIVE_COMPOSITOR_FRAME') receives.push(e);
     if (row.step === 'STEP_DRAW_AND_SWAP') swaps.set(row.display_trace_id, e);
     if (row.step === 'STEP_SURFACE_AGGREGATION') for (const id of row.aggregated_surface_frame_trace_ids || []) {
       if (!aggregates.has(id)) aggregates.set(id, []);
@@ -83,7 +83,7 @@ function indexOffscreenPresentations(events) {
     }
   }
 
-  const sinks = [...receives.values()].filter(e => {
+  const sinks = receives.filter(e => {
     const id = e.args.chrome_graphics_pipeline.frame_sink_id;
     return id?.frame_sink_client_id > 0 && id.frame_sink_id >= 0x80000000;
   }).sort((a, b) => a.ts - b.ts);
@@ -108,6 +108,9 @@ function indexOffscreenPresentations(events) {
     if (!received || received.ts >= (dispatchRows[i + 1]?.ts ?? Infinity)) return;
     if (sinks[n + 1]?.ts < (dispatchRows[i + 1]?.ts ?? Infinity)) return;
     const id = received.args.chrome_graphics_pipeline.surface_frame_trace_id;
+    // Manual submissions share the same sentinel. A display can contain an
+    // older or newer image from this surface without changing that identifier.
+    if (typeof id !== 'string' || id === '-1') return;
     for (const aggregate of aggregates.get(id) || []) {
       if (aggregate.ts < received.ts) continue;
       const swap = swaps.get(aggregate.args.chrome_graphics_pipeline.display_trace_id);

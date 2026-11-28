@@ -31,6 +31,25 @@ test('独立画布必须找到同一子图层与实际合成器呈现', () => {
   assert.equal(readPresentations(events, page, 0, 15).rows.length, 0);
 });
 
+test('低延迟主线程画布不能拿先于自身提交的页面回执验收', () => {
+  const worker = (name, ts, args = {}, ph) => ({ name, ts, pid: 1, tid: 2, args, ph });
+  const page = { page: 'A', surface: { desynchronized: true }, frames: [{ sequence: 0, at: 1.1, poses: [1, 4, 7] }] };
+  const blink = [worker('AnimationFrame', 1000, { id: 4 }, 'b'),
+    worker('tide.refresh.A.0.start', 1100, { data: { callTime: 1100 } }),
+    worker('tide.refresh.A.0.end', 2000, { data: { callTime: 2000 } }),
+    worker('AnimationFrame', 2020, { id: 4 }, 'e'), worker('AnimationFrame::Presentation', 2100, { id: 4 })];
+  const frames = [...blink, worker('CanvasResourceDispatcher::DispatchFrame', 2120),
+    { name: 'Graphics.Pipeline', ts: 2200, pid: 3, tid: 4, args: { chrome_graphics_pipeline: {
+      step: 'STEP_RECEIVE_COMPOSITOR_FRAME', surface_frame_trace_id: '-1', frame_sink_id: { frame_sink_client_id: 6, frame_sink_id: 2147483648 }
+    } } }, { name: 'Display::FrameDisplayed', ts: 8250, pid: 3, tid: 4 }];
+  assert.equal(readPresentations(blink, { ...page, surface: { desynchronized: false } }, 0, 15).rows[0].traceTs, 2100);
+  assert.equal(readPresentations(blink, page, 0, 15).rows.length, 0);
+  const unverified = readPresentations(frames, page, 0, 15);
+  assert.equal(unverified.rows.length, 0);
+  assert.equal(unverified.unverifiedCanvas, 1);
+  assert.equal(readPresentations(frames, { ...page, surface: undefined }, 0, 15).rows.length, 0);
+});
+
 test('双端本地结算从最先发起的请求计时，遗漏对方的时标或确认均不能通过', () => {
   const requests = [500, 1000, 1500, 2000].map((tick, sequence) => ({ tick, sequence, agreed: sequence > 0 }));
   const peers = [{ tick: 1000, sequence: 4, agreed: true, committed: true },

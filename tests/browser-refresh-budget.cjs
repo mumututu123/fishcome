@@ -82,7 +82,9 @@ async function startTrace(browser, boundariesOnly, profileRules = false, offscre
 function readPresentations(events, page, start, end) {
   const startMarks = new Map(), samples = new Map(), presentation = new Map();
   const prefix = `tide.refresh.${page.page}.`;
-  const ownerPresentation = page.frames.some(frame => frame.owner) && indexOffscreenPresentations(events);
+  const dispatchThreads = new Set(events.filter(e => e.name === 'CanvasResourceDispatcher::DispatchFrame').map(e => `${e.pid}:${e.tid}`));
+  const useCanvasFeedback = page.frames.some(frame => frame.owner) || page.surface?.desynchronized === true || dispatchThreads.size > 0;
+  const canvasPresentation = useCanvasFeedback && indexOffscreenPresentations(events);
   const sorted = events.filter(event => event.name.startsWith('AnimationFrame') || event.name.startsWith(prefix))
     .sort((a, b) => (a.args?.data?.callTime ?? a.ts) - (b.args?.data?.callTime ?? b.ts));
   for (const event of sorted) {
@@ -101,6 +103,7 @@ function readPresentations(events, page, start, end) {
     }
   }
   const drawn = [];
+  let unverifiedCanvas = 0;
   let minClockOffset = -Infinity, maxClockOffset = Infinity;
   const displayed = new Map();
   for (const frame of page.frames) {
@@ -113,8 +116,12 @@ function readPresentations(events, page, start, end) {
     maxClockOffset = Math.min(maxClockOffset, (frame.afterMark ?? frame.at) - mark.ts / 1000 + .1);
     const drawCpu = (mark.endTts - mark.tts) / 1000;
     if (Number.isFinite(drawCpu)) drawn.push({ at: frame.at, drawCpu });
-    const presented = frame.owner ? ownerPresentation(mark, startMarks.get(`owner.${frame.sequence + 1}`)?.ts ?? Infinity)?.presented
+    const childSurface = frame.owner || page.surface?.desynchronized === true || dispatchThreads.has(`${mark.pid}:${mark.tid}`);
+    // A low-latency 2D canvas submits its own surface. Blink's page frame can
+    // be acknowledged before that submission, so require its own Viz receipt.
+    const presented = childSurface ? canvasPresentation(mark, startMarks.get(`${frame.owner ? 'owner.' : ''}${frame.sequence + 1}`)?.ts ?? Infinity)?.presented
       : presentation.get(mark.frame);
+    if (childSurface && !(presented >= mark.endTs)) unverifiedCanvas++;
     if (!(presented >= mark.endTs)) continue;
     const at = frame.at + (presented - mark.ts) / 1000;
     displayed.set(presented, { ...frame, at, traceTs: presented, drawStartTs: mark.ts, drawEndTs: mark.endTs,
@@ -167,7 +174,7 @@ function readPresentations(events, page, start, end) {
   }));
   // Both independent browser processes run on the same machine. Check the
   // mapping from trace ticks to the page clock before comparing their events.
-  return { drawn, rows, moving, longestGaps, longestMotionGaps,
+  return { drawn, rows, moving, longestGaps, longestMotionGaps, unverifiedCanvas,
     clockOffsets: Number.isFinite(minClockOffset) && minClockOffset <= maxClockOffset ? [minClockOffset, maxClockOffset] : undefined };
 }
 
