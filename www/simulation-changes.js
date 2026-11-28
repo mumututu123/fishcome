@@ -27,6 +27,16 @@ export function worldEdited(world, origin, merge) {
   for (const listener of listeners) listener(world, null, origin, merge);
 }
 
+// A verified history replacement has no geometry or table-membership edits.
+// Prepared steps must still observe the new revision before they can run.
+export function replaceLifeHistory(world, life) {
+  const patch = { values: { life }, tables: {} };
+  simulationWillApply(world, patch);
+  revisions.set(world, worldRevision(world) + 1);
+  world.data.life = life;
+  simulationApplied(world, patch);
+}
+
 export function simulationApplied(world, patch) {
   if (!patch.workerChanges) {
     for (const field of ['fishes', 'travel']) {

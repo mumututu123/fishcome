@@ -626,6 +626,9 @@ export class WorkerSimulation {
       // these lookups needs no future time, input, or simulated movement.
       const groups = this.world.ecologyCharacters().groups;
       this.world.movementGrid(groups).swimmers(this.world, CONFIG.speed);
+    } else if (message.kind === 'history') {
+      Object.assign(this.world.data.life, message.parts);
+      this.tracker.reset();
     } else if (message.kind === 'restore') {
       this.tracker.invalidateOrigins();
       for (const [field, id, value] of message.rows) {

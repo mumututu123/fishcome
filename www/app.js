@@ -140,9 +140,12 @@ const ordered = new OrderedSession({
     const records = mergeBonds(s.world.data.life.bonds, bonds);
     return JSON.stringify(records) === JSON.stringify(s.world.data.life.bonds) ? s.world.data.life.bonds : records;
   },
-  install: (target, changes, valid, apply) => atCheckpointBoundary(target.data, () => {
-    if (valid()) apply(() => { worldEdited(target); Object.assign(target.data, changes); target.dirty = true; });
-  }),
+  install: (target, changes, valid, apply) => atCheckpointBoundary(target.data, () => simulation.atStepBoundary(() => {
+    if (valid()) apply(() => {
+      if (changes.life && Object.keys(changes).length === 1) simulation.installLifeHistory(target, changes.life);
+      else { worldEdited(target); Object.assign(target.data, changes); target.dirty = true; }
+    });
+  })),
   apply(target, op, archived) {
     const result = target.apply({ ...clone(op.body), proof: clone(op) }, archived);
     inbox.delete(op.body.id);
@@ -160,8 +163,6 @@ const ordered = new OrderedSession({
     diagnostics),
   archiveBoundary: (target, commit) => atCheckpointBoundary(target.data, () => simulation.archiveAtStepBoundary(target, commit)),
   archiveConfirmed: () => { renderChat(); save({ reusePicture: true }).catch(error => diagnostics.record('warn', 'archive', error.message)); },
-  // Both workers start with the same row roster and compact patch reference.
-  // An existing leader worker may still contain private pre-join indexes.
   beginExecution: () => worldBroadcast.reset(),
   prepare: (target, valid) => simulation.prepareAgreed(target, valid),
   advance: (target, nextTick, valid, handle) => simulation.advanceAgreed(target, nextTick, valid, handle),

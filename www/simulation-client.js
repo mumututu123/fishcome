@@ -1,6 +1,6 @@
 import { CONFIG } from './engine.js';
 import { fishOrigin, writeBreedingRecord } from './breeding.js';
-import { simulationWillApply, simulationApplied, subscribeSimulationChanges, worldRevision, worldTables } from './simulation-changes.js';
+import { replaceLifeHistory, simulationWillApply, simulationApplied, subscribeSimulationChanges, worldRevision, worldTables } from './simulation-changes.js';
 import { expandSimulationPatch, rowId } from './simulation-delta.js';
 import { SimulationRows } from './simulation-rows.js';
 export { subscribeSimulationChanges } from './simulation-changes.js';
@@ -100,6 +100,7 @@ export class SimulationClient {
     this.worker = null;
     this.owner = null;
     this.knownFish = null;
+    this.historyParts = null;
     this.failure = null;
     const pending = this.pending;
     this.pending = null;
@@ -126,6 +127,21 @@ export class SimulationClient {
       if (change && this.owner === world) this.archiveChanges.push(change);
       return !!change;
     });
+  }
+  installLifeHistory(world, life) {
+    const hot = this.owner === world && this.tick === world.data.tick && this.revision === worldRevision(world);
+    if (hot) {
+      const parts = this.historyParts ??= {};
+      for (const [key, value] of Object.entries(life)) if (value !== world.data.life[key]) parts[key] = value;
+    }
+    replaceLifeHistory(world, life);
+    if (hot) this.revision = worldRevision(world);
+  }
+  async syncHistory(valid) {
+    const parts = this.historyParts;
+    this.historyParts = null;
+    await this.request({ kind: 'history', parts });
+    return valid();
   }
   finishBoundary() {
     for (const apply of this.boundaries?.splice(0) || []) apply();
@@ -243,6 +259,7 @@ export class SimulationClient {
     if (this.owner !== world || this.revision !== revision || this.tick !== base) {
       if (!await this.startTask(world, () => this.open(world, valid))) return null;
     }
+    if (this.historyParts && !await this.startTask(world, () => this.syncHistory(valid))) return null;
     return valid() ? { world, base, revision, worker: this.worker } : null;
   }
   async advanceAgreed(world, nextTick, stillValid, prepared) {
@@ -275,6 +292,7 @@ export class SimulationClient {
     if (this.owner !== world || this.revision !== revision || this.tick !== base) {
       if (!await this.open(world, valid)) { this.close(); return; }
     }
+    if (this.historyParts && !await this.syncHistory(valid)) { this.close(); return; }
     if (repair.geometry || repair.chat) {
       const result = await this.compute(world, { kind: 'repair', base, now, geometry: repair.geometry }, valid);
       if (!result) return;
