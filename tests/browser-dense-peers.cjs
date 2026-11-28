@@ -331,7 +331,11 @@ if (typeof renderClient !== 'undefined') {
     });
   };
 }
-window.denseSurvey = () => ({ ...testData, frames: ownerFrames.length ? [...testData.frames, ...ownerFrames].sort((a, b) => a.at - b.at) : testData.frames,
+const capturedFrames = () => ownerFrames.length ? [...testData.frames, ...ownerFrames].sort((a, b) => a.at - b.at) : testData.frames;
+let surveyFrames;
+window.denseSealFrames = () => { surveyFrames = capturedFrames().slice(); return surveyFrames.length; };
+window.denseReadFrames = offset => JSON.stringify(surveyFrames.slice(offset, offset + 256));
+window.denseSurvey = (includeFrames = true) => ({ ...testData, frames: includeFrames ? capturedFrames() : undefined,
   offscreen: ownerFrames.length > 0, node: network?.node, leader: network && leader(), peers: network?.live().length,
   simulationFailure: simulation.failure?.error?.message,
   page: window.densePage, timeOrigin: performance.timeOrigin,
@@ -746,10 +750,25 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
   const ended = observationNow(), sampled = event => event.at >= recent && event.at <= ended;
   await Promise.all([a, b].map(page => page.waitForFunction(end => denseSurvey().frames.at(-1)?.at >= end, ended, { polling: 50, timeout: 10000 })));
   if (stopTrace) await pause(step);
-  const traces = stopTrace && await Promise.all(stopTrace.map((stop, i) => {
+  const frameCounts = await Promise.all([a,b].map(page => page.evaluate(() => denseSealFrames())));
+  const closingTraces = stopTrace && Promise.all(stopTrace.map((stop, i) => {
     const { dir, name, ext } = path.parse(values.trace);
     return stop(i ? path.join(dir, name + '.B' + ext) : values.trace);
   }));
+  async function captureCheckpoint() {
+    if (!values['refresh-budget']) return {};
+    const states = await Promise.all([a, b].map(page => page.evaluate(() => {
+      const { proofs, tick } = denseSurvey(false);
+      return { proofs: proofs.length, tick };
+    })));
+    if (!states.every(state => state.proofs)) return {};
+    const tick = Math.max(...states.map(state => state.tick)) + 3 * step;
+    try {
+      const commonCheckpoint = await Promise.all([a,b].map(page => page.evaluate(tick => denseCheckpointAt(tick), tick)));
+      return { commonCheckpoint };
+    } catch (error) { return { checkpointError: error.message }; }
+  }
+  const [traces, { commonCheckpoint, checkpointError }] = await Promise.all([closingTraces, captureCheckpoint()]);
   const { rounds = [], error: archiveError } = await archiveResult;
   let profileSummary;
   if (profiler) {
@@ -758,12 +777,15 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
     await writeFile(values.profile, JSON.stringify(profile));
     profileSummary = profileTimes(profile);
   }
-  const pages = await Promise.all([a, b].map(page => page.evaluate(() => denseSurvey())));
-  let commonCheckpoint;
-  if (values['refresh-budget'] && pages.every(page => page.proofs.length)) {
-    const tick = Math.max(...await Promise.all([a,b].map(page => page.evaluate(() => denseSurvey().tick)))) + 3 * step;
-    commonCheckpoint = await Promise.all([a,b].map(page => page.evaluate(tick => denseCheckpointAt(tick), tick)));
-  }
+  const pages = await Promise.all([a, b].map(async (page, i) => {
+    const report = await page.evaluate(() => denseSurvey(false));
+    report.frames = [];
+    for (let offset = 0; offset < frameCounts[i]; offset += 256) {
+      const json = await page.evaluate(offset => denseReadFrames(offset), offset);
+      report.frames.push(...JSON.parse(json));
+    }
+    return report;
+  }));
   const archiveIds = [...fixture.archiveIds, ...rounds.map(round => round.id)];
   assert.equal(new Set(archiveIds).size, archiveIds.length, '每轮应生成不同于历史记录的新归档');
   const saved = await Promise.all((backup ? [a, b] : [b]).map(page => page.evaluate(async ({ joinedFish, archiveIds }) => {
@@ -874,7 +896,7 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
     .map(field => [field, stats(received.flatMap(row => row.rows ? [row.rows[field]] : []))]));
   const report = JSON.stringify({ count, realBackup: Boolean(backup), browserVersion, cold, joinedMs: joined - joining, settledMs: recent - joining, steadyMs: ended - recent,
     saved, liveWire, browserProcesses: browsers.length, graphics, traceClockSkewMs, worldStart,
-    agreedSteps: agreed.length, matchedProofs, commonCheckpoint,
+    agreedSteps: agreed.length, matchedProofs, commonCheckpoint, checkpointError,
     bundledArchives: new Set(follower.receives.filter(sampled).flatMap(row => row.bundled || [])).size,
     separateArchiveMessages: follower.receives.filter(row => sampled(row) && row.kind === 'archiveChunk').length,
     ...(switched ? { switched } : {}),
@@ -929,6 +951,7 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
   if (archiveRounds && !values.drop && !values['forget-live-base'] && !values['plain-live']) {
     assert(!pages.some(page => page.repairs.some(sampled)), '完整存档直连归档时误报缺少记录，触发了补拉');
   }
+  assert(!checkpointError, checkpointError);
   if (commonCheckpoint) assert.deepEqual(commonCheckpoint[0], commonCheckpoint[1], '实际提交到两端的同一步完整世界不同');
   if (values['refresh-budget']) assert(schedule.unpresented.length === 0 && confirmed.missing === 0 && confirmed.over20 === 0 &&
     commonCheckpoint && agreed.length === requests.length && matchedProofs === agreed.length &&

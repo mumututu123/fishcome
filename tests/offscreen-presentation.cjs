@@ -5,6 +5,49 @@ function decodeGraphicsTrace(json) {
     .replace(/("aggregated_surface_frame_trace_ids"\s*:\s*\[)([^\]]*)/g, (_, start, ids) => start + ids.replace(/-?\d+/g, id => `"${id}"`)));
 }
 
+// The full release-window trace can exceed V8's maximum string length. Keep
+// the raw trace on disk and decode one event at a time, including 64-bit IDs.
+async function readGraphicsEvents(chunks) {
+  const traceEvents = [];
+  let head = '', opened = false, fragment = '', depth = 0, quoted = false, escaped = false;
+  for await (let text of chunks) {
+    if (!opened) {
+      head += text;
+      const prefix = /^\s*\{\s*"traceEvents"\s*:\s*\[/.exec(head);
+      if (!prefix) {
+        if (head.length > 128) throw Error('无法读取浏览器跟踪事件表');
+        continue;
+      }
+      text = head.slice(prefix[0].length);
+      head = '';
+      opened = true;
+    }
+    let start = depth ? 0 : -1;
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i];
+      if (!depth) {
+        if (c === ']') return { traceEvents };
+        if (c === '{') { depth = 1; start = i; }
+      } else if (quoted) {
+        if (escaped) escaped = false;
+        else if (c === '\\') escaped = true;
+        else if (c === '"') quoted = false;
+      } else if (c === '"') quoted = true;
+      else if (c === '{') depth++;
+      else if (c === '}' && --depth === 0) {
+        const json = fragment + text.slice(start, i + 1);
+        fragment = '';
+        start = -1;
+        if (/tide\.|"AnimationFrame(?:::Presentation)?"|Graphics\.Pipeline\.DrawAndSwap|Display::FrameDisplayed|CanvasResourceDispatcher::DispatchFrame|STEP_(RECEIVE_COMPOSITOR_FRAME|DRAW_AND_SWAP|SURFACE_AGGREGATION)|Profile|RunTask|MicrotaskCheckpoint|HandlePostMessage|GC/.test(json)) {
+          traceEvents.push(decodeGraphicsTrace(json));
+        }
+      }
+    }
+    if (start >= 0) fragment += text.slice(start);
+  }
+  throw Error('浏览器跟踪事件表被截断');
+}
+
 const thread = e => `${e.pid}:${e.tid}`;
 
 function indexOffscreenPresentations(events) {
@@ -78,4 +121,4 @@ function indexOffscreenPresentations(events) {
   };
 }
 
-module.exports = { decodeGraphicsTrace, indexOffscreenPresentations };
+module.exports = { decodeGraphicsTrace, readGraphicsEvents, indexOffscreenPresentations };

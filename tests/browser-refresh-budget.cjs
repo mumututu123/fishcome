@@ -1,6 +1,9 @@
 const { once } = require('node:events');
 const { writeFile } = require('node:fs/promises');
-const { decodeGraphicsTrace, indexOffscreenPresentations } = require('./offscreen-presentation.cjs');
+const { createReadStream, createWriteStream } = require('node:fs');
+const { pipeline } = require('node:stream/promises');
+const { createGunzip } = require('node:zlib');
+const { readGraphicsEvents, indexOffscreenPresentations } = require('./offscreen-presentation.cjs');
 
 function recordDraw(renderer, frames, page, trace, owner = false) {
   const draw = renderer.draw.bind(renderer);
@@ -43,28 +46,36 @@ async function startTrace(browser, boundariesOnly, profileRules = false, offscre
   const client = await browser.newBrowserCDPSession();
   const complete = once(client, 'Tracing.tracingComplete');
   const categories = ['devtools.timeline', 'blink.user_timing'];
-  if (offscreen) categories.push('blink', 'cc', 'viz', 'benchmark', 'graphics.pipeline');
+  if (offscreen) categories.push('blink', 'viz');
   if (profileRules) categories.push('disabled-by-default-v8.cpu_profiler');
   if (!boundariesOnly) categories.push('toplevel');
-  await client.send('Tracing.start', { categories: categories.join(','), transferMode: 'ReturnAsStream' });
+  await client.send('Tracing.start', { traceConfig: { includedCategories: categories, excludedCategories: ['*'],
+    ...(offscreen && { traceBufferSizeInKb: 384 * 1024 }) }, transferMode: 'ReturnAsStream',
+    ...(offscreen && { streamCompression: 'gzip' }) });
   return async filename => {
     await client.send('Tracing.end');
     const [{ stream, dataLossOccurred }] = await complete;
-    if (!stream || dataLossOccurred) throw new Error('浏览器跟踪不完整');
+    if (!stream) throw new Error('浏览器未提供跟踪数据');
     const chunks = [];
-    try {
+    async function* readChunks() {
       for (;;) {
         const { data, base64Encoded, eof } = await client.send('IO.read', { handle: stream, size: 1024 * 1024 });
-        chunks.push(Buffer.from(data, base64Encoded ? 'base64' : 'utf8'));
+        yield Buffer.from(data, base64Encoded ? 'base64' : 'utf8');
         if (eof) break;
       }
+    }
+    try {
+      if (dataLossOccurred) throw new Error('浏览器跟踪不完整');
+      if (offscreen) await pipeline(readChunks(), createGunzip(), createWriteStream(filename));
+      else for await (const bytes of readChunks()) chunks.push(bytes);
     } finally {
       await client.send('IO.close', { handle: stream });
       await client.detach();
     }
+    if (offscreen) return readGraphicsEvents(createReadStream(filename, { encoding: 'utf8' }));
     const json = Buffer.concat(chunks);
     await writeFile(filename, json);
-    return offscreen ? decodeGraphicsTrace(json.toString()) : JSON.parse(json);
+    return JSON.parse(json);
   };
 }
 

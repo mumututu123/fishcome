@@ -1,7 +1,15 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readPresentations, frameSummary, bothDisplays, scheduledSteps, matchStepStarts } from './browser-refresh-budget.cjs';
-import { decodeGraphicsTrace } from './offscreen-presentation.cjs';
+import { decodeGraphicsTrace, readGraphicsEvents } from './offscreen-presentation.cjs';
+
+test('连续多轮的图层跟踪可跨块读取，保留原始帧编号并拒绝截断', async () => {
+  const event = { name: 'Graphics.Pipeline', args: { chrome_graphics_pipeline: { step: 'STEP_DRAW_AND_SWAP', display_trace_id: 0 }, text: '}"[\\' } };
+  const source = JSON.stringify({ traceEvents: [event] }).replace('"display_trace_id":0', '"display_trace_id":9223372036854775701');
+  const result = await readGraphicsEvents([...source]);
+  assert.deepEqual(result, decodeGraphicsTrace(source));
+  await assert.rejects(readGraphicsEvents([source.slice(0, -2)]), /截断/);
+});
 
 test('独立画布必须找到同一子图层与实际合成器呈现', () => {
   const worker = (name, ts) => ({ name, ts, pid: 1, tid: 2, tts: ts, args: { data: { callTime: ts } } });
