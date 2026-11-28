@@ -180,7 +180,14 @@ const enc = new TextEncoder();
 const actorHashes = new Map();
 export async function actorId(jwk) { const text = `${jwk.crv}:${jwk.x}:${jwk.y}`; if (actorHashes.has(text)) return actorHashes.get(text); const bytes = await crypto.subtle.digest('SHA-256', enc.encode(text)); const id = [...new Uint8Array(bytes)].map(b => b.toString(16).padStart(2, '0')).join(''); actorHashes.set(text, id); return id; }
 export async function newIdentity(nick, generation) { const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']); const pub = await crypto.subtle.exportKey('jwk', pair.publicKey), secret = await crypto.subtle.exportKey('jwk', pair.privateKey); const identity = { nick, pub, secret, actor: await actorId(pub), remainder: 0, serial: 0, registration: { at: Date.now(), joined: false } }; await putMany([['identity', identity]], { generation, registerIdentity: generation !== undefined }); return identity; }
-export async function signer(identity) { const key = await crypto.subtle.importKey('jwk', identity.secret, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign']); return async value => { const bytes = await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, key, enc.encode(JSON.stringify(value))); return btoa(String.fromCharCode(...new Uint8Array(bytes))); }; }
+export async function signer(identity) {
+  const key = await crypto.subtle.importKey('jwk', identity.secret, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign']);
+  async function signBytes(bytes) {
+    const signature = await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, key, bytes);
+    return btoa(String.fromCharCode(...new Uint8Array(signature)));
+  }
+  return Object.assign(value => signBytes(enc.encode(JSON.stringify(value))), { bytes: signBytes });
+}
 const keys = new Map();
 export async function verifyEnvelope(message) {
   if (typeof message?.actor !== 'string' || message.from?.slice(0, 16) !== message.actor.slice(0, 16)) return false;

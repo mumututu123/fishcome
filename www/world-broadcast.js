@@ -1,8 +1,8 @@
 import { breedingForBroadcast, stopBreedingBroadcast } from './breeding.js';
 import { replicaRowEquality } from './replica-stream.js';
-import { committedStepFields, FishPoseFrame } from './replica-row-delta.js';
-import { shanghaiDay } from './fish-status.js';
+import { committedStepFields, DailyDistance, FishPoseFrame, travelRow } from './replica-row-delta.js';
 import { applyBondIntervals } from './bond-interval.js';
+import { applyStoryChanges } from './simulation-delta.js';
 import { CONFIG, detachReplicaRows } from './engine.js';
 import { deltaX } from './geography.js';
 import { capturedFishIds } from './legends.js';
@@ -36,7 +36,7 @@ function changedRows(data, base, pending) {
     const changed = rows[field] = {};
     const check = id => {
       if (!Object.hasOwn(table, id)) { last.delete(id); return; }
-      const sent = last.get(id);
+      const sent = travelRow(last.get(id));
       const value = table[id];
       if (sent === undefined ? value !== undefined : !sameRow(field, sent, value)) changed[id] = value;
     };
@@ -64,7 +64,7 @@ function captureDelta(delta) {
 // previous detached records as the static part of a contiguous publication.
 function captureStep(data, base, patch, breeding) {
   const worker = patch.workerChanges, rows = fullRows({});
-  const source = { previousFishes: base.fishes, travelDay: shanghaiDay(data.tick), journeys: new Map() };
+  const source = { previousFishes: base.fishes, trips: rows.travel };
   const poses = patch.tables.fishes && FishPoseFrame.capture(worker.tables.fishes, patch.tables.fishes, base.poseFrame, base.fishes, data.tick);
   if (poses) source.poses = poses;
   else reconcileFishRows(base);
@@ -79,15 +79,17 @@ function captureStep(data, base, patch, breeding) {
     for (let i = 0; i < length; i++) {
       const id = frame ? frame.idAt(i) : edits.set[i][0], value = frame ? frame.records[i] : edits.set[i][1];
       const prior = last.get(id);
-      if (prior !== undefined && changed(field, prior, value)) continue;
       const edit = worker.tables[field]?.set[i];
+      if (prior && field === 'travel' && edit?.length === 3 && typeof edit[1] === 'string') {
+        const day = edit[1], distance = edit[2];
+        const before = prior instanceof DailyDistance && day === prior.day ? prior.distance : travelRow(prior).days[day];
+        if (before !== distance) rows.travel[id] = new DailyDistance(prior, day, distance);
+        continue;
+      }
+      if (prior !== undefined && changed(field, travelRow(prior), value)) continue;
       if (prior && field === 'fishes' && edit !== undefined && !Array.isArray(edit)) {
         rows.fishes[id] = { ...prior, x: value.x, y: value.y, facing: value.facing,
           cx: value.cx, cy: value.cy, posAt: value.posAt };
-      } else if (prior && field === 'travel' && edit?.length === 3 && typeof edit[1] === 'string') {
-        const day = edit[1];
-        rows.travel[id] = { ...prior, days: { ...prior.days, [day]: value.days[day] } };
-        if (day === source.travelDay) source.journeys.set(id, prior);
       } else if (prior && field === 'chars' && edit?.length === 3) {
         const copy = { ...prior, ...edit[1] };
         for (const key in edit[1]) {
@@ -109,14 +111,26 @@ function captureStep(data, base, patch, breeding) {
       Object.defineProperty(detached, field, { enumerable: true, configurable: true, get: () => poses.table() });
       continue;
     }
+    if (field === 'travel') {
+      let table;
+      Object.defineProperty(detached, field, { enumerable: true, configurable: true, get: () => {
+        if (!table) {
+          table = {};
+          for (const id of Object.keys(rows.travel)) table[id] = travelRow(rows.travel[id]);
+        }
+        return table;
+      } });
+      continue;
+    }
     detached[field] = rows[field];
   }
   if (!base.life || Object.hasOwn(worker.values, 'life')) detached.life = structuredClone(data.life);
   else if (!worker.life) detached.life = base.life;
   else {
-    const { properties: [properties, remove], bonds } = worker.life;
+    const { properties: [properties, remove], stories, bonds } = worker.life;
     const life = { ...base.life, ...structuredClone(properties) };
     for (const key of remove || []) delete life[key];
+    if (stories) life.stories = applyStoryChanges(base.life.stories, stories, true);
     if (bonds?.intervals) {
       // Both cuts use the same order as the committed worker. Keep the
       // operation alongside its result for peers that confirmed this cut.
@@ -334,7 +348,8 @@ export class WorldBroadcast {
       if (!changes) continue;
       let ids = this.pending.get(field);
       if (!ids) this.pending.set(field, ids = new Set());
-      for (const [id] of changes.set) ids.add(id);
+      if (changes.frame) { for (const id of changes.frame.ids) ids.add(id); }
+      else for (const [id] of changes.set) ids.add(id);
       for (const id of changes.remove) ids.add(id);
     }
   }
@@ -408,7 +423,7 @@ export class WorldBroadcast {
         // joins keep their own immutable snapshot of the world.
         for (const field of rowFields) {
           if (poses && field === 'fishes') continue;
-          const rows = world[field], last = previous.rows[field];
+          const rows = field === 'travel' ? committedStepFields.get(world)?.trips ?? world.travel : world[field], last = previous.rows[field];
           for (const id in rows) if (Object.hasOwn(rows, id)) last.set(id, rows[id]);
         }
       } else {

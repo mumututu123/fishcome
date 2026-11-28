@@ -3,6 +3,46 @@ import test from 'node:test';
 import { World, key } from '../www/engine.js';
 import { motionOrder } from '../www/breeding.js';
 import { BodyLayout, compileHull, fitsHullAt, sweepsHullAt } from '../www/motion-hull.js';
+import { WorkerSimulation } from '../www/simulation-worker.js';
+import { makeFishWorld } from './capacity-fish.mjs';
+
+test('游动意向跨过饥饿与换相边界，投食、改时和丢弃缓存后仍与逐鱼判向一致', () => {
+  const start = Date.UTC(2025, 5, 15, 12, 17), day = 86400000;
+  const reference = makeFishWorld(World, 12, 1000, { now: start, mixedGenders: true, spacingX: 3 });
+  const ids = Object.keys(reference.data.fishes);
+  for (const [i, id] of ids.entries()) Object.assign(reference.data.fishes[id], {
+    created: start - day + (i % 3) * 350, lastFed: start - day + (i % 2 ? 750 : -500), hungerAt: start + day
+  });
+  const worker = new WorkerSimulation();
+  worker.receive({ kind: 'open', values: reference.serialize(), tables: [], ambient: true });
+  worker.receive({ kind: 'ready' });
+  function replace(field, id, value) {
+    if (value === undefined) delete reference.data[field][id];
+    else reference.data[field][id] = value;
+    worker.receive({ kind: 'restore', rows: [[field, id, structuredClone(value)]] });
+  }
+  let planned = false;
+  for (let step = 1; step <= 38; step++) {
+    if (step === 8) {
+      const fish = reference.data.fishes[ids[1]];
+      replace('fishes', fish.id, { ...fish, lastFed: reference.data.tick, created: fish.created - 3000 });
+    }
+    if (step === 13) replace('chars', 'food', { id: 'food', kind: 'food', entity: '',
+      x: 999, y: 5, ch: '*', color: '#fff', born: reference.data.tick, fall: 0, moveAt: reference.data.tick, path: [] });
+    if (step === 19 && reference.data.chars.food?.kind === 'food') replace('chars', 'food', undefined);
+    if (step === 25) {
+      reference.data.tick -= 1500;
+      worker.receive({ kind: 'restore', rows: [], previous: { tick: reference.data.tick }, foodRevision: 0 });
+    }
+    if (step === 32 && worker.world.movingPopulation) delete worker.world.movingPopulation.grid.intentPlan;
+    const base = reference.data.tick;
+    reference.step(base + 500);
+    worker.receive({ kind: 'step', base, names: [], foods: [] });
+    planned ||= !!worker.world.movingPopulation?.grid.intentPlan;
+    assert.deepEqual(JSON.parse(JSON.stringify(worker.world.data)), JSON.parse(JSON.stringify(reference.data)), '第 ' + step + ' 步');
+  }
+  assert(planned);
+});
 
 test('亲鱼跨海界平移、转身、被分开或恢复旧小数位置，联合鱼体始终与重新摆放相同', () => {
   const world = new World(100, 'test', { populate: false });

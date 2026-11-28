@@ -7,32 +7,106 @@ const poseFields = ['x', 'y', 'facing', 'cx', 'cy'];
 const travelFields = ['since', 'days'];
 const contactFields = ['male', 'female', 'since', 'lastAt'];
 export const committedStepFields = new WeakMap();
+const confirmedRosters = new WeakMap();
 const maxColumns = 30;
 const rowTable = value => value && typeof value === 'object' && !Array.isArray(value);
 const safeId = id => typeof id === 'string' && !['__proto__', 'prototype', 'constructor'].includes(id);
+export const supportsPoseBytes = typeof Uint8Array.prototype.toBase64 === 'function' && typeof Uint8Array.fromBase64 === 'function';
+// A daily movement overwrites one number. Independent immutable steps may
+// share older days without building two new dictionaries for every swimmer.
+export class DailyDistance {
+  constructor(prior, day, distance) {
+    this.history = prior instanceof DailyDistance ? prior.day === day ? prior.history : prior.row() : prior;
+    this.day = day;
+    this.distance = distance;
+  }
+  follows(prior) {
+    return this.history === prior || prior instanceof DailyDistance && this.day === prior.day && this.history === prior.history;
+  }
+  row() {
+    return this.materialized ??= { ...this.history, days: { ...this.history.days, [this.day]: this.distance } };
+  }
+}
+export const travelRow = row => row instanceof DailyDistance ? row.row() : row;
+
+// Ordinals are immutable for this confirmed roster. Copying a dense reference
+// array preserves old baselines while sparse travel updates touch only movers.
+class ConfirmedTravel {
+  constructor(indices, updates, previous) {
+    this.indices = indices;
+    if (previous?.indices === indices) {
+      this.values = previous.values.slice();
+      this.size = previous.size;
+    } else {
+      this.values = new Array(indices.size);
+      this.size = 0;
+      if (previous) for (const [id, index] of indices) {
+        const row = previous.get(id);
+        if (row) { this.values[index] = row; this.size++; }
+      }
+    }
+    for (const id of Object.keys(updates || {})) {
+      const i = indices.get(id);
+      if (i === undefined || !updates[id]) continue;
+      if (!this.values[i]) this.size++;
+      this.values[i] = updates[id];
+    }
+  }
+  get(id) { return this.values[this.indices.get(id)]; }
+}
 function exactFields(row, expected) {
   const keys = Object.keys(row);
   return keys.length === expected.length && keys.every((key, i) => key === expected[i]);
 }
 
-// A uniform swimming step owns the numeric buffer transferred by the worker.
-// Cold columns are shared with an already detached roster. The full dictionary
-// is needed only for a legacy reader, a repair or a change of roster.
+const motionKeys = new Set([...poseFields, 'posAt']);
+function poseEdit(edit, row, prior, tick) {
+  return edit.length === 3 && !edit[2]?.length && row.posAt === tick && Object.hasOwn(prior, 'posAt') &&
+    Object.keys(edit[1]).every(key => motionKeys.has(key)) &&
+    poseFields.every(key => Object.hasOwn(prior, key) && Number.isFinite(row[key]));
+}
+
+// The receiver indexes rows by its last confirmed packet. Simulation order is
+// independent of that order, particularly when parents move as a single body.
 export class FishPoseFrame {
   static capture(raw, edits, previous, table, tick) {
     const frame = edits.frame, length = frame ? frame.length : edits.set.length;
-    if (!raw?.motion || raw.remove?.length || raw.motion.length !== length * 5) return;
+    if (!raw?.motion || raw.remove?.length || !length) return;
     const roster = previous?.roster ?? Object.entries(table);
-    if (!roster.length || roster.length !== length) return;
-    for (let i = 0; i < roster.length; i++) {
-      if (Array.isArray(raw.set[i]) || roster[i][0] !== (frame ? frame.idAt(i) : edits.set[i][0])) return;
+    if (roster.length !== length) return;
+    const indices = previous?.indices ?? new Map(roster.map(([id], i) => [id, i]));
+    const idAt = i => frame ? frame.idAt(i) : edits.set[i][0];
+    if (raw.motion.length === length * 5 && raw.set.every((row, i) => !Array.isArray(row) && idAt(i) === roster[i][0])) {
+      return new FishPoseFrame(previous, roster, indices, raw.motion, tick);
     }
-    return new FishPoseFrame(previous, roster, raw.motion, tick);
+    const motion = new Float64Array(length * 5), seen = new Uint8Array(length);
+    let updated, exceptions, offset = 0;
+    for (let i = 0; i < length; i++) {
+      const id = idAt(i), ref = indices.get(id), edit = raw.set[i];
+      if (ref === undefined || seen[ref]) return;
+      seen[ref] = 1;
+      const at = ref * 5;
+      if (!Array.isArray(edit)) {
+        for (let k = 0; k < 5; k++) motion[at + k] = raw.motion[offset++];
+      } else {
+        const row = frame ? frame.records[i] : edits.set[i][1];
+        for (let k = 0; k < 5; k++) motion[at + k] = row[poseFields[k]];
+        if (!poseEdit(edit, row, roster[ref][1], tick)) {
+          const snapshot = structuredClone(row);
+          (exceptions ??= new Map()).set(ref, snapshot);
+          (updated ??= roster.slice())[ref] = [id, snapshot];
+        }
+      }
+    }
+    if (offset !== raw.motion.length) return;
+    return new FishPoseFrame(previous, updated ?? roster, indices, motion, tick, exceptions);
   }
-  constructor(previous, roster, motion, tick) {
+  constructor(previous, roster, indices, motion, tick, exceptions) {
     this.roster = roster;
-    this.indices = previous?.indices ?? new Map(roster.map(([id], i) => [id, i]));
+    this.indices = indices;
     this.priorMotion = previous?.motion;
+    this.priorExceptions = previous?.exceptions;
+    this.exceptions = exceptions;
     this.motion = motion;
     this.tick = tick;
     this.token = {};
@@ -40,51 +114,75 @@ export class FishPoseFrame {
   table() {
     if (this.materialized) return this.materialized;
     const table = {};
-    let j = 0;
-    for (const [id, cold] of this.roster) table[id] = { ...cold,
-      x: this.motion[j++], y: this.motion[j++], facing: this.motion[j++],
-      cx: this.motion[j++], cy: this.motion[j++], posAt: this.tick };
+    for (let i = 0, j = 0; i < this.roster.length; i++, j += 5) {
+      const [id, cold] = this.roster[i];
+      table[id] = this.exceptions?.get(i) ?? { ...cold, x: this.motion[j], y: this.motion[j + 1],
+        facing: this.motion[j + 2], cx: this.motion[j + 3], cy: this.motion[j + 4], posAt: this.tick };
+    }
     return this.materialized = table;
   }
   encode() {
     const rows = new Array(this.roster.length);
-    for (let i = 0, j = 0; i < rows.length; i++) {
+    for (let i = 0; i < rows.length; i++) {
+      const exception = this.exceptions?.get(i);
+      if (exception) { rows[i] = [this.roster[i][0], exception]; continue; }
       const row = rows[i] = [i, -1], cold = this.roster[i][1];
-      for (let k = 0; k < 5; k++, j++) {
-        if (this.motion[j] === (this.priorMotion ? this.priorMotion[j] : cold[poseFields[k]])) continue;
+      const prior = this.priorExceptions?.get(i);
+      for (let k = 0, j = i * 5; k < 5; k++, j++) {
+        const before = prior ? prior[poseFields[k]] : this.priorMotion ? this.priorMotion[j] : cold[poseFields[k]];
+        if (this.motion[j] === before) continue;
         row[1] -= 1 << k;
         row.push(this.motion[j]);
       }
     }
     return rows;
   }
+  // One mask per confirmed fish, followed by the changed doubles in field
+  // order. Bit 5 selects the next exceptional complete row. No IDs or decimal
+  // conversions are necessary on a stable roster.
+  packed() {
+    if (this.packedRows) return this.packedRows;
+    const bytes = new Uint8Array(this.roster.length * 41), view = new DataView(bytes.buffer);
+    const full = [];
+    let offset = 0;
+    for (let i = 0; i < this.roster.length; i++) {
+      const maskAt = offset++, exception = this.exceptions?.get(i);
+      if (exception) { bytes[maskAt] = 32; full.push(exception); continue; }
+      const cold = this.roster[i][1], prior = this.priorExceptions?.get(i);
+      for (let k = 0, j = i * 5; k < 5; k++, j++) {
+        const before = prior ? prior[poseFields[k]] : this.priorMotion ? this.priorMotion[j] : cold[poseFields[k]];
+        if (this.motion[j] === before) continue;
+        bytes[maskAt] |= 1 << k;
+        view.setFloat64(offset, this.motion[j], true);
+        offset += 8;
+      }
+    }
+    return this.packedRows = { poses: bytes.subarray(0, offset).toBase64(), ...(full.length && { full }) };
+  }
 }
 
 export function replicaRowBase(id, world, frames = false, previous) {
-  const poses = frames && committedStepFields.get(world)?.poses;
-  const tables = fields.map(([field, table], i) => !i && poses ? poses.token : table ? world[field]?.[table] : world[field]);
+  const source = frames && committedStepFields.get(world), poses = source?.poses, trips = source?.trips;
+  const tables = fields.map(([field, table], i) => !i && poses ? poses.token : i === 2 && trips ? trips : table ? world[field]?.[table] : world[field]);
   if (!frames) return { id, tick: world.tick, rows: tables.map(table => Object.entries(table || {})) };
   const rows = [];
   for (let i = 0; i < tables.length; i++) {
     let entries;
-    Object.defineProperty(rows, i, { get: () => entries ??= Object.entries((!i && poses ? poses.table() : tables[i]) || {}) });
+    Object.defineProperty(rows, i, { get: () => entries ??= Object.entries((!i && poses ? poses.table() : i === 2 && trips ? world.travel : tables[i]) || {}) });
   }
   // Travel is sparse: a fish need not move on successive steps. Both peers
   // retain its last confirmed journey only while it occurs in the fish roster.
-  const travel = new Map();
-  for (const [fish] of poses?.roster || rows[0]) {
-    const row = world.travel?.[fish] ?? previous?.travel?.get(fish);
-    if (row) travel.set(fish, row);
-  }
+  const indices = poses?.indices ?? confirmedRosters.get(world) ?? new Map(rows[0].map(([fish], i) => [fish, i]));
+  const travel = new ConfirmedTravel(indices, trips || world.travel, previous?.travel);
   return { id, tick: world.tick, rows, tables, travel, roots: world.roots, terrain: world.terrain };
 }
 
-function mapTables(world, transform, fishRows) {
+function mapTables(world, transform, fishRows, trips) {
   const result = {};
-  for (const field in world) if (Object.hasOwn(world, field)) result[field] = field === 'fishes' && fishRows ? fishRows : world[field];
+  for (const field in world) if (Object.hasOwn(world, field)) result[field] = field === 'fishes' && fishRows ? fishRows : field === 'travel' && trips ? trips : world[field];
   for (const [index, [field, table]] of fields.entries()) {
     if (index === 0 && fishRows) continue;
-    const source = table ? world[field]?.[table] : world[field];
+    const source = table ? world[field]?.[table] : result[field];
     if (source === undefined) continue;
     const rows = transform(source, index);
     if (!rows) return;
@@ -121,7 +219,7 @@ function todayOnly(old, next, day) {
   return before.every((key, index) => key === after[index] && (key === day || old.days[key] === next.days[key]));
 }
 
-export function encodeReplicaRowDelta(body, base, frames = false) {
+export function encodeReplicaRowDelta(body, base, frames = false, poseBytes = false) {
   if (!base || body.delta !== true || body.world.tick !== base.tick + CONFIG.step) return body;
   const compact = frames && !!base.travel;
   const day = compact ? shanghaiDay(body.world.tick) : null;
@@ -136,22 +234,24 @@ export function encodeReplicaRowDelta(body, base, frames = false) {
       const { keys, intervals: { before, length, kept, added } } = step.bonds.changes;
       return { before, length, kept: Array.from(kept), added: Array.from(added), keys };
     }
-    const known = new Map(base.rows[index].map(([id], row) => [id, row]));
-    if (compact && index === 0) fishIndices = known;
+    let known;
+    if (compact && index === 0) fishIndices = known = base.travel.indices;
     const rows = compact ? [] : {};
     let next = 0;
-    for (const [id, row] of Object.entries(table)) {
-      const reference = known.get(id);
+    for (const id of Object.keys(table)) {
+      const candidate = table[id];
       const oldTravel = compact && index === 2 && base.travel.get(id);
-      if (oldTravel && fishIndices?.has(id) &&
-          (step?.travelDay === day && step.journeys.get(id) === oldTravel || todayOnly(oldTravel, row, day))) {
-        rows[next++] = [fishIndices.get(id), -1, row.days[day]];
+      if (oldTravel && fishIndices?.has(id) && (candidate instanceof DailyDistance
+          ? candidate.day === day && candidate.follows(oldTravel) : todayOnly(travelRow(oldTravel), candidate, day))) {
+        rows[next++] = [fishIndices.get(id), -1, candidate instanceof DailyDistance ? candidate.distance : candidate.days[day]];
         continue;
       }
+      known ??= new Map(base.rows[index].map(([id], row) => [id, row]));
+      const reference = known.get(id), row = travelRow(candidate);
       rows[next++] = encodeRow(id, row, reference, base.rows[index][reference]?.[1]);
     }
     return rows;
-  }, poses?.encode());
+  }, poses && (poseBytes && supportsPoseBytes ? poses.packed() : poses.encode()), step?.trips);
   if (world && compact) {
     for (const field of ['roots', 'terrain']) if (world[field] && world[field] === base[field]) world[field] = true;
     if (rowTable(world.contacts)) world.contacts = Object.entries(world.contacts).map(([id, row]) => {
@@ -181,7 +281,31 @@ function decodeRow(encoded, known) {
   return [id, row];
 }
 
-export function decodeReplicaRowDelta(body, base, frames = false) {
+function unpackPoses(encoded, previous, tick) {
+  const { poses, full = [] } = encoded, n = previous.length;
+  if (typeof poses !== 'string' || poses.length > 4 * Math.ceil(41 * n / 3) || !Array.isArray(full) || full.length > n) throw new Error('无效的实时鱼位置长度');
+  const bytes = Uint8Array.fromBase64(poses, { lastChunkHandling: 'strict' }), view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const rows = {};
+  let offset = 0, copied = 0;
+  for (const [id, before] of previous) {
+    if (!safeId(id)) throw new Error('无效的实时鱼标识');
+    const mask = bytes[offset++];
+    if (mask === 32 && rowTable(full[copied])) { rows[id] = full[copied++]; continue; }
+    if (mask === undefined || mask > 31 || !rowTable(before)) throw new Error('无效的实时鱼位置');
+    const fish = { ...before };
+    for (let k = 0; k < 5; k++) if (mask & 1 << k) {
+      const value = view.getFloat64(offset, true);
+      if (!Number.isFinite(value)) throw new Error('实时鱼坐标须为有限数值');
+      offset += 8; fish[poseFields[k]] = value || 0;
+    }
+    fish.posAt = tick;
+    rows[id] = fish;
+  }
+  if (offset !== bytes.length || copied !== full.length) throw new Error('实时鱼位置数量不符');
+  return rows;
+}
+
+export function decodeReplicaRowDelta(body, base, frames = false, poseBytes = false) {
   if (typeof body.rowBase !== 'string' || body.rowBase.length !== 36 || body.delta !== true) throw new Error('无效的实时变更版本');
   if (base?.id !== body.rowBase) return null;
   if (body.world.tick !== base.tick + CONFIG.step) throw new Error('实时变更不连续');
@@ -190,6 +314,7 @@ export function decodeReplicaRowDelta(body, base, frames = false) {
   const day = frameRows ? shanghaiDay(message.world.tick) : null;
   const world = mapTables(message.world, (encoded, rowsIndex) => {
     if (frameRows && encoded === true && base.tables[rowsIndex]) return base.tables[rowsIndex];
+    if (frameRows && rowsIndex === 0 && poseBytes && rowTable(encoded)) return unpackPoses(encoded, base.rows[0], message.world.tick);
     if (frameRows && rowsIndex === 3 && rowTable(encoded)) {
       const { before, length, kept, added, keys } = encoded;
       return applyBondIntervals(base.tables[rowsIndex], { at: message.world.life.at, keys, intervals: { before, length, kept, added } });
@@ -211,7 +336,7 @@ export function decodeReplicaRowDelta(body, base, frames = false) {
         row = [before[0], fish];
       } else if (frameRows && rowsIndex === 2 && Array.isArray(entry) && entry[1] === -1) {
         const [index, , distance] = entry;
-        const id = Number.isSafeInteger(index) && base.rows[0][index]?.[0], old = base.travel.get(id);
+        const id = Number.isSafeInteger(index) && base.rows[0][index]?.[0], old = travelRow(base.travel.get(id));
         if (!old || entry.length !== 3 || !Number.isFinite(distance)) throw new Error('无效的实时行程记录');
         row = [id, { ...old, days: { ...old.days, [day]: distance } }];
       } else row = decodeRow(entry, base.rows[rowsIndex]);
@@ -221,6 +346,7 @@ export function decodeReplicaRowDelta(body, base, frames = false) {
     return table;
   });
   if (frameRows) {
+    if (poseBytes && rowTable(message.world.fishes) && Object.hasOwn(message.world.fishes, 'poses')) confirmedRosters.set(world, base.travel.indices);
     for (const field of ['roots', 'terrain']) if (world[field] === true) {
       if (!base[field]) throw new Error('缺少实时世界来源');
       world[field] = base[field];

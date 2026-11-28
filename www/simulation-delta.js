@@ -22,21 +22,38 @@ function applyFields(record, [set, remove]) {
   return result;
 }
 
-function expandRow(table, row) {
+function expandedRecord(table, row) {
   if (row.length === 3 && typeof row[1] === 'string') {
     const [id, day, distance] = row, previous = table[id];
-    return [id, { ...previous, days: { ...previous.days, [day]: distance } }];
+    return { ...previous, days: { ...previous.days, [day]: distance } };
   }
   const [id, fields, removed, days] = row;
-  if (row.length < 3) return row.length === 2 ? row : [id, table[id]];
+  if (row.length < 3) return row.length === 2 ? fields : table[id];
   const previous = table[id], record = applyFields(previous, [fields, removed]);
   if (days) record.days = applyFields(previous.days, days);
-  return [id, record];
+  return record;
+}
+function expandRow(table, row) {
+  return row.length === 2 ? row : [row[0], expandedRecord(table, row)];
+}
+function poseRecord(previous, motion, offset, tick) {
+  const record = { ...previous };
+  record.x = motion[offset]; record.y = motion[offset + 1]; record.facing = motion[offset + 2];
+  record.cx = motion[offset + 3]; record.cy = motion[offset + 4]; record.posAt = tick;
+  return record;
 }
 
 export function rowId(row, knownFish) {
   if (Array.isArray(row)) return row[0];
   return typeof row === 'number' ? knownFish[row] : row;
+}
+
+// A network snapshot owns its new records, and borrows retained rows from
+// the preceding detached snapshot.
+export function applyStoryChanges(previous, changes, detach = false) {
+  const before = Object.entries(previous);
+  return Object.fromEntries(changes.map(row => typeof row === 'number' ? before[row] :
+    detach ? [row[0], structuredClone(row[1])] : row));
 }
 
 // The page and its observers share one committed set of complete, immutable
@@ -53,12 +70,11 @@ class CommittedRows {
       const row = set[i], id = this.ids[i] = rowId(row, knownFish), previous = table[id];
       let record;
       if (motion && !Array.isArray(row)) {
-        record = { ...previous };
-        record.x = motion[offset++]; record.y = motion[offset++]; record.facing = motion[offset++];
-        record.cx = motion[offset++]; record.cy = motion[offset++]; record.posAt = tick;
-      } else record = expandRow(table, row)[1];
+        record = poseRecord(previous, motion, offset, tick);
+        offset += 5;
+      } else record = expandedRecord(table, row);
       this.records[i] = record;
-      if (previous === undefined && !Object.hasOwn(table, id)) this.added.push(id);
+      if (!Object.hasOwn(table, id)) this.added.push(id);
       if (this.moved && (!previous || previous.x !== record.x || previous.y !== record.y || previous.facing !== record.facing)) this.moved.push(i);
     }
   }
@@ -84,9 +100,9 @@ export function expandSimulationPatch(data, patch, knownFish, commitRows = false
       let offset = 0;
       const set = change.set.map(row => {
         if (Array.isArray(row)) return expandRow(table, row);
-        const id = rowId(row, knownFish), previous = table[id];
-        return [id, { ...previous, x: motion[offset++], y: motion[offset++], facing: motion[offset++],
-          cx: motion[offset++], cy: motion[offset++], posAt: patch.values.tick }];
+        const id = rowId(row, knownFish), record = poseRecord(table[id], motion, offset, patch.values.tick);
+        offset += 5;
+        return [id, record];
       });
       tables[field] = { set, remove: change.remove };
     } else if (change.set.some(row => row.length > 2)) {
@@ -94,8 +110,9 @@ export function expandSimulationPatch(data, patch, knownFish, commitRows = false
     }
   }
   if (patch.life) {
-    const { properties, bonds } = patch.life;
+    const { properties, stories, bonds } = patch.life;
     values.life = applyFields(data.life, properties);
+    if (stories) values.life.stories = applyStoryChanges(data.life.stories, stories);
     if (bonds) {
       const previous = data.life.bonds;
       if (bonds.intervals) values.life.bonds = applyBondIntervals(previous, bonds);

@@ -22,13 +22,17 @@ export class MovementGrid {
   overlapped = false;
   integerCells = true;
   constructor(layout) { this.layout = layout; }
-  swimmers(world) {
+  swimmers(world, speed) {
     const roster = world.stableFishRoster?.();
     if (!roster) return this.layout.ordered;
     if (this.roster !== roster) {
       this.roster = roster;
-      this.swimmersById = this.layout.ordered.map(([id, cells]) =>
-        [id, cells, null, { fish: world.readFish(id), ordinal: world.swimOrdinal?.(id), hull: this.layout.hull(cells), slot: this.slots.get(id) }]);
+      this.swimmersById = this.layout.ordered.map(([id, cells]) => {
+        const hull = this.layout.hull(cells);
+        return [id, cells, null, { fish: world.readFish(id), ordinal: world.swimOrdinal?.(id), hull, slot: this.slots.get(id),
+          speedX: hull && speed * hull.bounds.width / cells.length, speedY: hull && speed * hull.bounds.height / cells.length,
+          intended: undefined }];
+      });
     }
     return this.swimmersById;
   }

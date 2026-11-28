@@ -21,7 +21,7 @@ function trackWorld(source) {
   const raw = object => originals.get(object) || object;
   const bondTimes = new WeakMap();
   let characters, ecology, bodies, meals, previousBonds, activeBonds, publishedBonds, orderedBonds = false;
-  let fishRoster, poseRevision = 0, originRevision = 0;
+  let fishRoster, previousStories, poseRevision = 0, originRevision = 0;
   const characterViews = new Map();
   const activeKinds = ['food', 'seaweed', 'scene'];
   const activeKey = JSON.stringify(activeKinds);
@@ -104,6 +104,12 @@ function trackWorld(source) {
   }
   function markLife(location, target, key, value) {
     const { part, bond } = location;
+    if (part === undefined && key === 'stories' && target.stories && value &&
+        !Array.isArray(value) && typeof value === 'object' && !lifeFields.has('stories')) {
+      previousStories ??= raw(target.stories);
+      return;
+    }
+    if ((part ?? key) === 'stories') previousStories = undefined;
     if (part === 'bonds' || part === undefined && key === 'bonds') {
       materializeBonds(raw(source.life.bonds));
       if (previousBonds) materializeBonds(previousBonds);
@@ -350,6 +356,7 @@ function trackWorld(source) {
   }
   function reset() {
     swimming = undefined;
+    previousStories = undefined;
     values.clear(); rows.clear(); lifeFields.clear(); bondRows.clear(); previousBonds = activeBonds = undefined; orderedBonds = false;
   }
   return {
@@ -428,9 +435,16 @@ function trackWorld(source) {
         if (motion && offset * 2 < motion.length) motion = motion.slice(0, offset);
         patch.tables[field] = motion ? { set, remove, motion: motion.subarray(0, offset) } : { set, remove };
       }
-      if (!values.has('life') && (lifeFields.size || bondRows.size || orderedBonds)) {
+      if (!values.has('life') && (lifeFields.size || previousStories || bondRows.size || orderedBonds)) {
         const life = raw(source.life);
         patch.life = { properties: encodeFields(life, lifeFields, plain) };
+        if (previousStories) {
+          // The bounded chronicle reorders on insertion. Preserve the previous
+          // order as a dictionary, even for stories from older saves.
+          const before = new Map(Object.keys(previousStories).map((id, i) => [id, i]));
+          patch.life.stories = Object.entries(raw(life.stories)).map(([id, row]) =>
+            before.has(id) && raw(previousStories[id]) === raw(row) ? before.get(id) : [id, plain(row)]);
+        }
         if (!lifeFields.has('bonds') && (bondRows.size || orderedBonds)) patch.life.bonds = encodeBonds(life.bonds);
       }
       reset();

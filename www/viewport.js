@@ -175,7 +175,7 @@ export class ViewportCells {
     for (const id of chars?.remove || []) this.remove(id);
     for (const [id, cell] of chars?.set || []) {
       if (this.remaining && !this.cells.has(id)) this.appended.add(id);
-      else this.put(id, cell);
+      else this.refresh(id, cell);
     }
     for (const [changes, owners] of [[fishes, this.owners.fish], [scenes, this.owners.scene]]) {
       if (!changes) continue;

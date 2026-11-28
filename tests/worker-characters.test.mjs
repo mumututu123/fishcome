@@ -4,6 +4,7 @@ import { CONFIG, World } from '../www/engine.js';
 import { worldTables } from '../www/simulation-changes.js';
 import { WorkerSimulation } from '../www/simulation-worker.js';
 import { expandSimulationPatch } from '../www/simulation-delta.js';
+import { updateContacts } from '../www/breeding.js';
 
 const start = Date.UTC(2025, 5, 15, 12, 17);
 const root = '00000000-0000-4000-8000-000000000012';
@@ -26,6 +27,23 @@ function startWorker(initial) {
   send({ kind: 'ready' });
   return { worker, send };
 }
+
+test('后台接触查询随性别编辑和恢复更新', () => {
+  const cells = ['a', 'b'].map(id => ({ ...food(id, 0), kind: 'fish', entity: id }));
+  const { worker, send } = startWorker(cells);
+  const world = worker.world;
+  const fish = (id, x, gender) => ({ id, x, y: 4, facing: 1, gender });
+  send({ kind: 'restore', rows: [['fishes', 'a', fish('a', 3, 'male')], ['fishes', 'b', fish('b', 4, 'female')]] });
+  const pairs = () => {
+    updateContacts(world, start, world.fishGroups(), world.sceneryMap());
+    return Object.keys(world.data.contacts);
+  };
+  assert.deepEqual(pairs(), ['a|b']);
+  world.data.fishes.b.gender = 'male';
+  assert.deepEqual(pairs(), []);
+  send({ kind: 'restore', rows: [['fishes', 'b', fish('b', 4, 'female')]] });
+  assert.deepEqual(pairs(), ['a|b']);
+});
 
 test('后台重算使用归档、回滚和投喂后的鱼元记录', () => {
   const initial = [food('rolled-back', 40), food('replaced', 50), food('archived', 60)];

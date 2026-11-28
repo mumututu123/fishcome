@@ -3,6 +3,30 @@ import assert from 'node:assert/strict';
 import { ViewportCells } from '../www/viewport.js';
 import { makeFishWorld } from './capacity-fish.mjs';
 import { subscribeSimulationChanges } from '../www/simulation-changes.js';
+import { expandSimulationPatch } from '../www/simulation-delta.js';
+
+test('页面写入完整运动记录，视窗只处理改变占格的鱼，旧帧仍可读取', () => {
+  const fishes = { a: { id: 'a', x: 5, y: 5, facing: 1 }, b: { id: 'b', x: 10, y: 5, facing: 1 } };
+  const data = { fishes, scenes: {}, chars: {} };
+  for (const id of Object.keys(fishes)) data.chars[id] = { id, kind: 'fish', entity: id, x: 0, y: 0 };
+  const viewport = new ViewportCells(data), known = ['a', 'b'];
+  function commit(tick, x) {
+    const patch = expandSimulationPatch(data, { values: { tick }, tables: { fishes: {
+      set: [0, 1], remove: [], motion: Float64Array.of(5, 5, 1, .5, 0, x, 5, 1, 0, .5)
+    } } }, known, true);
+    const frame = patch.tables.fishes.frame;
+    frame.commit(fishes);
+    viewport.update(patch.tables);
+    assert.equal(frame.pairs, undefined);
+    assert.deepEqual(frame.moved, [1]);
+    return patch.tables.fishes;
+  }
+  const first = commit(500, 33);
+  commit(1000, 65);
+  assert.deepEqual(first.set.map(([id, f]) => [id, f.x, f.posAt]), [['a', 5, 500], ['b', 33, 500]]);
+  assert.deepEqual(viewport.query(64, 66, 4, 6).map(cell => cell.id), ['b']);
+  assert.equal(fishes.a.posAt, 1000);
+});
 
 test('跟随端连续合流时，五千条鱼的海域保留已绘制的鱼和点击位置', async () => {
   const { World, CONFIG } = await import('../www/engine.js');

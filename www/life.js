@@ -6,7 +6,7 @@ import { EVENTS, activeEvent, updateEvents, validEvent, eventSchedule, eventNarr
 import { validLegendStory } from './legends.js';
 
 // Ambient life has no player commands. All randomness is tied to world/fish IDs.
-export const LIFE = Object.freeze({ weatherPeriod: 180000, weatherDuration: 55000, familiar: 45, haunt: 45, reunion: 180000, storyLimit: 512, bondLimit, planktonLife: 75000 });
+export const LIFE = Object.freeze({ wanderPeriod: 12000, weatherPeriod: 180000, weatherDuration: 55000, familiar: 45, haunt: 45, reunion: 180000, storyLimit: 512, bondLimit, planktonLife: 75000 });
 const TYPES = ['quiet', 'social', 'deep', 'curious'];
 const HABITS = { quiet: '喜欢独自慢慢游', social: '喜欢往热闹的地方凑', deep: '喜欢在海底附近闲逛', curious: '喜欢绕着造景探索' };
 const KINDS = new Set(['arrive', 'meal', 'grass', 'friend', 'reunion', 'haunt', 'birth', 'depart', 'revisit', 'rediscover', 'ambient', 'captured', 'cthulhuDepart', 'atomicSurvivor', 'shipMeal', 'depressed', 'recovered']);
@@ -393,8 +393,8 @@ export function updateLife(world, now, context) {
   life.haunts = trim(Object.fromEntries(Object.entries(life.haunts || {}).filter(([id]) => world.data.fishes[id])), LIFE.bondLimit);
 }
 const wandering = new WeakMap();
-function swimPattern(fish, now) {
-  const phase = Math.floor((now - fish.created) / 12000);
+export function swimPattern(fish, now) {
+  const phase = Math.floor((now - fish.created) / LIFE.wanderPeriod);
   let pattern = wandering.get(fish);
   if (!pattern || pattern.id !== fish.id) {
     pattern = { id: fish.id, prefix: hash(fish.id + ':'), trait: personality(fish.id) };

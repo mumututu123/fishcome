@@ -20,13 +20,13 @@ const revisionOf = head => pagedRevision(head) ?? (head ? compatibilityMark(head
 // already reading those rows its cut before running that synchronous mutation.
 export async function atCheckpointBoundary(data, apply) {
   let capture;
-  while ((capture = captures.get(data))) await capture.read;
+  while ((capture = captures.get(data)) && !capture.detached) await capture.read;
   return apply();
 }
 
 export function beforeCheckpointPatch(data, patch) {
   const capture = captures.get(data);
-  if (!capture) return;
+  if (!capture || capture.detached) return;
   // Worker patches replace records. Preserve their earlier references until
   // this transaction finishes reading the version at which it started.
   for (const [field, changes] of Object.entries(patch.tables || {})) {
@@ -34,7 +34,7 @@ export function beforeCheckpointPatch(data, patch) {
     if (!source) continue;
     if (capture.snapshots.has(field)) continue;
     const frame = changes.frame;
-    const prior = frame && committed?.tables.get(field);
+    const prior = frame && committed?.tables?.get(field);
     if (prior?.source.deref() === source && frame.length >= PAGE_SIZE && frame.length * 2 >= prior.byId.size) {
       // Freeze table membership and references once during this active cut.
       // Prior sparse changes, if any, still win in lookup().
@@ -70,7 +70,7 @@ function recordChange(dirty, field, ids, id, exists) {
 }
 
 function noteFramePages(data, dirty, field, frame) {
-  const table = committed?.data.deref() === data && committed.tables.get(field);
+  const table = committed?.data?.deref() === data && committed.tables.get(field);
   if (!table || table.source.deref() !== data[field] || captures.has(data)) return false;
   const fields = dirty.framePages ??= new Map();
   let saved = fields.get(field);
@@ -90,14 +90,15 @@ export function noteCheckpointChanges(data, patch, merge) {
   let dirty = pending.get(data);
   if (!dirty) pending.set(data, dirty = { scan: false, tables: new Map() });
   if (!patch) {
-    const knownChars = trackedField(dirty, 'chars');
-    dirty.merge = merge && knownChars ? { handle: merge, chars: dirty.tables.get('chars') || new Map() } : undefined;
+    dirty.merge = merge ? { handle: merge, scan: dirty.scan, tables: dirty.tables } : undefined;
+    dirty.replica = false;
     dirty.scan = true;
-    dirty.tables.clear();
+    dirty.tables = new Map();
     dirty.framePages?.clear();
     // Foreground edits may mutate arbitrary records in place. A partial copy
     // must never become durable. Retry from a fresh boundary after this edit.
-    captures.get(data)?.abort(checkpointChanged);
+    const capture = captures.get(data);
+    if (capture && !capture.detached) capture.abort(checkpointChanged);
     return;
   }
   if (patch.tables?.chars) dirty.merge = undefined;
@@ -114,17 +115,42 @@ export function noteCheckpointChanges(data, patch, merge) {
   }
 }
 
-export function noteCheckpointMerge(data, merge) {
+export function noteCheckpointMerge(data, merge, incoming, archived) {
   const dirty = pending.get(data);
   if (!merge || dirty?.merge?.handle !== merge) return;
-  const { chars } = dirty.merge;
+  const before = dirty.merge;
   dirty.merge = undefined;
   if (!merge.chars) return;
-  dirty.tables.set('chars', chars);
-  for (const id of merge.chars) if (!recordChange(dirty, 'chars', chars, id, Object.hasOwn(data.chars, id))) break;
+  const track = (field, ids) => {
+    if (!trackedField(before, field)) return;
+    const changes = before.tables.get(field) || new Map();
+    dirty.tables.set(field, changes);
+    const prior = committed?.tables?.get(field);
+    for (const id of ids) {
+      const present = Object.hasOwn(data[field], id);
+      if (present && !prior?.byId.has(id) && String(Number(id) >>> 0) === id && Number(id) < 0xffffffff) {
+        dirty.tables.set(field, null);
+        break;
+      }
+      if (!recordChange(dirty, field, changes, id, present)) break;
+    }
+  };
+  track('chars', merge.chars);
+  if (!incoming) return;
+  // These tables only receive the indicated incoming rows. Chat ingestion may
+  // also register its sender, and archive reconciliation may remove operations.
+  track('ops', [...Object.keys(incoming.ops || {}), ...Object.keys(archived?.ops || {})]);
+  const roots = committed?.data?.deref() === data ? committed.tables.get('roots') : undefined;
+  track('roots', Object.keys(incoming.roots || {}).filter(id => !roots?.byId.has(id) || before.tables.get('roots')?.has(id)));
+  const messages = Object.values(incoming.chats || {});
+  track('chats', messages.map(message => message.id));
+  track('participants', [...Object.keys(incoming.participants || {}), ...messages.map(message => message.actor)]);
+  dirty.replica = true;
 }
 
 function lookup(capture, field, source, id) {
+  const delta = capture.deltas?.get(field);
+  if (delta) return delta.has(id) ? delta.get(id) : ABSENT;
   const old = capture.before.get(field);
   source = capture.snapshots.get(field) || source;
   return old?.has(id) ? old.get(id) : Object.hasOwn(source, id) ? source[id] : ABSENT;
@@ -173,7 +199,7 @@ function append(table, id) {
 }
 
 function* scanLayout(capture, field, source, prior, capacity = prior?.capacity || PAGE_SIZE) {
-  const ids = capture.keys.get(field) ?? Object.keys(source);
+  const ids = capture.keys.get(field) ?? Object.keys(capture.snapshots.get(field) || source);
   capture.keys.set(field, ids);
   const compact = prior && prior.pages.length > 1 && (prior.pages.length - 1) * capacity > 2 * ids.length;
   const table = { capacity, pages: [], byId: new Map(), source: new WeakRef(source) };
@@ -236,9 +262,10 @@ function* writePages(store, head, capture, dirty, reuse, incremental) {
       if (framePages) for (const page of framePages.pages) touched.add(page);
       if (table.pages.length > 1 && table.byId.size < (table.pages.length - 1) * table.capacity / 2) touched = null;
     }
+    const changes = capture.deltas?.get(field);
     const dense = field === 'chars' && prior?.capacity === DENSE_CHAR_PAGE;
     const scattered = field === 'chars' && touched && prior.byId.size >= 8192 && touched.size * 2 > prior.pages.length;
-    if (dense || scattered) {
+    if (!changes && (dense || scattered)) {
       let large = prior.largeChar;
       if (large === undefined || fitsDenseChar(lookup(capture, field, source, large))) {
         const ids = dense && touched ? dirty?.tables.get(field)?.keys() || [] : capture.keys.get(field) ?? Object.keys(source);
@@ -252,16 +279,33 @@ function* writePages(store, head, capture, dirty, reuse, incremental) {
       table.largeChar = large;
     }
     if (!touched) table = yield* scanLayout(capture, field, source, prior);
+    const moving = field === 'fishes' || field === 'travel';
+    if (moving && !table.samples) table.samples = prior?.samples?.slice() || [];
     for (const number of touched || table.pages.keys()) {
-      const rows = table.pages[number].map(id => [id, lookup(capture, field, source, id)]);
       const key = [PREFIX, field, number];
-      if (!touched && prior && number < prior.pages.length) {
+      // The unchanged siblings of a sparse update belong to its durable page.
+      // They can be read after the live world has accepted another merge.
+      let rows;
+      if (changes) {
+        const previous = yield store.get(key);
+        const saved = new Map(previous);
+        rows = table.pages[number].map(id => {
+          if (changes.has(id)) return [id, changes.get(id)];
+          if (!saved.has(id)) throw new Error('本地存档缺少原始记录');
+          return [id, saved.get(id)];
+        });
+        if (sameRecord(rows, previous)) continue;
+      } else rows = table.pages[number].map(id => [id, lookup(capture, field, source, id)]);
+      if (!touched && prior && number < prior.pages.length &&
+          (!prior.samples?.[number] || sameRecord(rows[0], prior.samples[number]))) {
         // Compare against the durable page only when the foreground edit had
         // no row-level journal. No copy of serialized save data lives in RAM.
         const previous = yield store.get(key);
         if (sameRecord(rows, previous)) continue;
       }
       store.put(rows, key);
+      // A single differing row proves that its whole page needs writing.
+      if (moving) table.samples[number] = structuredClone(rows[0]);
       yield;
     }
     if (prior && prior.pages.length > table.pages.length) store.delete(IDBKeyRange.bound([PREFIX, field, table.pages.length], [PREFIX, field, prior.pages.length - 1]));
@@ -270,6 +314,35 @@ function* writePages(store, head, capture, dirty, reuse, incremental) {
   }
   store.put(head, PAGE_HEAD);
   return tables;
+}
+
+function detachReplicaCut(capture, dirty) {
+  // Full imports, reordered histories and unjournaled foreground edits still
+  // use the cooperative traversal. Only an exact delta may reuse cold rows.
+  if (!dirty?.replica || dirty.framePages?.size) return;
+  for (const field of ['chars', 'ops']) {
+    const prior = committed.tables.get(field);
+    if (!trackedField(dirty, field) || prior?.source.deref() !== capture.sources.get(field)) return;
+  }
+  const sparse = new Map(), whole = {};
+  for (const [field, source] of capture.sources) {
+    const prior = committed.tables.get(field), updates = dirty.tables.get(field);
+    if (!trackedField(dirty, field) || prior?.source.deref() !== source) { whole[field] = source; continue; }
+    let deleted = 0;
+    const values = new Map();
+    for (const id of updates?.keys() || []) {
+      const present = Object.hasOwn(source, id);
+      if (present && prior.capacity === DENSE_CHAR_PAGE && !fitsDenseChar(source[id])) return;
+      if (present) values.set(id, source[id]);
+      else if (prior.byId.has(id)) deleted++;
+    }
+    if (prior.pages.length > 1 && prior.byId.size - deleted < (prior.pages.length - 1) * prior.capacity / 2) return;
+    sparse.set(field, values);
+  }
+  const copy = structuredClone({ sparse, whole });
+  capture.deltas = copy.sparse;
+  for (const [field, table] of Object.entries(copy.whole)) capture.snapshots.set(field, table);
+  capture.detached = true;
 }
 
 function* detachedCheckpoint(head, capture) {
@@ -329,6 +402,7 @@ export function beginCheckpoint(store, prior, checkpoint, options, done, fail) {
     release();
   };
   const capture = { sources, keys: new Map(), before: new Map(), snapshots: new Map(), read, abort(error) { finishRead(); fail(error); } };
+  if (incremental && !stale) detachReplicaCut(capture, dirty);
   if (options.simulationChanges) captures.set(data, capture);
   // A stale tab may still send its own signed replica. It cannot replace the
   // version that another tab saved, including identity/metadata in this batch.
@@ -408,6 +482,7 @@ export function readCheckpoint(store, head, resolve, reject, remember = true) {
       }
       if (table) {
         if (field === 'chars' && rows.length > PAGE_SIZE) table.capacity = DENSE_CHAR_PAGE;
+        if (field === 'fishes' || field === 'travel') (table.samples ??= [])[number] = structuredClone(rows[0]);
         table.pages.push(page);
       }
       cursor.continue();

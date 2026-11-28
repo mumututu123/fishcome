@@ -38,8 +38,10 @@ export class DiagnosticLog {
 
 export function buildOriginSources(data, extra = {}, current = null, chars) {
   return {
-    ops: replicaSourceTable(current?.ops, data?.ops, extra?.ops),
-    breeding: replicaSourceTable(current?.breeding, data?.breeding, extra?.breeding),
+    // A verification that awaits chat signatures keeps its own
+    // dictionary membership across the await. A live read finishes synchronously.
+    ops: chars ? replicaSourceTable(current?.ops, data?.ops, extra?.ops) : { ...extra?.ops, ...current?.ops, ...data?.ops },
+    breeding: chars ? replicaSourceTable(current?.breeding, data?.breeding, extra?.breeding) : { ...extra?.breeding, ...current?.breeding, ...data?.breeding },
     roots: { ...current?.roots, ...data?.roots },
     chars: chars ?? { ...extra?.chars, ...current?.chars, ...data?.chars }
   };

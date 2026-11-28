@@ -259,6 +259,86 @@ async function replicaCheckpointJournal(page) {
   assert.equal(result.longHistory, 256);
 }
 
+async function detachedReplicaCheckpoint(page) {
+  await page.goto(origin + '/welcome.html');
+  await page.evaluate(async () => {
+    const { get, putMany, atCheckpointBoundary } = await import('./storage.js');
+    const { noteCheckpointChanges, noteCheckpointMerge } = await import('./checkpoint-pages.js');
+    const world = {
+      tick: 1, roots: { home: 1 }, participants: { local: '甲' }, chats: {}, chatSources: {},
+      ops: { first: { id: 'first' }, old: { id: 'old' } },
+      chars: Object.fromEntries(Array.from({ length: 800 }, (_, i) => ['c' + i, { kind: 'fish', path: [] }])),
+      fishes: { f: { x: 1, parents: ['p'] } }, travel: { f: { days: { today: 1 } } },
+      breeding: { pair: { status: 'active' } }, scenes: { s: { x: 1 } }, life: { history: [1] }
+    };
+    const save = (captureCheckpoint = false) => putMany(() => [
+      ['checkpoint', { world, picture: { tick: world.tick } }], ['known', [world.tick]]
+    ], { simulationChanges: true, captureCheckpoint });
+    const edit = (incoming, archived, chars, act) => {
+      const handle = {};
+      noteCheckpointChanges(world, null, handle);
+      act();
+      handle.chars = new Set(chars);
+      noteCheckpointMerge(world, handle, incoming, archived);
+    };
+    await save();
+    edit({ ops: { new: {} }, roots: world.roots, chats: { m: { id: 'm', actor: 'guest' } } },
+      { ops: { old: {} } }, ['c500', 'c700'], () => {
+        world.tick++;
+        delete world.ops.old;
+        world.ops.new = { id: 'new' };
+        world.chats.m = { id: 'm', actor: 'guest' };
+        world.participants.guest = '乙';
+        world.chars.c500.path.push({ reason: 'birth' });
+        delete world.chars.c700;
+        world.travel.f.days.today++;
+      });
+    const expected = JSON.stringify(world);
+    const original = IDBObjectStore.prototype.get;
+    let during = false, completed;
+    IDBObjectStore.prototype.get = function (key) {
+      const request = original.call(this, key);
+      if (!during && Array.isArray(key) && key[1] === 'chars') {
+        during = true;
+        completed = atCheckpointBoundary(world, () => {
+          edit({ ops: {}, participants: { guest: '丙' } }, {}, ['c100', 'c500'], () => {
+            world.tick++;
+            world.chars.c100.path.push({ reason: 'eat' });
+            world.chars.c500.path.push({ reason: 'burn' });
+            world.fishes.f.parents.push('q');
+            world.travel.f.days.today++;
+            delete world.scenes.s;
+            world.breeding.pair.status = 'cancelled';
+            world.life.history.push(2);
+            world.participants.guest = '丙';
+          });
+        });
+        if (world.tick !== 3) throw new Error('普通合流等待了独立存档的读盘');
+      }
+      return request;
+    };
+    let first;
+    try { first = await save(true); } finally { IDBObjectStore.prototype.get = original; }
+    await completed;
+    if (!during || JSON.stringify(first.world) !== expected || first.picture.tick !== 2 ||
+        (await get('known'))[0] !== 2) throw new Error('并发合流改变了已截取的版本或配套记录');
+    const put = IDBObjectStore.prototype.put;
+    let failed = false;
+    IDBObjectStore.prototype.put = function (value, key) {
+      if (Array.isArray(key) && key[1] === 'chars') throw new Error('中断独立存档');
+      return put.call(this, value, key);
+    };
+    try { await save(); } catch (error) { failed = error.message === '中断独立存档'; }
+    finally { IDBObjectStore.prototype.put = put; }
+    if (!failed || JSON.stringify((await get('checkpoint', { observeCheckpoint: false })).world) !== expected ||
+        (await get('known'))[0] !== 2) throw new Error('存档失败时未保留完整旧版本');
+    await save();
+    const last = await get('checkpoint', { observeCheckpoint: false });
+    if (last.picture.tick !== 3 || (await get('known'))[0] !== 3 ||
+        JSON.stringify(last.world) !== JSON.stringify(world)) throw new Error('重试后的记录或插入顺序错误');
+  });
+}
+
 async function concurrentCheckpoints(context) {
   const writer = await context.newPage(), other = await context.newPage();
   await Promise.all([writer.goto(origin + '/welcome.html'), other.goto(origin + '/welcome.html')]);
@@ -403,6 +483,7 @@ async function main() {
     if (!countArg) {
       await motionCheckpoint(await isolated.newPage());
       await replicaCheckpointJournal(await isolated.newPage());
+      await detachedReplicaCheckpoint(await isolated.newPage());
       await concurrentCheckpoints(isolated);
     }
   }

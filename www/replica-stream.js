@@ -211,7 +211,7 @@ export class ReplicaTransfers {
         const body = lane.pending;
         lane.pending = null;
         let prior = this.rowsSent.get(peer);
-        const encoded = peer.replicaRows ? encodeReplicaRowDelta(body, prior, peer.replicaFrames) : body;
+        const encoded = peer.replicaRows ? encodeReplicaRowDelta(body, prior, peer.replicaFrames, peer.replicaPoseBytes) : body;
         let id = await this.sendLivePacket(peer, lane, encoded);
         if (!id && encoded !== body) { prior = null; id = await this.sendLivePacket(peer, lane, body); }
         if (!id) throw new Error('伙伴拒绝世界增量');
@@ -352,7 +352,7 @@ export class ReplicaTransfers {
         if (frame !== (body.frameRows === true) || frame && !Object.hasOwn(body, 'rowBase')) throw new Error('实时帧格式不一致');
         if (Object.hasOwn(body, 'rowBase')) {
           if (!live || !peer.replicaRows) throw new Error('伙伴未确认实时变更格式');
-          body = decodeReplicaRowDelta(body, this.rowsReceived.get(peer), frame);
+          body = decodeReplicaRowDelta(body, this.rowsReceived.get(peer), frame, peer.replicaPoseBytes);
         }
         if (body) {
           state.applying = this.network.onMessage({ id, kind: kind === 'catchup' ? 'merge' : live ? 'world' : kind, actor: message.actor, from: message.from, key: message.key, body }, peer);

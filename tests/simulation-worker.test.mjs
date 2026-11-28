@@ -456,6 +456,32 @@ test('后台关系逐项修改、删除再加入和回滚都保留原始字段�
   assert.deepEqual(worker.world.readBonds(), world.data.life.bonds);
 });
 
+test('故事按上一版序号保留，替换、重排、删减和嵌套修改均可重放', () => {
+  const world = new World(start, root, { populate: false }), worker = new WorkerSimulation();
+  world.data.life.stories = { a: { id: 'a', old: { value: 1 } }, b: { id: 'b' }, c: { id: 'c' } };
+  worker.receive({ kind: 'open', values: world.serialize(), tables: [], ambient: false });
+  worker.receive({ kind: 'ready' });
+  const src = worker.world.data.life;
+  const apply = () => {
+    const patch = worker.tracker.changes();
+    world.data.life = expandSimulationPatch(world.data, patch).values.life;
+    return patch.life;
+  };
+  src.stories = { c: src.stories.c, a: src.stories.a, d: { id: 'd', new: 2 } };
+  const moved = apply();
+  assert.deepEqual(moved.stories, [2, 0, ['d', { id: 'd', new: 2 }]]);
+  assert.deepEqual(Object.keys(world.data.life.stories), ['c', 'a', 'd']);
+  const old = world.data.life.stories;
+  src.stories = { a: src.stories.a };
+  src.stories.a.old.value = 3;
+  assert.equal(apply().stories, undefined);
+  assert.deepEqual(world.data.life.stories, { a: { id: 'a', old: { value: 3 } } });
+  assert.equal(old.a.old.value, 1);
+  src.stories = {};
+  assert.deepEqual(apply().stories, []);
+  assert.deepEqual(world.data.life.stories, {});
+});
+
 test('连续关系只交付进出名单，时间跳变、逐项编辑和回滚按实际版本复原', () => {
   const world = new World(start, root, { populate: false }), worker = new WorkerSimulation();
   const ids = Array.from({ length: 94 }, (_, i) => 'fish-' + String(i).padStart(3, '0'));

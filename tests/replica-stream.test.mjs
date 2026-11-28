@@ -589,6 +589,15 @@ test('连续工作线程更新保留旧快照，将完整位置与稀疏字符�
   assert(poses);
   replicaRowBase(crypto.randomUUID(), next.world, true, base);
   assert.equal(poses.materialized, undefined);
+  const packed = encodeReplicaRowDelta(next, base, true, true);
+  assert.equal(typeof packed.world.fishes.poses, 'string');
+  assert.equal(encodeReplicaRowDelta(next, base, true, true).world.fishes, packed.world.fishes);
+  assert.throws(() => decodeReplicaRowDelta(packed, base, true, false));
+  for (const bytes of [[], [1], [0, 0], [32], [64], [1, 0, 0, 0, 0, 0, 0, 248, 127]]) {
+    const fish = { poses: Uint8Array.from(bytes).toBase64() };
+    assert.throws(() => decodeReplicaRowDelta({ ...packed, world: { ...packed.world, fishes: fish } }, base, true, true));
+  }
+  assert.deepEqual(decodeReplicaRowDelta(packed, base, true, true), next);
   assert.deepEqual(decodeReplicaRowDelta(encoded, base, true), next);
   a.parents.push('later'); c.new.info = 'later';
   assert.deepEqual(first.world.fishes.a.parents, ['p']);
@@ -621,6 +630,82 @@ test('发布缺口锁住只覆盖较晚时刻的包，合包保留最早覆盖�
   assert.equal(recovery.request(peer).to, from);
 });
 
+test('跨日和停游后继续累计时，已签名的历史行程和较早的伙伴基准仍各自固定', async () => {
+  let notify;
+  const midnight = Date.parse('2026-11-28T00:00:00+08:00'), world = new World(midnight - 1000);
+  const { data } = world, sender = new WorldBroadcast(fn => { notify = fn; });
+  const sink = { live: () => [1], periodicWorldRequired: () => false, broadcast: (_, body) => body };
+  data.fishes.a = { id: 'a', x: 0 };
+  const firstDay = '2026-11-27', nextDay = '2026-11-28';
+  data.travel.a = { since: 100, days: { [firstDay]: 12 } };
+  const initial = await sender.send(sink, data);
+  let base = replicaRowBase(crypto.randomUUID(), initial.world, true), received = base;
+  const retained = [];
+  async function publish(day, distance) {
+    data.tick += 500;
+    const tick = data.tick;
+    const fishes = { set: [['a', { id: 'a', x: tick }]], remove: [] };
+    data.fishes.a = fishes.set[0][1];
+    if (day) data.travel.a.days[day] = distance;
+    const update = day ? { travel: { set: [['a', data.travel.a]], remove: [] } } : {};
+    const raw = day ? { travel: { set: [['a', day, distance]], remove: [] } } : {};
+    notify(world, { tables: { fishes, ...update }, values: { tick }, workerChanges: { tables: { fishes, ...raw }, values: { tick } } });
+    const body = await sender.send(sink, data), encoded = encodeReplicaRowDelta(body, base, true, true);
+    const decoded = decodeReplicaRowDelta(encoded, received, true, true);
+    assert.deepEqual(decoded, body);
+    if (day) assert.deepEqual(decoded.world.travel.a, data.travel.a);
+    const id = crypto.randomUUID();
+    base = replicaRowBase(id, body.world, true, base);
+    received = replicaRowBase(id, decoded.world, true, received);
+    retained.push([body, received]);
+  }
+  await publish(firstDay, 13); await publish(nextDay, 1); await publish(); await publish(nextDay, 3);
+  assert.deepEqual(retained[0][0].world.travel.a.days, { [firstDay]: 13 });
+  assert.deepEqual(retained[1][1].travel.get('a').days, { [firstDay]: 13, [nextDay]: 1 });
+  assert.deepEqual(received.travel.get('a').days, { [firstDay]: 13, [nextDay]: 3 });
+});
+
+test('游动顺序与收包顺序不同，亲鱼、进食与旧字段例外仍共用同一份位置帧', async () => {
+  let notify;
+  const sender = new WorldBroadcast(fn => { notify = fn; });
+  const world = new World(100, 'sea', { populate: false, ambient: false }), data = world.data;
+  const sink = { live: () => [1], broadcast: (_, body) => body };
+  const ids = ['z', 'a', 'b'];
+  for (const id of ids) data.fishes[id] = { id, x: 1, y: 4, facing: 1, cx: 0, cy: 0, posAt: data.tick };
+  let previous = await sender.send(sink, data, 100), base = replicaRowBase(crypto.randomUUID(), previous.world, true);
+  const first = previous.world.fishes.z;
+  for (let step = 1; step <= 2; step++) {
+    const tick = data.tick += CONFIG.step;
+    const a = data.fishes.a = { ...data.fishes.a, x: step + 1, posAt: tick };
+    const b = data.fishes.b = { ...data.fishes.b, x: step + 2, posAt: tick };
+    const z = data.fishes.z = { ...data.fishes.z, x: step + 3, posAt: tick, lastFed: 600, cx: 0 };
+    let raw;
+    if (step === 1) {
+      delete z.cx;
+      raw = { set: [1, ['b', { x: b.x, posAt: tick }, undefined], ['z', { ...z }, ['cx']]],
+        motion: Float64Array.of(a.x, a.y, a.facing, a.cx, a.cy), remove: [] };
+    } else raw = { set: [1, 2, 0],
+      motion: Float64Array.from([a, b, z].flatMap(f => [f.x, f.y, f.facing, f.cx, f.cy])), remove: [] };
+    notify(world, { values: { tick }, tables: { fishes: { set: [['a', a], ['b', b], ['z', z]], remove: [] } },
+      workerChanges: { values: { tick }, tables: { fishes: raw } } });
+    const next = await sender.send(sink, data, tick);
+    const frame = committedStepFields.get(next.world).poses, encoded = encodeReplicaRowDelta(next, base, true);
+    assert(frame);
+    assert.equal(frame.materialized, undefined);
+    assert(encoded.world.fishes[1][1] < 0 && encoded.world.fishes[2][1] < 0);
+    const decoded = decodeReplicaRowDelta(encoded, base, true);
+    assert.deepEqual(decoded.world.fishes, data.fishes);
+    const packed = encodeReplicaRowDelta(next, base, true, true);
+    assert.deepEqual(decodeReplicaRowDelta(packed, base, true, true), decoded);
+    assert.deepEqual(Object.keys(decoded.world.fishes), ids);
+    if (step === 2) assert.equal(Object.hasOwn(previous.world.fishes.z, 'cx'), false);
+    base = replicaRowBase(crypto.randomUUID(), next.world, true, base);
+    previous = next;
+  }
+  assert.equal(first.x, 1);
+  assert.equal(first.lastFed, undefined);
+});
+
 test('漏掉一次发布的伙伴直接补足上一帧独有的行程，不必等待重新加入', () => {
   const transfers = new ReplicaTransfers({}), peer = {}, other = {};
   const packet = (fromTick, tick, travel) => ({ delta: true, fromTick, world: { tick, travel } });
@@ -633,6 +718,30 @@ test('漏掉一次发布的伙伴直接补足上一帧独有的行程，不必�
   transfers.publishLive(next, [peer, other], missing);
   assert.deepEqual(transfers.live.get(peer).pending, { ...next, fromTick: 500, world: { tick: 1500, travel: { ...missing.world.travel, ...next.world.travel } } });
   assert.equal(transfers.live.get(other).pending, next);
+});
+
+test('仅对确认同一关系基准的伙伴发送区间，新增行与延续行均还原到原序', async () => {
+  const world = new World(1000), { data } = world;
+  data.life.at = 500;
+  data.life.bonds = { 'a|b': { a: 'a', b: 'b', seconds: 2, at: 500, lastNear: 500, run: 1 } };
+  const sink = { live: () => [1], broadcast: (_, body) => body };
+  let notify;
+  const sender = new WorldBroadcast(fn => { notify = fn; }), first = await sender.send(sink, data, 1000);
+  const base = replicaRowBase(crypto.randomUUID(), first.world, true);
+  const bonds = { at: 1500, keys: ['a|c'], intervals: { before: 1, length: 2, kept: Uint8Array.of(1), added: Uint8Array.of(1) } };
+  data.tick = 1500;
+  data.life = { ...data.life, at: 1500, bonds: {
+    'a|c': { a: 'a', b: 'c', seconds: 1, at: 1500, lastNear: 1500, run: 0 },
+    'a|b': { a: 'a', b: 'b', seconds: 3, at: 1500, lastNear: 1500, run: 2 } } };
+  notify(world, { tables: {}, values: { tick: 1500, life: data.life },
+    workerChanges: { tables: {}, values: { tick: 1500 }, life: { properties: [{ at: 1500 }], bonds } } });
+  const next = await sender.send(sink, data, 1500), wire = encodeReplicaRowDelta(next, base, true);
+  assert.deepEqual(wire.world.life.bonds, { before: 1, length: 2, kept: [1], added: [1], keys: ['a|c'] });
+  assert.deepEqual(decodeReplicaRowDelta(wire, base, true).world.life.bonds, data.life.bonds);
+  const legacy = replicaRowBase(base.id, first.world);
+  assert.deepEqual(decodeReplicaRowDelta(encodeReplicaRowDelta(next, legacy), legacy).world.life.bonds, data.life.bonds);
+  wire.world.life.bonds.before = 2;
+  assert.throws(() => decodeReplicaRowDelta(wire, base, true));
 });
 
 test('已确认直连持续发差量，归档删除后回收比较基线，旧网状成员仍定期补齐', async () => {

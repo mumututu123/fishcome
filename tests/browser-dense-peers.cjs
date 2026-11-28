@@ -46,7 +46,8 @@ assert(!values.source || launchers.every(Boolean), '--source 需要相同规则�
 const { chromium } = require(process.env.TIDE_TEST_MODULES ? path.join(process.env.TIDE_TEST_MODULES, 'playwright') : 'playwright');
 const www = values.source ? path.resolve(values.source, 'www') : path.resolve(__dirname, '../www');
 const browsers = [], children = [], observed = [], errors = [];
-const phaseModules = { '/archive.js': 'compactKnown', '/replica.js': 'verifyReplica', '/storage.js': 'putMany' };
+const phaseModules = { '/archive.js': 'compactKnown', '/replica.js': 'verifyReplica', '/storage.js': 'putMany',
+  '/simulation-delta.js': 'expandSimulationPatch', '/checkpoint-pages.js': 'noteCheckpointChanges' };
 const observeCommit = `
 const reportApplied = simulationApplied;
 simulationApplied = (world, patch) => {
@@ -96,7 +97,12 @@ SimulationClient.prototype.request = function (message) {
     stepRequests.set(message, { row, start });
     testData.stepRequests.push(row);
   }
-  return originalRequest.call(this, message);
+  const reply = originalRequest.call(this, message);
+  if (message.kind === 'step') reply.then(result => {
+    if (result?.ruleTime !== undefined) window.densePhases.push({ phase: 'worker.rules',
+      at: Date.now(), total: result.ruleTime, sync: result.ruleTime });
+  }, () => {});
+  return reply;
 };
 const originalCompute = SimulationClient.prototype.compute;
 SimulationClient.prototype.compute = async function (target, message, ownsWorld) {
@@ -162,7 +168,8 @@ window.denseCommitted = (target, patch, at) => {
 };
 for (const [object, method, name] of [
   [World.prototype, 'merge', 'World.merge'], [pictures, 'prepare', 'pictures.prepare'], [renderer, 'cellIndex', 'renderer.cellIndex'],
-  [renderer, 'applyMergedChars', 'renderer.applyMergedChars']
+  [renderer, 'applyMergedChars', 'renderer.applyMergedChars'], [renderer, 'worldChanged', 'renderer.worldChanged'],
+  [worldBroadcast, 'send', 'WorldBroadcast.send'], [Network.prototype, 'broadcast', 'Network.broadcast']
 ]) {
   const original = object[method];
   if (typeof original !== 'function') continue;
@@ -289,6 +296,21 @@ async function openPage(browser, origin, options, assets) {
       if (pathname === '/app.js') return route.fulfill({ contentType: 'text/javascript', body: readFileSync(file, 'utf8') + instrument });
       if (pathname === '/replica-stream.js') return route.fulfill({ contentType: 'text/javascript', body: readFileSync(file, 'utf8') + observeReplicaPages });
       if (pathname === '/simulation-changes.js') return route.fulfill({ contentType: 'text/javascript', body: readFileSync(file, 'utf8') + observeCommit });
+      if (pathname === '/simulation-worker.js') return route.fulfill({
+        contentType: 'text/javascript', body: readFileSync(file, 'utf8') + `
+const timedStep = World.prototype.step;
+const timedReceive = WorkerSimulation.prototype.receive;
+let ruleTime;
+World.prototype.step = function (...args) {
+  const start = performance.now(), result = timedStep.apply(this, args);
+  ruleTime = performance.now() - start;
+  return result;
+};
+WorkerSimulation.prototype.receive = function (message) {
+  const result = timedReceive.call(this, message);
+  if (message.kind === 'step') result.ruleTime = ruleTime;
+  return result;
+};` });
       if (pathname === '/network.js' && ['both', options].includes(values['plain-live'])) {
         const source = readFileSync(file, 'utf8').replace('const replicaRowsVersion = 1;', 'const replicaRowsVersion = 0;');
         return route.fulfill({ contentType: 'text/javascript', body: source });

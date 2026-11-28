@@ -264,7 +264,7 @@ async function mergeVerifiedWorld(data, peer, context, { local = false, worldMes
       const index = delta && renderer.currentIndex(target);
       let changes;
       try { changes = target.merge(incoming, archived, routine ? 'replica' : undefined, delta); }
-      finally { if (delta) noteCheckpointMerge(target.data, changes); }
+      finally { if (delta) noteCheckpointMerge(target.data, changes, incoming, archived); }
       if (index) renderer.applyMergedChars(target, index, changes?.chars);
     };
     let movement;
