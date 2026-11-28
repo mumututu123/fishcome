@@ -7,6 +7,7 @@ import { expandSimulationPatch } from '../www/simulation-delta.js';
 import { POPULATION } from '../www/population.js';
 import { CONTACT_TIME, updateContacts } from '../www/breeding.js';
 import { makeFishWorld } from './capacity-fish.mjs';
+import { LIFE, recordStory } from '../www/life.js';
 
 test('入体、换鱼、删除再加入只更新涉事字块，保留原表和整数键的顺序', () => {
   const fish = (id, entity) => ({ id, entity, kind: 'fish', path: [], x: 0, y: 0 });
@@ -41,6 +42,31 @@ function open(reference) {
   worker.receive({ kind: 'ready' });
   return worker;
 }
+
+test('同一步多鱼进食和饿死共用一次故事提交，逐条内容和先后次序一致', () => {
+  const now = Date.UTC(2026, 0, 1), at = now + CONFIG.step;
+  const world = makeFishWorld(World, 48, 1000, { now, spacingX: 16 });
+  world.ambient = false;
+  const expected = new World(now, 'stories', { populate: false });
+  for (let i = 0; i < LIFE.storyLimit; i++) recordStory(expected, 'arrive', 'old-' + i, now);
+  let stories = structuredClone(expected.data.life.stories), commits = 0;
+  Object.defineProperty(world.data.life, 'stories', { get: () => stories, set(value) { commits++; stories = value; } });
+  const fishes = Object.values(world.data.fishes);
+  for (const [index, fish] of fishes.entries()) {
+    if (index % 2 === 0) { fish.hungerAt = at; continue; }
+    const id = 'food-' + index;
+    world.data.chars[id] = { id, kind: 'food', entity: '', ch: '饵',
+      x: fish.x + 2, y: fish.y, born: now, fall: 0, path: [] };
+  }
+  world.step(at);
+  for (const [index, fish] of fishes.entries()) {
+    if (index % 2 === 0) assert.equal(world.data.fishes[fish.id], undefined);
+    else assert.equal(world.data.chars['food-' + index].entity, fish.id);
+    recordStory(expected, index % 2 === 0 ? 'depart' : 'meal', fish.id, at);
+  }
+  assert.deepEqual(Object.entries(stories), Object.entries(expected.data.life.stories));
+  assert.equal(commits, 1);
+});
 
 test('连续两步进食保留鱼群顺序，之后的转向、避让和结伴与完整重算一致', () => {
   const now = Date.UTC(2026, 0, 1);

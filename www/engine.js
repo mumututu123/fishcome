@@ -9,7 +9,7 @@ import { initialLife, initialSources, validInitialOp } from './genesis.js';
 import { fishNameError } from './fish-profile.js';
 import { newEcology, updateEcology, validEcology, mergeEcology } from './ecology.js';
 import { emptyArchiveState, mergeArchiveState, operationValue, archiveDependencies } from './archive.js';
-import { LIFE, newLife, lifeContext, updateLife, idleMotion, swimPattern, spawnPlankton, recordStory, mergeLife, validateLife, freshPlankton } from './life.js';
+import { LIFE, newLife, lifeContext, updateLife, idleMotion, swimPattern, spawnPlankton, recordStory, withStoryBatch, mergeLife, validateLife, freshPlankton } from './life.js';
 import { REFERRAL_REWARD, referralError, chooseReferral } from './referral.js';
 import { WORLD_WIDTH, MAX_FLOOR, wrapX, worldKey, deltaX, nearX, makeTerrain, terrainOf, validTerrain, chooseTerrain, floorAt, waterAt } from './geography.js';
 import { canonicalBirthFish, canonicalBirthPath, fishOrigin, activeBreeding, finishBreeding, updateContacts, motionOrder, motionUnits, commitUnit, mergeBreeding, normalizeBreeding, normalizeBirthCells, writeBreedingRecord } from './breeding.js';
@@ -647,6 +647,9 @@ export class World {
     this.dirty = true; return { ok: true };
   }
   step(now, swims) {
+    return withStoryBatch(this, () => this.#advanceEcology(now, swims));
+  }
+  #advanceEcology(now, swims) {
     this.initializeTracking(now);
     // Only an unchanged body can replay its confirmed path from the preceding frame.
     const changedBodies = swims && capturedFishIds(this.data, this.data.tick), paths = [];
@@ -1084,6 +1087,6 @@ export class World {
     return changes;
   }
   counts() { const chars = Object.values(this.data.chars); return { fish: Object.keys(this.data.fishes).length, scene: sceneryCount(this.data), food: chars.filter(c => c.kind === 'food' && this.data.tick - c.born < CONFIG.foodLife).length, characters: chars.filter(c => c.kind !== 'burn').length }; }
-  resolveLegends(now) { worldEdited(this); processLegends(this, now, transition); }
+  resolveLegends(now) { worldEdited(this); withStoryBatch(this, () => processLegends(this, now, transition)); }
   resolvePopulation(now) { worldEdited(this); updatePopulation(this, now, transition, { resume: true }); }
 }

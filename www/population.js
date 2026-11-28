@@ -1,7 +1,7 @@
 import { cellPosition, hash, key } from './engine.js';
 import { wrapX, deltaX } from './geography.js';
 import { cancelBreeding } from './breeding.js';
-import { recordStory, storyBatch } from './life.js';
+import { recordStory, withStoryBatch } from './life.js';
 
 // Shared, conservative limits. NPCs and geology never spend player currency.
 export const POPULATION = Object.freeze({ threshold: 300, sickRatio: .2, check: 3600000,
@@ -71,12 +71,10 @@ function checkIllness(world, now) {
     && (!state.illnesses[f.id]?.curedAt || now - state.illnesses[f.id].curedAt >= POPULATION.immunity));
   const ranked = eligible.map(fish => ({ fish, rank: hash(`crowding:${slot}:${fish.id}`) }));
   ranked.sort((a, b) => a.rank - b.rank || a.fish.id.localeCompare(b.fish.id));
-  const stories = storyBatch(world);
   for (const { fish: f } of ranked.slice(0, quota)) {
     state.illnesses[f.id] = { at: now, nextLossAt: now + POPULATION.dissolveEvery, curedAt: 0 };
-    stories.record(world, 'depressed', f.id, now, { visit: now });
+    recordStory(world, 'depressed', f.id, now, { visit: now });
   }
-  stories.commit();
 }
 function lineClear(world, a, b, scenery) {
   const dx = deltaX(b.x, a.x), dy = b.y - a.y, n = Math.ceil(Math.max(Math.abs(dx), Math.abs(dy)));
@@ -227,6 +225,9 @@ function updateVolcano(world, now, dt, transition, resume = false) {
   }
 }
 export function updatePopulation(world, now, transition, { resume = false } = {}) {
+  return withStoryBatch(world, () => advancePopulation(world, now, transition, resume));
+}
+function advancePopulation(world, now, transition, resume) {
   world.data.population ||= newPopulation(now); world.data.rocks ||= {};
   const state = world.data.population, dt = Math.min(1, Math.max(0, (now - state.at) / 1000));
   settleIllness(world, now, transition);

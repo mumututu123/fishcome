@@ -47,12 +47,15 @@ function makeStory(kind, fish, at, extra) {
   return { id, kind, fish, at, ...extra };
 }
 export function recordStory(world, kind, fish, at, extra = {}) {
+  if (world.activeStoryWriter) return world.activeStoryWriter(world, kind, fish, at, extra);
   const life = state(world, at), story = makeStory(kind, fish, at, extra);
   life.stories[story.id] = choose(life.stories[story.id], story);
   if (Object.keys(life.stories).length > LIFE.storyLimit) life.stories = trim(life.stories, LIFE.storyLimit);
   world.dirty = true;
 }
-export function storyBatch(world, life) {
+export function withStoryBatch(world, work) {
+  if (world.activeStoryWriter) return work(world.activeStoryWriter);
+  let life;
   let stories, storyOrder, storyCount, orderChanged = false;
   const compareStories = (a, b) => stories[b].at - stories[a].at || a.localeCompare(b);
   function record(_, kind, fish, at, extra = {}) {
@@ -80,12 +83,16 @@ export function storyBatch(world, life) {
     while (storyOrder.length > LIFE.storyLimit) delete stories[storyOrder.pop()];
     storyCount = storyOrder.length; orderChanged = false;
   }
-  function commit() {
-    if (!stories) return;
-    life.stories = storyOrder ? Object.fromEntries(storyOrder.map(id => [id, stories[id]])) : stories;
-    world.dirty = true;
+  world.activeStoryWriter = record;
+  try {
+    return work(record);
+  } finally {
+    world.activeStoryWriter = undefined;
+    if (stories) {
+      life.stories = storyOrder ? Object.fromEntries(storyOrder.map(id => [id, stories[id]])) : stories;
+      world.dirty = true;
+    }
   }
-  return { record, commit };
 }
 function clearLine(a, b, blockedRows) {
   const dx = deltaX(b.x, a.x), dy = b.y - a.y, steps = Math.ceil(Math.max(Math.abs(dx), Math.abs(dy)));
@@ -328,8 +335,10 @@ export function lifeContext(world, now, scenery, groups, sharedLayout) {
 export function updateLife(world, now, context) {
   const life = state(world, now), elapsed = now - life.at;
   if (elapsed < 1000 && elapsed >= 0) return;
+  return withStoryBatch(world, record => observeLife(world, now, context, life, elapsed, record));
+}
+function observeLife(world, now, context, life, elapsed, record) {
   const dt = elapsed > 0 && elapsed <= 2500 ? Math.min(1, elapsed / 1000) : 0;
-  const { record, commit } = storyBatch(world, life);
   const encounters = new Map();
   const previousAt = life.at;
   const spans = elapsed === 1000 && context.orderedPairs && world.activeBondSpans?.(previousAt);
@@ -414,7 +423,6 @@ export function updateLife(world, now, context) {
     if (row) return spans ? advanceBond(row, now) : row;
     return spans && previous[key] ? advanceBond(previous[key], previousAt) : previous[key];
   });
-  commit();
   life.at = now;
   if (context.orderedPairs && !inactive.length) {
     if (world.writeActiveBonds) world.writeActiveBonds(active, head, now, spans);
