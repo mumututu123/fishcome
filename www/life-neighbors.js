@@ -1,11 +1,11 @@
 import { WORLD_WIDTH, deltaX } from './geography.js';
 
-const size = 10, columns = WORLD_WIDTH / size;
 export function fishNeighbors(geometry, canSeeLine) {
   const { points, ordered, ranks } = geometry;
   const n = ordered.length, stride = 2 ** Math.ceil(Math.log2(Math.max(1, n)));
   const halfGrid = ordered.every(p => Number.isInteger(2 * p.x) && Number.isInteger(2 * p.y));
   const uniqueRanks = n === 0 || ranks.get(ordered[n - 1]) === n - 1;
+  const size = uniqueRanks ? 5 : 10, columns = WORLD_WIDTH / size;
   // Twice the distance is exact on a half-cell grid. Unique ranks fit below the stride.
   const numericOrder = halfGrid && uniqueRanks && stride * 25 < 2 ** 32;
   const scratch = geometry.scratch ??= {

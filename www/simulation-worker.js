@@ -401,6 +401,7 @@ function trackWorld(source) {
     // Callers enumerate this read-only list. Its rows still carry tracked writes.
     charValues,
     readBonds: () => materializeBonds(raw(source.life.bonds)),
+    readStories: () => raw(source.life.stories),
     activeBondSpans: at => publishedBonds?.at === at && publishedBonds.table === raw(source.life.bonds) ? publishedBonds : null,
     writeActiveBonds(table, keys, at, base) {
       const previous = raw(source.life.bonds);
@@ -518,6 +519,7 @@ export class WorkerSimulation {
       this.world.data = this.tracker.data;
       this.world.charValues = this.tracker.charValues;
       this.world.readBonds = this.tracker.readBonds;
+      this.world.readStories = this.tracker.readStories;
       this.world.activeBondSpans = this.tracker.activeBondSpans;
       this.world.writeActiveBonds = this.tracker.writeActiveBonds;
       this.world.ecologyCharacters = this.tracker.ecologyCharacters;

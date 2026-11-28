@@ -105,6 +105,7 @@ function schoolGeometry(world, layout, roster) {
     }
     if (subset && !previous.points.has(id)) subset = false;
     const { point } = center;
+    point.order = centers.length;
     maxRadius = Math.max(maxRadius, point.halfWidth, point.halfHeight);
     points.set(id, point);
     centers.push(center);
@@ -233,6 +234,16 @@ export function lifeContext(world, now, scenery, groups, sharedLayout) {
     const p = points.get(a), q = points.get(b);
     return p && q && (visibleFrom(p, q) || visibleFrom(q, p));
   }
+  function orderEncounters(encounters) {
+    const ordered = [];
+    for (const story of encounters) {
+      let first = points.get(story.a), partner = points.get(story.b);
+      if (first.order > partner.order) [first, partner] = [partner, first];
+      if (!visibleFrom(first, partner)) [first, partner] = [partner, first];
+      ordered.push({ story, first: first.order, distance: distance(first, partner), partner: partner.slot });
+    }
+    return ordered.sort((a, b) => a.first - b.first || a.distance - b.distance || a.partner - b.partner);
+  }
   function visitBonds(visit) {
     let remaining = LIFE.bondLimit;
     const visible = (p, q) => visibleFrom(p, q) || visibleFrom(q, p);
@@ -255,7 +266,7 @@ export function lifeContext(world, now, scenery, groups, sharedLayout) {
     }
     return name;
   }
-  return { points, neighbors, visitBonds, visiblePair, orderedPairs: geometry.orderedPairs, crowdedNeighbor, scenes, memories, get school() { return school ??= makeSchool(); },
+  return { points, neighbors, visitBonds, visiblePair, orderEncounters, orderedPairs: geometry.orderedPairs, crowdedNeighbor, scenes, memories, get school() { return school ??= makeSchool(); },
     weather: weatherAt(world.data, now), event: activeEvent(world.data, now) };
 }
 export function updateLife(world, now, context) {
@@ -265,7 +276,7 @@ export function updateLife(world, now, context) {
   let stories, storyOrder, storyCount, orderChanged = false;
   const compareStories = (a, b) => stories[b].at - stories[a].at || a.localeCompare(b);
   function record(_, kind, fish, at, extra) {
-    if (!stories) { stories = { ...life.stories }; storyCount = Object.keys(stories).length; }
+    if (!stories) { stories = { ...(world.readStories?.() ?? life.stories) }; storyCount = Object.keys(stories).length; }
     const story = makeStory(kind, fish, at, extra), id = story.id, old = stories[id];
     if (old) {
       stories[id] = choose(old, story);
@@ -341,19 +352,7 @@ export function updateLife(world, now, context) {
     } else if (head.length < limit || old.at >= now) inactive.push([key, spans ? advanceBond(old, previousAt) : old]);
   }
   if (encounters.size && context.orderedPairs) {
-    // A previously pruned story can be created again. Apply simultaneous stories
-    // in their original encounter order, including one-way lines of sight.
-    const involved = new Set();
-    for (const { a, b } of encounters.values()) { involved.add(a); involved.add(b); }
-    for (const id of context.points.keys()) {
-      if (!involved.has(id)) continue;
-      for (const q of context.neighbors.get(id)) {
-        const key = id < q.id ? id + '|' + q.id : q.id + '|' + id;
-        const story = encounters.get(key);
-        if (story) { record(world, story.kind, story.a, now, { other: story.b }); encounters.delete(key); }
-      }
-      if (!encounters.size) break;
-    }
+    for (const { story: { kind, a, b } } of context.orderEncounters(encounters.values())) record(world, kind, a, now, { other: b });
   } else for (const { kind, a, b } of encounters.values()) record(world, kind, a, now, { other: b });
   for (const [id, spot] of context.scenes) {
     if (distance(context.points.get(id), spot) > 7) continue;
