@@ -9,6 +9,7 @@ import { characterPositionFields, worldTables } from './simulation-changes.js';
 import { encodeFields, motionFields } from './simulation-delta.js';
 import { advanceBond, encodeBondIntervals } from './bond-interval.js';
 import { digestJsonText, jsonDigest } from './step-digest.js';
+import { FishStepProof } from './fish-step-proof.js';
 
 const motionEdit = { properties: motionFields };
 const fallFields = ['fall', 'y', 'moveAt'];
@@ -24,6 +25,7 @@ const inputFields = new Set(['ops', 'terrain', 'roots', 'participants', 'archive
 // them in a message. Collections can be replaced by the simulation as a whole
 // (notably contacts), in which case additions and removals must both be sent.
 function trackWorld() {
+  const fishProof = new FishStepProof();
   let source, knownFish, fishIds, daysByOrdinal, firstHunger = Infinity, travelComplete;
   function includeHunger(at) {
     // The original comparison ignores missing and nonnumeric deadlines.
@@ -338,19 +340,25 @@ function trackWorld() {
     for (const key of Object.keys(value)) result[key] = plain(value[key]);
     return result;
   }
-  function logicalChanges(patch) {
+  function proveChanges(patch) {
     // Ordinals belong to one worker's roster. A worker retained across a
     // connection and one opened from the same current checkpoint can assign
     // different numbers to the same fish and encode equal bonds differently.
     const idOf = ref => typeof ref === 'number' ? fishIds[ref] : Array.isArray(ref) ? ref[0] : ref;
     const tables = { ...patch.tables };
+    let fish;
     for (const field of ['fishes', 'travel']) {
       const changes = tables[field];
       if (!changes) continue;
       const rows = raw(source[field]);
+      if (field === 'fishes') {
+        fish = fishProof.records(changes.set, idOf, id => raw(rows[id]));
+        tables.fishes = { remove: changes.remove };
+        continue;
+      }
       tables[field] = { remove: changes.remove, set: changes.set.map(ref => {
-        const id = idOf(ref);
-        return [id, raw(rows[id])];
+        const id = idOf(ref), row = raw(rows[id]);
+        return [id, row && Object.hasOwn(row, 'days') ? { ...row, days: raw(row.days) } : row];
       }) };
     }
     const logical = { ...patch, tables };
@@ -363,7 +371,8 @@ function trackWorld() {
       logical.life = { ...patch.life, bonds };
     }
     if (patch.swims) logical.swims = patch.swims.map(ids => ids.map(idOf));
-    return logical;
+    const other = jsonDigest(logical);
+    return fish ? Promise.all([other, fish]).then(jsonDigest) : other;
   }
   function encodeRow(id, row, edit) {
     if (!edit) return [id, plain(row)];
@@ -608,7 +617,7 @@ function trackWorld() {
       }
     },
     reset,
-    logicalChanges,
+    proveChanges,
     changes() {
       const patch = { values: {}, tables: {} };
       for (const field of values) patch.values[field] = plain(source[field]);
@@ -708,7 +717,7 @@ export class WorkerSimulation {
       const patch = this.agreedPatch;
       if (!patch || patch.values.tick !== message.tick) throw new Error('没有此步待确认的生态变化');
       this.agreedPatch = undefined;
-      return jsonDigest(this.tracker.logicalChanges(patch));
+      return this.tracker.proveChanges(patch);
     }
     this.agreedPatch = undefined;
     if (message.kind === 'characterWitness') {

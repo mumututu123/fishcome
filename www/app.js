@@ -108,7 +108,9 @@ const historyQueues = new Map();
 function authorNick(actor, fallback) { return actor === identity?.actor ? identity.nick : active().find(member => member.actor === actor)?.nick || world.data.participants[actor] || displayNick(fallback) || '匿名'; }
 function rememberAuthor(actor, nick) { if (setParticipantName(world, actor, nick)) { renderedChatCount = -1; renderChat(); } }
 function toast(text) { $('toast').textContent = text; $('toast').hidden = false; clearTimeout(toast.timer); toast.timer = setTimeout(() => $('toast').hidden = true, 5000); }
-function member() { return { replicaPages: 1, orderedSteps: 1, build: meta.version, id: network.node, actor: identity.actor, nick: displayNick(identity.nick), url: meta.url, at: Date.now(), visible: !document.hidden, peers: network.live().length }; }
+const orderedProtocol = 2;
+function sameOrderedProtocol(other) { return other?.orderedSteps === orderedProtocol && other.build === meta.version; }
+function member() { return { replicaPages: 1, orderedSteps: orderedProtocol, build: meta.version, id: network.node, actor: identity.actor, nick: displayNick(identity.nick), url: meta.url, at: Date.now(), visible: !document.hidden, peers: network.live().length }; }
 function active() { return [...members.values()].filter(m => Date.now() - m.at < 120000); }
 function leader() { return active().sort((a, b) => +b.visible - +a.visible || a.id.localeCompare(b.id))[0]?.id || network.node; }
 function amLeader() { return !!network && leader() === network.node; }
@@ -118,13 +120,13 @@ function orderedPeer() {
   const peers = network.live(), people = active();
   if (peers.length !== 1 || people.length !== 2 || network.hasRelayedWorldPeer(peers)) return;
   const peer = peers[0], other = members.get(peer.node);
-  if (other?.orderedSteps === 1 && other.build === meta.version && peer.replicaLive && peer.sentHello && peer.confirmedReplica && other.peers <= 1 &&
+  if (sameOrderedProtocol(other) && peer.replicaLive && peer.sentHello && peer.confirmedReplica && other.peers <= 1 &&
       !peer.replicaCatchingUp && (!amLeader() || !geometryRepair && !world.data.pendingChatGlyphs)) return peer;
 }
 function mayRetainWorker() {
   const peers = network.live(), winner = leader(), other = members.get(winner);
   return peers.length === 1 && active().length === 2 && peers[0].node === winner && peers[0].replicaLive &&
-    other?.orderedSteps === 1 && other.build === meta.version && other.peers <= 1;
+    sameOrderedProtocol(other) && other.peers <= 1;
 }
 function followVerifiedReplica(target, tick, revision, changes) {
   const follower = () => target === world && !updateFrozen && !replacingCheckpoint && mayRetainWorker();
@@ -493,7 +495,7 @@ async function onMessage(message, peer) {
     if (message.from !== peer.node || body.member?.id !== message.from || body.member.actor !== message.actor) return;
     const newKnowledge = Object.keys(body.world.roots || {}).some(r => !world.data.roots[r]) || Object.keys(body.world.ops || {}).some(id => !world.data.ops[id]) || Object.keys(body.world.chats || {}).some(id => !world.data.chats[id]) || Object.keys(body.world.chatSources || {}).some(id => !world.data.chatSources[id]);
     let joined;
-    const retain = peer.replicaLive && body.member.orderedSteps === 1 && body.member.build === meta.version && simulation.owner === world;
+    const retain = peer.replicaLive && sameOrderedProtocol(body.member) && simulation.owner === world;
     await mergeReplica(body.world, peer, 'hello', undefined, retain ? (...state) => { joined = state; } : undefined); geometryRepair = true;
     replicaRecovery.covered(message);
     const own = body.member; members.set(own.id, { ...own, url: peer.url, at: Date.now() }); remember(peer.url);

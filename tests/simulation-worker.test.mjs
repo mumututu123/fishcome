@@ -10,9 +10,41 @@ import { LIFE, lifeContext, updateLife } from '../www/life.js';
 import { applyInputRows, setParticipantName, subscribeBeforeSimulationPatch, worldEdited, worldRevision } from '../www/simulation-changes.js';
 import { CONTACT_TIME, updateContacts } from '../www/breeding.js';
 import { orderedCheckpoint } from '../www/ordered-session.js';
+import { FishStepProof } from '../www/fish-step-proof.js';
 
 const start = Date.UTC(2025, 5, 15, 12, 17);
 const root = '00000000-0000-4000-8000-000000000012';
+
+test('同一步从权威鱼行核对位置、字段顺序、旧档扩展和跨页鱼序', async () => {
+  const rows = Array.from({ length: 130 }, (_, i) => ({
+    id: 'fish' + i, x: i, y: 20, facing: 1, cx: 0, cy: 0, posAt: start, lineage: { parents: ['甲'] }
+  }));
+  const refs = rows.map((_, i) => i), observer = new FishStepProof();
+  const prove = (writer = observer) => writer.records(refs, i => 'f' + i, id => rows[Number(id.slice(1))]);
+  let prior = await prove();
+  const equalCold = async () => {
+    const next = await prove();
+    assert.deepEqual(next, await prove(new FishStepProof()));
+    return next;
+  };
+  rows[129].x += 0.125;
+  let next = await equalCold();
+  assert.deepEqual(next.pages, prior.pages);
+  assert.notEqual(next.positions, prior.positions);
+  for (const edit of [
+    () => { rows[129].lineage.parents[0] = '乙'; },
+    () => { rows[129].extra = null; },
+    () => { rows[129].extra = undefined; },
+    () => { const { id } = rows[129]; delete rows[129].id; rows[129].id = id; },
+    () => { rows[129].facing = '旧档值'; },
+    () => { refs.reverse(); }
+  ]) {
+    prior = next;
+    edit();
+    next = await equalCold();
+    assert.notDeepEqual(next.pages, prior.pages);
+  }
+});
 
 test('半秒时钟对齐存档步，提前醒来只等剩余时间，迟醒也不累积偏移', t => {
   let now = 1320, base = 1000, wake;
