@@ -12,15 +12,24 @@ export function advanceBond(row, at) {
 const bit = (bits, i) => bits[i >>> 3] & 1 << (i & 7);
 const mark = (bits, i) => { bits[i >>> 3] |= 1 << (i & 7); };
 
-export function encodeBondIntervals(previous, table, keys, at) {
-  const kept = new Uint8Array(Math.ceil(previous.keys.length / 8));
-  const added = new Uint8Array(Math.ceil(keys.length / 8)), names = [];
-  for (let i = 0; i < previous.keys.length; i++) if (table[previous.keys[i]]) mark(kept, i);
-  for (let i = 0; i < keys.length; i++) if (!previous.table[keys[i]]) {
-    mark(added, i);
-    names.push(keys[i]);
+export function compareBondIntervals(before, after, at) {
+  const kept = new Uint8Array(Math.ceil(before.length / 8)), added = new Uint8Array(Math.ceil(after.length / 8));
+  const removed = [], keys = [];
+  let old = 0, next = 0;
+  // Both lists are the canonical pair-key order proved by the school roster.
+  // A continuing pair retains its relative position even when a neighbor leaves.
+  while (old < before.length && next < after.length) {
+    if (before[old] === after[next]) {
+      mark(kept, old++); next++;
+    } else if (before[old].localeCompare(after[next]) < 0) {
+      removed.push(before[old++]);
+    } else {
+      mark(added, next); keys.push(after[next++]);
+    }
   }
-  return { at, intervals: { before: previous.keys.length, kept, added, length: keys.length }, keys: names };
+  while (old < before.length) removed.push(before[old++]);
+  while (next < after.length) { mark(added, next); keys.push(after[next++]); }
+  return { removed, patch: { at, intervals: { before: before.length, kept, added, length: after.length }, keys } };
 }
 
 function validBits(bits, size) {

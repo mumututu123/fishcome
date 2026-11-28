@@ -7,7 +7,7 @@ import { World, CONFIG, indexEcologyCharacters } from './engine.js';
 import { shanghaiDay } from './fish-status.js';
 import { characterPositionFields, worldTables } from './simulation-changes.js';
 import { encodeFields, motionFields } from './simulation-delta.js';
-import { advanceBond, encodeBondIntervals } from './bond-interval.js';
+import { advanceBond } from './bond-interval.js';
 import { digestJsonText, jsonDigest } from './step-digest.js';
 import { FishStepProof } from './fish-step-proof.js';
 
@@ -405,9 +405,9 @@ function trackWorld() {
   function encodeBonds(table) {
     table = raw(table);
     if (activeBonds?.table === table) {
-      const { keys, at, base } = activeBonds;
+      const { keys, at, intervals } = activeBonds;
       publishedBonds = { table, keys, at, retain: row => row[observation]?.target === row ? { ...row } : row };
-      if (base) return encodeBondIntervals(base, table, keys, at);
+      if (intervals) return intervals;
       const counters = new Float64Array(keys.length * 2);
       for (let i = 0; i < keys.length; i++) {
         const row = table[keys[i]];
@@ -573,13 +573,13 @@ function trackWorld() {
     readBonds: () => materializeBonds(raw(source.life.bonds)),
     readStories: () => raw(source.life.stories),
     activeBondSpans: at => publishedBonds?.at === at && publishedBonds.table === raw(source.life.bonds) ? publishedBonds : null,
-    writeActiveBonds(table, keys, at, base) {
+    writeActiveBonds(table, keys, at, intervals) {
       const previous = raw(source.life.bonds);
       previousBonds ??= previous;
       raw(source.life).bonds = watch(table, { field: 'life', part: 'bonds' });
       orderedBonds = true;
-      bondTimes.set(table, base ? at : null);
-      activeBonds = { table, keys, at, base };
+      bondTimes.set(table, intervals ? at : null);
+      activeBonds = { table, keys, at, intervals };
     },
     ecologyCharacters,
     bodyEdits: (before, after) => membership?.edits(before, after),

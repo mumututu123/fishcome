@@ -5,7 +5,7 @@ import { ARCHIVE_FIELDS, ArchiveStore, encodeArchive, prepareCompaction } from '
 import { SimulationClient, startSimulationClock, subscribeSimulationChanges } from '../www/simulation-client.js';
 import { WorkerSimulation, simulationBuffers } from '../www/simulation-worker.js';
 import { expandSimulationPatch } from '../www/simulation-delta.js';
-import { applyBondIntervals } from '../www/bond-interval.js';
+import { applyBondIntervals, compareBondIntervals } from '../www/bond-interval.js';
 import { LIFE, lifeContext, updateLife } from '../www/life.js';
 import { applyInputRows, setParticipantName, subscribeBeforeSimulationPatch, worldEdited, worldRevision } from '../www/simulation-changes.js';
 import { CONTACT_TIME, updateContacts } from '../www/breeding.js';
@@ -14,6 +14,19 @@ import { FishStepProof } from '../www/fish-step-proof.js';
 
 const start = Date.UTC(2025, 5, 15, 12, 17);
 const root = '00000000-0000-4000-8000-000000000012';
+
+test('连续观察只提交按原次序留下、新增和离开的伙伴', () => {
+  const names = Array.from({ length: 300 }, (_, i) => 'a|' + String(i).padStart(4, '0'));
+  for (const [before, after] of [[[], names], [names, []], [names, names],
+    [names.filter((_, i) => i % 3), names.filter((_, i) => i % 5)]]) {
+    const { removed, patch } = compareBondIntervals(before, after, start);
+    assert.deepEqual(removed, before.filter(key => !after.includes(key)));
+    assert.deepEqual(patch.keys, after.filter(key => !before.includes(key)));
+    const selected = (rows, bits) => rows.filter((_, i) => bits[i >>> 3] & (1 << (i & 7)));
+    assert.deepEqual(selected(before, patch.intervals.kept), after.filter(key => before.includes(key)));
+    assert.deepEqual(selected(after, patch.intervals.added), patch.keys);
+  }
+});
 
 test('同一步从权威鱼行核对位置、字段顺序、旧档扩展和跨页鱼序', async () => {
   const rows = Array.from({ length: 130 }, (_, i) => ({

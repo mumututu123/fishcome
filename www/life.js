@@ -1,7 +1,7 @@
 import { bounds, hash } from './engine.js';
 import { fishNeighbors, placeSchoolCenter, schoolBuckets } from './life-neighbors.js';
 import { schoolMembership } from './fish-school.js';
-import { advanceBond, bondLimit } from './bond-interval.js';
+import { advanceBond, bondLimit, compareBondIntervals } from './bond-interval.js';
 import { WORLD_WIDTH, wrapX, deltaX, worldKey } from './geography.js';
 import { EVENTS, activeEvent, updateEvents, validEvent, eventSchedule, eventNarration, eventMotion } from './random-events.js';
 import { validLegendStory } from './legends.js';
@@ -398,8 +398,9 @@ function observeLife(world, now, context, life, elapsed, record) {
   // pair-key ranges disjoint. A previous row outside the cap can still cause
   // a reunion or participate in an event before it leaves the retained table.
   const tail = new Map(), inactive = [];
-  if (context.orderedPairs) for (const key in previous) {
-    if (active[key]) continue;
+  const intervals = spans && compareBondIntervals(spans.keys, head, now);
+  if (context.orderedPairs) for (const key of intervals ? intervals.removed : Object.keys(previous)) {
+    if (!intervals && active[key]) continue;
     const old = previous[key];
     if (head.length === limit && context.visiblePair(old.a, old.b)) {
       tail.set(key, near(old.a, old.b, key, old));
@@ -436,7 +437,7 @@ function observeLife(world, now, context, life, elapsed, record) {
   });
   life.at = now;
   if (context.orderedPairs && !inactive.length) {
-    if (world.writeActiveBonds) world.writeActiveBonds(active, head, now, spans);
+    if (world.writeActiveBonds) world.writeActiveBonds(active, head, now, intervals?.patch);
     else life.bonds = active;
   } else {
     if (spans) for (const key of head) active[key] = advanceBond(active[key], now);
