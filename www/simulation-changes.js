@@ -42,7 +42,7 @@ export function replaceLifeHistory(world, life) {
 }
 
 export function simulationApplied(world, patch) {
-  if (patch.tables.chars || patch.values.chars) charactersChanged(world);
+  if (patch.tables.chars || patch.values?.chars) charactersChanged(world);
   if (!patch.workerChanges) {
     for (const field of ['fishes', 'travel']) {
       const remove = patch.tables[field]?.remove;
