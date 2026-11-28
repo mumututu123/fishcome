@@ -1,3 +1,4 @@
+import { hash } from './world-hash.js';
 import { wrapX, deltaX } from './geography.js';
 import { activeLegend } from './legends.js';
 
@@ -5,7 +6,6 @@ export const EVENTS = Object.freeze({ period: 360000, opening: 2000, limit: 32, 
 export const EVENT_KINDS = Object.freeze(['whale', 'hiccup', 'bottle', 'meeting', 'blossom', 'meteor', 'radio', 'parade']);
 const DURATIONS = { whale: 32000, hiccup: 22000, bottle: 60000, meeting: 18000, blossom: 32000, meteor: 16000, radio: 30000, parade: 18000 };
 const TITLES = { whale: '深海巨影', hiccup: '海洋打了个嗝', bottle: '漂流瓶路过', meeting: '鱼群临时开会', blossom: '海底开花', meteor: '流星掉进海里', radio: '海洋电台', parade: '倒着游的游行' };
-const hash = (text, n = 2166136261) => { for (const ch of text) n = Math.imul(n ^ ch.codePointAt(0), 16777619); return n >>> 0; };
 const distance = (a, b) => Math.max(Math.abs(deltaX(a.x, b.x)), Math.abs(a.y - b.y));
 const seedOf = data => data.terrain?.seed || Object.keys(data.roots).sort()[0];
 export const eventTitle = kind => TITLES[kind] || '';
@@ -52,10 +52,9 @@ export function planEvent(world, schedule, now, context, bondFor = key => world.
     .sort((a, b) => a.rank - b.rank || a.item.id.localeCompare(b.item.id)).map(entry => entry.item);
   const healthy = p => !world.breedingState(p.id) && now - world.data.fishes[p.id].lastFed < 86400000;
   const needsGroup = schedule.kind === 'meeting' || schedule.kind === 'parade';
-  const all = [...context.points.values()];
-  const points = ranked(needsGroup ? all.filter(healthy) : all);
-  let focus = points[0], fishes = [], plants = [];
+  let focus, ranks, fishes = [], plants = [];
   if (needsGroup) {
+    const points = ranked([...context.points.values()].filter(healthy));
     for (const point of points) {
       const companions = (context.neighbors.get(point.id) || []).filter(q => healthy(q) && bondFor([point.id, q.id].sort().join('|'))?.seconds >= 45);
       const group = [point.id];
@@ -63,11 +62,20 @@ export function planEvent(world, schedule, now, context, bondFor = key => world.
       if (group.length >= 3) { focus = point; fishes = group; break; }
     }
     if (!fishes.length) return null;
-  }
-  if (['hiccup', 'blossom'].includes(schedule.kind)) {
+  } else if (schedule.kind === 'hiccup' || schedule.kind === 'blossom') {
     const weeds = ranked(world.charValues('seaweed').filter(c => schedule.kind !== 'blossom' || now - c.created >= 3600000));
     if (!weeds.length) return null;
     focus = weeds[0]; plants = weeds.filter(c => distance(c, focus) <= 8).slice(0, 7).map(c => c.id).sort();
+  } else {
+    let lowest = Infinity, i = 0;
+    ranks = new Uint32Array(context.points.size);
+    for (const point of context.points.values()) {
+      const rank = hash(point.id, prefix);
+      ranks[i++] = rank;
+      if (rank < lowest || rank === lowest && point.id.localeCompare(focus.id) < 0) {
+        focus = point; lowest = rank;
+      }
+    }
   }
   const x = wrapX(focus?.x ?? hash(`x:${schedule.id}`) % 1000);
   let y = focus?.y ?? 25;
@@ -75,7 +83,17 @@ export function planEvent(world, schedule, now, context, bondFor = key => world.
   if (schedule.kind === 'bottle') y = 5;
   if (schedule.kind === 'meteor') y = 2;
   if (schedule.kind === 'radio') y = Math.min(55, Math.max(8, y));
-  if (!fishes.length) fishes = points.filter(p => distance(p, { x, y: schedule.kind === 'meteor' ? p.y : y }) <= 35).slice(0, 4).map(p => p.id);
+  if (!fishes.length) {
+    const nearby = [];
+    let i = 0;
+    for (const point of context.points.values()) {
+      const rank = ranks?.[i++];
+      if (Math.abs(deltaX(point.x, x)) <= 35 && (schedule.kind === 'meteor' || Math.abs(point.y - y) <= 35)) {
+        nearby.push({ point, rank: rank ?? hash(point.id, prefix) });
+      }
+    }
+    fishes = nearby.sort((a, b) => a.rank - b.rank || a.point.id.localeCompare(b.point.id)).slice(0, 4).map(({ point }) => point.id);
+  }
   return { id: schedule.id, seed: schedule.seed, slot: schedule.slot, kind: schedule.kind, at: now, x, y, fishes, plants };
 }
 export function updateEvents(world, now, context, continuous, record, bondFor) {

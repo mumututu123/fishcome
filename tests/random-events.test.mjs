@@ -24,6 +24,9 @@ function startEvent(w, kind) { const s = schedule(w, kind); w.data.tick = s.star
 const sources = w => ({ roots: w.data.roots, ops: w.data.ops, breeding: w.data.breeding, chars: w.data.chars });
 
 test('事件按相同抽签值选择鱼，给每个候选只计算一次抽签值', () => {
+  assert.equal(hash('鱼🐟'), 2963087020);
+  assert.equal(hash('鱼🐟', 0), 3839220913);
+  assert.equal(hash(String.fromCharCode(0xd800, 0x61, 0xdc00)), 420870318);
   const w = make(), points = new Map();
   const ids = Array.from({ length: 512 }, (_, i) => '鱼🐟-' + i);
   let reads = 0;

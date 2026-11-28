@@ -1,3 +1,5 @@
+import { hash } from './world-hash.js';
+export { hash };
 import { BodyLayout, fitsHull, fitsHullAt, sweepsHull, sweepsHullAt } from './motion-hull.js';
 import { MovementGrid, foreignOwner } from './movement-grid.js';
 import { CHAT_FLOOR, validChatMessage, buildChatFloor, chatGlyphs } from './chat.js';
@@ -67,7 +69,6 @@ export function replicaSourceRows(...tables) {
   });
 }
 export const ordinal = (a, b) => a === b ? 0 : a > b ? 1 : -1;
-export function hash(text, n = 2166136261) { for (const c of text) n = Math.imul(n ^ c.codePointAt(0), 16777619); return n >>> 0; }
 export function validGlyph(ch) { return typeof ch === 'string' && Array.from(ch).length === 1 && !/\s/u.test(ch) && (/^[\x21-\x7e]$/.test(ch) || /\p{Script=Han}/u.test(ch) || /^[\u3001-\u303f\uff01-\uff65]$/u.test(ch)); }
 export function bounds(cells) {
   if (!cells.length) return { minX: 0, minY: 0, maxX: 0, maxY: 0, width: 0, height: 0 };

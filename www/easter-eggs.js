@@ -1,8 +1,8 @@
+import { hash } from './world-hash.js';
 import { wrapX, worldKey } from './geography.js';
 import { LIFE, pairKey } from './life.js';
 import { CHAT_FLOOR, chatGlyphs, validChatMessage } from './chat.js';
 
-const hash = text => { let n = 2166136261; for (const c of text) n = Math.imul(n ^ c.codePointAt(0), 16777619); return n >>> 0; };
 export const hasFriendSecret = story => story.kind === 'reunion' && hash(`greeting:${story.id}`) % 3 === 0;
 export function friendSignals(data, now) {
   const signals = [], used = new Set();

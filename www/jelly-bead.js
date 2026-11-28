@@ -1,12 +1,11 @@
 import { beadTint } from './bead-visual.js';
+import { hash } from './world-hash.js';
 
 const TAU = Math.PI * 2;
 const translucent = (color, target, mix, alpha) => beadTint(color, target, mix).replace('rgb(', 'rgba(').replace(')', `,${alpha})`);
 
 export function jellyPhase(id = '') {
-  let hash = 2166136261;
-  for (const ch of String(id)) hash = Math.imul(hash ^ ch.codePointAt(0), 16777619);
-  return (hash >>> 0) / 4294967296 * TAU;
+  return hash(String(id)) / 4294967296 * TAU;
 }
 
 export function jellyPose(time = 0, phase = 0, x = 0, y = 0, facing = 1, reduced = false) {
