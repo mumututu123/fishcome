@@ -265,7 +265,10 @@ async function mergeVerifiedWorld(data, peer, context, { local = false, worldMes
     let movement;
     if (worldMessage && worldMessage.from !== network.node) movement = replicaSwims.merge(target.data, worldMessage, apply);
     else { apply(); replicaSwims.reset(); }
-    if (worldMessage && !delta) replicaRecovery.covered(worldMessage);
+    if (worldMessage && !delta) {
+      const orderedRepair = peer?.replicaLive && peer.node === worldMessage.from && worldMessage.body.repairFor === network.node;
+      replicaRecovery.covered(worldMessage, orderedRepair ? worldMessage.body.request : undefined, orderedRepair);
+    }
     if (target.archives !== store) target.attachArchives(store);
     return { joinedWorld: target.roots.length > rootCount, movement, routine };
   };
@@ -400,7 +403,9 @@ async function onMessage(message, peer) {
   } else if (message.kind === 'replicaRequest') {
     if (body.to === network.node) {
       const repair = typeof body.request === 'string' && body.request.length === 36 ? { repairFor: message.from, request: body.request } : {};
-      await network.broadcast('merge', { ...repair, world: await captureReplica() }, { capturedWorld: true });
+      if (repair.request && amLeader() && peer?.node === message.from && peer.replicaLive && peer.sentHello && peer.confirmedReplica) {
+        network.replicas.repairLive(peer, async () => ({ ...repair, delta: false, world: await captureReplica() }));
+      } else await network.broadcast('merge', { ...repair, world: await captureReplica() }, { capturedWorld: true });
     }
   } else if (message.kind === 'world') {
     if (message.from !== leader()) { replicaRecovery.ignore(message); return; }

@@ -12,7 +12,7 @@ const { recordDraw, frameSummary, startTrace, readPresentations } = require('./b
 
 const { positionals, values } = parseArgs({ allowPositionals: true, options: {
   profile: { type: 'string' }, source: { type: 'string' }, seconds: { type: 'string', default: '10' },
-  'full-updates': { type: 'string' }, drop: { type: 'boolean' }, help: { type: 'boolean' },
+  'full-updates': { type: 'string' }, drop: { type: 'boolean' }, 'drop-steps': { type: 'string' }, help: { type: 'boolean' },
   backup: { type: 'string' }, trace: { type: 'string' }, report: { type: 'string' }, 'refresh-budget': { type: 'boolean' },
   'archive-rounds': { type: 'string', default: '0' }, 'plain-live': { type: 'string' },
   'forget-live-base': { type: 'boolean' }, 'switch-leader': { type: 'boolean' }, 'rebuild-viewport': { type: 'boolean' }
@@ -21,6 +21,7 @@ if (values.help) {
   console.log('用法：node tests/browser-dense-peers.cjs [鱼数] [--seconds=35] [--full-updates=0|1] [--drop] [--profile=跟随端.cpuprofile]');
   console.log('默认使用仓库发行构建工具，临时构建两套启动器。也可用 TIDE_DENSE_LAUNCHER_A 和 TIDE_DENSE_LAUNCHER_B 指定两套隔离的启动器，另以 --source=对照工作区指定网页来源。');
   console.log('--drop 蓄意漏发一个已提交的半秒更新，检查后续能否继续同步。');
+  console.log('--drop --drop-steps=3 连续漏发三步，检查下一次更新能否一起补全。');
   console.log('--backup=本地存档 使用真实存档和归档；--trace=本地跟踪文件 记录浏览器呈现；--report=汇总文件 保存验收数据；--refresh-budget 严格检查每次刷新不超过 20 毫秒（需 --trace）。');
   console.log('--archive-rounds=3 在观测期间连续生成并同步 3 个新归档包（需 --backup）。');
   console.log('--plain-live=A|B|both 模拟不支持紧凑发送的端；--forget-live-base 模拟跟随端遗失上一版本；--switch-leader 在观测后切换协调端。');
@@ -32,6 +33,8 @@ const count = backup ? Object.keys(backup.world.fishes).length : Number(position
 const seconds = Number(values.seconds);
 const expectedFull = values['full-updates'] === undefined ? undefined : Number(values['full-updates']);
 const archiveRounds = Number(values['archive-rounds']);
+const dropSteps = Number(values['drop-steps'] ?? 1);
+assert(Number.isSafeInteger(dropSteps) && dropSteps >= 1 && dropSteps <= 3 && (!values['drop-steps'] || values.drop));
 assert(positionals.length < 2 && Number.isSafeInteger(count) && count >= 2 && count <= 5500);
 assert(Number.isSafeInteger(seconds) && seconds >= 6 && seconds <= 90);
 assert(expectedFull === undefined || Number.isSafeInteger(expectedFull) && expectedFull >= 0);
@@ -136,14 +139,16 @@ mergeReplica = async (...args) => {
   finally { testData.merges.push({ type: args[2], tick: args[0].tick, ms: performance.now() - start, failed }); }
 };
 const originalBroadcast = Network.prototype.broadcast;
-let lastWorldSent = -Infinity, suppressedTick;
+let lastWorldSent = -Infinity, suppressedTick, dropsRemaining = ${dropSteps};
 Network.prototype.broadcast = async function (kind, body, ...args) {
   if (kind === 'replicaRequest') testData.repairs.push({ at: Date.now(), correlated: !!body.request });
   if (kind !== 'world') return originalBroadcast.call(this, kind, body, ...args);
   const at = Date.now();
-  if (window.denseDropNext && body.delta && body.world.tick > lastWorldSent) {
-    window.denseDropNext = false;
+  if (window.denseDropNext && body.delta && body.world.tick > lastWorldSent && body.world.tick !== suppressedTick) {
+    window.denseDropNext = --dropsRemaining > 0;
     suppressedTick = body.world.tick;
+    window.denseDropped?.();
+    window.denseDropped = null;
   }
   // An archive may publish the same logical step a second time.
   if (body.delta && body.world.tick === suppressedTick) {
@@ -210,12 +215,13 @@ window.denseJoinSettled = () => {
   return full && Date.now() - full.at >= 800 && !network.replicas.outgoing.size &&
     [...network.replicas.incoming.values()].every(state => state.kind === 'world' || state.kind === 'live');
 };
-window.denseArchiveRound = async serial => {
+window.denseArchiveRound = async (serial, dropStep) => {
   if (!amLeader()) throw new Error('归档轮次开始时协调端已切换');
   const t = Date.now() - 8 * ARCHIVE.period;
   const op = { id: identity.actor + ':hour:' + serial, actor: identity.actor, nick: identity.nick,
     roots: world.roots, kind: 'earn', t, cost: 0, serial };
   const proof = await network.makeEnvelope('op', op);
+  if (dropStep) await new Promise(resolve => { window.denseDropped = resolve; window.denseDropNext = true; });
   const result = await simulation.atStepBoundary(() => world.apply({ ...op, proof }));
   if (!result?.ok || result.duplicate) throw new Error('未写入本轮待归档的签名操作');
   archiveCheckAt = 0;
@@ -499,7 +505,7 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
     profileStartedAt = Date.now();
   }
   let dropTimer;
-  if (values.drop) dropTimer = setTimeout(() => (firstLeads ? a : b).evaluate(() => { window.denseDropNext = true; }).catch(() => {}), 2500);
+  if (values.drop && !archiveRounds) dropTimer = setTimeout(() => (firstLeads ? a : b).evaluate(() => { window.denseDropNext = true; }).catch(() => {}), 2500);
   const forgotten = values['forget-live-base'] && pause(3200).then(() => (firstLeads ? b : a).evaluate(() => denseForgetLiveBase()));
   const archiveRun = runArchiveRounds(archiveRounds, firstLeads ? a : b, firstLeads ? b : a, fixture.archiveIds);
   // Keep reporting the acceptance metrics if an in-window archive round fails.
@@ -566,8 +572,13 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
       failed: page.receives.filter(event => event.failed), replicaFailures: page.replicaFailures, logs: page.logs };
   });
   const dropped = coordinator.sends.filter(event => event.dropped && sampled(event));
-  const recovered = new Set(dropped.map(event => event.tick)).size === 1 && actualSteps.some(event => event.tick < dropped[0].tick) &&
-    !actualSteps.some(event => event.tick === dropped[0].tick) && actualSteps.some(event => event.tick > dropped[0].tick);
+  const droppedTicks = new Set(dropped.map(event => event.tick));
+  const resumedTick = dropped.at(-1)?.tick + 500;
+  const resumed = actualSteps.find(event => event.tick === resumedTick);
+  const resumeSent = coordinator.sends.find(event => event.tick === resumedTick && !event.dropped);
+  const resumeMs = resumed && resumeSent ? resumed.at - resumeSent.at : undefined;
+  const recovered = droppedTicks.size === dropSteps && actualSteps.some(event => event.tick < dropped[0].tick) &&
+    !actualSteps.some(event => droppedTicks.has(event.tick)) && actualSteps.some(event => event.tick > dropped.at(-1).tick);
   const fullUpdates = follower.receives.filter(event => event.kind === 'world' && sampled(event) && !event.delta && !event.failed).length;
   const transfers = coordinator.liveTransfers.filter(sampled);
   const liveWire = { bytes: coordinator.liveBytes.filter(sampled).reduce((sum, row) => sum + row.bytes, 0),
@@ -592,15 +603,28 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
     followerTickGaps: stats(actualSteps.slice(1).map((step, index) => step.tick - actualSteps[index].tick)),
     longestFollowerGap: gapDetails(actualSteps, coordinator, follower),
     receiveTickGaps: [...new Set(received.slice(1).map((event, index) => event.after - received[index].after))],
-    helloMs: pages.map(page => page.merges.filter(event => event.type === 'hello').map(event => event.ms)), ...(values.drop ? { dropped, recovered } : {}),
+    helloMs: pages.map(page => page.merges.filter(event => event.type === 'hello').map(event => event.ms)), ...(values.drop ? { dropped, recovered, resumeMs } : {}),
     summaries, profileStartedAt, profileSummary, errors }, null, 2);
   if (values.report) await writeFile(values.report, report + '\n');
   console.log(report);
   assertProgress(leaderProgress, ended - recent, '主端');
-  assertProgress(followerProgress, ended - recent, '跟随端');
+  if (dropSteps > 1 && resumed && resumeSent) {
+    // Keep the full physical gap in the report. Check normal continuity up to
+    // the blackout and again from the first publication actually available.
+    const before = actualSteps.filter(row => row.tick < dropped[0].tick), after = actualSteps.filter(row => row.tick >= resumedTick);
+    assert(before.length && before.at(-1).tick === dropped[0].tick - 500, '漏发前的最后一步应已提交');
+    const prior = progress(before, recent, dropped[0].at), following = progress(after, resumeSent.at, ended);
+    assertProgress({ ...followerProgress, maxUncommittedMs: Math.max(prior.maxUncommittedMs, following.maxUncommittedMs) }, ended - recent, '跟随端可收包期间');
+  } else assertProgress(followerProgress, ended - recent, '跟随端');
   assert(leaderSteps.slice(1).every((step, index) => step.tick - leaderSteps[index].tick === 500), '生态步时间跳跃');
   assert(actualSteps.slice(1).every((step, index) => step.tick > actualSteps[index].tick && (step.tick - actualSteps[index].tick) % 500 === 0), '跟随端收到非半秒边界的世界步');
   if (values.drop) assert(recovered, '跟随端应跳过未发布的更新并继续提交');
+  if (values.drop && archiveRounds) {
+    assert(dropped.length > dropSteps, '归档必须实际重发已漏掉的同一步');
+    assert.equal(follower.repairs.filter(sampled).length, 0, '已知伙伴漏收的变化应直接补齐');
+    assert(resumeMs >= 0 && resumeMs < 500, '首个恢复发布的更新应在下一次半秒结算前完成提交');
+    assert(!follower.receives.some(row => sampled(row) && row.kind === 'merge'), '直连伙伴应在原有实时通道恢复');
+  }
   if (values['plain-live']) assert(liveWire.plain > 0 && liveWire.compact === 0 && liveWire.missingBase === 0, '旧版应继续接收原实时分块');
   if (forgotten) assert(await forgotten && liveWire.missingBase === 1 && liveWire.plain > 0 && liveWire.compact > 0, '遗失版本后应先重放原分块再恢复紧凑发送');
   if (expectedFull !== undefined) assert.equal(fullUpdates, expectedFull, '测试区间的定期全量同步次数不符');
@@ -628,7 +652,8 @@ async function runArchiveRounds(count, leader, follower, known) {
   const written = new Set(known), rounds = [];
   for (let i = 0; i < count; i++) {
     await pause(1000);
-    const round = await leader.evaluate(serial => denseArchiveRound(serial), 100000 + i);
+    const round = await leader.evaluate(([serial, dropStep]) => denseArchiveRound(serial, dropStep),
+      [100000 + i, values.drop && i === Math.min(1, count - 1)]);
     assert(!written.has(round.id), '本轮归档重复使用了旧包');
     written.add(round.id);
     await follower.waitForFunction(id => denseHasArchive(id), round.id, { polling: 100, timeout: 12000 });

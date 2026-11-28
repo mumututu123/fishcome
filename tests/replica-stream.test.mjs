@@ -728,11 +728,93 @@ test('漏掉一次发布的伙伴直接补足上一帧独有的行程，不必�
   const next = packet(1000, 1500, { swimmer: { since: 0, days: { today: 1 } } });
   transfers.publishLive(a, [peer, other]);
   transfers.live.clear();
-  transfers.publishLive(missing, [other], a);
+  transfers.stageLive(missing, [peer, other]);
+  transfers.publishLive(missing, [other]);
   transfers.live.clear();
-  transfers.publishLive(next, [peer, other], missing);
+  transfers.stageLive(next, [peer, other]);
+  transfers.publishLive(next, [peer, other]);
   assert.deepEqual(transfers.live.get(peer).pending, { ...next, fromTick: 500, world: { tick: 1500, travel: { ...missing.world.travel, ...next.world.travel } } });
   assert.equal(transfers.live.get(other).pending, next);
+});
+
+test('归档多次发布同一步，漏收这一步的伙伴仍能在下一步取得全部变化', async () => {
+  const { data } = new World(100), sender = new WorldBroadcast(), transfers = new ReplicaTransfers({});
+  const peer = {}, other = {};
+  const sink = { live: () => [peer, other], stageWorld: packet => transfers.stageLive(packet, [peer, other]), broadcast(_, packet) {
+    transfers.publishLive(packet, data.tick === 1100 ? [other] : [peer, other]);
+  } };
+  const publish = async tick => {
+    data.tick = tick;
+    await sender.send(sink, data, tick);
+    const pending = [peer, other].map(p => transfers.live.get(p)?.pending);
+    transfers.live.clear();
+    return pending;
+  };
+  await publish(100);
+  await publish(600);
+  data.travel.one = { since: 0, days: { today: 3 } };
+  await publish(1100);
+  data.participants.reader = '读者';
+  await publish(1100);
+  data.participants.writer = '作者';
+  await publish(1100);
+  const [recovered, current] = await publish(1600);
+  assert.equal(recovered.fromTick, 600);
+  assert.deepEqual(recovered.world.travel.one, data.travel.one);
+  assert.deepEqual(recovered.world.participants, { reader: '读者', writer: '作者' });
+  assert.equal(current.fromTick, 1100);
+  assert.deepEqual(current.world.participants, {});
+});
+
+test('修复只占用该伙伴的实时通道，取全海和等待确认期间的增量一起接在后面', async () => {
+  const transfers = new ReplicaTransfers({});
+  const peer = { confirmedReplica: 'known', replicaCatchingUp: true }, other = {};
+  const packet = (fromTick, tick, id) => ({ delta: true, fromTick, world: { tick, ops: { [id]: tick } } });
+  const full = { delta: false, request: 'request', world: { tick: 1000 } };
+  let releaseCapture, acknowledgeFull, startedSending;
+  const sent = [], sending = new Promise(resolve => { startedSending = resolve; });
+  transfers.sendLivePacket = async (target, _, body) => {
+    assert.equal(target, peer);
+    sent.push(body);
+    if (body === full) { startedSending(); await new Promise(resolve => { acknowledgeFull = resolve; }); }
+    return crypto.randomUUID();
+  };
+  transfers.repairLive(peer, () => new Promise(resolve => { releaseCapture = () => resolve(full); }));
+  const lane = transfers.live.get(peer);
+  const running = transfers.sendLive(peer, lane);
+  transfers.repairLive(peer, () => assert.fail('同一个伙伴只需要一次全海'));
+  transfers.publishLive(packet(1000, 1500, 'a'), [peer]);
+  releaseCapture();
+  await sending;
+  transfers.publishLive(packet(1500, 2000, 'b'), [peer, other]);
+  assert.equal(transfers.live.get(other).pending.fromTick, 1500);
+  assert.deepEqual(sent, [full]);
+  acknowledgeFull();
+  await running;
+  assert.deepEqual(sent, [full, { delta: true, fromTick: 1000, world: { tick: 2000, ops: { a: 1500, b: 2000 } } }]);
+});
+
+test('伙伴已收到游动却错过同一步的收入，下一步仍会带上这笔收入', () => {
+  const transfers = new ReplicaTransfers({}), peer = {}, other = {};
+  const peers = [peer, other];
+  const publish = (body, recipients) => {
+    transfers.stageLive(body, peers);
+    transfers.publishLive(body, recipients);
+    const result = peers.map(peer => transfers.live.get(peer)?.pending);
+    transfers.live.clear();
+    return result;
+  };
+  publish({ delta: true, fromTick: 500, world: { tick: 1000, ops: {} } }, peers);
+  publish({ delta: true, fromTick: 1000, world: { tick: 1000, ops: { income: 1 } } }, [other]);
+  const [missed, current] = publish({ delta: true, fromTick: 1000, world: { tick: 1500, ops: {} } }, peers);
+  assert.deepEqual(missed.world.ops, { income: 1 });
+  assert.deepEqual(current.world.ops, {});
+  transfers.stageLive({ delta: true, fromTick: 1500, world: { tick: 1500, ops: { oldSea: 1 } } }, [peer, other]);
+  transfers.close(peer, new Error('断线'));
+  transfers.discardPendingLive();
+  const fresh = { delta: true, fromTick: 3000, world: { tick: 3500, ops: {} } };
+  transfers.publishLive(fresh, [peer, other]);
+  for (const target of [peer, other]) assert.equal(transfers.live.get(target).pending, fresh);
 });
 
 test('仅对确认同一关系基准的伙伴发送区间，新增行与延续行均还原到原序', async () => {
@@ -811,4 +893,11 @@ test('选主期间跳过的更新只向原发布者补齐，较早的全量及�
   assert.equal(recovery.request(source(600), 13000).to, 'original-publisher');
   recovery.covered(source(550));
   assert.equal(recovery.request(source(600), 19000), undefined);
+  recovery.ignore(source(700));
+  const direct = recovery.request(source(700), 20000);
+  recovery.ignore(source(750));
+  recovery.covered(source(700), direct.request, true);
+  assert(recovery.missed.has('original-publisher'));
+  recovery.covered(source(750), direct.request, true);
+  assert.equal(recovery.request(source(800), 26000), undefined);
 });

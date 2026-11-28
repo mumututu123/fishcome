@@ -127,6 +127,7 @@ export class Network {
     return fitsLegacyEnvelope(body, MAX_RAW - encoder.encode(JSON.stringify(header)).length + 4);
   }
   async broadcastEnvelope(message, peers = this.live()) { this.seen.set(message.id, Date.now()); const bytes = await this.encode(message); await Promise.allSettled(peers.map(p => this.send(p, message.id, bytes))); return message; }
+  stageWorld(body, peers) { this.replicas.stageLive(body, peers.filter(peer => peer.replicaLive)); }
   clearPendingWorld() {
     this.replicas.discardPendingLive();
     this.worldRelayPending = null;
@@ -164,7 +165,7 @@ export class Network {
         const live = peers.filter(peer => peer.replicaLive);
         if (live.length) {
           const snapshot = options?.capturedWorld ? body : structuredClone(body);
-          this.replicas.publishLive(snapshot, live, options?.previousStep);
+          this.replicas.publishLive(snapshot, live);
           if (live.length !== peers.length || this.hasRelayedWorldPeer(peers)) this.relayWorld(snapshot, { capturedWorld: true });
           return;
         }

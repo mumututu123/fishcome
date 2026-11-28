@@ -330,10 +330,10 @@ export class ReplicaRecovery {
     return { to: from, request: request.id };
   }
 
-  covered({ from, actor, body }, response) {
+  covered({ from, actor, body }, response, ordered = false) {
     const missed = this.missed.get(from), tick = body?.world?.tick;
     if (!missed || missed.actor !== actor || !Number.isFinite(tick) || tick < missed.tick) return;
-    if (response ? missed.request?.id === response && missed.request.revision === missed.revision : tick > missed.tick) {
+    if (response ? missed.request?.id === response && (ordered || missed.request.revision === missed.revision) : tick > missed.tick) {
       this.missed.delete(from);
     }
   }
@@ -375,7 +375,6 @@ export class WorldBroadcast {
     this.network = null;
     this.source = null;
     this.previous = null;
-    this.lastPacket = null;
     this.pending = null;
     this.step = null;
     this.generation = (this.generation || 0) + 1;
@@ -447,9 +446,8 @@ export class WorldBroadcast {
         this.needsFull = false;
       }
       const body = { delta: !!previous, ...(previous && { fromTick }), ...(swims ? { swims } : {}), world };
-      const prior = this.lastPacket;
-      this.lastPacket = body.delta ? body : null;
-      return await network.broadcast('world', body, { capturedWorld: true, previousStep: prior });
+      network.stageWorld?.(body, peers);
+      return await network.broadcast('world', body, { capturedWorld: true });
     } catch (error) {
       this.reset();
       throw error;

@@ -183,19 +183,24 @@ export class ReplicaTransfers {
     this.live = new Map();
     this.rowsSent = new WeakMap();
     this.rowsReceived = new WeakMap();
-    this.queuedTicks = new WeakMap();
+    this.unpublished = new WeakMap();
   }
-  publishLive(body, peers, previousStep) {
+  // A tick can have multiple publications. Each connected peer owns its
+  // unpublished changes until its reliable stream accepts them.
+  stageLive(body, peers) {
+    for (const peer of peers) this.unpublished.set(peer, coalesceWorld(this.unpublished.get(peer), body));
+  }
+  liveLane(peer) {
+    let lane = this.live.get(peer);
+    if (!lane) this.live.set(peer, lane = { pending: null, receipt: null, running: false });
+    return lane;
+  }
+  publishLive(body, peers) {
     for (const peer of peers) {
-      // A single missed publication can be filled immediately from the last
-      // immutable cut. A longer gap requests the peer's verified full world.
-      const tick = this.queuedTicks.get(peer);
-      const packet = body.delta && tick < body.fromTick && previousStep?.world.tick === body.fromTick && previousStep.fromTick <= tick
-        ? coalesceWorld(previousStep, body) : body;
-      this.queuedTicks.set(peer, body.world.tick);
-      const current = this.live.get(peer);
-      if (current) current.pending = coalesceWorld(current.pending, packet);
-      else this.live.set(peer, { pending: packet, receipt: null, running: false });
+      const packet = this.unpublished.get(peer) ?? body;
+      this.unpublished.delete(peer);
+      const lane = this.liveLane(peer);
+      lane.pending = coalesceWorld(lane.pending, packet);
       this.resumeLive(peer);
     }
   }
@@ -205,17 +210,30 @@ export class ReplicaTransfers {
     lane.running = true;
     this.sendLive(peer, lane).catch(error => this.network.close(peer, error));
   }
+  repairLive(peer, capture) {
+    const lane = this.liveLane(peer);
+    if (lane.snapshot) return;
+    lane.snapshot = capture;
+    this.resumeLive(peer);
+  }
   async sendLive(peer, lane) {
     try {
-      while (lane.pending) {
-        const body = lane.pending;
+      while (lane.pending || lane.snapshot) {
+        // Take the full snapshot on the same ordered stream as subsequent
+        // changes. Accumulate live publications while capturing and sending it.
+        const snapshot = lane.snapshot;
+        const pending = lane.pending;
         lane.pending = null;
+        const body = snapshot ? await snapshot() : pending;
+        if (this.live.get(peer) !== lane) return;
+        if (snapshot && lane.snapshot !== snapshot) continue;
         let prior = this.rowsSent.get(peer);
         const encoded = peer.replicaRows ? encodeReplicaRowDelta(body, prior, peer.replicaFrames, peer.replicaPoseBytes) : body;
         let id = await this.sendLivePacket(peer, lane, encoded);
         if (!id && encoded !== body) { prior = null; id = await this.sendLivePacket(peer, lane, body); }
         if (!id) throw new Error('伙伴拒绝世界增量');
         if (peer.replicaRows) this.rowsSent.set(peer, replicaRowBase(id, body.world, peer.replicaFrames, encoded.frameRows && prior));
+        if (snapshot && lane.snapshot === snapshot) lane.snapshot = null;
       }
     } finally { if (this.live.get(peer) === lane) this.live.delete(peer); }
   }
@@ -237,8 +255,10 @@ export class ReplicaTransfers {
     }
   }
   discardPendingLive() {
+    this.unpublished = new WeakMap();
+    this.unpublished = new WeakMap();
     for (const [peer, lane] of this.live) {
-      if (lane.running) lane.pending = null;
+      if (lane.running) { lane.pending = null; lane.snapshot = null; }
       else this.live.delete(peer);
     }
   }
@@ -377,11 +397,14 @@ export class ReplicaTransfers {
     return !direct && !live;
   }
   close(peer, error) {
+    this.unpublished.delete(peer);
+    this.unpublished.delete(peer);
     peer.replicaAck?.reject(error);
     const lane = this.live.get(peer);
     if (lane) { lane.pending = null; lane.receipt?.reject(error); this.live.delete(peer); }
   }
   stop() {
+    this.unpublished = new WeakMap();
     for (const s of this.incoming.values()) clearTimeout(s.timer);
     for (const s of this.completed.values()) clearTimeout(s.timer);
     for (const s of this.outgoing.values()) clearTimeout(s.expiration);
