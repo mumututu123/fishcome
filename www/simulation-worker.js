@@ -560,6 +560,10 @@ export class WorkerSimulation {
       this.world.beginSwimBatch = this.tracker.beginSwimBatch;
       this.world.completeSwimBatch = this.tracker.completeSwimBatch;
       this.world.recordMovement = this.tracker.recordMovement;
+      // Index the checkpoint's existing bodies while loading it. Building
+      // these lookups needs no future time, input, or simulated movement.
+      const groups = this.world.ecologyCharacters().groups;
+      this.world.movementGrid(groups).swimmers(this.world, CONFIG.speed);
     } else if (message.kind === 'restore') {
       this.tracker.invalidateOrigins();
       for (const [field, id, value] of message.rows) {
