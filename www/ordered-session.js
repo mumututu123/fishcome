@@ -134,8 +134,20 @@ export class OrderedSession {
     const peer = this.io.peer(), now = performance.now();
     if (this.current || !peer || !this.io.isLeader() || now < (this.retryAt || 0) ||
         Date.now() - this.io.world().data.tick > CONFIG.step) return;
+    const world = this.io.world(), leader = this.io.leader();
+    const possible = this.candidate;
+    if (!possible?.acknowledged || possible.peer !== peer || possible.world !== world || possible.leader !== leader || now - possible.askedAt > 1000) {
+      if (possible?.peer === peer && !possible.acknowledged && now - possible.askedAt < CONFIG.step / 2) return;
+      const id = crypto.randomUUID();
+      this.candidate = { peer, world, leader, id, askedAt: now };
+      // An unanswered enquiry never reserves an ecology tick. The existing
+      // authority keeps publishing while the other tab finishes its hello.
+      await this.io.send(peer, { action: 'available?', id, leader });
+      return;
+    }
+    this.candidate = undefined;
     this.retryAt = now + 3000;
-    const world = this.io.world(), s = this.begin(peer, crypto.randomUUID(), world.data.tick);
+    const s = this.begin(peer, crypto.randomUUID(), world.data.tick);
     const order = checkpointOrder(world.data);
     await this.send(s, { action: 'opening', base: s.base, order });
     s.cut = await orderedCheckpoint(world, s.store, undefined, () => this.valid(s));
@@ -149,6 +161,12 @@ export class OrderedSession {
     if (!s?.waiting || s.checking || s.world.data.tick < s.base) return;
     if (!this.valid(s) || s.world.data.tick !== s.base) { this.stop('已错过共同检查点'); return; }
     s.checking = true;
+    // Loading the independently verified local replica executes no ecological
+    // step. The final preparation below rechecks inputs, revision and tick.
+    s.preload ??= this.io.prepare(s.world, () => this.valid(s) && s.world.data.tick === s.base).catch(error => {
+      if (this.current === s) this.stop(error.message);
+      return null;
+    });
     s.cut = await orderedCheckpoint(s.world, s.store, s.order, () => this.valid(s));
     await this.finishCheckpoint(s);
   }
@@ -226,6 +244,19 @@ export class OrderedSession {
   async receive(peer, b) {
     if (!b || typeof b !== 'object' || this.io.peer() !== peer) return;
     let s = this.current;
+    if (b.action === 'available?') {
+      if (!s && !this.io.isLeader() && b.leader === this.io.leader() && typeof b.id === 'string' && b.id.length === 36) {
+        await this.io.send(peer, { action: 'available', id: b.id, leader: b.leader });
+      }
+      return;
+    }
+    if (b.action === 'available') {
+      const c = this.candidate;
+      if (s || !c || !this.io.isLeader() || peer !== c.peer || b.id !== c.id || b.leader !== c.leader ||
+          c.world !== this.io.world() || c.leader !== this.io.leader() || performance.now() - c.askedAt > CONFIG.step) return;
+      c.acknowledged = true;
+      return this.probe();
+    }
     if (b.action === 'open' || b.action === 'opening') {
       if (this.io.isLeader() || typeof b.epoch !== 'string' || b.epoch.length !== 36 || !Number.isSafeInteger(b.base) ||
           b.base < this.io.world().data.tick || b.base > this.io.world().data.tick + CONFIG.step * 2 ||
@@ -352,6 +383,8 @@ export class OrderedSession {
         if (this.current === s) this.stop(error.message);
       });
     }
+    if (s.preload) { await s.preload; s.preload = null; }
+    if (!this.valid(s)) return;
     const handle = await this.io.prepare(s.world, () => this.valid(s));
     if (!this.valid(s) || !handle) return;
     const outcomes = await stepDigest([slot.outcomes, slot.archiveChange ?? null]);
@@ -379,7 +412,6 @@ export class OrderedSession {
       return false;
     }
     if (!s.localReady || s.localReady !== s.remoteReady) {
-      if (!s.executed && performance.now() - s.began < 2000) return true;
       this.stop('本步输入尚未得到双方确认'); return false;
     }
     const slot = s.steps.take(s.world.data.tick);

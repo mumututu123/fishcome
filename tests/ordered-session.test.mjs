@@ -103,14 +103,13 @@ test('一批两份签名依业务编号各取自己的归档凭据', async () =>
   await a.session.probe(); await drain();
   for (const side of [a,b]) assert.deepEqual(side.applied, [first.body.id, second.body.id]);
 });
-test('没有收到最后的输入签认时两端都不执行，收到旧连接的消息也不能重新启用', async () => {
+test('起步到点仍缺签认时立即交还前一权威通道，重连后不执行旧步', async () => {
   const now = Date.now(), { sides: [a,b], drain } = pair(now);
   let withheld;
   await a.session.probe();
   await drain(message => { if (message.action === 'seal') { withheld = message; return true; } });
   assert.ok(withheld);
   for (const side of [a,b]) {
-    side.session.current.began = performance.now() - 2500;
     assert.equal(side.session.run(now + 500), false);
     assert.deepEqual(side.calls, []);
   }
@@ -189,4 +188,17 @@ test('漏掉首次归档公告时继续确认鱼步，随后补发同一归档',
     assert.deepEqual(side.stops,[]);
     assert.equal(side.calls.length,2);
   }
+});
+test('对方尚未完成首次加入时询问不占用时钟，迟到的回执不能锁定旧世界', async () => {
+  const now = Date.now(), { sides: [a,b], drain } = pair(now);
+  await a.session.probe();
+  let old;
+  await drain(message => { if (message.action === 'available') { old = message; return true; } });
+  assert.ok(old); assert.equal(a.session.current, undefined);
+  assert.equal(a.session.run(now + 500), false);
+  a.session.candidate.askedAt = performance.now() - 1100;
+  await a.session.receive(a.peer,old);
+  assert.equal(a.session.current,undefined);
+  await a.session.probe(); await drain();
+  assert.ok(a.session.current.steps); assert.ok(b.session.current.steps);
 });
