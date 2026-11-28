@@ -1,6 +1,6 @@
 import { CONFIG } from './engine.js';
 import { fishOrigin, writeBreedingRecord } from './breeding.js';
-import { characterRevision, replaceLifeHistory, simulationWillApply, simulationApplied, subscribeSimulationChanges, worldRevision, worldTables } from './simulation-changes.js';
+import { characterPositionFields, characterRevision, replaceLifeHistory, simulationWillApply, simulationApplied, subscribeSimulationChanges, worldRevision, worldTables } from './simulation-changes.js';
 import { expandSimulationPatch, rowId } from './simulation-delta.js';
 import { SimulationRows } from './simulation-rows.js';
 export { subscribeSimulationChanges } from './simulation-changes.js';
@@ -58,6 +58,21 @@ function* initialRows(world, missingCharacters) {
   if (!summary) return;
   for (const [id, at] of summary.lastMeals) yield ['@lastMeals', id, at];
   for (const id of summary.grassMeals) yield ['@grassMeals', id, true];
+}
+
+function characterPositions(table, pages) {
+  const positions = [];
+  for (const page of pages) {
+    if (!Array.isArray(page)) continue;
+    for (const id of page) {
+      const cell = table[id];
+      if (cell.kind !== 'food' && cell.kind !== 'seaweed' && !Object.hasOwn(cell, 'moveAt')) continue;
+      const fields = {};
+      for (const key of characterPositionFields) if (Object.hasOwn(cell, key)) fields[key] = cell[key];
+      positions.push([id, fields]);
+    }
+  }
+  return positions;
 }
 
 function applyResult(world, { patch: delta, foodRevision }, knownFish) {
@@ -189,6 +204,7 @@ export class SimulationClient {
   }
   async open(world, valid, characterPages) {
     let characters;
+    let positions;
     const retainedWorker = characterPages?.table === world.data.chars && characterPages.revision === characterRevision(world) &&
       this.hasSavedCharacters(world) && this.worker;
     if (retainedWorker) {
@@ -198,6 +214,7 @@ export class SimulationClient {
         if (old !== undefined) return old;
         return ids.slice(i * 128, (i + 1) * 128);
       });
+      positions = characterPositions(world.data.chars, characters);
       this.worker = null;
     }
     this.close();
@@ -214,7 +231,7 @@ export class SimulationClient {
       for (const [id, nick] of patch.tables.participants?.set || []) this.names.set(id, nick);
       for (const [id, food] of patch.tables.chars?.set || []) this.foods.set(id, food);
     });
-    return this.loadWorld(world, valid, worker, characters, characters && characterPages.hashes);
+    return this.loadWorld(world, valid, worker, characters, characters && characterPages.hashes, positions);
   }
   bindWorker(world, worker) {
     this.worker = worker;
@@ -235,12 +252,12 @@ export class SimulationClient {
     };
     worker.onerror = worker.onmessageerror = failed;
   }
-  async loadWorld(world, valid, worker, characters, hashes) {
+  async loadWorld(world, valid, worker, characters, hashes, positions) {
     const values = {}, tables = [];
     for (const field of Object.keys(world.data)) {
       if (worldTables.has(field)) tables.push(field); else values[field] = world.data[field];
     }
-    const missing = await this.request({ kind: 'open', values, tables, ambient: world.ambient, characters, hashes });
+    const missing = await this.request({ kind: 'open', values, tables, ambient: world.ambient, characters, hashes, positions });
     if (!valid() || this.worker !== worker) return false;
     const missingCharacters = characters && missing.flatMap(page => characters[page]);
     // Gather the next page while the worker installs the previous one. A single

@@ -5,7 +5,7 @@ import { indexContactBodies } from './breeding-contacts.js';
 import { indexSchoolBodies } from './life.js';
 import { World, CONFIG, indexEcologyCharacters } from './engine.js';
 import { shanghaiDay } from './fish-status.js';
-import { worldTables } from './simulation-changes.js';
+import { characterPositionFields, worldTables } from './simulation-changes.js';
 import { encodeFields, motionFields } from './simulation-delta.js';
 import { advanceBond, encodeBondIntervals } from './bond-interval.js';
 import { digestJsonText, jsonDigest } from './step-digest.js';
@@ -592,12 +592,25 @@ function trackWorld() {
 
 export class WorkerSimulation {
   characterPageHash(rows) { return digestJsonText('[' + rows.map(row => row.json).join(',') + ']'); }
-  async installCharacters(table, order, hashes) {
+  async installCharacters(table, order, hashes, positions) {
     const pages = this.characterPages;
     this.characterPages = undefined;
     const byId = this.characterRows;
     this.characterRows = undefined;
     const missing = [], checks = [];
+    for (const [id, fields] of positions) {
+      const row = byId.get(id);
+      if (!row) continue;
+      if (characterPositionFields.every(key => Object.hasOwn(fields, key) === Object.hasOwn(row.record, key) && fields[key] === row.record[key])) continue;
+      // Coordinate and fall-time fields cover routine movement of loose food.
+      // Any other difference must still fail the complete target page hash.
+      const cell = { ...row.record };
+      for (const key of characterPositionFields) {
+        if (Object.hasOwn(fields, key)) cell[key] = fields[key]; else delete cell[key];
+      }
+      row.json = JSON.stringify([id, cell]);
+      row.record = this.preparedTracker.observeCharacter(id, cell);
+    }
     for (const [index, page] of order.entries()) {
       if (typeof page === 'number') {
         for (const row of pages[page]) table[row.id] = row.record;
@@ -649,7 +662,7 @@ export class WorkerSimulation {
         get: (overrides, id) => Object.hasOwn(overrides, id) ? overrides[id] || undefined : fishes[id]
       });
       this.archive = { summary: { catalog, lastMeals: new Map(), grassMeals: new Set() } };
-      if (message.characters) return this.installCharacters(this.world.data.chars, message.characters, message.hashes);
+      if (message.characters) return this.installCharacters(this.world.data.chars, message.characters, message.hashes, message.positions);
       this.characterPages = undefined;
       this.characterRows = undefined;
       this.preparedTracker = undefined;

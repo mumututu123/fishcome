@@ -208,6 +208,37 @@ test('已预装的鱼元继续上报真实下落，未知历史字段参与页�
   } finally { for (const client of clients) client.close(); }
 });
 
+test('同一权威基准中食物位置和下落实时量散在每页，只补送路径等其他内容真正不同的页', async () => {
+  const world = new World(start,root,{populate:false,ambient:false}), store = new ArchiveStore();
+  world.attachArchives(store);
+  const ids = Array.from({length:512},(_,index)=>'food' + index);
+  for (const [i,id] of ids.entries()) world.data.chars[id] = {
+    id,kind:'food',entity:'',x:i,y:2,moveAt:start,fall:0.2,path:[],old:{unknown:i}
+  };
+  const worker = new WorkerSimulation(), sent = [];
+  let loading = false;
+  const client = new SimulationClient(()=>localWorker(message=>{
+    if (loading && message.kind === 'rows') for (const [field,id] of message.rows) if (field === 'chars') sent.push(id);
+  },worker));
+  try {
+    await client.checkRetained(world);
+    worldEdited(world);
+    for (const [i,id] of ids.entries()) {
+      const cell = world.data.chars[id];
+      cell.y++; cell.moveAt+=500; cell.fall=0; cell.x++;
+      if (i%2===0) delete cell.fall;
+    }
+    world.data.chars[ids[134]].old.unknown++;
+    world.data.chars[ids[204]].path.push({reason:'eat',target:'some fish',t:start});
+    loading = true;
+    const cut = await orderedCheckpoint(world,store);
+    const handle = await client.prepareAgreed(world,()=>true,cut.characterPages);
+    assert.ok(handle);
+    assert.deepEqual(sent,ids.slice(128,256));
+    assert.equal(JSON.stringify(worker.world.data.chars),JSON.stringify(world.data.chars));
+  } finally { client.close(); }
+});
+
 test('确认输入只装载基准，到点双方各提交一个相同的生态步，过期约定无法再用', async () => {
   const makeWorld = () => new World(start, root, { populate: false, ambient: false });
   const worlds = [makeWorld(), makeWorld()];

@@ -83,3 +83,5 @@ export function setParticipantName(world, actor, nick) {
 // (e.g. the current ecology hour) are replaced as a value.
 export const worldTables = new Set(['roots', 'participants', 'fishes', 'chars', 'scenes',
   'ops', 'breeding', 'contacts', 'travel', 'chats', 'chatSources', 'bubbles', 'rocks']);
+
+export const characterPositionFields = ['x', 'y', 'moveAt', 'fall'];
