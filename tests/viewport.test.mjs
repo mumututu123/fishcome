@@ -1,9 +1,28 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { ViewportCells } from '../www/viewport.js';
+import { FishSprites, fishRuns } from '../www/fish-sprites.js';
 import { makeFishWorld } from './capacity-fish.mjs';
 import { simulationApplied, subscribeSimulationChanges, worldEdited } from '../www/simulation-changes.js';
 import { expandSimulationPatch } from '../www/simulation-delta.js';
+
+test('相同鱼形可共用图像，穿插在其他鱼之后的字符保留叠放顺序', t => {
+  const glyph = (entity, x, ch) => ({ entity, kind: 'fish', x, y: 0, ch, color: '#89abcd' });
+  const a = glyph('甲', 0, '鱼'), b = glyph('甲', 1, '口');
+  const c = glyph('乙', 3, '鱼'), d = glyph('乙', 4, '口'), e = glyph('甲', 2, '尾');
+  const runs = fishRuns([a, { kind: 'scene' }, b, c, d, e]);
+  assert.deepEqual(runs.map(run => run.cells), [[a, b], [c, d], [e]]);
+  const paints = [], renderer = { frameTime: 1, glyph(ctx, ch, color, x, y) { paints.push([ch, x, y]); } };
+  const previous = Object.getOwnPropertyDescriptor(globalThis, 'document');
+  Object.defineProperty(globalThis, 'document', { configurable: true, value: { createElement() { return { getContext() { return {}; } }; } } });
+  t.after(() => { if (previous) Object.defineProperty(globalThis, 'document', previous); else delete globalThis.document; });
+  const sprites = new FishSprites();
+  const right = sprites.get(renderer, runs[0], 18, 1);
+  assert.equal(sprites.get(renderer, runs[1], 18, 1), right);
+  const left = sprites.get(renderer, runs[1], 18, -1);
+  assert.notEqual(left, right);
+  assert.deepEqual(paints, [['鱼', 6, 6], ['口', 24, 6], ['鱼', 24, 6], ['口', 6, 6]]);
+});
 
 test('页面写入完整运动记录，视窗只处理改变占格的鱼，旧帧仍可读取', () => {
   const fishes = { a: { id: 'a', x: 5, y: 5, facing: 1 }, b: { id: 'b', x: 10, y: 5, facing: 1 } };
