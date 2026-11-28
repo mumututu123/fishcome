@@ -1,6 +1,5 @@
 import { CONFIG, sceneryCount } from './engine.js';
 
-const character = cell => cell && cell.kind !== 'burn' ? 1 : 0;
 const liveMetadata = world => ({ id: world.id, roots: world.roots, participants: Object.keys(world.data.participants).length || 1, counts: world.counts() });
 
 class PictureState {
@@ -10,8 +9,8 @@ class PictureState {
     this.nextExpiry = Infinity;
     this.edit = 0;
     this.fish = Object.keys(world.data.fishes).length;
-    this.characters = 0;
-    this.beforeScan = new Map();
+    this.characters = new Set();
+    this.scanned = false;
   }
   foodChanged(id, cell) {
     const expiry = cell?.kind === 'food' ? cell.born + CONFIG.foodLife : 0;
@@ -20,40 +19,33 @@ class PictureState {
       this.nextExpiry = Math.min(this.nextExpiry, expiry);
     } else this.food.delete(id);
   }
+  setCell(id, cell) {
+    if (cell && cell.kind !== 'burn') this.characters.add(id);
+    else this.characters.delete(id);
+    if (cell?.kind === 'food' || this.food.has(id)) this.foodChanged(id, cell);
+  }
   async scan(current) {
-    if (!this.beforeScan) return;
-    // Rows may disappear between slices. Remember only the contributions
-    // changed since this cut; the patch also adjusts the running total.
+    if (this.scanned) return;
+    // Both the initial scan and subsequent edits read the latest row. A row
+    // touched between slices can be visited twice with the same result.
     const chars = this.world.data.chars;
     const ids = Object.keys(chars);
     let start = performance.now();
     for (let i = 0; i < ids.length; i++) {
       const id = ids[i];
-      this.characters += this.beforeScan.get(id) ?? character(chars[id]);
-      this.foodChanged(id, chars[id]);
+      this.setCell(id, chars[id]);
       if (i % 512 === 511 && performance.now() - start >= 5) {
         await new Promise(resolve => setTimeout(resolve, 0));
         if (!current()) return;
         start = performance.now();
       }
     }
-    this.beforeScan = null;
-  }
-  beforePatch(tables) {
-    const changed = (id, cell) => {
-      const previous = this.world.data.chars[id];
-      const was = character(previous), difference = character(cell) - was;
-      if (difference) {
-        if (this.beforeScan && !this.beforeScan.has(id)) this.beforeScan.set(id, was);
-        this.characters += difference;
-      }
-      if (previous?.kind === 'food' || cell?.kind === 'food') this.foodChanged(id, cell);
-    };
-    for (const id of tables.chars?.remove || []) changed(id, undefined);
-    for (const [id, cell] of tables.chars?.set || []) changed(id, cell);
+    this.scanned = true;
   }
   applied(tables) {
-    if (tables.fishes) this.fish += tables.fishes.addedCount - tables.fishes.removedCount;
+    for (const id of tables.chars?.remove || []) this.setCell(id, undefined);
+    for (const [id, cell] of tables.chars?.set || []) this.setCell(id, cell);
+    if (tables.fishes && this.fish !== undefined) this.fish += tables.fishes.addedCount - tables.fishes.removedCount;
     if (tables.scenes || tables.ops) this.scene = undefined;
     if (tables.participants) this.participants = undefined;
   }
@@ -68,9 +60,10 @@ class PictureState {
       }
     }
     this.scene ??= sceneryCount(data);
+    this.fish ??= Object.keys(data.fishes).length;
     this.participants ??= Object.keys(data.participants).length || 1;
     return { id: this.world.id, roots: this.world.roots, participants: this.participants,
-      counts: { fish: this.fish, scene: this.scene, food: this.food.size, characters: this.characters } };
+      counts: { fish: this.fish, scene: this.scene, food: this.food.size, characters: this.characters.size } };
   }
 }
 
@@ -92,21 +85,29 @@ export class CheckpointPictures {
   }
   recent() {
     const world = this.getWorld();
-    if (this.hasRecent(world)) return { ...this.latest, ...liveMetadata(world) };
+    if (this.hasRecent(world)) return { ...this.latest, ...(this.state?.world === world && this.state.scanned ? this.state.metadata() : liveMetadata(world)) };
   }
-  beforePatch(world, patch) {
-    if (this.state?.world === world) this.state.beforePatch(patch.tables);
-  }
-  changed(world, patch, source) {
+  changed(world, patch, source, merge) {
     if (this.state?.world !== world) return;
     if (!patch) {
-      if (source === 'replica') this.state.recount = true;
+      if (source === 'replica') {
+        this.state.pendingMerge = this.state.recount ? undefined : merge;
+        this.state.recount = true;
+      }
       else this.state = null;
       return;
     }
     const tables = patch.tables;
     this.state.applied(tables);
     if (source === 'input' && (tables.chars || tables.fishes || tables.scenes || tables.roots)) this.state.edit++;
+  }
+  merged(world, merge) {
+    const state = this.state;
+    if (state?.world !== world || !merge?.chars || state.pendingMerge !== merge) return;
+    for (const id of merge.chars) state.setCell(id, world.data.chars[id]);
+    state.fish = state.scene = state.participants = undefined;
+    state.recount = false;
+    state.pendingMerge = undefined;
   }
   current(state) { return state === this.state && state.world === this.getWorld(); }
   async generate(state, force) {

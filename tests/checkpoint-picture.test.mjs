@@ -55,7 +55,6 @@ test('持续自然步进只编码一次，统计跟随出生、移除、食物�
   const pending = pictures.prepare();
   await started.promise;
   function apply(tables, tick) {
-    pictures.beforePatch(world, { tables });
     for (const [field, edits] of Object.entries(tables)) {
       for (const id of edits.remove) delete world.data[field][id];
       for (const [id, row] of edits.set) world.data[field][id] = row;
@@ -115,7 +114,6 @@ test('分批统计期间删除已读和未读字符，同时补入食物，最�
   const pictures = new CheckpointPictures(() => world, async () => String(++renders));
   const task = pictures.prepare();
   const charPatch = { tables: { chars: { set: [['fresh', { kind: 'food', born: 0 }]], remove: ['10', '900'] } } };
-  pictures.beforePatch(world, charPatch);
   delete world.data.chars['10']; delete world.data.chars['900'];
   world.data.chars.fresh = charPatch.tables.chars.set[0][1];
   pictures.changed(world, charPatch);
@@ -134,7 +132,6 @@ test('合影编码期间投食会重拍，昵称更新只需刷新元数据', as
   const task = pictures.prepare(true);
   await started.promise;
   const input = { tables: { chars: { set: [['feed', { kind: 'food', born: 0 }]], remove: [] } } };
-  pictures.beforePatch(world, input);
   world.data.chars.feed = input.tables.chars.set[0][1];
   pictures.changed(world, input, 'input');
   finish.release();
@@ -144,6 +141,37 @@ test('合影编码期间投食会重拍，昵称更新只需刷新元数据', as
   world.data.participants = { a: '甲', b: '乙' };
   pictures.changed(world, { tables: { participants: {} } }, 'input');
   assert.equal(pictures.atCut(prepared).participants, 2);
+});
+
+test('连续合并复用已统计的鱼元，失败的合并会在下一次存档重新计数', async t => {
+  const world = makeWorld('A');
+  const pictures = new CheckpointPictures(() => world, async () => 'data:image/webp;base64,AAA=');
+  await pictures.prepare();
+  const count = t.mock.method(world, 'counts');
+  function merge(ids, apply) {
+    const change = { chars: new Set(ids) };
+    pictures.changed(world, null, 'replica', change);
+    apply();
+    pictures.merged(world, change);
+  }
+  merge(['a', 'b'], () => {
+    world.data.chars.a = { kind: 'food', born: 1 };
+    world.data.chars.b = { kind: 'fish' };
+    world.data.fishes.fish = {};
+  });
+  merge(['b'], () => {
+    world.data.tick = CONFIG.foodLife + 1;
+    world.data.chars.b = { kind: 'burn' };
+  });
+  const expected = { fish: 1, scene: 1, food: 0, characters: 1 };
+  assert.deepEqual(pictures.recent().counts, expected);
+  assert.deepEqual(pictures.atCut(await pictures.prepare()).counts, expected);
+  assert.equal(count.mock.callCount(), 0);
+  pictures.changed(world, null, 'replica', {});
+  delete world.data.chars.a;
+  merge([], () => {});
+  assert.deepEqual(pictures.recent().counts, { ...expected, characters: 0 });
+  assert.equal(count.mock.callCount(), 1);
 });
 
 test('恢复时可以保留同一片海的存档合影，资料变更或缺图时重新生成', async () => {

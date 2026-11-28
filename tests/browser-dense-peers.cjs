@@ -122,6 +122,12 @@ SimulationClient.prototype.request = function (message) {
   this.pending.resolve = result => {
     row.reply = performance.now() - start;
     row.rule = result?.ruleTime;
+    if (result?.workerTiming) {
+      const [entered, leaving] = result.workerTiming;
+      row.toWorker = entered - row.startAt;
+      row.inWorker = leaving - entered;
+      row.fromWorker = row.startAt + row.reply - leaving;
+    }
     if (row.rule !== undefined) window.densePhases.push({ phase: 'worker.rules', context: row.tick,
       at: row.startAt + row.reply, total: row.rule, sync: row.rule });
     resolve(result);
@@ -348,8 +354,12 @@ World.prototype.step = function (...args) {
   return result;
 };
 WorkerSimulation.prototype.receive = function (message) {
+  const entered = performance.timeOrigin + performance.now();
   const result = timedReceive.call(this, message);
-  if (message.kind === 'step') result.ruleTime = ruleTime;
+  if (message.kind === 'step') {
+    result.ruleTime = ruleTime;
+    result.workerTiming = [entered, performance.timeOrigin + performance.now()];
+  }
   return result;
 };` });
       if (pathname === '/network.js' && ['both', options].includes(values['plain-live'])) {
@@ -592,6 +602,9 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
   const committed = requests.filter(row => row.committed);
   const authority = committed.map(row => row.authority).filter(Number.isFinite);
   const stepStages = {
+    toWorker: stats(committed.map(row => row.toWorker).filter(Number.isFinite)),
+    inWorker: stats(committed.map(row => row.inWorker).filter(Number.isFinite)),
+    fromWorker: stats(committed.map(row => row.fromWorker).filter(Number.isFinite)),
     requestToReply: stats(committed.map(row => row.reply)),
     replyToAuthority: stats(committed.map(row => row.authority - row.reply)),
     requestToAuthority: { ...stats(authority), over20: authority.filter(ms => ms > 20).length, missing: committed.length - authority.length },
@@ -636,7 +649,8 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
       requested: page.repairs.filter(sampled).map(row => ({ afterMs: row.at - recent, correlated: row.correlated })),
       incoming: page.receives.filter(row => row.kind === 'merge' && sampled(row)).map(row => ({ afterMs: row.startAt - recent, ms: row.ms })) })),
     archiveRounds: rounds.map(({ at, tick, deliveredAt }) => ({ afterMs: at - recent, tick, deliveredAfterMs: deliveredAt - recent })), archiveError,
-    leaderProgress, followerProgress, stepComplete, stepStages, stepSamples: requests, replicaRows,
+    leaderProgress, followerProgress, stepComplete, stepStages, slowestStep: committed.reduce((slowest, row) =>
+      !slowest || row.ms > slowest.ms ? row : slowest, null), stepSamples: requests, replicaRows,
     requestGaps: stats(requests.slice(1).map((row, index) => row.startAt - requests[index].startAt)),
     stepGaps: stats(leaderSteps.slice(1).map((step, index) => step.at - leaderSteps[index].at)),
     tickGaps: [...new Set(leaderSteps.slice(1).map((step, index) => step.tick - leaderSteps[index].tick))],

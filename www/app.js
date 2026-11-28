@@ -260,6 +260,7 @@ async function mergeVerifiedWorld(data, peer, context, { local = false, worldMes
       let changes;
       try { changes = target.merge(incoming, archived, delta ? 'replica' : undefined, delta); }
       finally { if (delta) noteCheckpointMerge(target.data, changes, incoming, archived); }
+      if (delta) pictures.merged(target, changes);
       if (index) renderer.applyMergedChars(target, index, changes?.chars);
     };
     let movement;
@@ -781,8 +782,7 @@ async function renderArchives() {
   $('archiveMore').hidden = view.limit >= Math.max(view.works.length, view.ledger.length);
 }
 const pictures = new CheckpointPictures(() => world, target => renderer.snapshotAsync(target));
-subscribeBeforeSimulationPatch((target, patch) => pictures.beforePatch(target, patch));
-subscribeSimulationChanges((target, patch, source) => pictures.changed(target, patch, source));
+subscribeSimulationChanges((target, patch, source, merge) => pictures.changed(target, patch, source, merge));
 async function captureLocalCheckpoint() {
   for (;;) {
     const picture = pictures.atCut(await pictures.prepare());
