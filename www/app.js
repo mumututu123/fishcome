@@ -7,13 +7,13 @@ import { CheckpointPictures } from './checkpoint-picture.js';
 import { Network } from './network.js';
 import { ReplicaInventory, ReplicaRecovery, ReplicaSwims, WorldBroadcast } from './world-broadcast.js';
 import { DiagnosticLog, inspectFishOrigins, repairFishOriginIssues, diagnosticSummary } from './diagnostics.js';
-import { loadReplicaArchives, verifyChats, verifyReplica } from './replica.js';
+import { loadReplicaArchives, verifyChats, verifyLocalCheckpoint, verifyReplica } from './replica.js';
 import { Renderer } from './renderer.js';
 import { Creator } from './creator.js';
 import { restoreCheckpoint } from './lifecycle.js';
 import { CHAT_FLOOR, orderedChats, chatColor, mergeChatRecords } from './chat.js';
 import { DAY, shanghaiDay } from './fish-status.js';
-import { fishOrigin, repairLocalBirthTimes } from './breeding.js';
+import { fishOrigin } from './breeding.js';
 import { defaultFishName, displayFishName, fishCatalog } from './fish-profile.js';
 import { drawPedigree, setupPedigreeViewport } from './pedigree.js';
 import { normalizeInvite, encodeInvite, decodeInvite, inviteDetails } from './invite.js';
@@ -211,22 +211,6 @@ async function archiveWorld(now = Date.now()) {
   } finally { dependencies.close(); archiveBusy = false; archiveScanning = false; }
 }
 async function requestHistory(peer) { const ids = (historyQueues.get(peer.id) || []).filter(id => !histories[id]); historyQueues.set(peer.id, ids); if (ids.length) await network.direct(peer, 'historyRequest', { ids: ids.slice(0, 32) }); else historyQueues.delete(peer.id); }
-// Never relax network validation; only local checkpoints and explicit backup
-// imports can take the legacy repair path, and the repaired copy must validate.
-async function verifyLocalCheckpoint(data, archived, store, options = {}) {
-  const ctx = options.context || 'checkpoint';
-  try { await verifyReplica(data, archived, store, { diagnostics, ...options }); return data; }
-  catch (error) {
-    const repaired = repairLocalBirthTimes(data, archived);
-    if (repaired === data) {
-      diagnostics.record('warn', ctx, `本地自动修复未命中：${error.message}`);
-      throw error;
-    }
-    await verifyReplica(repaired, archived, store, { diagnostics, ...options, context: `${ctx}:repaired` });
-    diagnostics.record('info', ctx, '本地旧版出生时间已自动修复');
-    return repaired;
-  }
-}
 function needsReplicaSave(incoming, current, store) {
   if (['ops', 'scenes', 'chats', 'chatSources'].some(field => Object.keys(incoming[field] || {}).length)) return true;
   if (Object.keys(incoming.roots).some(root => !Object.hasOwn(current.roots, root))) return true;
@@ -303,7 +287,7 @@ async function mergeReplica(data, peer, context = 'merge', worldMessage) {
     const checkpointStore = newArchiveStore();
     await ensureArchives(checkpoint.world, peer, null, checkpointStore);
     const older = await checkpointStore.dependencies(checkpoint.world);
-    const local = await verifyLocalCheckpoint(checkpoint.world, older, checkpointStore);
+    const local = await verifyLocalCheckpoint(checkpoint.world, older, checkpointStore, { diagnostics });
     await mergeVerifiedWorld(local, peer, 'checkpoint');
     if (priorCheckpoint === checkpoint) priorCheckpoint = null;
     recovered = true;
@@ -945,7 +929,7 @@ async function start() {
   if (previous?.world) await ensureArchives(previous.world);
   const expires = previous?.world && now - (previous.lastOnlineAt ?? previous.at ?? previous.world.tick) >= CONFIG.offlineLife;
   const savedWorld = previous?.world;
-  if (savedWorld) previous.world = await verifyLocalCheckpoint(savedWorld, await archiveStore.dependencies(savedWorld), archiveStore, { context: 'start' });
+  if (savedWorld) previous.world = await verifyLocalCheckpoint(savedWorld, await archiveStore.dependencies(savedWorld), archiveStore, { context: 'start', diagnostics });
   if (expires) previous.world.chats = await archiveStore.chats(Infinity, previous.world.chats, previous.world.archives);
   const restored = restoreCheckpoint(previous, now);
   world = restored.world; world.data.participants[identity.actor] = identity.nick; lastOnlineAt = now; lastMeter = now;
@@ -1640,7 +1624,7 @@ $('importBackup').onchange = async e => {
     const checkpoint = data.checkpoint;
     if (checkpoint) {
       await ensureArchives(checkpoint.world, null, bundle, store);
-      checkpoint.world = await verifyLocalCheckpoint(checkpoint.world, await store.dependencies(checkpoint.world), store, { context: 'import' });
+      checkpoint.world = await verifyLocalCheckpoint(checkpoint.world, await store.dependencies(checkpoint.world), store, { context: 'import', diagnostics });
     }
     if (data.known != null && (!Array.isArray(data.known) || !data.known.every(invite => typeof invite === 'string'))) throw new Error('备份中的接入记录无效');
     const chunks = new Set(Object.keys(store.manifests));

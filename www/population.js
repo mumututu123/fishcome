@@ -145,6 +145,29 @@ export function volcanoPlan(data, slot) {
   if (!Object.hasOwn(data.roots, seed) || !Number.isInteger(slot) || slot < 0 || slot * POPULATION.volcanoPeriod < data.roots[seed] || hash(id) % 10000 >= POPULATION.volcanoChance * 10000) return null;
   return { id, seed, slot, x: hash(`vent:${id}`) % 1000 };
 }
+function magmaOrigin(vent, id) {
+  const roll = hash(id);
+  return { x: wrapX(vent + roll % 5 - 2), rise: 8 + roll % 8, drift: roll % 3 - 1 };
+}
+
+export function repairLocalMagma(data) {
+  const population = data?.population, eruption = population?.eruption;
+  let repaired;
+  for (const [id, c] of Object.entries(eruption?.particles || {})) {
+    if (c?.drift !== 0 || !Number.isFinite(c.cx) || c.cx <= 1) continue;
+    const index = Number(id.slice(id.lastIndexOf(':') + 1));
+    if (!Number.isInteger(index) || index < 0 || index >= eruption.emitted || id !== `${eruption.id}:${index}`) continue;
+    const source = magmaOrigin(eruption.x, id);
+    // Old writers added at most one second on emission, then a quarter cell
+    // per active second. Vertical particles never left their emission column.
+    const age = Math.min(population.at - c.born, POPULATION.cooling);
+    if (source.drift !== 0 || source.x !== c.x || !(age >= 0 && c.cx <= (age / 1000 + 1) * .25)) continue;
+    repaired ??= { ...eruption.particles };
+    repaired[id] = { ...c, cx: 0 };
+  }
+  return repaired ? { ...data, population: { ...population, eruption: { ...eruption, particles: repaired } } } : data;
+}
+
 function updateVolcano(world, now, dt, transition, resume = false) {
   const state = world.data.population, slot = Math.floor(now / POPULATION.volcanoPeriod);
   if (!resume && world.ambient && slot > state.volcanoSlot) {
@@ -162,9 +185,9 @@ function updateVolcano(world, now, dt, transition, resume = false) {
   const groups = world.fishGroups(), scenery = world.sceneryMap(), occupancy = world.movementGrid(groups);
   const hit = c => { for (const id of occupancy.get(c.x, c.y) || []) if (world.data.fishes[id]) killFish(world, id, now, 'magma', transition, groups); };
   if (emitting) {
-    const index = e.emitted++, r = hash(`${e.id}:${index}`), x = wrapX(e.x + r % 5 - 2), y = world.floorAt(x) - 1;
+    const id = `${e.id}:${e.emitted++}`, { x, rise, drift } = magmaOrigin(e.x, id), y = world.floorAt(x) - 1;
     e.nextAt = now + POPULATION.emission;
-    if (!scenery.has(key(x, y))) { const id = `${e.id}:${index}`; e.particles[id] = { id, x, y, born: now, rise: 8 + r % 8, drift: r % 3 - 1, cx: 0, cy: 0, settled: false }; }
+    if (!scenery.has(key(x, y))) e.particles[id] = { id, x, y, born: now, rise, drift, cx: 0, cy: 0, settled: false };
   }
   const hot = new Set(Object.values(e.particles).map(c => key(c.x, c.y)));
   for (const [id, c] of Object.entries(e.particles)) {

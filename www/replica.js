@@ -6,12 +6,12 @@ import { CHAT_FLOOR, validChatMessage, chatGlyphs, chatColor, chatCellId } from 
 import { validTravel } from './fish-status.js';
 import { HOUR, validWildCell } from './seaweed.js';
 import { MINUTE, validBubble } from './bubbles.js';
-import { fishOrigin, validBreedingRecord, inheritedGlyph } from './breeding.js';
+import { fishOrigin, validBreedingRecord, inheritedGlyph, repairLocalBirthTimes } from './breeding.js';
 import { validTerrain } from './geography.js';
 import { validInitialOp, initialSources } from './genesis.js';
 import { validPlankton } from './life.js';
 import { validEcology } from './ecology.js';
-import { validPopulation, validRocks } from './population.js';
+import { validPopulation, validRocks, repairLocalMagma } from './population.js';
 import { validGhostCell } from './legends.js';
 import { ARCHIVE_FIELDS, assembleFragments, decodeArchive, mergeArchiveRecord, validArchiveState } from './archive.js';
 import { buildOriginSources, inspectFishOrigin } from './diagnostics.js';
@@ -33,6 +33,23 @@ export async function verifyChats(messages = {}, store, current = {}, roots) {
       const encoded = JSON.stringify(message);
       if (copies.some(copy => JSON.stringify(copy) !== encoded)) throw new Error('已有聊天记录不可覆盖');
     } else if (!await verifyEnvelope(message)) throw new Error('聊天签名无效');
+  }
+}
+// Local starts and explicit imports can repair recognizable legacy data.
+// Every correction goes back through the full network verifier.
+export async function verifyLocalCheckpoint(data, archived, store, options = {}) {
+  const { diagnostics, context = 'checkpoint' } = options;
+  try { await verifyReplica(data, archived, store, options); return data; }
+  catch (error) {
+    const birth = repairLocalBirthTimes(data, archived), repaired = repairLocalMagma(birth);
+    if (repaired === data) {
+      diagnostics?.record('warn', context, `本地自动修复未命中：${error.message}`);
+      throw error;
+    }
+    await verifyReplica(repaired, archived, store, { ...options, context: `${context}:repaired` });
+    if (birth !== data) diagnostics?.record('info', context, '本地旧版出生时间已自动修复');
+    if (repaired !== birth) diagnostics?.record('info', context, '本地旧版岩浆移动记录已自动修复');
+    return repaired;
   }
 }
 export async function verifyReplica(data, extra = {}, store, { current = {}, context: ctx = 'replica', diagnostics, mergeCut = false } = {}) {

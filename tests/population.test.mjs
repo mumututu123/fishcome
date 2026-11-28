@@ -1,10 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { World, clone, cellPosition, key, chooseClaim } from '../www/engine.js';
+import { World, clone, cellPosition, key, chooseClaim, hash } from '../www/engine.js';
 import { wrapX } from '../www/geography.js';
 import { POPULATION, updatePopulation, illnessOf, volcanoPlan, predatorCells, validPopulation, validRocks, mergePopulation, mergeRocks } from '../www/population.js';
 import { restoreCheckpoint } from '../www/lifecycle.js';
-import { verifyReplica } from '../www/replica.js';
+import { verifyLocalCheckpoint, verifyReplica } from '../www/replica.js';
 import { validateLife } from '../www/life.js';
 import { WorkerSimulation } from '../www/simulation-worker.js';
 import { SimulationClient } from '../www/simulation-client.js';
@@ -163,8 +163,12 @@ test('红色浆真实碰鱼致死；正好10分钟冷却不再伤鱼，岩石堆
   assert(validRocks(w.data.rocks, w.data));
 });
 test('岩浆竖直移动超过四秒时，每一步仍可同步；恢复旧存档也能继续同步', async () => {
-  const w = world(), e = erupt(w), at = e.at + POPULATION.warning;
-  const c = particle(w, e, 0, e.x, 50, at);
+  const started = Date.UTC(2025, 0, 1);
+  const w = new World(started, 'd17f6454-c149-487d-a9f9-5a5d3c3fa775', { populate: false });
+  const e = erupt(w, started + HOUR), at = e.at + POPULATION.warning;
+  const index = Array.from({ length: POPULATION.magmaLimit }, (_, i) => i).find(i => hash(`${e.id}:${i}`) % 3 === 1);
+  const x = wrapX(e.x + hash(`${e.id}:${index}`) % 5 - 2);
+  const c = particle(w, e, index, x, 50, at);
   c.settled = false;
   c.rise = 4;
   const peer = world();
@@ -174,7 +178,7 @@ test('岩浆竖直移动超过四秒时，每一步仍可同步；恢复旧存�
     const next = w.serialize();
     await verifyReplica(next, {}, undefined, { current: peer.data });
     peer.merge(next);
-    assert.equal(peer.data.population.eruption.particles[c.id].x, e.x);
+    assert.equal(peer.data.population.eruption.particles[c.id].x, x);
   }
   assert(c.y < 50);
   const legacy = w.serialize(), old = legacy.population.eruption.particles[c.id];
@@ -182,11 +186,20 @@ test('岩浆竖直移动超过四秒时，每一步仍可同步；恢复旧存�
   old.cx = 1.125;
   await assert.rejects(verifyReplica(legacy, {}, undefined, { current: peer.data }), /生态控制/);
   assert.throws(() => peer.merge(legacy), /生态控制/);
-  const recovered = restoreCheckpoint({ world: legacy, lastOnlineAt: legacy.tick }, legacy.tick + 500).world;
-  const saved = recovered.serialize(), corrected = saved.population.eruption.particles[c.id];
-  assert.deepEqual(corrected, { ...old, cx: 0 });
-  await verifyReplica(saved, {}, undefined, { current: peer.data });
-  peer.merge(saved);
+  for (const context of ['start', 'import']) {
+    const checked = await verifyLocalCheckpoint(legacy, {}, undefined, { context });
+    assert.deepEqual(checked.population.eruption.particles[c.id], { ...old, cx: 0 });
+    const recovered = restoreCheckpoint({ world: checked, lastOnlineAt: checked.tick }, checked.tick + 500).world;
+    const saved = recovered.serialize();
+    await verifyReplica(saved, {}, undefined, { current: peer.data });
+    peer.merge(saved);
+  }
+  assert.equal(old.cx, 1.125);
+  for (const change of [p => p.x = wrapX(p.x + 1), p => p.drift = -1, p => p.cx = 1000, p => p.cy = -1]) {
+    const invalid = clone(legacy);
+    change(invalid.population.eruption.particles[c.id]);
+    await assert.rejects(verifyLocalCheckpoint(invalid, {}, undefined, { context: 'import' }), /生态控制/);
+  }
 });
 test('岩石和康复合流顺序一致，旧快照不重新加热或重复沉积', () => {
   const w = world(), e = erupt(w), bornAt = e.at + POPULATION.warning, c = particle(w, e, 0, e.x, w.floorAt(e.x) - 1, bornAt), hot = w.serialize();
