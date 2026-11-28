@@ -511,6 +511,31 @@ function trackWorld() {
     values.clear(); rows.clear(); lifeFields.clear(); bondRows.clear(); previousBonds = activeBonds = undefined; orderedBonds = false;
   }
   return {
+    rebaseCharacters(changed, removed) {
+      const table = source.chars;
+      for (const id of removed) delete table[id];
+      for (const [id, row] of Object.entries(changed)) {
+        const prior = table[id], keys = Object.keys(row), oldKeys = prior && Object.keys(prior);
+        if (!oldKeys || keys.length !== oldKeys.length || keys.some((key, i) => key !== oldKeys[i])) {
+          table[id] = row;
+          continue;
+        }
+        // Preserve live body/meal indexes for loose food whose only edit was a
+        // scalar position. Older and nested fields still compare in full.
+        for (const key of keys) {
+          const before = prior[key], after = row[key];
+          if (before === after || before && after && typeof before === 'object' && typeof after === 'object' &&
+              JSON.stringify(before) === JSON.stringify(after)) continue;
+          prior[key] = after;
+        }
+      }
+      reset();
+      publishedBonds = fishRoster = undefined;
+      poses = new Map();
+      mealEdits.clear();
+      illnessSchedule.due = witherSchedule.due = -Infinity;
+      return table;
+    },
     attach(data) {
       source = data;
       fishIds = Object.keys(source.fishes);
@@ -703,6 +728,12 @@ export class WorkerSimulation {
       return Promise.all(this.characterPages.map(page => this.characterPageHash(page)));
     }
     if (message.kind === 'open') {
+      if (message.rebase && (!this.generation || this.generation !== message.rebase.generation || this.world?.data.tick !== message.rebase.base)) {
+        throw new Error('后台线程失去了已验证的上一基准');
+      }
+      this.generation = undefined;
+      this.openGeneration = message.generation;
+      this.rebase = message.rebase;
       this.world = new World(message.values.tick, 'worker', { populate: false, ambient: message.ambient });
       this.world.data = message.values;
       for (const field of message.tables) this.world.data[field] = {};
@@ -725,6 +756,11 @@ export class WorkerSimulation {
         if (field === 'fishes' && origin !== undefined) this.archive.summary.catalog[id] = origin;
       }
     } else if (message.kind === 'ready') {
+      if (this.rebase) {
+        this.world.data.chars = this.tracker.rebaseCharacters(this.world.data.chars, this.rebase.removed);
+        this.preparedTracker = this.tracker;
+        this.rebase = undefined;
+      }
       this.world.attachArchives(this.archive);
       this.tracker = this.preparedTracker || trackWorld();
       this.preparedTracker = undefined;
@@ -771,6 +807,7 @@ export class WorkerSimulation {
       grid.swimmers(this.world, CONFIG.speed);
       indexContactBodies(grid, contactRoster(this.world, groups));
       if (this.world.ambient) indexSchoolBodies(this.world, grid.layout);
+      this.generation = this.openGeneration;
     } else if (message.kind === 'history') {
       Object.assign(this.world.data.life, message.parts);
       this.tracker.reset();

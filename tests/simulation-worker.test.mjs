@@ -7,7 +7,7 @@ import { WorkerSimulation, simulationBuffers } from '../www/simulation-worker.js
 import { expandSimulationPatch } from '../www/simulation-delta.js';
 import { applyBondIntervals } from '../www/bond-interval.js';
 import { LIFE, lifeContext, updateLife } from '../www/life.js';
-import { applyInputRows, setParticipantName, subscribeBeforeSimulationPatch, worldEdited } from '../www/simulation-changes.js';
+import { applyInputRows, setParticipantName, subscribeBeforeSimulationPatch, worldEdited, worldRevision } from '../www/simulation-changes.js';
 import { CONTACT_TIME, updateContacts } from '../www/breeding.js';
 import { orderedCheckpoint } from '../www/ordered-session.js';
 
@@ -76,6 +76,55 @@ function localWorker(beforeReceive = () => {}, simulation = new WorkerSimulation
     }
   };
 }
+
+test('连续两次已核合流只更新热线程里变过的鱼元，保留旧字段、顺序和后续生态结果', async () => {
+  const make = () => new World(start, root, { populate: false, ambient: false });
+  const replica = make(), authority = make();
+  const op = { id: crypto.randomUUID(), kind: 'food', actor: 'visitor', nick: '甲', x: 5, y: 0, ch: '鱼', color: '#ace123', t: start, cost: 1 };
+  for (const world of [replica, authority]) {
+    world.attachArchives(new ArchiveStore());
+    assert.ok(world.apply(op).ok);
+    world.data.chars[op.id].former = { words: ['旧记录'] };
+  }
+  const workers = [], sent = [], cold = new SimulationClient(() => localWorker());
+  const client = new SimulationClient(() => {
+    const simulation = new WorkerSimulation();
+    workers.push(simulation);
+    return localWorker(message => sent.push(message), simulation);
+  });
+  try {
+    await client.prepareAgreed(replica, () => true);
+    for (let n = 1; n <= 2; n++) {
+      const prior = replica.data.tick, revision = worldRevision(replica);
+      const input = { ...op, id: crypto.randomUUID(), t: prior };
+      assert.ok(authority.apply(input).ok);
+      const incoming = { ...authority.serialize(), chars: { [input.id]: authority.data.chars[input.id] }, tick: prior + CONFIG.step };
+      const changes = replica.merge(incoming, {}, 'replica', true);
+      assert.deepEqual([...changes.chars], [input.id]);
+      sent.length = 0;
+      await client.followVerifiedReplica(replica, prior, revision, changes, () => true);
+      assert.ok(sent.find(message => message.kind === 'open').rebase);
+      assert.deepEqual(sent.flatMap(message => (message.rows || []).filter(row => row[0] === 'chars').map(row => row[1])), [input.id]);
+      assert.ok(sent.every(message => message.kind !== 'step'));
+      assert.equal(workers.length, 1);
+      assert.equal(JSON.stringify(workers[0].world.data.chars), JSON.stringify(replica.data.chars));
+    }
+    const copy = make();
+    copy.data = replica.serialize();
+    copy.attachArchives(new ArchiveStore());
+    for (let n = 0; n < 3; n++) {
+      const results = await Promise.all([[client, replica], [cold, copy]].map(async ([sim, world]) =>
+        sim.advanceAgreed(world, world.data.tick + CONFIG.step, () => true, await sim.prepareAgreed(world, () => true))));
+      assert.equal(results[0].changesDigest, results[1].changesDigest);
+      assert.equal(JSON.stringify(replica.data), JSON.stringify(copy.data));
+    }
+    const revision = worldRevision(replica), prior = replica.data.tick;
+    worldEdited(replica);
+    await client.followVerifiedReplica(replica, prior - CONFIG.step, revision, { chars: new Set() }, () => true);
+    assert.equal(workers.length, 2);
+    assert.equal(sent.findLast(message => message.kind === 'open').rebase, undefined);
+  } finally { client.close(); cold.close(); }
+});
 
 test('旧伙伴线程只复用逐页一致的鱼元，补齐换序、增删和未知字段，过期检查点重装', async () => {
   const world = new World(start, root, { populate: false, ambient: false });

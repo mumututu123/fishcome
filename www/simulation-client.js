@@ -32,7 +32,7 @@ function* initialRows(world, missingCharacters) {
     const table = world.data[field];
     if (field === 'chats') continue;
     if (field === 'chars' && missingCharacters) {
-      for (const id of missingCharacters) yield [field, id, table[id]];
+      for (const id of missingCharacters) if (Object.hasOwn(table, id)) yield [field, id, table[id]];
       continue;
     }
     for (const id in table) {
@@ -122,6 +122,8 @@ export class SimulationClient {
     this.knownFish = null;
     this.historyParts = null;
     this.savedCharacters = undefined;
+    this.generation = undefined;
+    this.followed = false;
     this.characterOwner = null;
     this.failure = null;
     const pending = this.pending;
@@ -172,6 +174,7 @@ export class SimulationClient {
   async checkRetained(world, valid = () => true) {
     if (this.task) await this.task;
     if (this.task || !valid() || this.hasSavedCharacters(world)) return;
+    if (this.followed && this.owner === world && this.tick === world.data.tick && this.revision === worldRevision(world)) return;
     await this.startTask(world, async () => {
       const cold = !this.worker || this.owner !== world;
       let worker = this.worker;
@@ -203,12 +206,12 @@ export class SimulationClient {
       }
     });
   }
-  async open(world, valid, characterPages) {
+  async open(world, valid, characterPages, rebase) {
     let characters;
     let positions;
-    const retainedWorker = characterPages?.table === world.data.chars && characterPages.revision === characterRevision(world) &&
-      this.hasSavedCharacters(world) && this.worker;
-    if (retainedWorker) {
+    const cached = characterPages?.table === world.data.chars && characterPages.revision === characterRevision(world) && this.hasSavedCharacters(world);
+    const retainedWorker = (cached || rebase) && this.worker;
+    if (cached) {
       const ids = Object.keys(world.data.chars);
       characters = characterPages.hashes.map((hash, i) => {
         const old = this.savedCharacters.get(hash);
@@ -216,8 +219,8 @@ export class SimulationClient {
         return ids.slice(i * 128, (i + 1) * 128);
       });
       positions = characterPositions(world.data.chars, characters);
-      this.worker = null;
     }
+    if (retainedWorker) this.worker = null;
     this.close();
     const worker = retainedWorker || this.makeWorker();
     this.bindWorker(world, worker);
@@ -232,7 +235,7 @@ export class SimulationClient {
       for (const [id, nick] of patch.tables.participants?.set || []) this.names.set(id, nick);
       for (const [id, food] of patch.tables.chars?.set || []) this.foods.set(id, food);
     });
-    return this.loadWorld(world, valid, worker, characters, characters && characterPages.hashes, positions);
+    return this.loadWorld(world, valid, worker, characters, characters && characterPages.hashes, positions, rebase);
   }
   bindWorker(world, worker) {
     this.worker = worker;
@@ -253,14 +256,16 @@ export class SimulationClient {
     };
     worker.onerror = worker.onmessageerror = failed;
   }
-  async loadWorld(world, valid, worker, characters, hashes, positions) {
+  async loadWorld(world, valid, worker, characters, hashes, positions, rebase) {
     const values = {}, tables = [];
     for (const field of Object.keys(world.data)) {
       if (worldTables.has(field)) tables.push(field); else values[field] = world.data[field];
     }
-    const missing = await this.request({ kind: 'open', values, tables, ambient: world.ambient, characters, hashes, positions });
+    const generation = crypto.randomUUID();
+    const missing = await this.request({ kind: 'open', values, tables, ambient: world.ambient, characters, hashes, positions, generation,
+      rebase: rebase && { generation: rebase.generation, base: rebase.base, removed: rebase.removed } });
     if (!valid() || this.worker !== worker) return false;
-    const missingCharacters = characters && missing.flatMap(page => characters[page]);
+    const missingCharacters = rebase ? rebase.changed : characters && missing.flatMap(page => characters[page]);
     // Gather the next page while the worker installs the previous one. A single
     // outstanding acknowledgement preserves cancellation and message ordering.
     let rows = [], prior, slice = performance.now();
@@ -280,9 +285,30 @@ export class SimulationClient {
     await this.request({ kind: 'ready' });
     if (!valid() || this.worker !== worker) return false;
     this.owner = world;
+    this.generation = generation;
     this.revision = worldRevision(world);
     this.tick = world.data.tick;
     return true;
+  }
+  async followVerifiedReplica(world, priorTick, priorRevision, changes, stillFollower) {
+    const base = world.data.tick, revision = worldRevision(world);
+    const valid = () => stillFollower() && world.data.tick === base && worldRevision(world) === revision;
+    if (this.task) await this.task;
+    if (this.task || !valid()) return;
+    if (this.owner === world && this.revision === revision && this.tick === base) return;
+    let rebase;
+    if (this.worker && this.owner === world && this.generation && this.tick === priorTick &&
+        this.revision === priorRevision && revision === priorRevision + 1 && changes?.chars instanceof Set && !this.archiveChanges.length) {
+      // Foreground food preceded the merge. Both sources preserve insertion
+      // order, and the merge supplies every removed or normalized character.
+      const changed = new Set([...this.foods.keys(), ...changes.chars]);
+      const removed = [...changed].filter(id => !Object.hasOwn(world.data.chars, id));
+      rebase = { base: priorTick, generation: this.generation, changed, removed };
+    }
+    // A seed or an interrupted first load has no exact previous generation.
+    // Keep its pages for the ordinary authenticated admission.
+    if (changes && !rebase && (!this.owner || this.hasSavedCharacters(world))) return;
+    this.followed = await this.startTask(world, () => this.open(world, valid, undefined, rebase));
   }
   async compute(world, message, valid) {
     this.finishBoundary();

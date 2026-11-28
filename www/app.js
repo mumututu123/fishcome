@@ -1,6 +1,6 @@
 import { World, CONFIG, clone, EYES, bounds, validGlyph, displayNick, hash, sceneryCount, chooseClaim } from './engine.js';
 import { SimulationClient, startSimulationClock, subscribeSimulationChanges } from './simulation-client.js';
-import { setParticipantName, subscribeBeforeSimulationPatch, worldEdited } from './simulation-changes.js';
+import { setParticipantName, subscribeBeforeSimulationPatch, worldEdited, worldRevision } from './simulation-changes.js';
 import { atCheckpointBoundary, get, getMany, readCheckpointVersion, sameStoredCheckpoint, putMany, readHandoffCheckpoint, replaceFromBackup, getOldBranch, LEGACY_NOTICE_SEEN, claimLegacyNotice, newIdentity, signer, verifyEnvelope, actorId, download } from './storage.js';
 import { beforeCheckpointPatch, noteCheckpointChanges, noteCheckpointMerge } from './checkpoint-pages.js';
 import { CheckpointPictures } from './checkpoint-picture.js';
@@ -125,6 +125,12 @@ function mayRetainWorker() {
   const peers = network.live(), winner = leader(), other = members.get(winner);
   return peers.length === 1 && active().length === 2 && peers[0].node === winner && peers[0].replicaLive &&
     other?.orderedSteps === 1 && other.build === meta.version && other.peers <= 1;
+}
+function followVerifiedReplica(target, tick, revision, changes) {
+  const follower = () => target === world && !updateFrozen && !replacingCheckpoint && mayRetainWorker();
+  if (ordered.current?.steps || !follower()) return;
+  simulation.followVerifiedReplica(target, tick, revision, changes, follower)
+    .catch(error => diagnostics.record('warn', 'replica', error.message));
 }
 function orderedInputs(limit = 64) {
   return [...inbox.values()].filter(op => !rejectedOps.has(op.body.id) && (op.body.kind === 'referral' || !world.data.ops[op.body.id] && !archiveStore.ids.ops.has(op.body.id)))
@@ -355,6 +361,7 @@ async function mergeVerifiedWorld(data, peer, context, { local = false, worldMes
       return { ignored: true };
     }
     const rootCount = target.roots.length;
+    const priorRevision = worldRevision(target), priorTick = target.data.tick;
     const routine = delta && !needsReplicaSave(incoming, target.data, store);
     const apply = () => {
       const index = delta && renderer.currentIndex(target);
@@ -363,6 +370,7 @@ async function mergeVerifiedWorld(data, peer, context, { local = false, worldMes
       finally { if (delta) noteCheckpointMerge(target.data, changes, incoming, archived); }
       if (delta) pictures.merged(target, changes);
       if (index) renderer.applyMerge(target, index, changes);
+      if (worldMessage && delta) followVerifiedReplica(target, priorTick, priorRevision, changes);
     };
     let movement;
     if (worldMessage && worldMessage.from !== network.node) movement = replicaSwims.merge(target.data, worldMessage, apply);
@@ -486,6 +494,7 @@ async function onMessage(message, peer) {
     await mergeReplica(body.world, peer, 'hello'); geometryRepair = true;
     replicaRecovery.covered(message);
     const own = body.member; members.set(own.id, { ...own, url: peer.url, at: Date.now() }); remember(peer.url);
+    followVerifiedReplica(world);
     rememberAuthor(message.actor, own.nick);
     for (const m of body.members || []) remember(m.url);
     if (newKnowledge) await network.broadcast('merge', { world: body.world }, { capturedWorld: true });

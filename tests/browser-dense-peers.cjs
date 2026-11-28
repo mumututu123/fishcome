@@ -134,12 +134,14 @@ SimulationClient.prototype.checkRetained = async function (world, valid) {
   finally { row.ms = Math.round(performance.now() - start); activeWorkerLoad.delete(this); }
 };
 const originalOpen = SimulationClient.prototype.open;
-SimulationClient.prototype.open = async function (world, valid, cut) {
+SimulationClient.prototype.open = async function (world, valid, cut, rebase) {
   const row = { at: Date.now(), tick: world.data.tick, oldWorker: !!this.worker, cached: this.savedCharacters?.size || 0,
+    previousTick: this.tick, sameWorld: this.owner === world, previousRevision: this.revision, revision: worldRevision(world),
+    rebased: !!rebase, orderedInputCount: ordered.current?.steps?.next?.inputs?.length,
     cutPages: cut?.hashes.length || 0, reused: 0, characters: 0, otherRows: 0, rowBatches: 0, rowMs: 0 };
   activeWorkerLoad.set(this,row); workerLoads.push(row);
   const start = performance.now();
-  try { return row.ok = await originalOpen.call(this,world,valid,cut); }
+  try { return row.ok = await originalOpen.call(this,world,valid,cut,rebase); }
   finally { row.ms = Math.round(performance.now() - start); activeWorkerLoad.delete(this); }
 };
 const originalStop = ordered.stop;
