@@ -28,6 +28,19 @@ function startWorker(initial) {
   return { worker, send };
 }
 
+test('后台连续替换与修改记录只传递世界字段，旧版嵌套数据仍可独立读取', () => {
+  const { worker } = startWorker([food('a', 4)]);
+  const table = worker.world.data.chars, original = table.a;
+  const retained = original.path;
+  table.a = { ...original, path: [{ reason: 'shed', t: start }] };
+  table.a.path[0].t += 500;
+  const copy = structuredClone(worker.tracker.changes());
+  const row = copy.tables.chars.set.find(([id]) => id === 'a')[1];
+  assert.deepEqual(row.path, [{ reason: 'shed', t: start + 500 }]);
+  assert.deepEqual(Object.keys(row), Object.keys(food('a', 4)));
+  assert.deepEqual(retained, []);
+});
+
 test('后台接触查询随性别编辑和恢复更新', () => {
   const cells = ['a', 'b'].map(id => ({ ...food(id, 0), kind: 'fish', entity: id }));
   const { worker, send } = startWorker(cells);

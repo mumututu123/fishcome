@@ -18,9 +18,11 @@ const inputFields = new Set(['ops', 'terrain', 'roots', 'participants', 'archive
 function trackWorld(source) {
   const knownFish = new Map(Object.keys(source.fishes).map((id, index) => [id, index]));
   const daysByOrdinal = new Array(knownFish.size);
-  const proxies = new WeakMap(), originals = new WeakMap();
+  // These are the worker's private, mutable records. Keeping the observation
+  // with its record avoids growing a world-sized hash table on a step.
+  const observation = Symbol('simulation observation');
   const values = new Set(), rows = new Map(), lifeFields = new Set(), bondRows = new Map();
-  const raw = object => originals.get(object) || object;
+  const raw = object => object?.[observation]?.target ?? object;
   const bondTimes = new WeakMap();
   let characters, ecology, membership, meals, previousBonds, activeBonds, publishedBonds, orderedBonds = false;
   let fishRoster, previousStories, poseRevision = 0, originRevision = 0;
@@ -106,7 +108,6 @@ function trackWorld(source) {
     if (!rows.has(field)) rows.set(field, new Map());
     return rows.get(field);
   }
-  const locations = new WeakMap();
   function child(location, key) {
     if (location.root) return { field: key, table: worldTables.has(key) };
     const { field, id, property, part, bond } = location;
@@ -207,14 +208,14 @@ function trackWorld(source) {
   const writes = {
     set(target, key, value) {
       if (raw(target[key]) === raw(value) && Object.hasOwn(target, key)) return true;
-      const parent = locations.get(target);
+      const parent = target[observation].location;
       mark(target, parent, key, value);
       target[key] = value && typeof value === 'object' ? watch(value, child(parent, key)) : value;
       return true;
     },
     deleteProperty(target, key) {
       if (!Object.hasOwn(target, key)) return true;
-      mark(target, locations.get(target), key, undefined, true);
+      mark(target, target[observation].location, key, undefined, true);
       return delete target[key];
     }
   };
@@ -223,13 +224,14 @@ function trackWorld(source) {
     // Terminal proofs are immutable during natural simulation. Keep the table
     // observed so a new active record or a replacement still enters the patch.
     if (location.field === 'breeding' && location.id !== undefined && object.status && object.status !== 'active') return object;
-    object = raw(object);
-    if (proxies.has(object)) return proxies.get(object);
+    const existing = object[observation];
+    if (existing) return existing.proxy;
     const bondTable = location.field === 'life' && location.part === 'bonds' && location.bond === undefined;
     const contactTable = location.field === 'contacts' && location.table;
     const proxy = new Proxy(object, bondTable || contactTable ? {
       ...writes,
       get(table, key, receiver) {
+        if (key === observation) return table[key];
         let value = Reflect.get(table, key, receiver);
         if (bondTable && value && typeof value === 'object') {
           const at = bondTimes.get(table);
@@ -238,13 +240,13 @@ function trackWorld(source) {
             // A caller may still hold an older table. Its first mutable read
             // owns a private row even when several observations share an anchor.
             if (at !== null && row.at !== at) value = table[key] = advanceBond(row, at);
-            else if (!proxies.has(row)) value = table[key] = { ...row };
+            else if (!row[observation]) value = table[key] = { ...row };
           }
         }
         return Object.hasOwn(table, key) && value && typeof value === 'object' ? watch(value, child(location, key)) : value;
       }
     } : writes);
-    proxies.set(object, proxy); originals.set(proxy, object); locations.set(object, location);
+    Object.defineProperty(object, observation, { value: { target: object, location, proxy } });
     if (bondTable || contactTable) return proxy;
     for (const key of Object.keys(object)) {
       const value = object[key];
@@ -295,7 +297,7 @@ function trackWorld(source) {
     table = raw(table);
     if (activeBonds?.table === table) {
       const { keys, at, base } = activeBonds;
-      publishedBonds = { table, keys, at, retain: row => proxies.has(row) ? { ...row } : row };
+      publishedBonds = { table, keys, at, retain: row => row[observation]?.target === row ? { ...row } : row };
       if (base) return encodeBondIntervals(base, table, keys, at);
       const counters = new Float64Array(keys.length * 2);
       for (let i = 0; i < keys.length; i++) {
