@@ -470,7 +470,9 @@ export function decodeReplicaRowDelta(body, base, frames = false, poseBytes = fa
     return table;
   });
   if (frameRows) {
-    if (poseBytes && rowTable(message.world.fishes) && Object.hasOwn(message.world.fishes, 'poses')) confirmedRosters.set(world, base.travel.indices);
+    if (poseBytes && rowTable(message.world.fishes) && (Object.hasOwn(message.world.fishes, 'poses') || poseTransitions && Object.hasOwn(message.world.fishes, 'moves'))) {
+      confirmedRosters.set(world, base.travel.indices);
+    }
     for (const field of ['roots', 'terrain']) if (world[field] === true) {
       if (!base[field]) throw new Error('缺少实时世界来源');
       world[field] = base[field];
