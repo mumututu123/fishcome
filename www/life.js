@@ -1,5 +1,6 @@
 import { bounds, hash } from './engine.js';
 import { fishNeighbors } from './life-neighbors.js';
+import { schoolMembership } from './fish-school.js';
 import { advanceBond, bondLimit } from './bond-interval.js';
 import { WORLD_WIDTH, wrapX, deltaX, worldKey } from './geography.js';
 import { EVENTS, activeEvent, updateEvents, validEvent, eventSchedule, eventNarration, eventMotion } from './random-events.js';
@@ -244,21 +245,24 @@ export function lifeContext(world, now, scenery, groups, sharedLayout) {
     const radius = Math.min(12, 2 + maxRadius + Math.max(p.halfWidth, p.halfHeight));
     return neighborhood().crowded(p, radius, nearObstacle[p.slot]);
   }
+  const schoolSlot = Math.floor(now / 60000);
+  function leaderMotion(p) {
+    if (geometry.schoolSlot !== schoolSlot) { geometry.schoolSlot = schoolSlot; geometry.leaders = []; }
+    if (!geometry.leaders[p.slot]) {
+      const r = hash(`school:${p.id}:${schoolSlot}`);
+      geometry.leaders[p.slot] = { dx: r % 2 ? 1 : -1, dy: [0, 0, -1, 1][Math.floor(r / 2) % 4], leader: p.id };
+    }
+    return geometry.leaders[p.slot];
+  }
   const makeSchool = () => {
     const school = new Map();
     if (now % 60000 >= 18000) return school;
     const available = Uint8Array.from(ordered, p => !world.breedingState(p.id));
-    const slot = Math.floor(now / 60000);
-    if (geometry.schoolSlot !== slot) { geometry.schoolSlot = slot; geometry.leaders = []; }
     for (const p of ordered) {
       if (!available[p.slot]) continue;
       const companions = neighborhood().sorted(p, nearObstacle[p.slot], available);
       if (companions.length < 2) continue;
-      let motion = geometry.leaders[p.slot];
-      if (!motion) {
-        const r = hash(`school:${p.id}:${slot}`);
-        motion = geometry.leaders[p.slot] = { dx: r % 2 ? 1 : -1, dy: [0, 0, -1, 1][Math.floor(r / 2) % 4], leader: p.id };
-      }
+      const motion = leaderMotion(p);
       school.set(p.id, motion); available[p.slot] = 0;
       for (const q of companions) { school.set(q.id, motion); available[q.slot] = 0; }
     }
@@ -267,6 +271,14 @@ export function lifeContext(world, now, scenery, groups, sharedLayout) {
   // Public callers retain a snapshot. In a step the school is consulted only
   // after hunger, environmental events and collision avoidance have all passed.
   let school = sharedLayout ? undefined : makeSchool();
+  let membership;
+  function schoolFor(p) {
+    if (school) return school.get(p.id);
+    if (now % 60000 >= 18000) return;
+    membership ??= schoolMembership(ordered, q => neighborhood().schoolSources(q, nearObstacle),
+      q => neighbors.get(q.id), q => !world.breedingState(q.id), leaderMotion, () => school ??= makeSchool());
+    return membership(p);
+  }
   const memories = new Map();
   for (const [id, home] of Object.entries(world.data.life?.haunts || {})) {
     const p = points.get(id); if (!p) continue;
@@ -322,7 +334,7 @@ export function lifeContext(world, now, scenery, groups, sharedLayout) {
     }
     return name;
   }
-  return { points, neighbors, visitBonds, visiblePair, orderEncounters, orderedPairs: geometry.orderedPairs, crowdedNeighbor, scenes, memories, get school() { return school ??= makeSchool(); },
+  return { points, neighbors, visitBonds, visiblePair, orderEncounters, orderedPairs: geometry.orderedPairs, crowdedNeighbor, scenes, memories, schoolFor, get school() { return school ??= makeSchool(); },
     weather: weatherAt(world.data, now), event: activeEvent(world.data, now) };
 }
 export function updateLife(world, now, context) {
@@ -460,7 +472,7 @@ export function idleMotion(world, fish, now, context, center) {
   const gap = q => Math.max(Math.abs(deltaX(q.x, point.x)) - (point.halfWidth || 0) - (q.halfWidth || 0), Math.abs(q.y - point.y) - (point.halfHeight || 0) - (q.halfHeight || 0));
   const crowded = !breeding && context.crowdedNeighbor(body);
   if (crowded) return { dx: Math.sign(deltaX(point.x, crowded.x)), dy: Math.sign(point.y - crowded.y) };
-  const school = body && context.school.get(fish.id); if (school) return school;
+  const school = body && (context.schoolFor ? context.schoolFor(body) : context.school.get(fish.id)); if (school) return school;
   let neighbors;
   if (now % 180000 < 45000) for (const q of neighbors = context.neighbors.get(fish.id) || []) {
     const pair = fish.id < q.id ? fish.id + '|' + q.id : q.id + '|' + fish.id;

@@ -53,6 +53,14 @@ export function fishNeighbors(geometry, canSeeLine) {
     const gap = Math.abs(a - b);
     return Math.min(gap, WORLD_WIDTH - gap);
   }
+  function schoolSources(point, obstacles) {
+    const sources = [point.slot];
+    for (const bin of collect(point, 12)) for (const p of bin) {
+      if (p === point || Math.abs(p.y - point.y) > 12 || horizontalDistance(point.x, p.x) > 12) continue;
+      if (!obstacles[p.slot] || canSeeLine(p, point)) sources.push(p.slot);
+    }
+    return sources.sort((a, b) => a - b);
+  }
   const compare = (a, b) => distances[a] - distances[b] || ranks.get(ordered[a]) - ranks.get(ordered[b]);
   function sorted(p, obstacle, available) {
     const bins = collect(p, 12);
@@ -173,5 +181,5 @@ export function fishNeighbors(geometry, canSeeLine) {
     return ordered[best];
   }
 
-  return { visitPairPartners, sorted, crowded: numericOrder ? crowdedHalfGrid : crowded };
+  return { visitPairPartners, sorted, schoolSources, crowded: numericOrder ? crowdedHalfGrid : crowded };
 }
