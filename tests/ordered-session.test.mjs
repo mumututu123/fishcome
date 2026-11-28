@@ -349,7 +349,9 @@ for (const conflict of [false, true]) test('慢入场遇到真实签名归档和
   await a.session.probe();
   await drain(message => { if (message.action === 'open') { anchor = message; return true; } });
   const epoch = anchor.epoch;
+  let archiving = true;
   for (const side of [a,b]) {
+    side.session.io.peer = observing => observing || !archiving ? side.peer : undefined;
     side.session.archiveChanging('归档');
     for (const chunk of chunks) {
       await side.store.ingest(chunk);
@@ -358,8 +360,11 @@ for (const conflict of [false, true]) test('慢入场遇到真实签名归档和
     side.world.data.archives.at = now + 1;
     delete side.world.data.ops[signed.body.id];
     if (side === b && conflict) side.store.summary.serials[signed.actor]++;
+    assert.equal(side.session.run(now + 500), false);
+    assert.equal(side.session.current.epoch, epoch);
   }
   publishOrdinary(a,b,now + 500);
+  archiving = false;
   await b.session.receive(b.peer,anchor);
   await drain();
   if (conflict) {

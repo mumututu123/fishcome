@@ -8,6 +8,7 @@ import { AdmissionJournal } from './admission-journal.js';
 const orderedTables = [...worldTables, 'life.events', 'life.bonds', 'life.stories',
   'life.places', 'life.haunts', 'life.bloomThrough', 'life.eventThrough'];
 const tableAt = (data, name) => name.startsWith('life.') ? data.life?.[name.slice(5)] : data[name];
+const observing = s => !!(s?.snapshot || s?.reserved) && !s.steps;
 
 const largeTables = new Set(['chars', 'fishes', 'ops', 'travel']);
 const snapshotPages = new WeakMap();
@@ -162,8 +163,8 @@ export class OrderedSession {
   constructor(io) { this.io = io; }
 
   valid(s) {
-    return this.current === s && this.io.peer() === s.peer && this.io.world() === s.world &&
-      this.io.leader() === s.leader && this.io.store() === s.store && ((s.snapshot || s.reserved) && !s.steps ||
+    return this.current === s && this.io.peer(observing(s)) === s.peer && this.io.world() === s.world &&
+      this.io.leader() === s.leader && this.io.store() === s.store && (observing(s) ||
       s.store.revision === s.revision && s.world.data.archives?.at === s.archiveAt);
   }
   send(s, message) {
@@ -218,8 +219,8 @@ export class OrderedSession {
       leader: this.io.leader(), owner: this.io.isLeader(), began: performance.now(), receipts: new Map() };
   }
   async probe() {
-    const peer = this.io.peer(), now = performance.now();
     const prior = this.current;
+    const peer = this.io.peer(observing(prior)), now = performance.now();
     if (prior?.reserved && prior.owner && this.valid(prior)) {
       if (prior.world.data.tick < prior.base) return;
       if (prior.world.data.tick > prior.base) { this.stop('权威步没有连续到达预约基准'); return; }
@@ -336,7 +337,7 @@ export class OrderedSession {
     }
     s.checkedProof = proof;
     const atCut = () => this.valid(s) && !s.changedAfterCut && s.world.data.tick === s.base &&
-      s.revision === s.store.revision && s.archiveAt === s.world.data.archives?.at && this.io.archiveStable?.() !== false;
+      s.revision === s.store.revision && s.archiveAt === s.world.data.archives?.at && this.io.peer() === s.peer;
     if (atCut() && Object.keys(changes).length) await this.installChecked(s, changes);
     if (!this.valid(s)) return;
     if (atCut()) await this.preload(s, s.cut.characterPages);
@@ -371,7 +372,7 @@ export class OrderedSession {
   async offerTip(s) {
     const { tick, version } = s.journal, revision = s.store.revision;
     const current = () => this.valid(s) && !s.steps && s.world.data.tick === tick && s.journal.version === version &&
-      s.store.revision === revision && this.io.archiveStable?.() !== false;
+      s.store.revision === revision && this.io.peer() === s.peer;
     if (s.offeredTip?.version === version || !current()) return;
     const proof = await s.journal.proof(s.world, s.store, s.proof);
     if (!proof || !current()) return;
@@ -401,7 +402,7 @@ export class OrderedSession {
   }
   installChecked(s, changes) {
     return this.io.install(s.world, changes, () => this.valid(s) && !s.changedAfterCut && s.world.data.tick === s.base &&
-      s.revision === s.store.revision && s.archiveAt === s.world.data.archives?.at && this.io.archiveStable?.() !== false, action => {
+      s.revision === s.store.revision && s.archiveAt === s.world.data.archives?.at && this.io.peer() === s.peer, action => {
       const pages = s.cut?.characterPages;
       const current = pages && characterRevision(s.world) === pages.revision;
       s.applying = true;
@@ -459,8 +460,8 @@ export class OrderedSession {
     }
   }
   async receive(peer, b) {
-    if (!b || typeof b !== 'object' || this.io.peer() !== peer) return;
     let s = this.current;
+    if (!b || typeof b !== 'object' || this.io.peer(observing(s)) !== peer) return;
     if (b.action === 'available?') {
       if (!s && !this.io.isLeader() && b.leader === this.io.leader() && typeof b.id === 'string' && b.id.length === 36) {
         const world = this.io.world();
@@ -592,7 +593,7 @@ export class OrderedSession {
     }
     if (b.action === 'joined' && s.owner && !s.steps && b.base === s.base && b.proof === s.proof) {
       if (s.changedAfterCut || s.world.data.tick !== s.base || s.store.revision !== s.revision ||
-          s.world.data.archives?.at !== s.archiveAt || this.io.archiveStable?.() === false) {
+          s.world.data.archives?.at !== s.archiveAt || this.io.peer() !== s.peer) {
         if (b.follow !== true || s.journal.broken) { s.nextCut = true; return; }
         s.followAnchor = true;
         return this.send(s, { action: 'followAnchor', base: s.base, proof: s.proof });
@@ -611,7 +612,7 @@ export class OrderedSession {
       if (s.journal.broken) { s.nextCut = true; return; }
       const version = s.journal.version, revision = s.store.revision, proof = await s.journal.proof(s.world, s.store, s.proof);
       if (!proof || !this.valid(s) || s.steps || s.world.data.tick !== b.base || s.journal.version !== version ||
-          s.store.revision !== revision || this.io.archiveStable?.() === false) return;
+          s.store.revision !== revision || this.io.peer() !== s.peer) return;
       if (proof !== b.proof) {
         s.differences = { fields: ['chars/ops', 'world', 'archive'].filter((name, i) => s.journal.tip.parts[i] !== b.parts?.[i]), tick: b.base };
         this.stop('双方实际提交的增量结果不同'); return;
@@ -621,11 +622,11 @@ export class OrderedSession {
     }
     if (b.action === 'offer' && !s.owner && !s.steps && s.followAnchor && s.offeredTip?.proof === b.previous &&
         s.offeredTip.tick === b.base && s.offeredTip.version === s.journal.version && s.offeredTip.revision === s.store.revision &&
-        this.io.archiveStable?.() !== false && s.world.data.tick === b.base) {
+        this.io.peer() === s.peer && s.world.data.tick === b.base) {
       this.startTip(s, b.base, b.previous);
     }
     if (b.action === 'offer' && !s.owner && !s.steps && s.localJoined && b.base === s.base && b.previous === s.proof) {
-      if (s.changedAfterCut || s.world.data.tick !== s.base || s.revision !== s.store.revision || s.archiveAt !== s.world.data.archives?.at) {
+      if (s.changedAfterCut || s.world.data.tick !== s.base || s.revision !== s.store.revision || s.archiveAt !== s.world.data.archives?.at || this.io.peer() !== s.peer) {
         await this.send(s, { action: 'pastJoined', base: s.base, proof: s.proof, follow: !s.cut?.changes.chars && !s.cut?.changes.ops });
         return;
       }

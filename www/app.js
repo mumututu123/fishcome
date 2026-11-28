@@ -116,13 +116,14 @@ function active() { return [...members.values()].filter(m => Date.now() - m.at <
 function leader() { return active().sort((a, b) => +b.visible - +a.visible || a.id.localeCompare(b.id))[0]?.id || network.node; }
 function amLeader() { return !!network && leader() === network.node; }
 let resumingInputs;
-function orderedPeer() {
-  if (resumingInputs || !started || updateFrozen || replacingCheckpoint || archiveImports || archiveBusy || !meta.version || !network) return;
+function orderedPeer(observing = false) {
+  if (!started || updateFrozen || replacingCheckpoint || !meta.version || !network) return;
+  if (!observing && (resumingInputs || archiveImports || archiveBusy)) return;
   const peers = network.live(), people = active();
   if (peers.length !== 1 || people.length !== 2 || network.hasRelayedWorldPeer(peers)) return;
   const peer = peers[0], other = members.get(peer.node);
   if (sameOrderedProtocol(other) && peer.replicaLive && peer.sentHello && peer.confirmedReplica && other.peers <= 1 &&
-      !peer.replicaCatchingUp && (!amLeader() || !geometryRepair && !world.data.pendingChatGlyphs)) return peer;
+      (observing || !peer.replicaCatchingUp && (!amLeader() || !geometryRepair && !world.data.pendingChatGlyphs))) return peer;
 }
 function mayRetainWorker() {
   const peers = network.live(), winner = leader(), other = members.get(winner);
@@ -201,7 +202,6 @@ const ordered = new OrderedSession({
   firstCommit: () => worldBroadcast.reset(),
   checkRetained: target => simulation.checkRetained(target, () => target === world && mayRetainWorker()),
   hasSavedCharacters: target => simulation.hasSavedCharacters(target),
-  archiveStable: () => !archiveBusy && !archiveImports,
   prepare: (target, valid, pages) => simulation.prepareAgreed(target, valid, pages),
   advance: (target, nextTick, valid, handle) => simulation.advanceAgreed(target, nextTick, valid, handle),
   stopped(session, reason) {
