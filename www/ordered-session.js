@@ -67,11 +67,12 @@ export class OrderedSession {
   begin(peer, epoch, base) {
     const world = this.io.world(), store = this.io.store();
     return this.current = { peer, epoch, base, world, store, revision: store.revision, archiveAt: world.data.archives?.at,
-      leader: this.io.leader(), owner: this.io.isLeader(), receipts: new Map() };
+      leader: this.io.leader(), owner: this.io.isLeader(), began: performance.now(), receipts: new Map() };
   }
   async probe() {
     const peer = this.io.peer(), now = performance.now();
-    if (this.current || !peer || !this.io.isLeader() || now < (this.retryAt || 0)) return;
+    if (this.current || !peer || !this.io.isLeader() || now < (this.retryAt || 0) ||
+        Date.now() - this.io.world().data.tick > CONFIG.step) return;
     this.retryAt = now + 3000;
     const world = this.io.world(), s = this.begin(peer, crypto.randomUUID(), world.data.tick);
     const order = checkpointOrder(world.data);
@@ -87,7 +88,11 @@ export class OrderedSession {
     s.checking = true;
     const { proof, changes } = await orderedCheckpoint(s.world, s.store, s.order);
     if (!this.valid(s)) return;
-    if (proof !== s.proof) { this.stop('两端已验证的世界内容不同'); return; }
+    if (proof !== s.proof) {
+      await this.send(s, { action: 'history', base: s.base, bonds: s.world.data.life.bonds });
+      if (this.current === s) this.stop('两端已验证的世界内容不同', false);
+      return;
+    }
     if (Object.keys(changes).length) {
       await this.io.install(s.world, changes, () => this.valid(s), action => {
         s.applying = true;
@@ -100,10 +105,11 @@ export class OrderedSession {
     await this.send(s, { action: 'joined', base: s.base, proof });
   }
   start(s) {
+    this.io.beginExecution?.(s.world);
     s.steps = new OrderedSteps({ epoch: s.epoch, tick: s.base, proof: s.proof, leader: s.owner,
       send: body => this.send(s, body), validOp: async op => {
         if (!await this.io.validOp(s.world, op)) return false;
-        s.receipts.set(op.id, await s.store.get('ops', op.body.id));
+        s.receipts.set(op.body.id, await s.store.get('ops', op.body.id));
         return this.valid(s);
       } });
   }
@@ -153,6 +159,14 @@ export class OrderedSession {
     if (b.action === 'stop') { this.stop('伙伴已切回世界同步', false); return; }
     if (!this.valid(s)) { this.stop('共同结算的连接或归档已更换'); return; }
     if (b.action === 'stop') { this.stop('伙伴已结束本次共同结算', false); return; }
+    if (b.action === 'history' && s.owner && !s.steps && b.base === s.base) {
+      const history = await this.io.bondHistory?.(s, b.bonds);
+      if (!this.valid(s)) return;
+      this.stop('双方重新合并已验证的伙伴历史', false);
+      if (history) await this.io.install(s.world, { life: { ...s.world.data.life, bonds: history } },
+        () => this.io.world() === s.world && s.world.data.tick === s.base && s.store.revision === s.revision && this.io.isLeader(), f => f());
+      return;
+    }
     if (b.action === 'joined' && s.owner && !s.steps && b.base === s.base && b.proof === s.proof) {
       this.start(s);
       return this.offer(s);
@@ -207,7 +221,7 @@ export class OrderedSession {
     }
     s.applying = true;
     try {
-      slot.outcomes = slot.inputs.map(op => this.io.apply(s.world, op, s.receipts.get(op.id), s.owner));
+      slot.outcomes = slot.inputs.map(op => this.io.apply(s.world, op, s.receipts.get(op.body.id), s.owner));
     } finally { s.applying = false; }
     s.receipts.clear();
     if (slot.inputs.length) {
@@ -238,7 +252,10 @@ export class OrderedSession {
     if (s.running) return true;
     if (now < s.base + CONFIG.step) return false;
     if (s.waiting && s.world.data.tick < s.base) return false;
-    if (!s.localReady || s.localReady !== s.remoteReady) { this.stop('本步输入尚未得到双方确认'); return false; }
+    if (!s.localReady || s.localReady !== s.remoteReady) {
+      if (!s.executed && performance.now() - s.began < 2000) return true;
+      this.stop('本步输入尚未得到双方确认'); return false;
+    }
     const slot = s.steps.take(s.world.data.tick);
     if (!slot) { this.stop('共同基准已变更'); return false; }
     s.running = s.executed = true;

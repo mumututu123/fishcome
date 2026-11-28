@@ -21,7 +21,7 @@ import { drawPedigree, setupPedigreeViewport } from './pedigree.js';
 import { normalizeInvite, encodeInvite, decodeInvite, inviteDetails } from './invite.js';
 import { verifyReferral } from './referral.js';
 import { wrapX, nearX } from './geography.js';
-import { weatherAt, fishLifeText, storiesFor, storyText, returnStory } from './life.js';
+import { weatherAt, fishLifeText, storiesFor, storyText, returnStory, mergeBonds, newLife, validateLife } from './life.js';
 import { memoryForCell, ancestralGlyph, ancestralText } from './easter-eggs.js';
 import { activeEvent, eventSchedule, eventTitle, eventPosition, eventLetter, radioTranscript, eventNarration } from './random-events.js';
 import { activeLegend, legendSchedule, legendTitle, legendPosition, capturedFish } from './legends.js';
@@ -132,6 +132,14 @@ const ordered = new OrderedSession({
   send: (peer, body) => network.directControl(peer, 'orderedStep', body),
   validOp: async (target, op) => op.body.roots?.some(root => Object.hasOwn(target.data.roots, root)) &&
     !target.validOp(op.body) && (op.body.kind !== 'referral' || await verifyReferral(op.body)),
+  async bondHistory(s, bonds) {
+    const life = { ...newLife(s.base), bonds };
+    const prior = await s.store.dependencies({ life }, s.world.data);
+    const sources = { ops: { ...prior.ops, ...s.world.data.ops }, breeding: { ...prior.breeding, ...s.world.data.breeding }, roots: s.world.data.roots };
+    if (!validateLife(life, sources)) throw new Error('伙伴历史缺少有效来源');
+    const records = mergeBonds(s.world.data.life.bonds, bonds);
+    return JSON.stringify(records) === JSON.stringify(s.world.data.life.bonds) ? undefined : records;
+  },
   install: (target, changes, valid, apply) => atCheckpointBoundary(target.data, () => {
     if (valid()) apply(() => { worldEdited(target); Object.assign(target.data, changes); target.dirty = true; });
   }),
@@ -152,6 +160,9 @@ const ordered = new OrderedSession({
     diagnostics),
   archiveBoundary: (target, commit) => atCheckpointBoundary(target.data, () => simulation.archiveAtStepBoundary(target, commit)),
   archiveConfirmed: () => { renderChat(); save({ reusePicture: true }).catch(error => diagnostics.record('warn', 'archive', error.message)); },
+  // Both workers start with the same row roster and compact patch reference.
+  // An existing leader worker may still contain private pre-join indexes.
+  beginExecution: () => simulation.close(),
   prepare: (target, valid) => simulation.prepareAgreed(target, valid),
   advance: (target, nextTick, valid, handle) => simulation.advanceAgreed(target, nextTick, valid, handle),
   stopped(session, reason) {

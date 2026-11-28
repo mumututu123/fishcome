@@ -553,7 +553,7 @@ export function validateLife(life, sources, now = Date.now() + 60000) {
   for (const r of Object.values(life.stories)) if (['captured', 'cthulhuDepart', 'atomicSurvivor', 'shipMeal'].includes(r.kind) && !validLegendStory(r, sources.roots)) return false;
   return true;
 }
-function mergeBonds(left, right) {
+export function mergeBonds(left, right) {
   const ids = Object.keys(right), limit = LIFE.bondLimit;
   const time = id => Math.max(left[id]?.at ?? -Infinity, right[id]?.at ?? -Infinity);
   let priorAt = Infinity, priorId, ordered = ids.length <= limit;

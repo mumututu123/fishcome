@@ -84,3 +84,19 @@ test('即使步号相同，不同的归档基准也无法开启会话', async ()
   assert.equal(a.session.current, null); assert.equal(b.session.current, null);
   assert.deepEqual(b.calls, []);
 });
+test('一批两份签名依业务编号各取自己的归档凭据', async () => {
+  const { sides: [a,b], drain } = pair(Date.now());
+  const first = await earn(a.world, 3), second = await earn(a.world, 5);
+  for (const side of [a,b]) {
+    const records = new Map([first, second].map(op => [op.body.id, { archived: op.body.id }]));
+    side.store.get = (_, id) => records.get(id);
+    side.session.io.apply = (_, op, archived) => {
+      assert.strictEqual(archived, records.get(op.body.id));
+      side.applied.push(op.body.id);
+      return { ok: true };
+    };
+  }
+  a.inputs.push(first, second);
+  await a.session.probe(); await drain();
+  for (const side of [a,b]) assert.deepEqual(side.applied, [first.body.id, second.body.id]);
+});
