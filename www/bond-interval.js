@@ -41,15 +41,19 @@ function readBondIntervals(previous, { at, intervals, keys }, frame) {
   if (!Number.isFinite(at) || !Number.isInteger(length) || length < 0 || length > bondLimit ||
       oldKeys.length !== before || oldKeys.length > bondLimit || !Array.isArray(keys) || keys.length > length ||
       !validBits(added, length) || !validBits(kept, oldKeys.length)) throw new Error('无效的伙伴变更范围');
-  if (frame?.writableTable && prior?.writableTable && !prior.fractionalRows && prior.at === at - 1000 &&
-      length === before && keys.length === 0 && sameBondKeys(kept, added, length)) {
+  const validated = frame?.writableTable && prior?.writableTable && !prior.materialized && !prior.fractionalRows && prior.at === at - 1000;
+  if (validated && length === before && keys.length === 0 && sameBondKeys(kept, added, length)) {
     prior.sharedRows = true;
     frame.names = prior.names;
     frame.rows = prior.rows;
+    frame.nameIndex = prior.nameIndex;
+    prior.nameIndex = undefined;
     return;
   }
   const table = frame ? null : {};
-  const oldNames = prior && keys.length ? new Set(oldKeys) : null;
+  const oldNames = prior && keys.length ? (validated && prior.nameIndex) || new Set(oldKeys) : null;
+  const nameIndex = validated && (prior.nameIndex || oldNames);
+  const removedNames = nameIndex && [];
   const newNames = frame && keys.length ? new Set() : null;
   let next = 0, old = 0;
   for (let i = 0; i < length; i++) {
@@ -64,24 +68,42 @@ function readBondIntervals(previous, { at, intervals, keys }, frame) {
       row = { a, b, seconds: 1, at, lastNear: at, run: 0 };
       newNames?.add(key);
     } else {
-      while (old < oldKeys.length && !bit(kept, old)) old++;
+      while (old < oldKeys.length && !bit(kept, old)) {
+        if (removedNames) removedNames.push(oldKeys[old]);
+        old++;
+      }
       if (old >= oldKeys.length) throw new Error('伙伴基准缺少记录');
       key = oldKeys[old];
       row = prior ? prior.rows[old] : previous[key];
       old++;
-      if ((prior?.at ?? row?.at) !== at - 1000 || row.lastNear !== row.at || !Number.isFinite(row.seconds) || !Number.isFinite(row.run)) {
-        throw new Error('伙伴基准时间不连续');
+      // An unexposed writable frame has already checked the retained rows.
+      if (!validated) {
+        if ((prior?.at ?? row?.at) !== at - 1000 || row.lastNear !== row.at || !Number.isFinite(row.seconds) || !Number.isFinite(row.run)) {
+          throw new Error('伙伴基准时间不连续');
+        }
+        const fractional = !Number.isInteger(row.seconds) || !Number.isInteger(row.run);
+        if (!frame || fractional || frame.writableTable && !prior) row = advanceBond(row, at);
+        else if (frame.writableTable) prior.sharedRows = true;
+        if (frame?.writableTable && fractional) frame.fractionalRows = true;
       }
-      const fractional = !Number.isInteger(row.seconds) || !Number.isInteger(row.run);
-      if (!frame || fractional || frame.writableTable && !prior) row = advanceBond(row, at);
-      else if (frame.writableTable) prior.sharedRows = true;
-      if (frame?.writableTable && fractional) frame.fractionalRows = true;
     }
     if (frame) { frame.names[i] = key; frame.rows[i] = row; }
     else table[key] = row;
   }
-  while (old < oldKeys.length && !bit(kept, old)) old++;
+  while (old < oldKeys.length && !bit(kept, old)) {
+    if (removedNames) removedNames.push(oldKeys[old]);
+    old++;
+  }
   if (next !== keys.length || old !== oldKeys.length) throw new Error('伙伴变更数量不一致');
+  if (validated && length > keys.length) prior.sharedRows = true;
+  if (nameIndex) {
+    // Move the lookup to its next owner after validation. The old frame can
+    // still rebuild its lookup from its unchanged ordered names.
+    prior.nameIndex = undefined;
+    for (const key of removedNames) nameIndex.delete(key);
+    for (const key of keys) nameIndex.add(key);
+    frame.nameIndex = nameIndex;
+  }
   return table;
 }
 

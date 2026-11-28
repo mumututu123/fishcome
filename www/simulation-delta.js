@@ -2,6 +2,7 @@ import { applyBondIntervals, BondFrame } from './bond-interval.js';
 import { SimulationRows } from './simulation-rows.js';
 
 const bondProjection = Symbol();
+const storyProjection = Symbol();
 
 // A standalone swimmer publishes one fixed-width row. Ordinary edits and
 // lifecycle changes retain their sparse record format.
@@ -25,27 +26,33 @@ function applyFields(record, [set, remove]) {
   return result;
 }
 
-function applyLifeFields(life, [set, remove], bonds) {
-  if (!bonds) return applyFields(life, [set, remove]);
+function applyLifeFields(life, [set, remove], bonds, stories) {
+  if (!bonds && !stories) return applyFields(life, [set, remove]);
   const fields = Reflect.ownKeys(life).filter(key => Object.prototype.propertyIsEnumerable.call(life, key));
-  const record = Object.fromEntries(fields.map(key => [key, key === 'bonds' ? undefined : life[key]]));
+  const record = Object.fromEntries(fields.map(key => [key,
+    (bonds && key === 'bonds' || stories && key === 'stories') ? undefined : life[key]]));
   const next = applyFields(record, [set, remove]);
-  if (Object.hasOwn(next, 'bonds') && !(set && Object.hasOwn(set, 'bonds'))) assignBonds(next, bonds);
+  if (bonds && Object.hasOwn(next, 'bonds') && !(set && Object.hasOwn(set, 'bonds'))) assignFrame(next, 'bonds', bondProjection, bondProperty, bonds);
+  if (stories && Object.hasOwn(next, 'stories') && !(set && Object.hasOwn(set, 'stories'))) assignFrame(next, 'stories', storyProjection, storyProperty, stories);
   return next;
 }
 
-const bondProperty = {
-  enumerable: true, configurable: true,
-  get() { return this[bondProjection].table(); },
-  set(value) {
-    delete this[bondProjection];
-    Object.defineProperty(this, 'bonds', { value, enumerable: true, configurable: true, writable: true });
-  }
-};
+function frameProperty(key, field) {
+  return {
+    enumerable: true, configurable: true,
+    get() { return this[field].table(); },
+    set(value) {
+      delete this[field];
+      Object.defineProperty(this, key, { value, enumerable: true, configurable: true, writable: true });
+    }
+  };
+}
 
-function assignBonds(life, frame) {
-  Object.defineProperty(life, bondProjection, { value: frame, configurable: true });
-  Object.defineProperty(life, 'bonds', bondProperty);
+const bondProperty = frameProperty('bonds', bondProjection), storyProperty = frameProperty('stories', storyProjection);
+
+function assignFrame(life, key, field, property, frame) {
+  Object.defineProperty(life, field, { value: frame, configurable: true });
+  Object.defineProperty(life, key, property);
 }
 
 function expandedRecord(table, row) {
@@ -86,6 +93,32 @@ export function applyStoryChanges(previous, changes, detach = false) {
   const before = Object.entries(previous);
   return Object.fromEntries(changes.map(row => typeof row === 'number' ? before[row] :
     detach ? [row[0], structuredClone(row[1])] : row));
+}
+
+// The worker sends retained stories in the next dictionary's order. Keep that
+// ordered list as the next basis until a caller needs the writable dictionary.
+class StoryFrame {
+  constructor(previous, changes) {
+    const prior = previous instanceof StoryFrame ? previous : undefined;
+    const dictionary = prior ? prior.materialized : previous;
+    const keys = dictionary && Object.keys(dictionary), before = prior?.entries;
+    this.entries = changes.map(row => {
+      let entry = row;
+      if (typeof row === 'number') {
+        entry = before?.[row];
+        if (dictionary) {
+          const id = keys[row];
+          if (id === undefined) throw new TypeError('无效的故事记录');
+          const story = dictionary[id];
+          if (entry?.[0] !== id || entry[1] !== story) entry = [id, story];
+        }
+      }
+      if (!entry || typeof entry !== 'object') throw new TypeError('无效的故事记录');
+      return entry;
+    });
+  }
+
+  table() { return this.materialized ??= Object.fromEntries(this.entries); }
 }
 
 // Retain the worker's numbers and the unchanged fields of each record.
@@ -182,13 +215,19 @@ export function expandSimulationPatch(data, patch, knownFish, commitRows = false
   }
   if (patch.life) {
     const { properties, stories, bonds } = patch.life;
-    const descriptor = commitRows && Object.getOwnPropertyDescriptor(data.life, 'bonds');
-    const projection = descriptor?.get === bondProperty.get ? data.life[bondProjection] : undefined;
-    values.life = applyLifeFields(data.life, properties, projection);
-    if (stories) values.life.stories = applyStoryChanges(data.life.stories, stories);
+    const { life } = data;
+    const bondDescriptor = commitRows && Object.getOwnPropertyDescriptor(life, 'bonds');
+    const storyDescriptor = commitRows && Object.getOwnPropertyDescriptor(life, 'stories');
+    const projection = bondDescriptor?.get === bondProperty.get ? life[bondProjection] : undefined;
+    const chronicle = storyDescriptor?.get === storyProperty.get ? life[storyProjection] : undefined;
+    values.life = applyLifeFields(life, properties, projection, chronicle);
+    if (stories) {
+      if (commitRows) assignFrame(values.life, 'stories', storyProjection, storyProperty, new StoryFrame(chronicle ?? life.stories, stories));
+      else values.life.stories = applyStoryChanges(life.stories, stories);
+    }
     if (bonds) {
       if (bonds.intervals && commitRows) {
-        assignBonds(values.life, new BondFrame(projection?.materialized ?? projection ?? data.life.bonds, bonds, true));
+        assignFrame(values.life, 'bonds', bondProjection, bondProperty, new BondFrame(projection?.materialized ?? projection ?? life.bonds, bonds, true));
       }
       else if (bonds.intervals) values.life.bonds = applyBondIntervals(data.life.bonds, bonds);
       else if (bonds.counters) {

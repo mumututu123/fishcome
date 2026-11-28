@@ -651,6 +651,24 @@ test('连续关系只交付进出名单，时间跳变、逐项编辑和回滚�
   assert.equal(update(start + 7000, 32).intervals, undefined);
 });
 
+test('连续提交的故事沿用顺序，旧版本仍可独立改写字典', () => {
+  const a = { id: 'a', kind: 'friend' }, b = { id: 'b', kind: 'friend' }, c = { id: 'c', kind: 'friend' };
+  const data = { life: { stories: { a, b } } };
+  function commit(stories) {
+    const { values } = expandSimulationPatch(data, { values: {}, tables: {}, life: { properties: [{}], stories } }, [], true);
+    return data.life = values.life;
+  }
+  const first = commit([1, ['c', c], 0]);
+  const second = commit([2, 1]);
+  assert.deepEqual(Object.keys(first.stories), ['b', 'c', 'a']);
+  assert.deepEqual(Object.keys(second.stories), ['a', 'c']);
+  assert.equal(second.stories.c, c);
+  delete first.stories.c;
+  assert.deepEqual(structuredClone(second).stories, { a, c });
+  second.stories = { b };
+  assert.equal(commit([0]).stories.b, b);
+});
+
 test('伙伴变更拒绝多余的位、不匹配的记录数、重复加入和中断的基准', () => {
   const at = start + 1000, previous = { 'a|b': { a: 'a', b: 'b', at: start, lastNear: start, seconds: 3599.25, run: 120 } };
   const change = { at, intervals: { before: 1, kept: [1], added: [2], length: 2 }, keys: ['b|c'] };
