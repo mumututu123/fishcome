@@ -122,6 +122,16 @@ replicaPages = function* (body, frame) {
 const instrument = `
 const testData = { frames: [], steps: [], stepRequests: [], applied: [], sends: [], receives: [], merges: [], worldMerges: [], repairs: [], saves: [], liveBytes: [] };
 const stoppedSessions = [];
+const workerLoads = [], activeWorkerLoad = new WeakMap();
+const originalOpen = SimulationClient.prototype.open;
+SimulationClient.prototype.open = async function (world, valid, cut) {
+  const row = { at: Date.now(), tick: world.data.tick, oldWorker: !!this.worker, cached: this.savedCharacters?.size || 0,
+    cutPages: cut?.hashes.length || 0, reused: 0, characters: 0, otherRows: 0, rowBatches: 0, rowMs: 0 };
+  activeWorkerLoad.set(this,row); workerLoads.push(row);
+  const start = performance.now();
+  try { return row.ok = await originalOpen.call(this,world,valid,cut); }
+  finally { row.ms = Math.round(performance.now() - start); activeWorkerLoad.delete(this); }
+};
 const originalStop = ordered.stop;
 ordered.stop = function (reason, ...rest) {
   const s = this.current;
@@ -150,6 +160,20 @@ SimulationClient.prototype.advanceAgreed = function (...args) {
 };
 const originalRequest = SimulationClient.prototype.request;
 SimulationClient.prototype.request = function (message) {
+  const load = activeWorkerLoad.get(this);
+  if (load && ['open','rows','ready'].includes(message.kind)) {
+    const start = performance.now();
+    if (message.kind === 'open') load.reused = message.characters?.filter(page => typeof page === 'number').length || 0;
+    if (message.kind === 'rows') {
+      load.rowBatches++;
+      for (const row of message.rows) if (row[0] === 'chars') load.characters++; else load.otherRows++;
+    }
+    return originalRequest.call(this,message).then(result => {
+      const ms = Math.round(performance.now() - start);
+      if (message.kind === 'rows') load.rowMs += ms; else load[message.kind + 'Ms'] = ms;
+      return result;
+    });
+  }
   if (message.kind !== 'step') return originalRequest.call(this, message);
   const sequence = testData.stepRequests.length;
   const { start, marker } = activeStepMark || markStep();
@@ -292,7 +316,7 @@ window.denseSurvey = () => ({ ...testData, node: network?.node, leader: network 
   tick: world.data.tick, step: CONFIG.step, fish: Object.keys(world.data.fishes).length, rejected: network?.stats.rejected,
   phases: window.densePhases, longTasks: window.denseLongTasks, replicaFailures: window.denseReplicaFailures,
   liveTransfers: window.denseLiveTransfers,
-  orderedHistory: diagnostics.list().filter(log => log.source === 'ordered-steps').slice(-24), stoppedSessions,
+  orderedHistory: diagnostics.list().filter(log => log.source === 'ordered-steps').slice(-24), stoppedSessions, workerLoads,
   proofs: window.denseProofs || [], surface: renderer.ctx.getContextAttributes?.(),
   logs: diagnostics.list().filter(log => log.level === 'warn' || log.level === 'error').slice(-10) });
 window.denseCheckpointAt = tick => new Promise((resolve, reject) => {
@@ -781,7 +805,7 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
       phases: Object.fromEntries(Object.entries(phases).map(([name, rows]) => [name, { sync: stats(rows.map(row => row.sync)), total: stats(rows.map(row => row.total)) }])),
       longestTasks: page.longTasks.filter(sampled).sort((a, b) => b.ms - a.ms).slice(0, 8),
       failed: page.receives.filter(event => event.failed), replicaFailures: page.replicaFailures, logs: page.logs,
-      orderedHistory: page.orderedHistory, stoppedSessions: page.stoppedSessions };
+      orderedHistory: page.orderedHistory, stoppedSessions: page.stoppedSessions, workerLoads: page.workerLoads };
   });
   const offsets = traces && summaries.flatMap(page => page.traceClockOffsets ?? []);
   const traceClockSkewMs = offsets?.length === 4 ? Math.max(...offsets) - Math.min(...offsets) : undefined;
