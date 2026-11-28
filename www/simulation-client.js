@@ -194,6 +194,9 @@ export class SimulationClient {
     const result = await this.request(message);
     if (!result || !valid()) { this.close(); return null; }
     if (!this.foods.size) {
+      // A signed next-step agreement can name this exact result after the
+      // first paint, even if a foreground edit has since changed a live row.
+      if (message.agreed) result.agreedChanges = structuredClone(result.patch);
       applyResult(world, result, this.knownFish);
       return result;
     }
@@ -220,6 +223,36 @@ export class SimulationClient {
     if (!valid() || !this.worker) this.close();
     return null;
   }
+  startTask(world, run) {
+    this.task = run().catch(error => {
+      this.close();
+      this.failure = { world, error, reported: true };
+      throw error;
+    }).finally(() => { this.task = null; this.finishBoundary(); });
+    return this.task;
+  }
+  async prepareAgreed(world, stillValid) {
+    if (this.task) await this.task;
+    if (this.task || !stillValid()) return null;
+    const base = world.data.tick, revision = worldRevision(world);
+    const valid = () => stillValid() && world.data.tick === base && worldRevision(world) === revision;
+    if (this.owner !== world || this.revision !== revision || this.tick !== base) {
+      if (!await this.startTask(world, () => this.open(world, valid))) return null;
+    }
+    return valid() ? { world, base, revision, worker: this.worker } : null;
+  }
+  async advanceAgreed(world, nextTick, stillValid, prepared) {
+    if (!prepared || prepared.world !== world || nextTick !== prepared.base + CONFIG.step || this.task) return null;
+    const valid = () => stillValid() && this.worker === prepared.worker && this.owner === world &&
+      world.data.tick === prepared.base && this.tick === prepared.base && worldRevision(world) === prepared.revision;
+    if (!valid()) return null;
+    return this.startTask(world, async () => {
+      const result = await this.compute(world, { kind: 'step', base: prepared.base, agreed: true }, valid);
+      if (!result) return null;
+      this.tick = world.data.tick;
+      return { tick: this.tick, changes: result.agreedChanges };
+    });
+  }
   advance(world, now, ownsWorld = () => true, repair = {}) {
     if (this.task) return this.task;
     if (this.failure?.world === world) {
@@ -228,12 +261,7 @@ export class SimulationClient {
       return Promise.reject(this.failure.error);
     }
     if (!ownsWorld() || world.data.tick + CONFIG.step > now && !repair.geometry && !repair.chat) return Promise.resolve();
-    this.task = this.run(world, now, ownsWorld, repair).catch(error => {
-      this.close();
-      this.failure = { world, error, reported: true };
-      throw error;
-    }).finally(() => { this.task = null; this.finishBoundary(); });
-    return this.task;
+    return this.startTask(world, () => this.run(world, now, ownsWorld, repair));
   }
   async run(world, now, ownsWorld, repair) {
     const revision = worldRevision(world);

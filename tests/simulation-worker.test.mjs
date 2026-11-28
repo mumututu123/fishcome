@@ -73,6 +73,32 @@ function localWorker(beforeReceive = () => {}, simulation = new WorkerSimulation
   };
 }
 
+test('确认输入只装载基准，到点双方各提交一个相同的生态步，过期约定无法再用', async () => {
+  const makeWorld = () => new World(start, root, { populate: false, ambient: false });
+  const worlds = [makeWorld(), makeWorld()];
+  const requested = [];
+  const clients = worlds.map(() => new SimulationClient(() => localWorker(message => {
+    if (message.kind === 'step') requested.push(message.base);
+  })));
+  try {
+    const ready = await Promise.all(clients.map((client, i) => client.prepareAgreed(worlds[i], () => true)));
+    assert.deepEqual(requested, []);
+    assert.equal(await clients[0].advanceAgreed(worlds[0], start + 2 * CONFIG.step, () => true, ready[0]), null);
+    const advance = (i, time, base) => clients[i].advanceAgreed(worlds[i], time, () => true, base);
+    const next = start + CONFIG.step;
+    const result = await Promise.all(ready.map((base, i) => advance(i, next, base)));
+    assert.deepEqual(requested, [start, start]);
+    assert.equal(result[0].tick, next);
+    assert.deepEqual(result[0].changes, result[1].changes);
+    assert.deepEqual(worlds[0].serialize(), worlds[1].serialize());
+    assert.equal(await advance(0, next, ready[0]), null);
+    const stale = await clients[0].prepareAgreed(worlds[0], () => true);
+    worldEdited(worlds[0]);
+    assert.equal(await advance(0, next + CONFIG.step, stale), null);
+    assert.equal(worlds[0].data.tick, next);
+  } finally { for (const client of clients) client.close(); }
+});
+
 test('半秒结算把接触顺序完整交给页面，包括仍保留的旧配对', async () => {
   const world = new World(start, root, { populate: false, ambient: false });
   for (let i = 0; i < 4; i++) {
