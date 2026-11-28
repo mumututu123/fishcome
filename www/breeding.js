@@ -167,24 +167,37 @@ const contactRosters = new WeakMap();
 function contactRoster(world, groups) {
   const revision = world.originRevision?.(), previous = contactRosters.get(world);
   if (previous && previous.revision === revision && previous.groups === groups) return previous;
-  const males = [], females = new Set();
+  const changed = previous && previous.revision === revision && world.bodyEdits?.(previous.groups, groups);
+  if (changed?.sameOrder) {
+    for (const id of changed.ids) {
+      const before = previous.maleSizes.get(id);
+      if (before === undefined) continue;
+      const size = groups.get(id).length;
+      previous.probeCount += (size - before) * NEIGHBORS.length;
+      previous.maleSizes.set(id, size);
+    }
+    previous.groups = groups;
+    return previous;
+  }
+  const males = [], females = new Set(), maleSizes = new Map();
   let ambiguousIds = false, probeCount = 0;
   for (const [id, cells] of groups) {
     const fish = world.readFish(id);
     if (!fish) continue;
     if (typeof id !== 'string' || id.includes('|')) ambiguousIds = true;
     const gender = fishOrigin(world.data, id)?.gender;
-    if (gender === 'male') { males.push(fish); probeCount += cells.length * NEIGHBORS.length; }
+    if (gender === 'male') { males.push(fish); maleSizes.set(id, cells.length); probeCount += cells.length * NEIGHBORS.length; }
     if (gender === 'female') females.add(id);
   }
-  const roster = { revision, groups, males, females, probeCount, ambiguousIds };
+  const roster = { revision, groups, males, females, maleSizes, probeCount, ambiguousIds };
   if (revision !== undefined) contactRosters.set(world, roster);
   return roster;
 }
 export function updateContacts(world, now, groups, scenery, captured = capturedFishIds(world.data, now), occupancy) {
   world.data.contacts ||= {}; world.data.breeding ||= {};
   const taken = new Set(activeRecords(world.data).flatMap(record => [record.male, record.female]));
-  const roster = contactRoster(world, groups), { males, females, ambiguousIds } = roster, pairs = new Map();
+  const roster = contactRoster(world, groups);
+  const { males, females, ambiguousIds } = roster, pairs = new Map();
   let density;
   if (males.length && females.size) occupancy ||= world.movementGrid(groups);
   const scanned = !ambiguousIds && collectGridPairs(world, occupancy, scenery, roster, taken, captured, pairs);

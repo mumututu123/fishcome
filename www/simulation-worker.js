@@ -26,6 +26,7 @@ function trackWorld(source) {
   const bondTimes = new WeakMap();
   let characters, ecology, membership, meals, previousBonds, activeBonds, publishedBonds, orderedBonds = false;
   let fishRoster, previousStories, poseRevision = 0, originRevision = 0;
+  const mealEdits = new Set();
   const characterViews = new Map();
   const activeKinds = ['food', 'seaweed', 'scene'];
   const activeKey = JSON.stringify(activeKinds);
@@ -86,8 +87,8 @@ function trackWorld(source) {
         meals.pastMeals.add(diner);
         if (source.chars[parent.id]?.wild) meals.pastGrass.add(diner);
         if (Number.isFinite(t) && t > (meals.latestMeals.get(diner) ?? -Infinity)) {
-          meals = { ...meals, latestMeals: new Map(meals.latestMeals).set(diner, t) };
-          ecology = undefined;
+          meals.latestMeals.set(diner, t);
+          mealEdits.add(diner);
         }
       } else if (changesMeal) meals = ecology = undefined;
       return;
@@ -158,8 +159,9 @@ function trackWorld(source) {
         field === 'breeding' && (key === 'baby' || key === 'gender' || key === 'status' ||
           parent.table && (target[key]?.status === 'born' || value?.status === 'born'))) originRevision++;
     if (parent.root && (key === 'fishes' || key === 'travel') ||
-        field === 'fishes' && (parent.table || !property && (key === 'id' || key === 'created' || key === 'lastFed' || key === 'lastMealAt')) ||
+        field === 'fishes' && (parent.table || !property && (key === 'id' || key === 'created')) ||
         field === 'travel' && parent.table && !value) fishRoster = undefined;
+    if (field === 'fishes' && !parent.table && !property && (key === 'lastFed' || key === 'lastMealAt')) mealEdits.add(id);
     if (parent.root && key === 'travel') daysByOrdinal.fill(undefined);
     else if (field === 'travel' && (parent.table || !property && key === 'days')) {
       const ordinal = knownFish.get(parent.table ? key : id);
@@ -421,6 +423,7 @@ function trackWorld(source) {
     readFish: id => raw(source.fishes[id]),
     readContacts: () => raw(source.contacts),
     fishValues: () => fishRoster ??= Object.values(raw(source.fishes)),
+    mealEdits,
     originRevision: () => originRevision,
     invalidateOrigins: () => { originRevision++; },
     // Swimming owns these six scalar fields until the ordered movement pass
@@ -529,12 +532,16 @@ export class WorkerSimulation {
       this.world.poseRevision = this.tracker.poseRevision;
       this.world.originRevision = this.tracker.originRevision;
       this.world.stableFishRoster = this.tracker.fishValues;
+      this.world.mealEdits = this.tracker.mealEdits;
       this.world.readFish = this.tracker.readFish;
       this.world.readContacts = this.tracker.readContacts;
       let layout;
       this.world.bodyLayout = groups => {
-        if (layout?.groups !== groups) layout = layout
-          ? layout.updated(groups, this.tracker.bodyEdits(layout.groups, groups)) : new BodyLayout(groups);
+        if (layout?.groups !== groups) {
+          const previous = layout;
+          const change = previous && this.tracker.bodyEdits(previous.groups, groups);
+          layout = previous ? previous.updated(groups, change?.ids, change?.sameOrder) : new BodyLayout(groups);
+        }
         return layout;
       };
       this.world.bodyEdits = this.tracker.bodyEdits;

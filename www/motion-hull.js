@@ -7,12 +7,21 @@ export class BodyLayout {
     this.geometries = geometries;
   }
   get ordered() {
+    if (!this.byId && this.priorOrder) {
+      this.byId = this.priorOrder.map(([id]) => [id, this.groups.get(id)]);
+      this.priorOrder = undefined;
+    }
     return this.byId ??= [...this.groups].sort(([a], [b]) => a.localeCompare(b));
   }
-  updated(groups, changed) {
+  updated(groups, changed, sameOrder) {
     const layout = new BodyLayout(groups, this.hulls, this.geometries);
     if (layout.geometries.size >= layout.geometryLimit) layout.pruneGeometries();
     layout.school = this.school;
+    if (sameOrder) {
+      layout.reshaped = { before: this.groups, ids: changed, checkedContacts: this.checkedContacts };
+      layout.priorOrder = this.byId ?? this.priorOrder;
+      return layout;
+    }
     if (!changed || !this.byId || [...changed].some(id => groups.has(id) && !this.groups.has(id))) return layout;
     // A locale may collate two different legacy names equally. Their tie order
     // follows the first glyph in the table and must be sorted again after edits.

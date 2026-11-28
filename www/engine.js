@@ -361,13 +361,19 @@ export class World {
   }
   applyMealClaims(claims) {
     const roster = this.stableFishRoster?.();
-    if (roster && this.appliedClaims === claims && this.fedRoster === roster) return;
+    const edits = this.mealEdits;
+    const current = roster && this.appliedClaims === claims && this.fedRoster === roster;
+    if (current && !edits?.size) return;
     const archived = this.archives?.summary.lastMeals;
-    for (const fish of roster ?? this.fishValues()) {
+    const apply = fish => {
       const recorded = Math.max(claims.get(fish.id) ?? -Infinity, archived?.get(fish.id) ?? -Infinity);
       const at = lastMealAt(fish, recorded);
       if (at !== undefined && fish.lastMealAt !== at) fish.lastMealAt = at;
-    }
+    };
+    if (current) {
+      for (const id of edits) if (this.data.fishes[id]) apply(this.data.fishes[id]);
+    } else for (const fish of roster ?? this.fishValues()) apply(fish);
+    edits?.clear();
     if (roster) this.appliedClaims = claims;
     this.fedRoster = roster;
   }
@@ -469,7 +475,7 @@ export class World {
     if (cached && cached.groups === groups && cached.version === this.poseRevision()) return cached.grid;
     const layout = this.bodyLayout(groups);
     if (cached && this.poseEdits) {
-      const bodies = this.bodyEdits(cached.groups, groups), poses = this.poseEdits();
+      const bodies = cached.groups === groups ? [] : this.bodyEdits(cached.groups, groups)?.ids, poses = this.poseEdits();
       if (bodies && poses && cached.grid.reconcile(this, layout, bodies, poses)) {
         this.retainMovementGrid(groups, cached.grid);
         return cached.grid;
@@ -729,7 +735,7 @@ export class World {
         slot = hull && !pair && breeding[id]?.status !== 'active' ? swimmer?.slot ?? fishOccupancy.slots.get(id) : undefined;
         const legacy = slot === undefined ? { world: this, id, cells, scenery, foodPositions, turningObstacles, center } : null;
         const visibleBins = hasFood && (!nearFood || swimmer?.slot === undefined || nearFood[swimmer.slot]) ? bins : null;
-        const intended = !visibleBins && freeIntents && swimmer?.intended ||
+        const intended = !visibleBins && freeIntents && now - f.lastFed >= CONFIG.hunger && swimmer?.intended ||
           chooseDirection(this, id, f, cells, pair, center, now, ambient, visibleBins, canEat);
         let dx = intended.dx, dy = intended.dy;
         if (pair) for (const member of pair.members) fishOccupancy.update(member, groups.get(member.id) || [], true);

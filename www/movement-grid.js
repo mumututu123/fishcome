@@ -26,8 +26,22 @@ export class MovementGrid {
   swimmers(world, speed) {
     const roster = world.stableFishRoster?.();
     if (!roster) return this.layout.ordered;
-    if (this.roster !== roster) {
+    const changed = this.layout.reshaped;
+    if (changed && this.roster === roster && this.swimmerGroups === changed.before) {
+      for (const id of changed.ids) {
+        const entry = this.swimmerBodies.get(changed.before.get(id)), cells = this.layout.groups.get(id);
+        this.swimmerBodies.delete(entry[1]);
+        const hull = this.layout.hull(cells);
+        entry[1] = cells;
+        Object.assign(entry[3], { hull, speedX: hull && speed * hull.bounds.width / cells.length,
+          speedY: hull && speed * hull.bounds.height / cells.length });
+        this.swimmerBodies.set(cells, entry);
+      }
+      this.swimmerGroups = this.layout.groups;
+    }
+    if (this.roster !== roster || this.swimmerGroups !== this.layout.groups) {
       this.roster = roster;
+      this.swimmerGroups = this.layout.groups;
       const entries = this.swimmerBodies ??= new WeakMap();
       this.swimmersById = this.layout.ordered.map(([id, cells]) => {
         const fish = world.readFish(id), cached = entries.get(cells);
@@ -122,7 +136,6 @@ export class MovementGrid {
       }
     }
     // Movement order and the adjacent-pair search use the same current body collection.
-    if (this.layout !== layout) this.roster = undefined;
     this.layout = layout;
     for (const id of changed) {
       const fish = world.readFish(id), body = layout.groups.get(id);

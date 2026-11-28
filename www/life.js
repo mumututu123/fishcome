@@ -90,8 +90,26 @@ function indexPoints(points) {
   };
 }
 function schoolGeometry(world, layout, roster) {
-  const points = new Map(), centers = [], ordered = [], ranks = new Map();
   const previous = layout.school, centerByBody = previous?.centerByBody ?? new WeakMap();
+  if (layout.reshaped && previous?.roster === roster && previous.groups === layout.reshaped.before) {
+    for (const id of layout.reshaped.ids) {
+      const point = previous.points.get(id);
+      if (!point) continue;
+      const cells = layout.groups.get(id), box = layout.hull(cells)?.bounds ?? bounds(cells);
+      const center = previous.centers[point.order];
+      point.halfWidth = (box.maxX - box.minX) / 2;
+      point.halfHeight = (box.maxY - box.minY) / 2;
+      center.localX = (box.maxX + box.minX) / 2;
+      center.localY = (box.maxY + box.minY) / 2;
+      centerByBody.delete(layout.reshaped.before.get(id));
+      centerByBody.set(cells, center);
+      // The radius is a search bound. The exact gaps are tested for each fish.
+      previous.maxRadius = Math.max(previous.maxRadius, point.halfWidth, point.halfHeight);
+    }
+    previous.groups = layout.groups;
+    return previous;
+  }
+  const points = new Map(), centers = [], ordered = [], ranks = new Map();
   let subset = !!previous?.orderedPairs, maxRadius = 0, rank = 0;
   for (const [id, cells] of layout.groups) {
     const fish = world.readFish(id);

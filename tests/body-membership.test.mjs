@@ -42,6 +42,33 @@ function open(reference) {
   return worker;
 }
 
+test('连续两步进食保留鱼群顺序，之后的转向、避让和结伴与完整重算一致', () => {
+  const now = Date.UTC(2026, 0, 1);
+  const reference = makeFishWorld(World, 24, 1000, { now, spacingX: 7, mixedGenders: true });
+  for (const fish of Object.values(reference.data.fishes)) {
+    fish.created = fish.lastFed = now - CONFIG.hunger;
+    fish.hungerAt = now + CONFIG.hunger;
+  }
+  const worker = open(reference), roster = worker.world.stableFishRoster();
+  const diners = Object.keys(reference.data.fishes).slice(0, 2);
+  for (let step = 0; step < 14; step++) {
+    const base = reference.data.tick, foods = [], paths = [];
+    if (step === 4 || step === 5) {
+      const fish = reference.data.fishes[diners[step - 4]];
+      const cell = { id: 'meal-' + step, kind: 'food', entity: '', ch: '饵',
+        x: (fish.x + 2 * fish.facing + CONFIG.width) % CONFIG.width, y: fish.y, born: base, fall: 0, path: [] };
+      reference.data.chars[cell.id] = cell;
+      foods.push([cell.id, structuredClone(cell)]);
+    }
+    reference.step(base + CONFIG.step, paths);
+    const reply = worker.receive({ kind: 'step', base, names: [], foods });
+    if (foods.length) assert.equal(reference.data.chars[foods[0][0]].entity, diners[step - 4]);
+    assert.equal(worker.world.stableFishRoster(), roster);
+    assert.deepEqual(reply.patch.swims || [], paths);
+    assert.deepEqual(JSON.parse(JSON.stringify(worker.world.data)), reference.serialize());
+  }
+});
+
 test('进食、饥饿和疾病只撤销变形鱼的画面路径，其余鱼仍逐步游动', () => {
   const now = Date.UTC(2026, 0, 1);
   for (const cause of ['food', 'hunger', 'illness']) {

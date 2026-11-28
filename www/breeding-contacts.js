@@ -1,7 +1,6 @@
 import { WORLD_WIDTH, deltaX, nearX, worldKey } from './geography.js';
 import { contactTime, densityField } from './ecology.js';
 
-const indexedLayouts = new WeakMap();
 const glyphOrders = new WeakMap();
 const namedBodies = new WeakMap();
 
@@ -20,17 +19,20 @@ export function hasNamedGlyphs(cells) {
 }
 
 function gridBodies(layout) {
-  if (!indexedLayouts.has(layout)) {
+  if (layout.checkedContacts === undefined) {
     // Geometric traversal may encounter tied pairs in a different order.
     // Keep the record traversal for identifiers with locale-equivalent spellings.
     let usable = true;
-    for (const [id, cells] of layout.groups) {
+    const changed = layout.reshaped;
+    const ids = changed?.checkedContacts ? changed.ids : layout.groups.keys();
+    for (const id of ids) {
+      const cells = layout.groups.get(id);
       const hull = layout.hull(cells);
       if (!/^[\w:-]+$/.test(id) || !hull || hull.duplicate || !hasNamedGlyphs(cells)) { usable = false; break; }
     }
-    indexedLayouts.set(layout, usable);
+    layout.checkedContacts = usable;
   }
-  return indexedLayouts.get(layout);
+  return layout.checkedContacts;
 }
 
 function glyphOrder(cells, mother) {
