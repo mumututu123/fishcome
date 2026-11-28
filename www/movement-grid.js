@@ -35,7 +35,7 @@ export class MovementGrid {
         const hull = this.layout.hull(cells);
         const entry = [id, cells, null, { fish, ordinal: world.swimOrdinal?.(id), hull, slot: this.slots.get(id),
           speedX: hull && speed * hull.bounds.width / cells.length, speedY: hull && speed * hull.bounds.height / cells.length,
-          intended: undefined }];
+          intended: undefined, avoidanceSeed: undefined }];
         entries.set(cells, entry);
         return entry;
       });

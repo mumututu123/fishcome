@@ -6,7 +6,7 @@ import { SimulationClient, startSimulationClock, subscribeSimulationChanges } fr
 import { WorkerSimulation } from '../www/simulation-worker.js';
 import { expandSimulationPatch } from '../www/simulation-delta.js';
 import { applyBondIntervals } from '../www/bond-interval.js';
-import { lifeContext, updateLife } from '../www/life.js';
+import { LIFE, lifeContext, updateLife } from '../www/life.js';
 import { applyInputRows, setParticipantName, subscribeBeforeSimulationPatch, worldEdited } from '../www/simulation-changes.js';
 import { CONTACT_TIME, updateContacts } from '../www/breeding.js';
 
@@ -569,20 +569,23 @@ test('长时间相处仍逐秒保留旧存档的小数舍入和熟鱼故事，�
 test('游动同一步的进食、消亡和行程修订只交付一次，并保留其余鱼的位置', () => {
   const world = new World(start, root, { populate: false }), worker = new WorkerSimulation();
   const ids = ['gone', 'fed', 'swam'], day = '2025-06-15', now = start + CONFIG.step;
-  for (const id of ids) {
-    world.data.fishes[id] = { id, x: 0, y: 7, facing: 1, cx: 0, cy: 0, posAt: start };
+  for (const [i, id] of ids.entries()) {
+    const facing = id === 'fed' ? -1 : 1, phase = id === 'fed' ? 3 : 2;
+    world.data.fishes[id] = { id, x: 20 * (i + 1), y: 7, facing, cx: 0, cy: 0, posAt: start,
+      created: start - phase * LIFE.wanderPeriod, hungerAt: now + CONFIG.hunger };
     world.data.travel[id] = { since: start, days: { [day]: 3 } };
+    for (let x = 0; x < 2; x++) {
+      const cellId = `${id}:${x}`;
+      world.data.chars[cellId] = { id: cellId, kind: 'fish', entity: id, x, y: 0, ch: '鱼', path: [] };
+    }
   }
   worker.receive({ kind: 'open', values: world.serialize(), tables: [], ambient: false });
   worker.receive({ kind: 'ready' });
   const sea = worker.world;
-  sea.data.tick = now;
-  for (const [i, id] of ids.entries()) {
-    const fish = sea.readFish(id);
-    fish.x = i + 1; fish.posAt = now;
-    sea.journalSwim(sea.swimOrdinal(id), fish);
-    sea.recordMovement(id, 1, now, day, sea.swimOrdinal(id));
-  }
+  const swims = [];
+  sea.step(now, swims);
+  assert.deepEqual(swims[3], ['fed']);
+  assert.deepEqual(swims[5], ['gone', 'swam']);
   delete sea.data.fishes.gone;
   delete sea.data.travel.gone;
   sea.data.fishes.fed.lastFed = now;
@@ -598,4 +601,11 @@ test('游动同一步的进食、消亡和行程修订只交付一次，并保�
   assert.deepEqual(Array.from(patch.tables.travel.distances), [4]);
   assert.equal(patch.tables.travel.set[0], ids.indexOf('swam'));
   assert.equal(expanded.tables.travel.set.find(([id]) => id === 'fed')[1].days[day], 6);
+
+  worker.receive({ kind: 'restore', rows: [['travel', 'swam', { since: start, days: { [day]: 10 } }]] });
+  worker.receive({ kind: 'step', base: now, names: [], foods: [] });
+  assert.equal(sea.data.travel.swam.days[day], 11);
+  sea.data.travel.swam.days = { [day]: 20 };
+  worker.receive({ kind: 'step', base: now + CONFIG.step, names: [], foods: [] });
+  assert.equal(sea.data.travel.swam.days[day], 21);
 });

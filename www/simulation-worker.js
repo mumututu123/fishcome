@@ -17,6 +17,7 @@ const inputFields = new Set(['ops', 'terrain', 'roots', 'participants', 'archive
 // (notably contacts), in which case additions and removals must both be sent.
 function trackWorld(source) {
   const knownFish = new Map(Object.keys(source.fishes).map((id, index) => [id, index]));
+  const daysByOrdinal = new Array(knownFish.size);
   const proxies = new WeakMap(), originals = new WeakMap();
   const values = new Set(), rows = new Map(), lifeFields = new Set(), bondRows = new Map();
   const raw = object => originals.get(object) || object;
@@ -158,6 +159,11 @@ function trackWorld(source) {
     if (parent.root && (key === 'fishes' || key === 'travel') ||
         field === 'fishes' && (parent.table || !property && (key === 'id' || key === 'created' || key === 'lastFed' || key === 'lastMealAt')) ||
         field === 'travel' && parent.table && !value) fishRoster = undefined;
+    if (parent.root && key === 'travel') daysByOrdinal.fill(undefined);
+    else if (field === 'travel' && (parent.table || !property && key === 'days')) {
+      const ordinal = knownFish.get(parent.table ? key : id);
+      if (ordinal !== undefined) daysByOrdinal[ordinal] = undefined;
+    }
     if (parent.root && key === 'fishes') {
       poseRevision++;
       poses = undefined;
@@ -339,21 +345,25 @@ function trackWorld(source) {
   // Ordinary fish publish their motion directly in the wire format. Later
   // feeding, death or repairs can still supersede that row in the same step.
   let swimming;
-  function journalSwim(ordinal, fish) {
-    if (!finitePose(fish)) { movingFish(fish); return; }
-    if (!swimming) {
-      swimming = { motion: new Float64Array(knownFish.size * 5), poses: [], travel: [],
-        poseIndex: new Int32Array(knownFish.size), tripIndex: new Int32Array(knownFish.size) };
+  function readDays(id, ordinal) {
+    const record = raw(source.travel[id]);
+    if (record) return daysByOrdinal[ordinal] = raw(record.days);
+  }
+  function beginSwimBatch() {
+    const count = knownFish.size;
+    return { motion: new Float64Array(count * 5), poses: [], travel: [], distances: new Float64Array(count),
+      poseIndex: new Int32Array(count), tripIndex: new Int32Array(count), daysByOrdinal, readDays };
+  }
+  function completeSwimBatch(frame, day) {
+    if (frame.poses.length) {
       poseRevision++;
       tableChanges('fishes');
     }
-    const frame = swimming, at = frame.poses.length * 5;
-    frame.poseIndex[ordinal] = frame.poses.push(ordinal);
-    frame.motion[at] = fish.x;
-    frame.motion[at + 1] = fish.y;
-    frame.motion[at + 2] = fish.facing;
-    frame.motion[at + 3] = fish.cx;
-    frame.motion[at + 4] = fish.cy;
+    if (frame.travel.length) {
+      frame.day = day;
+      tableChanges('travel');
+    }
+    if (frame.poses.length || frame.travel.length) swimming = frame;
   }
   function frameRows(field, edits) {
     if (!swimming || (field !== 'fishes' && field !== 'travel')) return [];
@@ -414,24 +424,15 @@ function trackWorld(source) {
     // completes. Other writes to the same fish still join the ordinary edit.
     movingFish,
     swimOrdinal: id => knownFish.get(id),
-    journalSwim,
-    recordMovement(id, distance, now, day, ordinal) {
+    beginSwimBatch,
+    completeSwimBatch,
+    recordMovement(id, distance, now, day) {
       if (!Number.isFinite(distance) || distance <= 0 || !source.fishes[id]) return;
       day ??= shanghaiDay(now);
       const table = source.travel, record = raw(table[id]);
       if (!record) { table[id] = { since: now, days: { [day]: distance } }; return; }
       const days = raw(record.days);
       days[day] = (days[day] || 0) + distance;
-      if (swimming && ordinal !== undefined && (swimming.day === undefined || swimming.day === day) && !swimming.tripIndex[ordinal]) {
-        if (!swimming.distances) {
-          tableChanges('travel');
-          swimming.day = day;
-          swimming.distances = new Float64Array(knownFish.size);
-        }
-        swimming.distances[swimming.travel.length] = days[day];
-        swimming.tripIndex[ordinal] = swimming.travel.push(ordinal);
-        return;
-      }
       const edits = tableChanges('travel');
       if (!edits.has(id)) edits.set(id, day);
       else {
@@ -537,7 +538,8 @@ export class WorkerSimulation {
       this.world.clearPoseEdits = this.tracker.clearPoseEdits;
       this.world.movingFish = this.tracker.movingFish;
       this.world.swimOrdinal = this.tracker.swimOrdinal;
-      this.world.journalSwim = this.tracker.journalSwim;
+      this.world.beginSwimBatch = this.tracker.beginSwimBatch;
+      this.world.completeSwimBatch = this.tracker.completeSwimBatch;
       this.world.recordMovement = this.tracker.recordMovement;
     } else if (message.kind === 'restore') {
       this.tracker.invalidateOrigins();
