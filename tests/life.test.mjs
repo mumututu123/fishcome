@@ -40,6 +40,17 @@ function track(w, seconds, start = t) { for (let i = 1; i <= seconds; i++) updat
 function source(w) { return { roots: w.data.roots, ops: w.data.ops, breeding: w.data.breeding }; }
 function weatherTime(w, type) { let now = Math.ceil((t + 180000) / LIFE.weatherPeriod) * LIFE.weatherPeriod; while (weatherAt(w.data, now).type !== type) now += LIFE.weatherPeriod; return now; }
 
+test('繁殖合体的虚拟鱼无需查找整海普通队形，实际游动方向保持一致', () => {
+  const w = world(), at = Math.ceil(t / 60000) * 60000;
+  for (const [index, x] of [10, 18, 26].entries()) fish(w, x, 20, 'school-' + index);
+  const center = { x: 20, y: 23 }, pair = { ...center, id: 'breed:virtual', created: t, facing: 1 };
+  const eager = context(w, at), expected = idleMotion(w, pair, at, eager, center);
+  assert.equal(eager.school.size, 3);
+  const groups = w.fishGroups(), working = lifeContext(w, at, w.sceneryMap(), groups, w.bodyLayout(groups));
+  Object.defineProperty(working, 'school', { get() { throw new Error('虚拟鱼没有普通队形'); } });
+  assert.deepEqual(idleMotion(w, pair, at, working, center), expected);
+});
+
 test('每条鱼的小性格稳定，创建、自然出生标识和旧鱼都有自然描述', () => {
   const w = world(), id = fish(w), saved = w.serialize();
   assert.equal(personality(id), personality(saved.fishes[id].id)); assert(personalityText(id));

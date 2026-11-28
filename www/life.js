@@ -461,13 +461,13 @@ export function idleMotion(world, fish, now, context, center) {
   const life = state(world, now);
   const breeding = world.breedingState(fish.id);
   if (!breeding) { const motion = eventMotion(fish.id, now, context); if (motion) return motion; }
-  const point = context.points.get(fish.id) || center;
+  const body = context.points.get(fish.id), point = body || center;
   // Leave water between bodies before following friends or a school. Center
   // distance alone makes larger fish keep trying to swim into each other.
   const gap = q => Math.max(Math.abs(deltaX(q.x, point.x)) - (point.halfWidth || 0) - (q.halfWidth || 0), Math.abs(q.y - point.y) - (point.halfHeight || 0) - (q.halfHeight || 0));
-  const crowded = !breeding && context.crowdedNeighbor(context.points.get(fish.id));
+  const crowded = !breeding && context.crowdedNeighbor(body);
   if (crowded) return { dx: Math.sign(deltaX(point.x, crowded.x)), dy: Math.sign(point.y - crowded.y) };
-  const school = context.school.get(fish.id); if (school) return school;
+  const school = body && context.school.get(fish.id); if (school) return school;
   let neighbors;
   if (now % 180000 < 45000) for (const q of neighbors = context.neighbors.get(fish.id) || []) {
     const pair = fish.id < q.id ? fish.id + '|' + q.id : q.id + '|' + fish.id;
