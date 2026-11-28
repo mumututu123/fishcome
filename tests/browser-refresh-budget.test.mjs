@@ -17,12 +17,16 @@ test('从实际呈现的同一鱼元坐标核实游动，切换可见鱼元不�
       { name: 'AnimationFrame::Presentation', ts: at + 4, args: { id } }
     ].map(event => ({ ...event, pid: 1, tid: 2 }));
   });
-  // One frame has a different page-clock origin. A median would hide it.
+  // A scheduling delay inside the mark widens just that observation.
+  frames[2].beforeMark = frames[2].at;
   frames[2].at += 2;
+  frames[2].afterMark = frames[2].at;
   const { rows, moving, clockOffsets } = readPresentations(events, { frames, page: 'A' }, 0, 40);
-  assert.ok(Math.abs(clockOffsets[1] - clockOffsets[0] - 2) < 1e-6);
+  assert.ok(clockOffsets[0] < 0 && clockOffsets[1] > 0 && clockOffsets[1] - clockOffsets[0] <= .201);
   assert.equal(rows.length, 4);
   assert.deepEqual(moving.map(frame => frame.sequence), [3]);
+  frames[2].beforeMark = frames[2].at;
+  assert.equal(readPresentations(events, { frames, page: 'A' }, 0, 40).clockOffsets, undefined);
 });
 
 test('按海洋的半秒时钟计数，采样首尾从未请求的步也算缺失', () => {

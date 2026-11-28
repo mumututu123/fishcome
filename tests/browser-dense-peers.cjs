@@ -16,7 +16,7 @@ const { positionals, values } = parseArgs({ allowPositionals: true, options: {
   backup: { type: 'string' }, trace: { type: 'string' }, report: { type: 'string' }, 'refresh-budget': { type: 'boolean' },
   'archive-rounds': { type: 'string', default: '0' }, 'plain-live': { type: 'string' },
   'forget-live-base': { type: 'boolean' }, 'switch-leader': { type: 'boolean' }, 'rebuild-viewport': { type: 'boolean' },
-  'step-boundaries-only': { type: 'boolean' }
+  'step-boundaries-only': { type: 'boolean' }, 'world-start': { type: 'string' }
 } });
 if (values.help) {
   console.log('用法：node tests/browser-dense-peers.cjs [鱼数] [--seconds=35] [--full-updates=0|1] [--drop] [--profile=跟随端.cpuprofile]');
@@ -28,9 +28,22 @@ if (values.help) {
   console.log('--plain-live=A|B|both 模拟不支持紧凑发送的端；--forget-live-base 模拟跟随端遗失上一版本；--switch-leader 在观测后切换协调端。');
   console.log('--rebuild-viewport 用接收端旧的整表画面索引方式对照。');
   console.log('--step-boundaries-only 关闭各阶段的细分计时，保留请求、提交和呈现时间，用于对照观测开销。');
+  console.log('--world-start=含时区的日期 用同一存档复现指定的游戏时刻，浏览器动画、网络和性能计时照常运行。');
   process.exit(0);
 }
 const backup = values.backup && JSON.parse(readFileSync(values.backup, 'utf8'));
+const worldStart = values['world-start'] && Date.parse(values['world-start']);
+assert(worldStart === undefined || backup && Number.isFinite(worldStart) && /(?:Z|[+-]\d{2}:\d{2})$/i.test(values['world-start']),
+  '复现游戏时刻需要真实存档和含时区的日期');
+let clockShift = 0;
+const observationNow = () => Date.now() + clockShift;
+function shiftGameClock(offset) {
+  const systemNow = Date.now;
+  Date.now = () => systemNow() + offset;
+  // Keep epoch-based probe timestamps comparable across the two processes.
+  // Timers, animation frames, performance.now() and trace ticks run in real time.
+  Object.defineProperty(performance, 'timeOrigin', { value: performance.timeOrigin + offset });
+}
 const count = backup ? Object.keys(backup.world.fishes).length : Number(positionals[0] || 120);
 const seconds = Number(values.seconds);
 const expectedFull = values['full-updates'] === undefined ? undefined : Number(values['full-updates']);
@@ -327,6 +340,7 @@ async function withLaunchers(run) {
 }
 async function openPage(browser, origin, options, assets) {
   const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  if (clockShift) await context.addInitScript(shiftGameClock, clockShift);
   await context.addInitScript(({ label, stepBoundariesOnly }) => {
     window.densePage = label;
     window.densePhases = []; window.denseLongTasks = []; window.denseReplicaFailures = []; window.denseLiveTransfers = [];
@@ -357,6 +371,7 @@ async function openPage(browser, origin, options, assets) {
       if (pathname === '/simulation-changes.js') return route.fulfill({ contentType: 'text/javascript', body: readFileSync(file, 'utf8') + observeCommit });
       if (pathname === '/simulation-worker.js') return route.fulfill({
         contentType: 'text/javascript', body: readFileSync(file, 'utf8') + `
+${clockShift ? "if (typeof document === 'undefined') (" + shiftGameClock.toString() + ")(" + clockShift + ");" : ''}
 const timedStep = World.prototype.step;
 const timedReceive = WorkerSimulation.prototype.receive;
 let ruleTime;
@@ -446,10 +461,11 @@ function assertProgress(result, elapsed, label) {
 
 async function main([urlA, urlB], assets) {
   for (const _ of [urlA, urlB]) browsers.push(await chromium.launch({ headless: true }));
+  if (worldStart !== undefined) clockShift = worldStart - Date.now();
   const [a, b] = await Promise.all([openPage(browsers[0], urlA, 'A', assets), openPage(browsers[1], urlB, 'B', assets)]);
   const fixture = backup ? await seedBackup([a, b]) : await seedSynthetic(a, b);
   console.log(`fixture ready ${count}`);
-  const began = Date.now();
+  const began = observationNow();
   const cold = await Promise.all([[a, urlA], [b, urlB]].map(async ([page, url]) => {
     await page.goto(url + '/');
     if (!backup && count < 200) {
@@ -457,23 +473,23 @@ async function main([urlA, urlB], assets) {
       await page.evaluate(() => denseFrameSampleFish());
     }
     await page.waitForFunction(() => window.tide && denseSurvey().frames.some(frame => frame.visible > 0), null, { polling: 50, timeout: 60000 });
-    return Date.now() - began;
+    return observationNow() - began;
   }));
   console.log(`app ready ${cold.join(', ')}`);
   await b.locator('#connect').click();
   await b.locator('#peerUrl').fill(urlA);
-  const joining = Date.now();
+  const joining = observationNow();
   await b.locator('#connectionForm .primary').click();
   await Promise.all([a, b].map(page => page.waitForFunction(({ count, real }) => {
     const event = denseSurvey();
     return event.peers > 0 && (real ? event.fish > 0 : event.fish === count) &&
       event.receives.some(message => message.kind === 'hello' && !message.failed);
   }, { count, real: Boolean(backup) }, { polling: 100, timeout: count < 200 ? 20000 : 95000 })));
-  const joined = Date.now();
+  const joined = observationNow();
   await Promise.all([a, b].map(page => page.waitForFunction(() => denseJoinSettled(), null, { polling: 125, timeout: 45000 })));
   const stopTrace = values.trace && await Promise.all(browsers.map(browser => startTrace(browser, values['step-boundaries-only'])));
   if (stopTrace) await pause(300);
-  const recent = Date.now();
+  const recent = observationNow();
   await survey({ a, b, fixture, cold, joining, joined, recent, stopTrace, browserVersion: browsers[0].version() });
 }
 
@@ -560,7 +576,7 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
     profiler = await followerPage.context().newCDPSession(followerPage);
     await profiler.send('Profiler.enable');
     await profiler.send('Profiler.start');
-    profileStartedAt = Date.now();
+    profileStartedAt = observationNow();
   }
   let dropTimer;
   if (values.drop && !archiveRounds) dropTimer = setTimeout(() => (firstLeads ? a : b).evaluate(() => { window.denseDropNext = true; }).catch(() => {}), 2500);
@@ -570,7 +586,7 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
   const archiveResult = archiveRun.then(rounds => ({ rounds }), error => ({ error: error.message }));
   try { await pause(seconds * 1000); }
   finally { clearTimeout(dropTimer); }
-  const ended = Date.now(), sampled = event => event.at >= recent && event.at <= ended;
+  const ended = observationNow(), sampled = event => event.at >= recent && event.at <= ended;
   await Promise.all([a, b].map(page => page.waitForFunction(end => denseSurvey().frames.at(-1)?.at >= end, ended, { polling: 50, timeout: 10000 })));
   if (stopTrace) await pause(step);
   const traces = stopTrace && await Promise.all(stopTrace.map((stop, i) => {
@@ -689,7 +705,7 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
   const replicaRows = Object.fromEntries(['fishes', 'chars', 'breeding', 'contacts', 'travel', 'ops', 'scenes']
     .map(field => [field, stats(received.flatMap(row => row.rows ? [row.rows[field]] : []))]));
   const report = JSON.stringify({ count, realBackup: Boolean(backup), browserVersion, cold, joinedMs: joined - joining, settledMs: recent - joining, steadyMs: ended - recent,
-    saved, liveWire, browserProcesses: browsers.length, traceClockSkewMs,
+    saved, liveWire, browserProcesses: browsers.length, traceClockSkewMs, worldStart,
     bundledArchives: new Set(follower.receives.filter(sampled).flatMap(row => row.bundled || [])).size,
     separateArchiveMessages: follower.receives.filter(row => sampled(row) && row.kind === 'archiveChunk').length,
     ...(switched ? { switched } : {}),
@@ -762,19 +778,19 @@ async function switchLeader(pages, oldLeader, newLeader) {
 
 async function runArchiveRounds(count, leader, follower, known) {
   const written = new Set(known), rounds = [];
-  const start = Date.now();
+  const start = observationNow();
   for (let i = 0; i < count; i++) {
     // Exercise a burst of adjacent archives, then repeat during the following
     // part of the run so later saves and heartbeats overlap archive traffic too.
     const group = Math.floor(i / 3), groups = Math.ceil(count / 3);
     const due = start + seconds * 1000 * group / groups + 1000 * (i % 3 + 1);
-    await pause(Math.max(0, due - Date.now()));
+    await pause(Math.max(0, due - observationNow()));
     const round = await leader.evaluate(([serial, dropStep]) => denseArchiveRound(serial, dropStep),
       [100000 + i, values.drop && i === Math.min(1, count - 1)]);
     assert(!written.has(round.id), '本轮归档重复使用了旧包');
     written.add(round.id);
     await follower.waitForFunction(id => denseHasArchive(id), round.id, { polling: 100, timeout: 12000 });
-    rounds.push({ ...round, deliveredAt: Date.now() });
+    rounds.push({ ...round, deliveredAt: observationNow() });
   }
   return rounds;
 }

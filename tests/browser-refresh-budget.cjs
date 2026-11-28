@@ -6,7 +6,9 @@ function recordDraw(renderer, frames, page, trace) {
   renderer.draw = (...args) => {
     const sequence = frames.length;
     const prefix = `tide.refresh.${page}.${sequence}`;
-    const start = trace ? performance.mark(prefix + '.start').startTime : performance.now();
+    const beforeMark = performance.now();
+    const start = trace ? performance.mark(prefix + '.start').startTime : beforeMark;
+    const afterMark = trace && performance.now();
     draw(...args);
     const drawMs = performance.now() - start;
     if (trace) {
@@ -23,6 +25,7 @@ function recordDraw(renderer, frames, page, trace) {
       poses.push(cells[i + 2].id, x, y);
     }
     frames.push({ sequence, at: performance.timeOrigin + start, draw: drawMs,
+      ...(trace && { beforeMark: performance.timeOrigin + beforeMark, afterMark: performance.timeOrigin + afterMark }),
       tick: args[0].data.tick, visible: cells.length / 3, poses });
   };
 }
@@ -74,14 +77,16 @@ function readPresentations(events, page, start, end) {
     }
   }
   const drawn = [];
-  let minClockOffset = Infinity, maxClockOffset = -Infinity;
+  let minClockOffset = -Infinity, maxClockOffset = Infinity;
   const displayed = new Map();
   for (const frame of page.frames) {
     const mark = startMarks.get(frame.sequence);
     if (!mark?.endTs) continue;
-    const offset = frame.at - mark.ts / 1000;
-    minClockOffset = Math.min(minClockOffset, offset);
-    maxClockOffset = Math.max(maxClockOffset, offset);
+    // The thread can be suspended inside performance.mark(). Its trace timestamp
+    // lies between these two readings. Intersect every observation, allowing
+    // 0.1 ms on either side for Chromium's non-isolated performance clock.
+    minClockOffset = Math.max(minClockOffset, (frame.beforeMark ?? frame.at) - mark.ts / 1000 - .1);
+    maxClockOffset = Math.min(maxClockOffset, (frame.afterMark ?? frame.at) - mark.ts / 1000 + .1);
     const drawCpu = (mark.endTts - mark.tts) / 1000;
     if (Number.isFinite(drawCpu)) drawn.push({ at: frame.at, drawCpu });
     const presented = presentation.get(mark.frame);
@@ -125,7 +130,7 @@ function readPresentations(events, page, start, end) {
   // Both independent browser processes run on the same machine. Check the
   // mapping from trace ticks to the page clock before comparing their events.
   return { drawn, rows, moving, longestGaps,
-    clockOffsets: Number.isFinite(minClockOffset) ? [minClockOffset, maxClockOffset] : undefined };
+    clockOffsets: Number.isFinite(minClockOffset) && minClockOffset <= maxClockOffset ? [minClockOffset, maxClockOffset] : undefined };
 }
 
 function distribution(values) {
