@@ -192,7 +192,8 @@ function groupFishCell(groups, cell) {
   if (body) body.push(cell); else groups.set(cell.entity, [cell]);
 }
 const replicaCellIndexes = new WeakMap();
-subscribeSimulationChanges((world, patch) => {
+subscribeSimulationChanges((world, patch, origin) => {
+  if (!patch && origin === 'archive') return;
   if (!patch || patch.tables?.chars || patch.tables?.breeding || patch.values?.tick !== undefined) replicaCellIndexes.delete(world);
 });
 function indexReplicaCells(world, changedChars) {
@@ -909,7 +910,7 @@ export class World {
       alternatives[id] = winner === previous ? other.breeding[id] : previous;
     }
     const reconcilePath = competingBirths.size ? cell => canonicalBirthPath(cell, birthRecords, alternatives) : cell => cell;
-    if (cellIndex && (cellIndex.table !== this.data.chars || cellIndex.tick !== this.data.tick || cellIndex.archiveRevision !== this.archives?.revision ||
+    if (cellIndex && (cellIndex.table !== this.data.chars || cellIndex.tick !== this.data.tick || cellIndex.mealRevision !== this.archives?.mealRevision ||
         Object.values(other.breeding || {}).some(record => record.status === 'born') ||
         Object.values(archived.breeding || {}).some(record => record.status === 'born'))) cellIndex = undefined;
     for (const [id, c] of Object.entries(other.chars)) {
@@ -1002,7 +1003,7 @@ export class World {
     if (origin === 'replica' && !localChatSources.size && beforePopulation === this.foodRevision) {
       cellIndex.table = this.data.chars;
       cellIndex.tick = this.data.tick;
-      cellIndex.archiveRevision = this.archives?.revision;
+      cellIndex.mealRevision = this.archives?.mealRevision;
       replicaCellIndexes.set(this, cellIndex);
     }
     if (changes && beforePopulation === this.foodRevision) changes.chars = changedChars;

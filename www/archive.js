@@ -194,6 +194,7 @@ export function mergeArchiveRecord(field, old, record, chooseChar) {
   return (record.posAt || 0) > (old.posAt || 0) || record.posAt === old.posAt && json(record).localeCompare(json(old)) > 0 ? record : old;
 }
 export class ArchiveStore {
+  mealRevision = 0;
   constructor({ load } = {}) { this.load = load; this.packs = new Map(); this.manifests = {}; this.rootsByChunk = new Map(); this.ids = Object.fromEntries(ARCHIVE_FIELDS.map(f => [f, new Map()])); this.cache = new Map(); this.bigCache = new Map(); this.overrides = Object.fromEntries(ARCHIVE_FIELDS.map(f => [f, {}])); this.summary = { ops: {}, ledger: {}, serials: {}, catalog: {}, lastMeals: new Map(), grassMeals: new Set(), mealSources: new Map() }; }
   async ingest(chunk, chooseChar, mealTargets) {
     if (this.manifests[chunk.manifest.id]) return;
@@ -218,6 +219,7 @@ export class ArchiveStore {
   setMealSource(id, cell, mealTargets) {
     const sources = this.summary.mealSources;
     const events = cell.path.filter(e => e.reason === 'eat').map(({ target, t }) => ({ target, t }));
+    if (events.length || sources.get(id)?.events.length) this.mealRevision++;
     if (mealTargets) {
       for (const event of sources.get(id)?.events || []) mealTargets.add(event.target);
       for (const event of events) mealTargets.add(event.target);

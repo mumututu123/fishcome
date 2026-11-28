@@ -163,6 +163,7 @@ test('连续合并复用已统计的鱼元，失败的合并会在下一次存�
     world.data.tick = CONFIG.foodLife + 1;
     world.data.chars.b = { kind: 'burn' };
   });
+  pictures.changed(world, null, 'archive');
   const expected = { fish: 1, scene: 1, food: 0, characters: 1 };
   assert.deepEqual(pictures.recent().counts, expected);
   assert.deepEqual(pictures.atCut(await pictures.prepare()).counts, expected);

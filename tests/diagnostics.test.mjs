@@ -307,6 +307,20 @@ test('共享诊断摘要只含统计，不携带聊天、邀请码、身份或�
   assert.deepEqual(diagnosticSummary({ state: 'archive_missing', verifyError: privateText }, []).scan, { state: 'archive_missing' });
 });
 
+test('只有签名操作的归档不遍历活鱼和鱼元，随包世界仍按已验证的操作核对', async () => {
+  const { data, maleId } = await signedFamily();
+  const records = Object.fromEntries(ARCHIVE_FIELDS.map(field => [field, {}]));
+  records.ops[maleId] = data.ops[maleId];
+  const chunk = await encodeArchive(records, data.roots);
+  const incoming = { roots: data.roots, archives: { ...data.archives, chunks: { [chunk.manifest.id]: chunk.manifest } } };
+  const current = { ...data, ops: {}, fishes: new Proxy(data.fishes, { ownKeys: () => assert.fail('归档遍历了活鱼') }),
+    chars: new Proxy(data.chars, { ownKeys: () => assert.fail('归档遍历了鱼元') }) };
+  let verified = false;
+  await loadReplicaArchives(incoming, new ArchiveStore(), () => chunk.encoded, { current,
+    beforeIngest(prior) { assert.deepEqual(prior.ops[maleId], records.ops[maleId]); verified = true; } });
+  assert.equal(verified, true);
+});
+
 test('归档中的鱼依赖热存档的凭据，独立导入时只能使用本份备份', async () => {
   const { data, maleId } = await signedFamily();
   const records = Object.fromEntries(ARCHIVE_FIELDS.map(field => [field, {}]));

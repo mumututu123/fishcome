@@ -164,8 +164,17 @@ export async function loadReplicaArchives(data, target, load, { current = {}, pe
   }
   await assembleFragments(chunks, data.archives, async id => ({ manifest: target.manifests[id], raw: await target.raw(id) }));
   const pool = Object.fromEntries(ARCHIVE_FIELDS.map(f => [f, {}])); for (const chunk of chunks) for (const field of ARCHIVE_FIELDS) Object.assign(pool[field], (chunk.logical || chunk.raw.records)[field]);
-  const prior = await target.dependencies({ ...data, ...Object.fromEntries(ARCHIVE_FIELDS.map(f => [f, { ...data[f], ...pool[f] }])) }, current);
-  const sources = Object.fromEntries(ARCHIVE_FIELDS.map(f => [f, { ...prior[f], ...current[f], ...pool[f], ...data[f] }]));
+  // The received world already owns its tables. Only a table with additional
+  // archived records needs an overlay for dependency discovery.
+  const incoming = { ...data };
+  const fields = ARCHIVE_FIELDS.filter(field => Object.keys(pool[field]).length);
+  for (const field of fields) incoming[field] = { ...data[field], ...pool[field] };
+  const prior = await target.dependencies(incoming, current);
+  // Signed operations are verified from their envelope and roots. The world
+  // that accompanies them is verified separately below against the merged
+  // archive. Its live fish and glyphs are not dependencies of the operations.
+  const sources = fields.some(field => field !== 'ops') ?
+    Object.fromEntries(ARCHIVE_FIELDS.map(f => [f, { ...prior[f], ...current[f], ...pool[f], ...data[f] }])) : {};
   await verifyArchivedOps({ ...pool.ops, ...data.ops }, { ...current.roots, ...data.roots }, data.roots);
   verifyArchiveBirthSources(chunks, sources);
   // Records in this batch become trusted only after their own signatures have passed.

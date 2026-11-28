@@ -4,8 +4,8 @@ import './browser-byte-arrays.mjs';
 import { changesSince, coalesceWorld, fitsLegacyEnvelope, PAGE_UNITS, replicaPages, ReplicaReader, ReplicaTransfers } from '../www/replica-stream.js';
 import { committedStepFields, decodeReplicaRowDelta, encodeReplicaRowDelta, replicaRowBase } from '../www/replica-row-delta.js';
 import { mergeBreeding } from '../www/breeding.js';
-import { ArchiveStore } from '../www/archive.js';
-import { applyInputRows, simulationApplied } from '../www/simulation-changes.js';
+import { ARCHIVE_FIELDS, ArchiveStore } from '../www/archive.js';
+import { applyInputRows, simulationApplied, worldEdited } from '../www/simulation-changes.js';
 import { ReplicaInventory, ReplicaRecovery, ReplicaSwims, WorldBroadcast } from '../www/world-broadcast.js';
 
 test('心跳按已知记录并集修复，允许在途记录先到达，搬入归档不会触发全海重传', () => {
@@ -224,11 +224,17 @@ test('连续合流跳过未变的鱼元归属，仍与完整合流同样处理�
   merge({ loose: meal });
   assert.equal(live.data.fishes[fish].lastFed, meal.path[0].t);
   const archivedMealAt = tick + 100;
-  for (const world of [full, live]) {
-    world.archives.summary.lastMeals.set(fish, archivedMealAt);
-    world.archives.revision = 1;
+  function ingest(id, rows) {
+    const records = Object.assign(Object.fromEntries(ARCHIVE_FIELDS.map(field => [field, {}])), rows);
+    for (const world of [full, live]) {
+      world.archives.addVerified({ manifest: { id }, encoded: '', raw: { records, roots: world.data.roots } });
+      worldEdited(world, 'archive');
+    }
   }
-  merge();
+  ingest('income', { ops: { income: { kind: 'earn', id: 'income', actor: fish, serial: 1 } } });
+  assert.equal(merge(), 0);
+  ingest('feeding', { chars: { food: { path: [{ reason: 'eat', target: fish, t: archivedMealAt }] } } });
+  assert.equal(merge(), 1);
   assert.equal(live.data.fishes[fish].lastFed, archivedMealAt);
   for (const world of [full, live]) {
     applyInputRows(world, [['chars', 'loose', { ...loose }]]);

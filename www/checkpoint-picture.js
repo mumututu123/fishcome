@@ -90,6 +90,7 @@ export class CheckpointPictures {
   changed(world, patch, source, merge) {
     if (this.state?.world !== world) return;
     if (!patch) {
+      if (source === 'archive') return;
       if (source === 'replica') {
         this.state.pendingMerge = this.state.recount ? undefined : merge;
         this.state.recount = true;
