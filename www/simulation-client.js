@@ -131,10 +131,10 @@ export class SimulationClient {
     this.pending = null;
     pending?.resolve(null);
   }
-  request(message, transfer) {
+  request(message) {
     return new Promise((resolve, reject) => {
       this.pending = { resolve, reject };
-      this.worker.postMessage(message, transfer);
+      this.worker.postMessage(message, message.renderPort ? [message.renderPort] : undefined);
     });
   }
   atStepBoundary(commit) {
@@ -327,7 +327,7 @@ export class SimulationClient {
     if (display) message.renderPort = display.port;
     let result;
     try {
-      result = await this.request(message, display ? [display.port] : undefined);
+      result = await this.request(message);
       if (!result || !valid()) { this.close(); return null; }
       if (!this.foods.size) {
         if (result.renderCut) result.display = display;
