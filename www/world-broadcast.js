@@ -1,7 +1,7 @@
 import { breedingForBroadcast, stopBreedingBroadcast } from './breeding.js';
 import { replicaRowEquality } from './replica-stream.js';
 import { committedStepFields, DailyDistance, FishPoseFrame, travelRow } from './replica-row-delta.js';
-import { applyBondIntervals } from './bond-interval.js';
+import { BondFrame } from './bond-interval.js';
 import { applyStoryChanges } from './simulation-delta.js';
 import { CONFIG, detachReplicaRows } from './engine.js';
 import { deltaX } from './geography.js';
@@ -25,7 +25,8 @@ function fullRows(data) { return Object.fromEntries(rowFields.map(field => [fiel
 
 function baseline(world, at) {
   return { rows: Object.fromEntries(rowFields.map(field => [field, new Map(Object.entries(world[field] || {}))])),
-    fishes: world.fishes, life: world.life, roots: world.roots, terrain: world.terrain, fullAt: at, tick: world.tick };
+    fishes: world.fishes, life: world.life, bondFrame: committedStepFields.get(world)?.bondFrame,
+    roots: world.roots, terrain: world.terrain, fullAt: at, tick: world.tick };
 }
 
 function changedRows(data, base, pending) {
@@ -130,17 +131,18 @@ function captureStep(data, base, patch, breeding, pending) {
     detached[field] = rows[field];
   }
   if (!base.life || Object.hasOwn(worker.values, 'life')) detached.life = structuredClone(data.life);
-  else if (!worker.life) detached.life = base.life;
+  else if (!worker.life) { detached.life = base.life; source.bondFrame = base.bondFrame; }
   else {
     const { properties: [properties, remove], stories, bonds } = worker.life;
-    const life = { ...base.life, ...structuredClone(properties) };
+    const life = Object.defineProperties({}, Object.getOwnPropertyDescriptors(base.life));
+    Object.defineProperties(life, Object.getOwnPropertyDescriptors(structuredClone(properties)));
     for (const key of remove || []) delete life[key];
     if (stories) life.stories = applyStoryChanges(base.life.stories, stories, true);
     if (bonds?.intervals) {
-      // Both cuts use the same order as the committed worker. Keep the
-      // operation alongside its result for peers that confirmed this cut.
-      source.bonds = { prior: base.life.bonds, changes: bonds };
-      life.bonds = applyBondIntervals(base.life.bonds, bonds);
+      const prior = base.bondFrame ?? base.life.bonds;
+      const frame = source.bondFrame = new BondFrame(prior, bonds);
+      source.bonds = { prior, changes: bonds };
+      Object.defineProperty(life, 'bonds', { enumerable: true, configurable: true, get: () => frame.table() });
     } else if (bonds) {
       const keys = bonds.keys;
       const table = keys || bonds.ordered ? {} : { ...base.life.bonds };
@@ -151,7 +153,9 @@ function captureStep(data, base, patch, breeding, pending) {
           table[key] = Number.isNaN(bonds.counters[i * 2]) ? structuredClone(value) : { ...value };
         }
       } else for (const [key] of bonds.set) table[key] = structuredClone(data.life.bonds[key]);
-      life.bonds = table;
+      Object.defineProperty(life, 'bonds', { value: table, writable: true, enumerable: true, configurable: true });
+    } else if (!Object.hasOwn(properties, 'bonds') && !remove?.includes('bonds')) {
+      source.bondFrame = base.bondFrame;
     }
     detached.life = life;
   }
@@ -436,6 +440,7 @@ export class WorldBroadcast {
         if (directions?.length && world.tick === previous.tick + CONFIG.step) swims = encodeSwims(poses ? poses.indices.keys() : Object.keys(world.fishes), directions);
         previous.tick = world.tick;
         previous.life = world.life;
+        previous.bondFrame = committedStepFields.get(world)?.bondFrame;
         previous.poseFrame = poses;
         previous.fishes = poses ? poses.token : world.fishes;
         previous.roots = world.roots;

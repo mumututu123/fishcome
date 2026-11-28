@@ -1,6 +1,6 @@
 import { CONFIG } from './engine.js';
 import { shanghaiDay } from './fish-status.js';
-import { applyBondIntervals } from './bond-interval.js';
+import { applyBondIntervals, BondFrame } from './bond-interval.js';
 
 const fields = [['fishes'], ['chars'], ['travel'], ['life', 'bonds'], ['life', 'stories'], ['life', 'events']];
 const poseFields = ['x', 'y', 'facing', 'cx', 'cy'];
@@ -169,13 +169,19 @@ export class FishPoseFrame {
 }
 
 export function replicaRowBase(id, world, frames = false, previous) {
-  const source = frames && committedStepFields.get(world), poses = source?.poses, trips = source?.trips;
-  const tables = fields.map(([field, table], i) => !i && poses ? poses.token : i === 2 && trips ? trips : table ? world[field]?.[table] : world[field]);
+  const source = frames && committedStepFields.get(world), poses = source?.poses, trips = source?.trips, bonds = source?.bondFrame;
+  const tables = fields.map(([field, table], i) => {
+    if (i === 0 && poses) return poses.token;
+    if (i === 2 && trips) return trips;
+    if (i === 3 && bonds) return bonds;
+    return table ? world[field]?.[table] : world[field];
+  });
   if (!frames) return { id, tick: world.tick, rows: tables.map(table => Object.entries(table || {})) };
   const rows = [];
   for (let i = 0; i < tables.length; i++) {
     let entries;
-    Object.defineProperty(rows, i, { get: () => entries ??= Object.entries((!i && poses ? poses.table() : i === 2 && trips ? world.travel : tables[i]) || {}) });
+    Object.defineProperty(rows, i, { get: () => entries ??= Object.entries((!i && poses ? poses.table() :
+      i === 2 && trips ? world.travel : i === 3 && bonds ? bonds.table() : tables[i]) || {}) });
   }
   // Travel is sparse: a fish need not move on successive steps. Both peers
   // retain its last confirmed journey only while it occurs in the fish roster.
@@ -184,18 +190,19 @@ export function replicaRowBase(id, world, frames = false, previous) {
   return { id, tick: world.tick, rows, tables, travel, roots: world.roots, terrain: world.terrain };
 }
 
-function mapTables(world, transform, fishRows, trips) {
+function mapTables(world, transform, fishRows, trips, bondRows) {
   const result = {};
   for (const field in world) if (Object.hasOwn(world, field)) result[field] = field === 'fishes' && fishRows ? fishRows : field === 'travel' && trips ? trips : world[field];
   for (const [index, [field, table]] of fields.entries()) {
     if (index === 0 && fishRows) continue;
-    const source = table ? world[field]?.[table] : result[field];
+    const source = index === 3 && bondRows ? bondRows : table ? world[field]?.[table] : result[field];
     if (source === undefined) continue;
-    const rows = transform(source, index);
+    const rows = index === 3 && bondRows ? bondRows : transform(source, index);
     if (!rows) return;
     if (table) {
-      if (result[field] === world[field]) result[field] = { ...world[field] };
-      result[field][table] = rows;
+      if (result[field] === world[field]) {
+        result[field] = Object.fromEntries(Object.keys(world[field]).map(key => [key, key === table ? rows : world[field][key]]));
+      } else result[field][table] = rows;
     } else result[field] = rows;
   }
   return result;
@@ -233,14 +240,16 @@ export function encodeReplicaRowDelta(body, base, frames = false, poseBytes = fa
   const source = compact && committedStepFields.get(body.world);
   const step = source && source.previousFishes === base.tables[0] ? source : null;
   const poses = step?.poses;
+  let bondRows;
+  if (source?.bondFrame && source.bondFrame === base.tables[3]) bondRows = true;
+  else if (step?.bonds && step.bonds.prior === base.tables[3]) {
+    const { keys, intervals: { before, length, kept, added } } = step.bonds.changes;
+    bondRows = { before, length, kept: Array.from(kept), added: Array.from(added), keys };
+  }
   let fishIndices = poses?.indices;
   const world = mapTables(body.world, (table, index) => {
     if (!rowTable(table)) return;
     if (compact && table === base.tables[index]) return true;
-    if (index === 3 && step?.bonds && step.bonds.prior === base.tables[index]) {
-      const { keys, intervals: { before, length, kept, added } } = step.bonds.changes;
-      return { before, length, kept: Array.from(kept), added: Array.from(added), keys };
-    }
     let known;
     if (compact && index === 0) fishIndices = known = base.travel.indices;
     const rows = compact ? [] : {};
@@ -258,7 +267,7 @@ export function encodeReplicaRowDelta(body, base, frames = false, poseBytes = fa
       rows[next++] = encodeRow(id, row, reference, base.rows[index][reference]?.[1]);
     }
     return rows;
-  }, poses && (poseBytes && supportsPoseBytes ? poses.packed() : poses.encode()), step?.trips);
+  }, poses && (poseBytes && supportsPoseBytes ? poses.packed() : poses.encode()), step?.trips, bondRows);
   if (world && compact) {
     for (const field of ['roots', 'terrain']) if (world[field] && world[field] === base[field]) world[field] = true;
     if (rowTable(world.contacts)) world.contacts = Object.entries(world.contacts).map(([id, row]) => {
@@ -320,7 +329,10 @@ export function decodeReplicaRowDelta(body, base, frames = false, poseBytes = fa
   if (frameRows !== undefined && (frameRows !== true || !frames || !base.travel)) throw new Error('伙伴未确认实时帧格式');
   const day = frameRows ? shanghaiDay(message.world.tick) : null;
   const world = mapTables(message.world, (encoded, rowsIndex) => {
-    if (frameRows && encoded === true && base.tables[rowsIndex]) return base.tables[rowsIndex];
+    if (frameRows && encoded === true && base.tables[rowsIndex]) {
+      const table = base.tables[rowsIndex];
+      return table instanceof BondFrame ? table.table() : table;
+    }
     if (frameRows && rowsIndex === 0 && poseBytes && rowTable(encoded)) return unpackPoses(encoded, base.rows[0], message.world.tick);
     if (frameRows && rowsIndex === 3 && rowTable(encoded)) {
       const { before, length, kept, added, keys } = encoded;

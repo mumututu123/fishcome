@@ -29,32 +29,61 @@ function validBits(bits, size) {
     (!(size & 7) || !(bits[bits.length - 1] >>> (size & 7)));
 }
 
-export function applyBondIntervals(previous, { at, intervals, keys }) {
-  const { before, length, added, kept } = intervals, oldKeys = Object.keys(previous);
+function readBondIntervals(previous, { at, intervals, keys }, frame) {
+  const prior = previous instanceof BondFrame ? previous : null;
+  const { before, length, added, kept } = intervals, oldKeys = prior?.names ?? Object.keys(previous);
   if (!Number.isFinite(at) || !Number.isInteger(length) || length < 0 || length > bondLimit ||
       oldKeys.length !== before || oldKeys.length > bondLimit || !Array.isArray(keys) || keys.length > length ||
       !validBits(added, length) || !validBits(kept, oldKeys.length)) throw new Error('无效的伙伴变更范围');
-  const table = {};
+  const table = frame ? null : {};
+  const oldNames = prior && keys.length ? new Set(oldKeys) : null;
+  const newNames = frame && keys.length ? new Set() : null;
   let next = 0, old = 0;
   for (let i = 0; i < length; i++) {
+    let key, row;
     if (bit(added, i)) {
-      const key = keys[next++];
+      key = keys[next++];
       if (typeof key !== 'string' || !/^[a-z0-9:-]+\|[a-z0-9:-]+$/.test(key) ||
-          Object.hasOwn(table, key) || Object.hasOwn(previous, key)) throw new Error('无效的新伙伴');
+          (table ? Object.hasOwn(table, key) : newNames?.has(key)) ||
+          (prior ? oldNames?.has(key) : Object.hasOwn(previous, key))) throw new Error('无效的新伙伴');
       const split = key.indexOf('|'), a = key.slice(0, split), b = key.slice(split + 1);
       if (a >= b) throw new Error('无效的伙伴顺序');
-      table[key] = { a, b, seconds: 1, at, lastNear: at, run: 0 };
+      row = { a, b, seconds: 1, at, lastNear: at, run: 0 };
+      newNames?.add(key);
     } else {
       while (old < oldKeys.length && !bit(kept, old)) old++;
       if (old >= oldKeys.length) throw new Error('伙伴基准缺少记录');
-      const key = oldKeys[old++], row = previous[key];
-      if (row?.at !== at - 1000 || row.lastNear !== row.at || !Number.isFinite(row.seconds) || !Number.isFinite(row.run)) {
+      key = oldKeys[old];
+      row = prior ? prior.rows[old] : previous[key];
+      old++;
+      if ((prior?.at ?? row?.at) !== at - 1000 || row.lastNear !== row.at || !Number.isFinite(row.seconds) || !Number.isFinite(row.run)) {
         throw new Error('伙伴基准时间不连续');
       }
-      table[key] = advanceBond(row, at);
+      if (!frame || !Number.isInteger(row.seconds) || !Number.isInteger(row.run)) row = advanceBond(row, at);
     }
+    if (frame) { frame.names[i] = key; frame.rows[i] = row; }
+    else table[key] = row;
   }
   while (old < oldKeys.length && !bit(kept, old)) old++;
   if (next !== keys.length || old !== oldKeys.length) throw new Error('伙伴变更数量不一致');
   return table;
+}
+
+export function applyBondIntervals(previous, changes) {
+  return readBondIntervals(previous, changes);
+}
+
+export class BondFrame {
+  constructor(previous, changes) {
+    this.at = changes.at;
+    this.names = [];
+    this.rows = [];
+    readBondIntervals(previous, changes, this);
+  }
+  table() {
+    if (this.materialized) return this.materialized;
+    const table = {};
+    for (let i = 0; i < this.names.length; i++) table[this.names[i]] = advanceBond(this.rows[i], this.at);
+    return this.materialized = table;
+  }
 }

@@ -940,7 +940,7 @@ test('伙伴已收到游动却错过同一步的收入，下一步仍会带上�
 test('仅对确认同一关系基准的伙伴发送区间，新增行与延续行均还原到原序', async () => {
   const world = new World(1000), { data } = world;
   data.life.at = 500;
-  data.life.bonds = { 'a|b': { a: 'a', b: 'b', seconds: 2, at: 500, lastNear: 500, run: 1 } };
+  data.life.bonds = { 'a|b': { a: 'a', b: 'b', seconds: 2.001, at: 500, lastNear: 500, run: 1.001 } };
   const sink = { live: () => [1], broadcast: (_, body) => body };
   let notify;
   const sender = new WorldBroadcast(fn => { notify = fn; }), first = await sender.send(sink, data, 1000);
@@ -949,14 +949,49 @@ test('仅对确认同一关系基准的伙伴发送区间，新增行与延续�
   data.tick = 1500;
   data.life = { ...data.life, at: 1500, bonds: {
     'a|c': { a: 'a', b: 'c', seconds: 1, at: 1500, lastNear: 1500, run: 0 },
-    'a|b': { a: 'a', b: 'b', seconds: 3, at: 1500, lastNear: 1500, run: 2 } } };
+    'a|b': { a: 'a', b: 'b', seconds: 2.001 + 1, at: 1500, lastNear: 1500, run: 1.001 + 1 } } };
   notify(world, { tables: {}, values: { tick: 1500, life: data.life },
     workerChanges: { tables: {}, values: { tick: 1500 }, life: { properties: [{ at: 1500 }], bonds } } });
   const next = await sender.send(sink, data, 1500), wire = encodeReplicaRowDelta(next, base, true);
   assert.deepEqual(wire.world.life.bonds, { before: 1, length: 2, kept: [1], added: [1], keys: ['a|c'] });
-  assert.deepEqual(decodeReplicaRowDelta(wire, base, true).world.life.bonds, data.life.bonds);
-  const legacy = replicaRowBase(base.id, first.world);
-  assert.deepEqual(decodeReplicaRowDelta(encodeReplicaRowDelta(next, legacy), legacy).world.life.bonds, data.life.bonds);
+  const received = decodeReplicaRowDelta(wire, base, true);
+  assert.deepEqual(received.world.life.bonds, data.life.bonds);
+  const sentBase = replicaRowBase(crypto.randomUUID(), next.world, true);
+  const receivedBase = replicaRowBase(sentBase.id, received.world, true);
+  const firstFrame = committedStepFields.get(next.world).bondFrame;
+  assert.equal(firstFrame.materialized, undefined);
+  data.tick = 2000;
+  notify(world, { tables: {}, values: { tick: 2000 }, workerChanges: { tables: {}, values: { tick: 2000 } } });
+  const same = await sender.send(sink, data, 2000), sameWire = encodeReplicaRowDelta(same, sentBase, true);
+  assert.equal(sameWire.world.life.bonds, true);
+  const sameReceived = decodeReplicaRowDelta(sameWire, receivedBase, true);
+  assert.deepEqual(sameReceived.world.life.bonds, data.life.bonds);
+  const sameBase = replicaRowBase(crypto.randomUUID(), same.world, true);
+  const finalBase = replicaRowBase(sameBase.id, sameReceived.world, true);
+  const changed = { at: 2500, keys: ['a|d'], intervals: { before: 2, length: 2, kept: Uint8Array.of(2), added: Uint8Array.of(2) } };
+  const before = data.life.bonds['a|b'];
+  data.tick = 2500;
+  data.life = { ...data.life, at: 2500, bonds: {
+    'a|b': { ...before, seconds: before.seconds + 1, at: 2500, lastNear: 2500, run: before.run + 1 },
+    'a|d': { a: 'a', b: 'd', seconds: 1, at: 2500, lastNear: 2500, run: 0 } } };
+  notify(world, { tables: {}, values: { tick: 2500, life: data.life },
+    workerChanges: { tables: {}, values: { tick: 2500 }, life: { properties: [{ at: 2500 }], bonds: changed } } });
+  const last = await sender.send(sink, data, 2500), lastWire = encodeReplicaRowDelta(last, sameBase, true);
+  assert.deepEqual(lastWire.world.life.bonds, { before: 2, length: 2, kept: [2], added: [2], keys: ['a|d'] });
+  assert.equal(decodeReplicaRowDelta(lastWire, receivedBase, true), null);
+  const canonical = decodeReplicaRowDelta(lastWire, finalBase, true);
+  assert.deepEqual(canonical.world.life.bonds, data.life.bonds);
+  assert.deepEqual(Object.keys(canonical.world.life.bonds), ['a|b', 'a|d']);
+  assert.equal(firstFrame.materialized, undefined);
+  const lastFrame = committedStepFields.get(last.world).bondFrame;
+  assert.equal(lastFrame.materialized, undefined);
+  const retransmit = encodeReplicaRowDelta(last, finalBase, true);
+  assert(Array.isArray(retransmit.world.life.bonds));
+  assert.deepEqual(decodeReplicaRowDelta(retransmit, finalBase, true).world.life.bonds, data.life.bonds);
+  const legacy = replicaRowBase(sameBase.id, same.world);
+  assert.deepEqual(decodeReplicaRowDelta(encodeReplicaRowDelta(last, legacy), legacy).world.life.bonds, data.life.bonds);
+  data.life.bonds['a|b'].seconds++;
+  assert.deepEqual(structuredClone(last.world).life.bonds, canonical.world.life.bonds);
   wire.world.life.bonds.before = 2;
   assert.throws(() => decodeReplicaRowDelta(wire, base, true));
 });
