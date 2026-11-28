@@ -1,6 +1,6 @@
 import { CONFIG } from './engine.js';
 import { fishOrigin, writeBreedingRecord } from './breeding.js';
-import { characterPositionFields, characterRevision, replaceLifeHistory, simulationWillApply, simulationApplied, subscribeSimulationChanges, worldRevision, worldTables } from './simulation-changes.js';
+import { characterPositionFields, characterRevision, replaceCheckedHistory, simulationWillApply, simulationApplied, subscribeSimulationChanges, worldRevision, worldTables } from './simulation-changes.js';
 import { expandSimulationPatch, rowId } from './simulation-delta.js';
 import { SimulationRows } from './simulation-rows.js';
 export { subscribeSimulationChanges } from './simulation-changes.js';
@@ -152,19 +152,23 @@ export class SimulationClient {
       return !!change;
     });
   }
-  installLifeHistory(world, life) {
+  installCheckedHistory(world, changes) {
     const hot = this.owner === world && this.tick === world.data.tick && this.revision === worldRevision(world);
     if (hot) {
       const parts = this.historyParts ??= {};
-      for (const [key, value] of Object.entries(life)) if (value !== world.data.life[key]) parts[key] = value;
+      if (changes.participants) parts.participants = changes.participants;
+      if (changes.life) {
+        const life = parts.life ??= {};
+        for (const [key, value] of Object.entries(changes.life)) if (value !== world.data.life[key]) life[key] = value;
+      }
     }
-    replaceLifeHistory(world, life);
+    replaceCheckedHistory(world, changes);
     if (hot) this.revision = worldRevision(world);
   }
   async syncHistory(valid) {
     const parts = this.historyParts;
     this.historyParts = null;
-    await this.request({ kind: 'history', parts });
+    await this.request({ kind: 'history', parts: parts.life, participants: parts.participants });
     return valid();
   }
   finishBoundary() {

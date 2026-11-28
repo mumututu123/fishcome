@@ -819,6 +819,7 @@ export class WorkerSimulation {
       this.generation = this.openGeneration;
     } else if (message.kind === 'history') {
       Object.assign(this.world.data.life, message.parts);
+      if (message.participants) this.world.data.participants = message.participants;
       this.tracker.reset();
     } else if (message.kind === 'restore') {
       this.tracker.invalidateOrigins();

@@ -391,8 +391,10 @@ test('按实际鱼逐步确认结果，老线程保留已经离开的鱼的序�
   } finally { for (const client of clients) client.close(); }
 });
 
-test('归并伙伴历史会使旧约定失效，同一工作线程从已核对的历史继续游动', async () => {
+test('同一基准同时归并伙伴历史和参与者顺序，旧约定失效、已有线程无需重装', async () => {
   const world = new World(start, root);
+  setParticipantName(world, 'first', '甲');
+  setParticipantName(world, 'second', '乙');
   const worker = new WorkerSimulation(), requests = [];
   const client = new SimulationClient(() => localWorker(msg => requests.push(msg.kind), worker));
   const replica = new World(start, root);
@@ -402,7 +404,8 @@ test('归并伙伴历史会使旧约定失效，同一工作线程从已核对�
     const old = await client.prepareAgreed(world, () => true);
     const [a,b] = Object.keys(world.data.fishes).sort();
     const bond = { a, b, seconds: 42, at: world.data.tick, lastNear: world.data.tick, run: 8 };
-    client.installLifeHistory(world, { ...world.data.life, bonds: { ...world.data.life.bonds, [a + '|' + b]: bond } });
+    const participants = Object.fromEntries(Object.entries(world.data.participants).reverse());
+    client.installCheckedHistory(world, { participants, life: { ...world.data.life, bonds: { ...world.data.life.bonds, [a + '|' + b]: bond } } });
     const tick = world.data.tick + CONFIG.step;
     assert.equal(await client.advanceAgreed(world, tick, () => true, old), null);
     replica.data = structuredClone(world.data);
@@ -412,6 +415,7 @@ test('归并伙伴历史会使旧约定失效，同一工作线程从已核对�
     }));
     assert.equal(requests.filter(kind => kind === 'open').length, 1);
     assert.equal(requests.filter(kind => kind === 'history').length, 1);
+    assert.deepEqual(Object.keys(worker.world.data.participants), Object.keys(participants));
     assert.equal(results[0].changesDigest, results[1].changesDigest);
     assert.deepEqual(world.serialize(), replica.serialize());
   } finally { client.close(); cold.close(); }

@@ -33,11 +33,11 @@ export function worldEdited(world, origin, merge) {
 
 // A verified history replacement has no geometry or table-membership edits.
 // Prepared steps must still observe the new revision before they can run.
-export function replaceLifeHistory(world, life) {
-  const patch = { values: { life }, tables: {} };
+export function replaceCheckedHistory(world, changes) {
+  const patch = { values: changes, tables: {} };
   simulationWillApply(world, patch);
   revisions.set(world, worldRevision(world) + 1);
-  world.data.life = life;
+  Object.assign(world.data, changes);
   simulationApplied(world, patch);
 }
 

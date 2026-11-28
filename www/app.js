@@ -176,7 +176,7 @@ const ordered = new OrderedSession({
   },
   install: (target, changes, valid, apply) => atCheckpointBoundary(target.data, () => simulation.atStepBoundary(() => {
     if (valid()) apply(() => {
-      if (changes.life && Object.keys(changes).length === 1) simulation.installLifeHistory(target, changes.life);
+      if (Object.keys(changes).every(key => key === 'life' || key === 'participants')) simulation.installCheckedHistory(target, changes);
       else { worldEdited(target); Object.assign(target.data, changes); target.dirty = true; }
     });
   })),
