@@ -138,7 +138,15 @@ export function advanceSwimming(world, now, dt, grid, groups, ambient, captured,
   const previous = packed && prior?.grid === packed ? prior.index : undefined;
   const phase = String(Math.floor(now / 12000));
   const avoidance = [0, 1, 2, 3].map(seed => hash(phase, seed) & 3);
-  let start = 0, count = 0, travelDay;
+  const schedule = grid.intentPlan, order = ordered === singles ? singles : layout.pairOrder?.entries;
+  const reusable = packed && order && !waitingToEat.size && !captured.size && schedule;
+  const oldRuns = reusable && previous && packed.runs;
+  let runs = oldRuns && oldRuns.order === order && oldRuns.groups === layout.groups && oldRuns.shapes === packed.shapes &&
+    oldRuns.revision === batch.inputRevision ? oldRuns.rows : null;
+  const record = reusable && !runs ? [] : null;
+  const sameDirections = runs && oldRuns.schedule === schedule && oldRuns.next === schedule.next && oldRuns.phase === phase;
+  if (packed && !runs) packed.runs = undefined;
+  let start = 0, count = 0, allWander = true, travelDay;
 
   function publishPose(fish, ordinal) {
     const { x, y, facing, cx, cy } = fish;
@@ -172,9 +180,22 @@ export function advanceSwimming(world, now, dt, grid, groups, ambient, captured,
       } else world.recordMovement(id, distance, now, travelDay);
     }
   }
+  function aimSingle(entry, row, prepare) {
+    const [id, cells, , swimmer] = entry, fish = swimmer.fish;
+    const sight = foodsNear && (!nearFood || swimmer.slot === undefined || nearFood[swimmer.slot]) ? foodsNear : null;
+    const planned = freeIntents && now - fish.lastFed >= CONFIG.hunger && swimmer.intended;
+    const wander = !sight && planned;
+    const direction = wander || chooseDirection(world, id, fish, cells, null, swimmer.hull.bounds, now, ambient, sight, canEat, planned);
+    const avoid = avoidance[swimmer.avoidanceSeed ??= hash('avoid:' + id + ':') & 3];
+    if (prepare) packed.put(row, swimmer, direction, avoid, previous);
+    else packed.aim(row, direction, avoid);
+    return !!wander;
+  }
   function flush() {
     if (!count) return;
     const first = batch.poses.length;
+    if (record) record[start] = { first, end: start + count, allWander };
+    allWander = true;
     packed.advance(count, dt, first);
     const poses = packed.doubles, trails = packed.words, base = packed.poseOffset / 8 + first * 5;
     for (let i = 0; i < count; i++) {
@@ -188,6 +209,20 @@ export function advanceSwimming(world, now, dt, grid, groups, ambient, captured,
   }
   for (let index = 0; index < ordered.length; index++) {
     const entry = ordered[index], id = entry[0], cells = entry[1], pair = entry[2], swimmer = entry[3];
+    const run = runs?.[index];
+    if (run && !grid.overlapped && !count && run.first === batch.poses.length) {
+      if (!sameDirections || !run.allWander || foodsNear) {
+        let all = true;
+        for (let k = index; k < run.end; k++) if (!aimSingle(ordered[k], run.first + k - index, false)) all = false;
+        run.allWander = all;
+      }
+      start = index; count = run.end - index; flush();
+      index = run.end - 1;
+      continue;
+    }
+    // A legacy row can become packable on this step. Its new position in the
+    // output may displace a previously reusable run and its directions.
+    if (run) runs = null;
     let f = pair ? pair.fish : swimmer?.fish ?? fishes[id];
     if (!f || !cells.length || (captured.size && (pair ? pair.members.some(member => captured.has(member.id)) : captured.has(id)))) {
       flush();
@@ -203,21 +238,21 @@ export function advanceSwimming(world, now, dt, grid, groups, ambient, captured,
     const bulk = packed && !grid.overlapped && !waiting && ordinal !== undefined && slot !== undefined && !hull.duplicate &&
       Number.isFinite(f.cx || 0) && Number.isFinite(f.cy || 0) &&
       oldY + hull.bounds.minY >= 0 && oldY + hull.bounds.maxY < MAX_FLOOR;
+    if (bulk) {
+      if (!count) start = index;
+      if (!aimSingle(entry, batch.poses.length + count++, true)) allWander = false;
+      continue;
+    }
     const sight = foodsNear && (!nearFood || swimmer?.slot === undefined || nearFood[swimmer.slot]) ? foodsNear : null;
     const planned = freeIntents && now - f.lastFed >= CONFIG.hunger && swimmer?.intended;
     // Food and school points are fixed before movement. The next geometry probe needs the current grid.
-    if (!bulk) flush();
+    flush();
     if (ordinal === undefined && !pair && world.movingFish) f = world.movingFish(f);
     let trail = 4;
     if (!waiting) {
       const center = hull?.bounds || bounds(cells);
       const direction = !sight && planned || chooseDirection(world, id, f, cells, pair, center, now, ambient, sight, canEat, planned);
       const avoid = swimmer ? avoidance[swimmer.avoidanceSeed ??= hash('avoid:' + id + ':') & 3] : hash('avoid:' + id + ':' + phase) & 3;
-      if (bulk) {
-        if (!count) start = index;
-        packed.put(batch.poses.length + count++, swimmer, direction, avoid, previous);
-        continue;
-      }
       if (pair) for (const member of pair.members) grid.update(member, groups.get(member.id) || [], true);
       const legacy = slot === undefined ? { world, id, cells, scenery, foodPositions, turningObstacles, center } : null;
       const speedX = hull && swimmer ? swimmer.speedX : CONFIG.speed * center.width / cells.length;
@@ -248,6 +283,9 @@ export function advanceSwimming(world, now, dt, grid, groups, ambient, captured,
   }
   flush();
   if (packed) {
+    if (record || runs) packed.runs = { order, groups: layout.groups, shapes: packed.shapes, revision: batch.inputRevision,
+      schedule, next: schedule.next, phase, rows: record || runs };
+    else packed.runs = undefined;
     const base = packed.poseOffset / 8;
     batch.motion.set(packed.doubles.subarray(base, base + batch.poses.length * 5));
   }

@@ -200,6 +200,8 @@ function trackWorld() {
   }
   function mark(target, parent, key, value, deleting = false) {
     const { field, id, property } = parent;
+    if (field === 'fishes' && !parent.table && !property && (key === 'cx' || key === 'cy' || key === 'lastFed') ||
+        parent.root && key === 'breeding' || field === 'breeding' && (parent.table || key === 'status')) swimInputRevision++;
     if (parent.root && key === 'fishes') firstHunger = -Infinity;
     else if (field === 'fishes') {
       if (parent.table) includeHunger(value?.hungerAt);
@@ -467,7 +469,7 @@ function trackWorld() {
   }
   // Ordinary fish publish their motion directly in the wire format. Later
   // feeding, death or repairs can still supersede that row in the same step.
-  let swimming, swimColumns;
+  let swimming, swimColumns, swimInputRevision = 0;
   function currentSwimColumns() {
     return swimColumns?.revision === poseRevision ? swimColumns : undefined;
   }
@@ -478,7 +480,7 @@ function trackWorld() {
   function beginSwimBatch() {
     const count = knownFish.size;
     swimColumns = undefined;
-    return { motion: new Float64Array(count * 5), poses: [], travel: [], distances: new Float64Array(count),
+    return { inputRevision: swimInputRevision, motion: new Float64Array(count * 5), poses: [], travel: [], distances: new Float64Array(count),
       poseIndex: new Int32Array(count), tripIndex: new Int32Array(count), daysByOrdinal, readDays };
   }
   function completeSwimBatch(frame, day, packed) {

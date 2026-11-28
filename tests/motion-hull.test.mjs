@@ -111,6 +111,32 @@ test('可转移的泳姿、独立观察与后续鱼位修正使用各自正确�
   }
 });
 
+test('旧坐标回到普通行、暂时投食和修改余量后，仍逐鱼按当前的食物和游向前进', () => {
+  const at = Date.UTC(2025, 5, 15, 12) + 1200;
+  const reference = makeFishWorld(World, 32, 1000, { now: at, spacingX: 10 });
+  const fish = Object.values(reference.data.fishes);
+  for (const row of fish) { row.created = at - 2 * 86400000; row.lastFed = at - 86400001; }
+  fish[0].x += 3000;
+  const worker = new WorkerSimulation();
+  worker.receive({ kind: 'open', values: reference.serialize(), tables: [], ambient: true });
+  worker.receive({ kind: 'ready' });
+  for (let step = 0; step < 10; step++) {
+    for (const w of [reference, worker.world]) {
+      if (step === 1) w.data.chars.bait = {
+        id: 'bait', kind: 'food', entity: '', x: 24, y: 11, ch: '*', color: '#fff', born: at, fall: 0, moveAt: at, path: []
+      };
+      if (step === 2) delete w.data.chars.bait;
+      if (step === 4) w.data.fishes[fish[7].id].cx = 1.8;
+      if (step === 6) w.data.fishes[fish[9].id].lastFed = w.data.tick;
+    }
+    const base = reference.data.tick, swims = [];
+    reference.step(base + 500, swims);
+    const { patch } = worker.receive({ kind: 'step', base, names: [], foods: [] });
+    assert.deepEqual((patch.swims || []).map(ids => ids.map(i => typeof i === 'number' ? fish[i].id : i)), swims);
+    assert.deepEqual(JSON.parse(JSON.stringify(worker.world.data)), JSON.parse(JSON.stringify(reference.data)), '第 ' + step + ' 步');
+  }
+});
+
 test('亲鱼跨海界平移、转身、被分开或恢复旧小数位置，联合鱼体始终与重新摆放相同', () => {
   const world = new World(100, 'test', { populate: false });
   const male = { id: 'a' }, female = { id: 'b' };

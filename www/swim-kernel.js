@@ -115,6 +115,10 @@ class PackedGrid {
     }
     doubles[pose + 3] = fish.cx || 0;
     doubles[pose + 4] = fish.cy || 0;
+    this.aim(index, intent, avoid);
+  }
+  aim(index, intent, avoid) {
+    const word = this.inputOffset / 4 + index * 10;
     this.words[word + 6] = intent.dx;
     this.words[word + 7] = intent.dy;
     this.words[word + 8] = avoid;
