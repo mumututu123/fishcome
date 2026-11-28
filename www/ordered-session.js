@@ -2,18 +2,34 @@ import { CONFIG } from './engine.js';
 import { OrderedSteps, stepDigest } from './ordered-steps.js';
 import { jsonDigest } from './step-digest.js';
 import { characterRevision, worldTables } from './simulation-changes.js';
+import { capturedCharacterProof, prepareCharacterProof } from './ordered-characters.js';
 
 const orderedTables = [...worldTables, 'life.events', 'life.bonds', 'life.stories',
   'life.places', 'life.haunts', 'life.bloomThrough', 'life.eventThrough'];
 const tableAt = (data, name) => name.startsWith('life.') ? data.life?.[name.slice(5)] : data[name];
 
 const largeTables = new Set(['chars', 'fishes', 'ops', 'travel']);
+const snapshotCharacters = new WeakMap();
+
+export function captureOrderedWorld(world, store) {
+  const characters = capturedCharacterProof(world);
+  const data = structuredClone({ ...world.data, chars: null });
+  if (characters) {
+    data.chars = {};
+    snapshotCharacters.set(data.chars, characters);
+  } else data.chars = structuredClone(world.data.chars);
+  const archives = structuredClone({ manifests: store.manifests, summary: store.summary, overrides: store.overrides });
+  return { world: { data, ambient: world.ambient }, store: archives };
+}
+
 export function checkpointOrder(data, requested) {
   const order = {};
   for (const name of requested || orderedTables) {
     if (!orderedTables.includes(name) || !requested && largeTables.has(name)) continue;
     const rows = tableAt(data, name);
     if (!rows) continue;
+    const captured = snapshotCharacters.get(rows);
+    if (captured) { order[name] = captured.keys; continue; }
     const keys = [];
     for (const id in rows) {
       keys.push(id);
@@ -49,7 +65,8 @@ async function checkpointProof(world, store, data, valid) {
   const fields = [], tableProofs = {};
   let bondOrder;
   async function proveTable(name, value) {
-    const pages = await table(value);
+    const prepared = name === 'chars' && (snapshotCharacters.get(value) || value === world.data.chars && capturedCharacterProof(world));
+    const pages = await (prepared ? prepared.hashes : table(value));
     if (valid() && orderedTables.includes(name) && (largeTables.has(name) || pages.length > 1)) tableProofs[name] = await stepDigest(pages);
     if (name === 'life.bonds' && pages?.length > 1) bondOrder = await jsonDigest(Object.keys(value));
     return pages;
@@ -96,13 +113,15 @@ export async function orderedCheckpoint(world, store, orders, valid = () => true
   if (orders) {
     for (const [name, keys] of Object.entries(orders)) {
       if (!orderedTables.includes(name)) throw new Error('共同检查点包含未知表');
-      const table = tableAt(data, name), local = Object.keys(table || {});
+      let table = tableAt(data, name);
+      const captured = snapshotCharacters.get(table), local = captured?.keys || Object.keys(table || {});
       // Separate legitimate histories can retain a different set of pairs.
       // Preserve our full local table until the ordinary history join verifies.
       if (name === 'life.bonds' && table && Array.isArray(keys) &&
           (keys.length !== local.length || keys.some(id => !Object.hasOwn(table, id)))) continue;
       if (!table || !Array.isArray(keys) || keys.length !== local.length) throw new Error('共同检查点的数据不齐');
       if (keys.every((key, i) => key === local[i])) continue;
+      if (captured) table = captured.materialize();
       const aligned = {};
       for (const key of keys) {
         if (typeof key !== 'string' || !Object.hasOwn(table, key) || Object.hasOwn(aligned, key) || key === '__proto__') throw new Error('共同检查点的记录不同');
@@ -146,6 +165,7 @@ export class OrderedSession {
   changed(world, patch) {
     const s = this.current;
     if (!s || world !== s.world || s.applying) return;
+    if (s.snapshot && !s.steps) { s.changedAfterCut = true; return; }
     if (s.running && patch?.workerChanges && patch.values?.tick === s.steps.next?.tick) {
       this.committed(s);
       return;
@@ -156,6 +176,7 @@ export class OrderedSession {
   committed(s) {
     if (s.executed) return;
     s.executed = true;
+    s.snapshot = undefined;
     this.io.firstCommit?.(s.world);
   }
   begin(peer, epoch, base) {
@@ -165,6 +186,14 @@ export class OrderedSession {
   }
   async probe() {
     const peer = this.io.peer(), now = performance.now();
+    const prior = this.current;
+    if (prior?.nextCut && prior.owner && this.valid(prior) && prior.world.data.tick > prior.base) {
+      prior.joined?.(false);
+      const s = this.begin(peer, crypto.randomUUID(), prior.world.data.tick);
+      s.priorProof = prior.proof;
+      s.orderFields = prior.orderFields;
+      return this.openCheckpoint(s);
+    }
     if (this.current || !peer || !this.io.isLeader() || now < (this.retryAt || 0) ||
         Date.now() - this.io.world().data.tick > CONFIG.step) return;
     const world = this.io.world(), leader = this.io.leader();
@@ -173,6 +202,7 @@ export class OrderedSession {
       if (possible?.peer === peer && !possible.acknowledged && now - possible.askedAt < CONFIG.step / 2) return;
       const id = crypto.randomUUID();
       this.candidate = { peer, world, leader, id, askedAt: now };
+      prepareCharacterProof(world).catch(() => {});
       // An unanswered enquiry never reserves an ecology tick. The existing
       // authority keeps publishing while the other tab finishes its hello.
       await this.io.send(peer, { action: 'available?', id, leader });
@@ -181,28 +211,38 @@ export class OrderedSession {
     this.candidate = undefined;
     this.retryAt = now + 3000;
     const s = this.begin(peer, crypto.randomUUID(), world.data.tick);
-    const order = checkpointOrder(world.data);
-    await this.send(s, { action: 'opening', base: s.base, order });
-    s.cut = await orderedCheckpoint(world, s.store, undefined, () => this.valid(s));
+    return this.openCheckpoint(s);
+  }
+  async openCheckpoint(s) {
+    s.snapshot = captureOrderedWorld(s.world, s.store);
+    const data = s.snapshot.world.data;
+    const order = { ...checkpointOrder(data), ...(s.orderFields && checkpointOrder(data, s.orderFields)) };
+    await this.send(s, { action: 'opening', base: s.base, order, previous: s.priorProof });
+    s.cut = await orderedCheckpoint(s.snapshot.world, s.snapshot.store, undefined, () => this.valid(s));
     const { proof } = s.cut;
-    if (!this.valid(s) || world.data.tick !== s.base) return;
+    if (!this.valid(s)) return;
     s.proof = proof;
-    await this.send(s, { action: 'open', base: s.base, proof, exceptBonds: s.cut.exceptBonds, bondOrder: s.cut.bondOrder });
+    await this.send(s, { action: 'open', base: s.base, proof, exceptBonds: s.cut.exceptBonds, bondOrder: s.cut.bondOrder, previous: s.priorProof });
   }
   async afterReplica() {
     const s = this.current;
     if (!s?.waiting || !s.order || s.checking || s.world.data.tick < s.base) return;
-    if (!this.valid(s) || s.world.data.tick !== s.base) { this.stop('已错过共同检查点'); return; }
+    if (!this.valid(s) || !s.snapshot && s.world.data.tick !== s.base) { this.stop('已错过共同检查点'); return; }
+    s.snapshot ??= captureOrderedWorld(s.world, s.store);
     s.checking = true;
     // Loading the independently verified local replica executes no ecological
     // step. The final preparation below rechecks inputs, revision and tick.
     if (!this.io.hasSavedCharacters?.(s.world)) this.preload(s);
-    s.cut = await orderedCheckpoint(s.world, s.store, s.order, () => this.valid(s));
+    s.cut = await orderedCheckpoint(s.snapshot.world, s.snapshot.store, s.order, () => this.valid(s));
+    if (!s.changedAfterCut && s.cut.characterPages?.table === s.snapshot.world.data.chars) {
+      s.cut.characterPages.table = s.world.data.chars;
+      s.cut.characterPages.revision = characterRevision(s.world);
+    }
     if (this.valid(s) && !Object.keys(s.cut.changes).length) this.preload(s, s.cut.characterPages);
     await this.finishCheckpoint(s);
   }
   preload(s, pages) {
-    s.preload ??= this.io.prepare(s.world, () => this.valid(s) && s.world.data.tick === s.base, pages)
+    return s.preload ??= this.io.prepare(s.world, () => this.valid(s) && s.world.data.tick === s.base, pages)
       .catch(error => { if (this.current === s) this.stop(error.message); return null; });
   }
   async finishCheckpoint(s) {
@@ -215,19 +255,37 @@ export class OrderedSession {
       const needsBonds = s.cut.exceptBonds === s.exceptBonds &&
         (s.expanded || !s.cut.bondOrder || !s.bondOrder || s.bondOrder === s.cut.bondOrder);
       await this.send(s, { action: 'history', base: s.base, exceptBonds: s.cut.exceptBonds, tableProofs: s.cut.tableProofs,
-        ...(needsBonds && { bonds: s.world.data.life.bonds }) });
+        ...(needsBonds && { bonds: s.snapshot.world.data.life.bonds }) });
       return;
     }
-    if (Object.keys(changes).length) {
-      await this.installChecked(s, changes);
-    }
+    s.checkedProof = proof;
+    if (!s.changedAfterCut && s.world.data.tick === s.base && Object.keys(changes).length) await this.installChecked(s, changes);
     if (!this.valid(s)) return;
+    const atCut = () => this.valid(s) && !s.changedAfterCut && s.world.data.tick === s.base;
+    if (atCut()) await this.preload(s, s.cut.characterPages);
+    const handle = atCut() && await this.io.prepare(s.world, atCut, s.cut.characterPages);
+    if (!this.valid(s)) return;
+    if (!handle || !atCut()) {
+      if (s.pastBonds) await this.mergePastHistory(s);
+      if (this.valid(s)) await this.send(s, { action: 'pastJoined', base: s.base, proof });
+      return;
+    }
     s.waiting = false;
-    this.start(s);
+    s.localJoined = true;
     await this.send(s, { action: 'joined', base: s.base, proof });
   }
+  async mergePastHistory(s) {
+    const life = s.world.data.life, previous = life.bonds;
+    const bonds = await this.io.bondHistory(s, s.pastBonds);
+    if (bonds === previous || !this.valid(s)) return;
+    await this.io.install(s.world, { life: { ...life, bonds } },
+      () => this.valid(s) && s.world.data.life === life && life.bonds === previous, action => {
+        s.applying = true;
+        try { action(); } finally { s.applying = false; }
+      });
+  }
   installChecked(s, changes) {
-    return this.io.install(s.world, changes, () => this.valid(s), action => {
+    return this.io.install(s.world, changes, () => this.valid(s) && !s.changedAfterCut && s.world.data.tick === s.base, action => {
       const pages = s.cut?.characterPages;
       const current = pages && characterRevision(s.world) === pages.revision;
       s.applying = true;
@@ -289,7 +347,8 @@ export class OrderedSession {
     let s = this.current;
     if (b.action === 'available?') {
       if (!s && !this.io.isLeader() && b.leader === this.io.leader() && typeof b.id === 'string' && b.id.length === 36) {
-        await this.io.checkRetained?.(this.io.world());
+        const world = this.io.world();
+        await Promise.all([prepareCharacterProof(world), this.io.checkRetained?.(world)]);
         if (!this.current && this.io.peer() === peer && !this.io.isLeader() && b.leader === this.io.leader()) {
           await this.io.send(peer, { action: 'available', id: b.id, leader: b.leader });
         }
@@ -307,13 +366,22 @@ export class OrderedSession {
       return;
     }
     if (b.action === 'open' || b.action === 'opening') {
+      const observed = s?.peer === peer && s.epoch === b.epoch && s.base === b.base && s.snapshot;
+      if (b.previous !== undefined && (!s || !this.valid(s) || b.previous !== (s.epoch === b.epoch ? s.priorProof : s.checkedProof))) return;
       if (this.io.isLeader() || typeof b.epoch !== 'string' || b.epoch.length !== 36 || !Number.isSafeInteger(b.base) ||
-          b.base < this.io.world().data.tick || b.base > this.io.world().data.tick + CONFIG.step * 2 ||
+          !observed && b.base < this.io.world().data.tick || b.base > this.io.world().data.tick + CONFIG.step * 2 ||
           (b.action === 'open' ? !/^[0-9a-f]{64}$/.test(b.proof) || !/^[0-9a-f]{64}$/.test(b.exceptBonds)
             : !b.order || typeof b.order !== 'object' || Array.isArray(b.order))) return;
+      if (s && s.peer === peer && s.epoch !== b.epoch && !s.executed && !s.steps?.next && s.checkedProof &&
+          b.previous === s.checkedProof && b.base > s.base) {
+        s.steps?.close();
+        s.joined?.(false);
+        s = undefined;
+      }
       if (s && (s.peer !== peer || s.epoch !== b.epoch || s.base !== b.base || !s.waiting)) return;
       if (!s) {
         s = this.begin(peer, b.epoch, b.base);
+        s.priorProof = b.previous;
         s.waiting = true;
       }
       if (b.action === 'open') { s.proof = b.proof; s.exceptBonds = b.exceptBonds; s.bondOrder = b.bondOrder; }
@@ -328,16 +396,21 @@ export class OrderedSession {
         const different = Object.keys(s.cut?.tableProofs || {}).filter(name => /^[0-9a-f]{64}$/.test(b.tableProofs?.[name]) && b.tableProofs[name] !== s.cut.tableProofs[name]);
         if (!s.expanded && different.length) {
           s.expanded = true;
-          await this.send(s, { action: 'tableOrder', base: s.base, order: checkpointOrder(s.world.data, different) });
+          s.orderFields = [...new Set([...(s.orderFields || []), ...different])];
+          await this.send(s, { action: 'tableOrder', base: s.base, order: checkpointOrder(s.snapshot.world.data, different) });
         } else this.stop('两端已验证的世界内容不同');
         return;
       }
       s.reconciling = true;
-      const bonds = await this.io.bondHistory(s, b.bonds);
+      const bonds = await this.io.bondHistory({ ...s, world: s.snapshot.world }, b.bonds);
       if (!this.valid(s)) return;
       const proof = await s.cut.withBonds(bonds);
       if (!proof || !this.valid(s)) return;
-      if (bonds !== s.world.data.life.bonds) await this.installChecked(s, { life: { ...s.world.data.life, bonds } });
+      if (bonds !== s.snapshot.world.data.life.bonds) {
+        s.pastBonds = bonds;
+        if (s.changedAfterCut || s.world.data.tick !== s.base) await this.mergePastHistory(s);
+        else await this.installChecked(s, { life: { ...s.world.data.life, bonds } });
+      }
       s.proof = proof;
       await this.send(s, { action: 'historyCut', base: s.base, proof, bonds });
       return;
@@ -352,20 +425,38 @@ export class OrderedSession {
       return;
     }
     if (b.action === 'historyCut' && !s.owner && s.reconciling && !s.steps && b.base === s.base && /^[0-9a-f]{64}$/.test(b.proof)) {
-      const bonds = await this.io.bondHistory(s, b.bonds);
+      const bonds = await this.io.bondHistory({ ...s, world: s.snapshot.world }, b.bonds);
       if (!this.valid(s)) return;
       const proof = await s.cut.withBonds(bonds);
       if (!this.valid(s)) return;
       if (proof !== b.proof) { this.stop('伙伴历史归并结果不同'); return; }
-      s.cut.changes.life = { ...(s.cut.changes.life || s.world.data.life), bonds };
+      s.pastBonds = bonds;
+      s.cut.changes.life = { ...(s.cut.changes.life || s.snapshot.world.data.life), bonds };
       s.cut.proof = s.proof = proof;
       s.joining = false;
       await this.finishCheckpoint(s);
       return;
     }
+    if (b.action === 'pastJoined' && s.owner && !s.executed && !s.steps?.next?.sealed && b.base === s.base && b.proof === s.proof) {
+      s.steps?.close();
+      s.steps = undefined;
+      s.nextCut = true;
+      return;
+    }
     if (b.action === 'joined' && s.owner && !s.steps && b.base === s.base && b.proof === s.proof) {
+      if (s.changedAfterCut || s.world.data.tick !== s.base) {
+        s.nextCut = true;
+        return;
+      }
       this.start(s);
       return this.offer(s);
+    }
+    if (b.action === 'offer' && !s.owner && !s.steps && s.localJoined && b.base === s.base && b.previous === s.proof) {
+      if (s.changedAfterCut || s.world.data.tick !== s.base) {
+        await this.send(s, { action: 'pastJoined', base: s.base, proof: s.proof });
+        return;
+      }
+      this.start(s);
     }
     if (!s.steps) return;
     if (b.action === 'archive' && !s.owner && !s.archive) {
@@ -458,6 +549,7 @@ export class OrderedSession {
     if (!this.valid(s)) { this.stop('成员、权威或归档已更换'); return false; }
     if (s.running) return true;
     if (now < s.base + CONFIG.step) return false;
+    if (s.snapshot && !s.steps) return false;
     if (s.waiting && s.world.data.tick < s.base) {
       if (performance.now() - s.began >= 2000) this.stop('直连未送达已约定的起始步');
       return false;

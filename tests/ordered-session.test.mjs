@@ -8,6 +8,35 @@ import { actorId, signer } from '../www/storage.js';
 import { prepareOrderedArchive } from '../www/ordered-archive.js';
 import { OrderedSession } from '../www/ordered-session.js';
 import { stepDigest } from '../www/step-digest.js';
+import { capturedCharacterProof, prepareCharacterProof } from '../www/ordered-characters.js';
+import { applyInputRows, simulationApplied, worldEdited } from '../www/simulation-changes.js';
+import { jsonDigest } from '../www/step-digest.js';
+
+test('鱼元页证明跨越已提交的新步，后到的签名输入、删除和旧字段修改仅影响新证明', async () => {
+  const world = new World(Date.now(), crypto.randomUUID(), { populate: false, ambient: false });
+  for (let i = 0; i < 385; i++) world.data.chars['k' + i] = { id: 'k' + i, kind: 'burn', path: [], former: { order: [i] } };
+  const canonical = () => {
+    const rows = Object.entries(world.data.chars);
+    return Promise.all(Array.from({ length: Math.ceil(rows.length / 128) }, (_, i) => jsonDigest(rows.slice(i * 128, i * 128 + 128))));
+  };
+  await prepareCharacterProof(world);
+  const first = capturedCharacterProof(world), original = canonical();
+  const updated = { ...world.data.chars.k22, former: { order: [22, '旧字段'] } };
+  applyInputRows(world, [['chars', 'k22', updated]]);
+  delete world.data.chars.k0;
+  simulationApplied(world, { values: {}, tables: { chars: { set: [], remove: ['k0'] } } });
+  const second = capturedCharacterProof(world), after = canonical();
+  const merge = {};
+  worldEdited(world, 'replica', merge);
+  world.data.chars.k14.former.order.push('归并');
+  merge.chars = new Set(['k14']);
+  const third = capturedCharacterProof(world), merged = canonical();
+  assert.deepEqual(await first.hashes, await original);
+  assert.deepEqual(await second.hashes, await after);
+  assert.deepEqual(await third.hashes, await merged);
+  worldEdited(world);
+  assert.equal(capturedCharacterProof(world), undefined);
+});
 
 async function earn(world, serial) {
   const keys = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
@@ -33,7 +62,7 @@ function pair(now) {
       stopped: (_, reason) => stops.push(reason), inputsCommitted: async () => {}, archiveConfirmed() {},
       prepareArchive: (_, boundary) => prepareOrderedArchive(world, store, boundary, id => packs[id], async () => {}),
       archiveBoundary: (_, commit) => commit(), prepare: async () => ({}),
-      bondHistory: (_, bonds) => mergeBonds(world.data.life.bonds, bonds),
+      bondHistory: (s, bonds) => mergeBonds(s.world.data.life.bonds, bonds),
       install: (_, changes, valid, wrap) => { if (valid()) wrap(() => Object.assign(world.data, changes)); },
       advance: async (_, tick) => { calls.push(tick); world.data.tick = tick; return { tick, changesDigest: await stepDigest({ tick }) }; }
     });
@@ -139,6 +168,48 @@ test('起步到点仍缺签认时立即交还前一权威通道，重连后不�
   await drain();
   assert.deepEqual(a.calls, b.calls);
 });
+
+for (const diverged of [false, true]) test('历史基准验真跨过三个正常权威步，最新实际状态' + (diverged ? '不同时不能切换' : '相同时才接管下一步'), async () => {
+  const now = Date.now(), { sides: [a,b], drain } = pair(now);
+  let withheld;
+  await a.session.probe();
+  await drain(message => {
+    if (message.action !== 'open') return false;
+    withheld = message; return true;
+  });
+  assert.ok(withheld && a.session.current.cut && b.session.current.cut);
+  const anchor = a.session.current.epoch;
+  for (let i = 1; i <= 3; i++) {
+    const due = now + i * 500;
+    assert.equal(a.session.run(due), false);
+    assert.equal(b.session.run(due), false);
+    a.world.step(due);
+    a.session.changed(a.world, { values: { tick: due } });
+    b.world.merge(a.world.serialize(), {}, 'replica', true);
+    b.session.changed(b.world);
+    await b.session.afterReplica();
+    assert.equal(a.world.data.tick, due);
+    assert.equal(b.world.data.tick, due);
+  }
+  await b.session.receive(b.peer, withheld);
+  await drain();
+  assert.equal(a.session.current.nextCut, true);
+  assert.deepEqual(a.calls, []);
+  if (diverged) b.world.data.notices = ['未获同一基准签认的本地记录'];
+  await a.session.probe(); await drain();
+  if (diverged) {
+    assert.equal(a.session.current, null);
+    assert.equal(b.session.run(now + 2000), false);
+    assert.deepEqual(b.calls, []);
+  } else {
+    assert.notEqual(a.session.current.epoch, anchor);
+    assert.equal(a.session.current.priorProof, withheld.proof);
+    for (const side of [a,b]) assert.equal(side.session.run(now + 2000), true);
+    await drain();
+    assert.deepEqual(a.calls, [now + 2000]);
+    assert.deepEqual(a.calls, b.calls);
+  }
+});
 test('缺少起始步的接收端能释放旧会话，成员更换后没有旧步提交', async () => {
   const now = Date.now(), { sides: [a,b], drain } = pair(now);
   const old = b.session.begin(b.peer, crypto.randomUUID(), now + 500);
@@ -150,6 +221,35 @@ test('缺少起始步的接收端能释放旧会话，成员更换后没有旧�
   assert.equal(a.session.run(now + 500), false);
   assert.equal(a.session.current, null); assert.deepEqual(a.calls, []);
   assert.equal(a.session.valid(past), false);
+});
+
+test('跟随端同一基准装载跨过半秒，旧端当步照常提交、下一步在追到的新基准共同结算', async () => {
+  const now = Date.now(), { sides: [a,b], drain } = pair(now);
+  let loaded, installing;
+  const started = new Promise(resolve => { installing = resolve; });
+  const slow = new Promise(resolve => { loaded = resolve; });
+  b.session.io.prepare = async (_world, valid) => {
+    if (b.world.data.tick === now) { installing(); await slow; }
+    return valid() ? {} : null;
+  };
+  await a.session.probe();
+  const messages = drain();
+  await started;
+  const late = now + 500;
+  assert.equal(a.session.run(late), false);
+  assert.equal(b.session.run(late), false);
+  a.world.step(late);
+  a.session.changed(a.world, { values: { tick: late } });
+  b.world.merge(a.world.serialize(), {}, 'replica', true);
+  b.session.changed(b.world);
+  loaded();
+  await messages;
+  assert.equal(a.session.current.nextCut, true);
+  await a.session.probe(); await drain();
+  for (const side of [a,b]) assert.equal(side.session.run(late + 500), true);
+  await drain();
+  assert.deepEqual(a.calls, [late + 500]);
+  assert.deepEqual(a.calls, b.calls);
 });
 test('首次共同基准和输入均已验、仅迟到一张就绪时，下一次权威发布即可重新会合', async () => {
   const now = Date.now(), { sides: [a,b], drain } = pair(now);

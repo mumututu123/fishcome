@@ -147,7 +147,7 @@ function resumeOrderedInputs() {
   resumingInputs = (async () => {
     const receipts = [];
     for (const op of ops) {
-      if (!amLeader() || world !== target || ordered.current) break;
+      if (!amLeader() || world !== target || ordered.current?.steps) break;
       const result = await applyAtBoundary(op, true);
       if (!result) break;
       if (!result.ok) rejectOperation(op.body.id);
@@ -303,7 +303,7 @@ async function archiveWorld(now = Date.now()) {
     if (chunks.length) await putMany(chunks.map(chunk => ['archive:' + chunk.manifest.id, chunk.encoded]), { generation: await saveGeneration });
     if (!canArchive()) return;
     const session = ordered.current;
-    if (session && await ordered.whenJoined(session)) {
+    if (session?.steps && await ordered.whenJoined(session)) {
       const boundary = { version: 1, at: now, chunks: Object.fromEntries(chunks.map(({ manifest }) => [manifest.id, manifest])) };
       if (await ordered.proposeArchive(boundary)) return;
       if (!canArchive()) return;
@@ -559,7 +559,7 @@ async function onMessage(message, peer) {
     if (rejectedOps.has(body.id)) return;
     if (body.kind === 'referral' && !await verifyReferral(body)) return;
     inbox.set(body.id, clone(message));
-    if (amLeader() && !ordered.current) {
+    if (amLeader() && !ordered.current?.steps) {
       const result = await applyAtBoundary(message, true);
       if (!result) return;
       if (result.ok) await save({ reusePicture: true }); else rejectOperation(body.id);
@@ -645,7 +645,7 @@ async function submit(payload) {
     const message = await network.broadcast('op', op);
     if (rejectedOps.has(op.id)) { pending.delete(op.id); update(); return; }
     inbox.set(op.id, clone(message));
-    const result = amLeader() && !ordered.current && await applyAtBoundary(message, true);
+    const result = amLeader() && !ordered.current?.steps && await applyAtBoundary(message, true);
     if (result) {
       pending.delete(op.id);
       if (!result.ok) { rejectOperation(op.id); toast(result.error); }
