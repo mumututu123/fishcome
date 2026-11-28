@@ -80,7 +80,7 @@ export class BodyMembership {
       groups.set(id, ordered.map(key => this.table[key]));
     }
     this.previous = this.groups;
-    this.changed = affected;
+    this.change = { ids: affected, sameOrder: !reorder && this.previous.size === groups.size };
     this.groups = reorder ? new Map([...groups].sort(([a], [b]) => this.compare(first.get(a), first.get(b)))) : groups;
   }
   activeCells() {
@@ -88,7 +88,6 @@ export class BodyMembership {
     return [...this.active].sort((a, b) => this.compare(a, b)).map(key => this.table[key]);
   }
   edits(before, after) {
-    if (before === after) return [];
-    if (this.previous === before && this.groups === after) return this.changed;
+    if (this.previous === before && this.groups === after) return this.change;
   }
 }

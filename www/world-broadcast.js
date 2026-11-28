@@ -91,19 +91,29 @@ function captureStep(data, base, patch, breeding, pending) {
         if (before !== distance) rows.travel[id] = new DailyDistance(prior, day, distance);
         continue;
       }
+      if (prior && field === 'chars' && edit?.length === 3) {
+        const [, fields, removed] = edit;
+        const keys = Object.keys(fields);
+        const hasChange = keys.some(key => {
+          const before = prior[key], after = fields[key];
+          if (before === after) return false;
+          return !before || !after || typeof before !== 'object' || typeof after !== 'object' || !changed(field, before, after);
+        });
+        if (!hasChange && !removed?.some(key => Object.hasOwn(prior, key) && prior[key] !== undefined)) continue;
+        const copy = { ...prior, ...fields };
+        for (const key of keys) {
+          const value = fields[key];
+          if (value !== null && typeof value === 'object') copy[key] = structuredClone(value);
+        }
+        for (const key of removed || []) delete copy[key];
+        rows.chars[id] = copy;
+        continue;
+      }
       const value = frame ? frame.recordAt(i) : edits.set[i][1];
       if (prior !== undefined && changed(field, travelRow(prior), value)) continue;
       if (prior && field === 'fishes' && edit !== undefined && !Array.isArray(edit)) {
         rows.fishes[id] = { ...prior, x: value.x, y: value.y, facing: value.facing,
           cx: value.cx, cy: value.cy, posAt: value.posAt };
-      } else if (prior && field === 'chars' && edit?.length === 3) {
-        const copy = { ...prior, ...edit[1] };
-        for (const key in edit[1]) {
-          const updated = copy[key];
-          if (updated !== null && typeof updated === 'object') copy[key] = structuredClone(updated);
-        }
-        for (const key of edit[2] || []) delete copy[key];
-        rows.chars[id] = copy;
       } else {
         rows[field][id] = field === 'fishes' || field === 'travel' || field === 'chars' ? structuredClone(value) : value;
       }

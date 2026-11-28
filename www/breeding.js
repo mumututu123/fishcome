@@ -164,27 +164,40 @@ function contactWait(density, father, fatherCells, mother, motherCells, scenery,
   return contactTime(density((p.x + nearX(q.x, p.x)) / 2, (p.y + q.y) / 2));
 }
 const contactRosters = new WeakMap();
-function contactRoster(world, groups) {
+export function contactRoster(world, groups) {
   const revision = world.originRevision?.(), previous = contactRosters.get(world);
   if (previous && previous.revision === revision && previous.groups === groups) return previous;
-  const males = [], females = new Set();
+  const changed = previous && previous.revision === revision && world.bodyEdits?.(previous.groups, groups);
+  if (changed?.sameOrder) {
+    for (const id of changed.ids) {
+      const before = previous.maleSizes.get(id);
+      if (before === undefined) continue;
+      const size = groups.get(id).length;
+      previous.probeCount += (size - before) * NEIGHBORS.length;
+      previous.maleSizes.set(id, size);
+    }
+    previous.groups = groups;
+    return previous;
+  }
+  const males = [], females = new Set(), maleSizes = new Map();
   let ambiguousIds = false, probeCount = 0;
   for (const [id, cells] of groups) {
     const fish = world.readFish(id);
     if (!fish) continue;
     if (typeof id !== 'string' || id.includes('|')) ambiguousIds = true;
     const gender = fishOrigin(world.data, id)?.gender;
-    if (gender === 'male') { males.push(fish); probeCount += cells.length * NEIGHBORS.length; }
+    if (gender === 'male') { males.push(fish); maleSizes.set(id, cells.length); probeCount += cells.length * NEIGHBORS.length; }
     if (gender === 'female') females.add(id);
   }
-  const roster = { revision, groups, males, females, probeCount, ambiguousIds };
+  const roster = { revision, groups, males, females, maleSizes, probeCount, ambiguousIds };
   if (revision !== undefined) contactRosters.set(world, roster);
   return roster;
 }
 export function updateContacts(world, now, groups, scenery, captured = capturedFishIds(world.data, now), occupancy) {
   world.data.contacts ||= {}; world.data.breeding ||= {};
   const taken = new Set(activeRecords(world.data).flatMap(record => [record.male, record.female]));
-  const roster = contactRoster(world, groups), { males, females, ambiguousIds } = roster, pairs = new Map();
+  const roster = contactRoster(world, groups);
+  const { males, females, ambiguousIds } = roster, pairs = new Map();
   let density;
   if (males.length && females.size) occupancy ||= world.movementGrid(groups);
   const scanned = !ambiguousIds && collectGridPairs(world, occupancy, scenery, roster, taken, captured, pairs);
@@ -274,7 +287,7 @@ function pairBody(record, members, layout, cache) {
 export function motionOrder(world, groups, layout = world.bodyLayout(groups), singles = layout.ordered) {
   const active = activeRecords(world.data);
   if (!active.length) return singles;
-  const result = [], paired = new Set();
+  const result = [];
   const cache = world.stableFishRoster && (layout.pairBodies ??= new WeakMap());
   for (const record of active.sort((a, b) => a.id.localeCompare(b.id))) {
     const members = [world.data.fishes[record.male], world.data.fishes[record.female]];
@@ -282,17 +295,40 @@ export function motionOrder(world, groups, layout = world.bodyLayout(groups), si
     const { cells, offsets, x, y } = pairBody(record, members, layout, cache);
     const fish = { id: record.id, x, y, facing: 1, created: record.started, ...record.motion };
     result.push([record.id, cells, { id: record.id, fish, cells, members, offsets, record }]);
-    for (const member of members) paired.add(member.id);
   }
-  const units = [];
+  if (!result.length) return singles;
+  // Only the membership and fish order determine the slots. Rebuild each
+  // pair's live pose above even when its slot in the collision order is fixed.
+  const previous = layout.pairOrder;
+  if (cache && previous?.singles === singles && previous.slots.length === result.length &&
+      result.every(([id, , { members }], i) => {
+        const slot = previous.slots[i];
+        return slot.id === id && slot.male === members[0].id && slot.female === members[1].id;
+      })) {
+    const units = previous.entries.slice();
+    for (let i = 0; i < result.length; i++) units[previous.slots[i].index] = result[i];
+    return units;
+  }
+  const paired = new Set(), slots = [], units = [];
+  for (const [, , { members }] of result) for (const member of members) paired.add(member.id);
   let index = 0;
+  function insertPair() {
+    const pair = result[index++], [male, female] = pair[2].members;
+    slots.push({ id: pair[0], male: male.id, female: female.id, index: units.length });
+    units.push(pair);
+  }
   for (const entry of singles) {
     const [id] = entry;
     if (paired.has(id)) continue;
-    while (index < result.length && result[index][0].localeCompare(id) <= 0) units.push(result[index++]);
+    while (index < result.length && result[index][0].localeCompare(id) <= 0) insertPair();
     units.push(entry);
   }
-  while (index < result.length) units.push(result[index++]);
+  while (index < result.length) insertPair();
+  if (cache) {
+    const entries = units.slice();
+    for (const slot of slots) entries[slot.index] = null;
+    layout.pairOrder = { singles, slots, entries };
+  }
   return units;
 }
 export function motionUnits(world, groups) {

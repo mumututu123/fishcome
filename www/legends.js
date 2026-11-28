@@ -1,7 +1,7 @@
 import { components, cellPosition, hash, key } from './engine.js';
 import { wrapX, deltaX, makeTerrain } from './geography.js';
 import { modelCells, legendaryModel, atomicPhase } from './legendary-models.js';
-import { recordStory } from './life.js';
+import { recordStory, withStoryBatch } from './life.js';
 import { cancelBreeding } from './breeding.js';
 
 export const LEGENDS = Object.freeze({ period: 600000, cooldown: 7200000, opening: 2000, warning: 20000, limit: 64 });
@@ -124,7 +124,12 @@ function settleCaptures(world, now, transition, onPose) {
     }
   }
 }
-export function settleLegendary(world, now, transition, onPose) { settleCaptures(world, now, transition, onPose); enforceLegends(world, now, transition, onPose); }
+export function settleLegendary(world, now, transition, onPose) {
+  withStoryBatch(world, () => {
+    settleCaptures(world, now, transition, onPose);
+    enforceLegends(world, now, transition, onPose);
+  });
+}
 export function ghostRoll(seed, slot, minute) { return (hash(`maggot:${seed}:${slot}:${minute}`) >>> 8) % 100 === 0; }
 export function ghostIndex(seed, slot, minute, prior = []) { const order = modelCells('ship').sort((a, b) => hash(`plank:${seed}:${slot}:${a.index}`) - hash(`plank:${seed}:${slot}:${b.index}`) || a.index - b.index); return order[minute - 1]?.index ?? null; }
 export function ghostSource(roots, source) {

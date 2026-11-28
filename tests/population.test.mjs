@@ -5,7 +5,7 @@ import { wrapX } from '../www/geography.js';
 import { POPULATION, updatePopulation, illnessOf, volcanoPlan, predatorCells, validPopulation, validRocks, mergePopulation, mergeRocks } from '../www/population.js';
 import { restoreCheckpoint } from '../www/lifecycle.js';
 import { verifyLocalCheckpoint, verifyReplica } from '../www/replica.js';
-import { validateLife } from '../www/life.js';
+import { LIFE, recordStory, validateLife } from '../www/life.js';
 import { WorkerSimulation } from '../www/simulation-worker.js';
 import { SimulationClient } from '../www/simulation-client.js';
 import { WorldBroadcast } from '../www/world-broadcast.js';
@@ -24,6 +24,26 @@ function world(count = 0) {
   w.data.population.illnessSlot = Math.floor(now / HOUR); w.data.population.volcanoSlot = Math.floor(now / POPULATION.volcanoPeriod); return w;
 }
 const advance = (w, t) => { updatePopulation(w, t, transition); w.data.tick = t; };
+test('整点集中患病只交付一次故事表，保留逐条写入的内容与顺序', () => {
+  const w = world(), reference = world(), at = now + HOUR;
+  for (let i = 0; i < 2600; i++) {
+    const id = 'fish-' + i;
+    w.data.fishes[id] = { id, created: born };
+  }
+  for (let i = 0; i < LIFE.storyLimit; i++) recordStory(w, 'arrive', 'fish-' + i, now);
+  let stories = w.data.life.stories, writes = 0;
+  reference.data.life.stories = clone(stories);
+  Object.defineProperty(w.data.life, 'stories', {
+    get: () => stories,
+    set(value) { writes++; stories = value; }
+  });
+  advance(w, at);
+  const patients = Object.keys(w.data.population.illnesses);
+  assert.equal(patients.length, 520);
+  for (const id of patients) recordStory(reference, 'depressed', id, at, { visit: at });
+  assert.deepEqual(Object.entries(stories), Object.entries(reference.data.life.stories));
+  assert.equal(writes, 1);
+});
 function erupt(w, at = now) {
   for (let slot = Math.floor(at / POPULATION.volcanoPeriod); ; slot++) {
     if (!volcanoPlan(w.data, slot)) continue;
@@ -220,9 +240,22 @@ test('多人副本接受合法疾病与岩石，拒绝伪造起源、无限数�
 test('后台线程同步疾病；正常多人广播只发送新增的岩石行', async () => {
   const a = world(300), b = new World(now, undefined, { populate: false }); b.data = a.serialize();
   a.data.population.illnessSlot = b.data.population.illnessSlot = Math.floor(now / HOUR) - 1;
-  const simulation = new WorkerSimulation();
-  const client = new SimulationClient(() => ({ terminate() {}, postMessage(message) { setImmediate(() => { try { this.onmessage({ data: { result: structuredClone(simulation.receive(structuredClone(message))) } }); } catch (e) { this.onmessage({ data: { error: e.message } }); } }); } }));
-  try { a.step(now + 500); await client.advance(b, now + 500); assert.deepEqual(b.serialize(), a.serialize()); } finally { client.close(); }
+  const simulation = new WorkerSimulation(), patches = [];
+  const client = new SimulationClient(() => ({ terminate() {}, postMessage(message) { setImmediate(() => {
+    try {
+      const result = structuredClone(simulation.receive(structuredClone(message)));
+      if (result?.patch) patches.push(result.patch);
+      this.onmessage({ data: { result } });
+    } catch (e) { this.onmessage({ data: { error: e.message } }); }
+  }); } }));
+  try {
+    for (const offset of [500, 1000]) {
+      a.step(now + offset); await client.advance(b, now + offset);
+      assert.deepEqual(b.serialize(), a.serialize());
+    }
+    assert.deepEqual(Object.keys(patches[0].population.illnesses[0]), Object.keys(a.data.population.illnesses));
+    assert(!patches[1].population.illnesses && !patches[1].values.population);
+  } finally { client.close(); }
   const channel = new WorldBroadcast(), network = { live: () => [1], broadcast: (kind, body) => body };
   const full = await channel.send(network, a.data, a.data.tick); assert(full.world.population);
   const e = erupt(a), c = particle(a, e, 0, e.x, a.floorAt(e.x) - 1); advance(a, c.born + POPULATION.cooling);

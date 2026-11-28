@@ -1,4 +1,5 @@
 import { WORLD_WIDTH, wrapX } from './geography.js';
+import { SimulationRows } from './simulation-rows.js';
 
 const side = 32;
 const columns = Math.ceil(WORLD_WIDTH / side);
@@ -32,8 +33,33 @@ function staysInSector(group, x, y, facing) {
   return facing === 1 ? x >= range.left && x < range.right : x >= range.flippedLeft && x < range.flippedRight;
 }
 
-// Several cells can share an owner. Moving the owner changes their sectors
-// without changing the insertion order used by painting and hit testing.
+function bodyBounds(group) {
+  let left = Infinity, right = -Infinity, top = Infinity, bottom = -Infinity;
+  for (const { x, y } of group) {
+    if (!Number.isInteger(x) || !Number.isInteger(y) || Math.abs(x) > WORLD_WIDTH || Math.abs(y) > WORLD_WIDTH) return false;
+    left = Math.min(left, x); right = Math.max(right, x);
+    top = Math.min(top, y); bottom = Math.max(bottom, y);
+  }
+  return { left, right, top, bottom };
+}
+
+// Integer bodies can be rejected by their bounds. Older coordinates still use
+// the glyph test, which rounds wrapped positions the same way as drawing.
+function reachesFishSector(bounds, x, y, facing, x1, x2, y1, y2, wraps, all) {
+  if (!bounds || !Number.isInteger(x) || x < 0 || x >= WORLD_WIDTH ||
+      !Number.isInteger(y) || Math.abs(y) > WORLD_WIDTH || Math.abs(facing) !== 1) return true;
+  if (y + bounds.top >= y2 || y + bounds.bottom < y1) return false;
+  if (all) return true;
+  const left = x + (facing === 1 ? bounds.left : -bounds.right);
+  const right = x + (facing === 1 ? bounds.right : -bounds.left);
+  if (wraps) return left < x2 || right >= x1;
+  return (left < x2 && right >= x1) ||
+    (left + WORLD_WIDTH < x2 && right + WORLD_WIDTH >= x1) ||
+    (left - WORLD_WIDTH < x2 && right - WORLD_WIDTH >= x1);
+}
+
+// Fish groups read their committed poses when queried. Other cells retain
+// sector membership and share the same order used by painting and hit testing.
 export class ViewportCells {
   constructor(data, progressive = false) {
     this.data = data;
@@ -69,13 +95,17 @@ export class ViewportCells {
   }
 
   place(entry) {
+    if (entry.kind === 'fish') {
+      entry.owner.bounds = undefined;
+      this.queryKey = undefined;
+      return;
+    }
     const { cell } = entry;
     let x = cell.x, y = cell.y;
     if (entry.owner) {
-      const fish = cell.kind === 'fish';
-      const owner = (fish ? this.data.fishes : this.data.scenes)[cell.entity];
+      const owner = this.data.scenes[cell.entity];
       if (!owner) return this.move(entry, undefined);
-      x = owner.x + (fish ? owner.facing : 1) * x;
+      x = owner.x + x;
       y += owner.y;
     }
     this.move(entry, sector(x, y));
@@ -103,7 +133,14 @@ export class ViewportCells {
     if (entry.owner) {
       entry.owner.delete(entry);
       entry.owner.range = null;
-      if (!entry.owner.size) this.owners[entry.kind].delete(entry.entity);
+      if (entry.kind === 'fish') {
+        entry.owner.bounds = undefined;
+        this.queryKey = undefined;
+      }
+      if (!entry.owner.size) {
+        this.owners[entry.kind].delete(entry.entity);
+        if (entry.kind === 'fish') this.fishGroups = null;
+      }
     }
     this.cells.delete(id);
     return entry.order;
@@ -116,8 +153,14 @@ export class ViewportCells {
     const owners = this.owners[cell.kind];
     if (owners) {
       if (!owners.has(cell.entity)) {
-        const group = new Set(), pose = (cell.kind === 'fish' ? this.data.fishes : this.data.scenes)[cell.entity];
-        if (pose) { group.x = pose.x; group.y = pose.y; group.facing = pose.facing; }
+        const group = new Set();
+        if (cell.kind === 'fish') {
+          group.id = cell.entity;
+          this.fishGroups = null;
+        } else {
+          const pose = this.data.scenes[cell.entity];
+          if (pose) { group.x = pose.x; group.y = pose.y; group.facing = pose.facing; }
+        }
         owners.set(cell.entity, group);
       }
       entry.owner = owners.get(cell.entity);
@@ -139,7 +182,7 @@ export class ViewportCells {
     group.x = x; group.y = y; group.facing = facing;
     if (!inside) {
       group.range = null;
-      for (const entry of group) this.move(entry, x === undefined ? undefined : sector(x + (entry.kind === 'fish' ? facing : 1) * entry.x, y + entry.y));
+      for (const entry of group) this.move(entry, x === undefined ? undefined : sector(x + entry.x, y + entry.y));
     }
   }
 
@@ -160,7 +203,7 @@ export class ViewportCells {
   reconcileMerge({ chars, fishes, scenes }) {
     if (chars.size) this.queryKey = undefined;
     for (const id of chars) this.refresh(id, this.data.chars[id]);
-    for (const id of fishes) this.moveOwner(this.owners.fish.get(id), this.data.fishes[id]);
+    if (fishes.size) this.fishQueryDirty = true;
     for (const id of scenes) this.moveOwner(this.owners.scene.get(id), this.data.scenes[id]);
   }
 
@@ -176,7 +219,6 @@ export class ViewportCells {
     }
     if (order !== this.cells.size) for (const id of this.cells.keys()) if (!Object.hasOwn(chars, id)) this.remove(id);
     this.order = order;
-    for (const [id, group] of this.owners.fish) this.moveOwner(group, this.data.fishes[id]);
     for (const [id, group] of this.owners.scene) this.moveOwner(group, this.data.scenes[id]);
   }
 
@@ -184,17 +226,15 @@ export class ViewportCells {
     const { chars, fishes, scenes } = tables;
     if (!chars && !fishes && !scenes) return;
     if (chars) this.queryKey = undefined;
+    if (fishes) this.fishQueryDirty = true;
     for (const id of chars?.remove || []) this.remove(id);
     for (const [id, cell] of chars?.set || []) {
       if (this.remaining && !this.cells.has(id)) this.appended.add(id);
       else this.refresh(id, cell);
     }
-    for (const [changes, owners] of [[fishes, this.owners.fish], [scenes, this.owners.scene]]) {
-      if (!changes) continue;
-      for (const id of changes.remove || []) this.moveOwner(owners.get(id));
-      const frame = changes.frame;
-      if (frame) frame.forEachPose((id, x, y, facing) => this.moveOwnerTo(owners.get(id), x, y, facing));
-      else for (const [id, pose] of changes.set || []) this.moveOwner(owners.get(id), pose);
+    if (scenes) {
+      for (const id of scenes.remove || []) this.moveOwner(this.owners.scene.get(id));
+      for (const [id, pose] of scenes.set || []) this.moveOwner(this.owners.scene.get(id), pose);
     }
   }
 
@@ -206,25 +246,46 @@ export class ViewportCells {
     const all = right - left >= WORLD_WIDTH;
     const wraps = Math.floor(left / WORLD_WIDTH) !== Math.floor(right / WORLD_WIDTH);
     const key = [first, last, upper, lower, all, wraps].join(',');
-    if (key === this.queryKey) return this.result;
+    if (key === this.queryKey && !this.fishQueryDirty) return this.result;
+    const previous = key === this.queryKey && this.result;
     const entries = new Set();
     this.queriedSectors = new Set();
     const visit = (a, b) => {
       for (let row = upper; row <= lower; row++) for (let col = a; col <= b; col++) {
         const id = row * columns + col;
         this.queriedSectors.add(id);
-        for (const entry of this.sectors.get(id) || []) {
-          // Fish shapes, eye placement and echo effects use the entire visible body.
-          if (entry.kind === 'fish') { if (!entries.has(entry)) for (const part of entry.owner) entries.add(part); }
-          else entries.add(entry);
-        }
+        for (const entry of this.sectors.get(id) || []) entries.add(entry);
       }
     };
     if (all) visit(0, columns - 1);
     else if (wraps) { visit(first, columns - 1); visit(0, last); }
     else visit(first, last);
+    const x1 = first * side, x2 = Math.min(WORLD_WIDTH, (last + 1) * side), y1 = upper * side, y2 = (lower + 1) * side;
+    const { fishes } = this.data, rows = SimulationRows.current(fishes), coordinates = {};
+    if (!this.fishGroups || this.fishRows !== rows) {
+      this.fishGroups = [...this.owners.fish.values()];
+      for (const group of this.fishGroups) group.slot = rows?.at(group.id);
+      this.fishRows = rows;
+    }
+    for (const group of this.fishGroups) {
+      let slot = group.slot;
+      if (rows && (!slot || slot.removed)) slot = group.slot = rows.at(group.id);
+      const frame = slot?.frame;
+      const pose = frame ? frame.readPose(slot.index, coordinates) : slot ? slot.value : fishes[group.id];
+      if (pose?.x === undefined) continue;
+      const { x, y, facing } = pose;
+      const bounds = group.bounds ??= bodyBounds(group);
+      if (!reachesFishSector(bounds, x, y, facing, x1, x2, y1, y2, wraps, all)) continue;
+      for (const part of group) if (this.queriedSectors.has(sector(x + facing * part.x, y + part.y))) {
+        // Fish shapes, eye placement and echo effects use the entire visible body.
+        for (const part of group) entries.add(part);
+        break;
+      }
+    }
+    this.fishQueryDirty = false;
     this.queryKey = key;
-    this.result = Array.from(entries).sort((a, b) => a.order - b.order).map(entry => entry.cell);
+    const result = Array.from(entries).sort((a, b) => a.order - b.order).map(entry => entry.cell);
+    if (!previous || previous.length !== result.length || result.some((cell, i) => cell !== previous[i])) this.result = result;
     return this.result;
   }
 }

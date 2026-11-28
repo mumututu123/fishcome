@@ -150,6 +150,38 @@ export class FishPoseFrame {
     }
     return rows;
   }
+  // One symbol per fish per field. A delta can stand for a double only if
+  // adding it to this exact confirmed pose reproduces the source value.
+  transitions() {
+    if (this.transitionRows) return this.transitionRows;
+    const { motion, offsets, loose } = this.columns, prior = this.prior, n = this.roster.length;
+    const codes = new Uint8Array(n * poseFields.length), increments = new Map(), literals = [], full = [];
+    for (let i = 0; i < n; i++) {
+      if (this.exceptions?.[i]) { codes[i] = 2; full.push(this.exceptions[i]); continue; }
+      const current = loose?.[i], before = prior ? prior.loose?.[i] : this.roster[i][1];
+      const nextAt = offsets ? offsets[i] - 1 : i * 5, beforeAt = prior?.offsets ? prior.offsets[i] - 1 : i * 5;
+      for (let k = 0; k < poseFields.length; k++) {
+        const value = current ? current[poseFields[k]] : motion[nextAt + k];
+        const old = before ? before[poseFields[k]] : prior.motion[beforeAt + k];
+        if (value === old) continue;
+        const at = k * n + i;
+        if (value === 0) { codes[at] = 1; continue; }
+        const delta = value - old;
+        if (old + delta === value && Number.isFinite(delta)) {
+          let code = increments.get(delta);
+          if (code === undefined && increments.size < 252) {
+            code = 4 + increments.size;
+            increments.set(delta, code);
+          }
+          if (code !== undefined) { codes[at] = code; continue; }
+        }
+        codes[at] = 3;
+        literals.push(value);
+      }
+    }
+    return this.transitionRows = { moves: codes.toBase64(), increments: [...increments.keys()],
+      ...(literals.length && { literals }), ...(full.length && { full }) };
+  }
   // One mask per confirmed fish, followed by the changed doubles in field
   // order. Bit 5 selects the next exceptional complete row. No IDs or decimal
   // conversions are necessary on a stable roster.
@@ -196,7 +228,7 @@ export function replicaRowBase(id, world, frames = false, previous) {
   // retain its last confirmed journey only while it occurs in the fish roster.
   const indices = poses?.indices ?? confirmedRosters.get(world) ?? new Map(rows[0].map(([fish], i) => [fish, i]));
   const travel = new ConfirmedTravel(indices, trips || world.travel, previous?.travel);
-  return { id, tick: world.tick, rows, tables, travel, roots: world.roots, terrain: world.terrain,
+  return { id, tick: world.tick, rows, tables, travel, roots: world.roots, terrain: world.terrain, archives: world.archives?.chunks,
     get fishIds() { return orderedFishIds(indices); },
     get fishTable() { return poses ? poses.table() : tables[0]; } };
 }
@@ -250,7 +282,7 @@ function encodableRange(body, base, transitions) {
     Number.isSafeInteger(elapsed) && elapsed >= 0 && elapsed % CONFIG.step === 0;
 }
 
-export function encodeReplicaRowDelta(body, base, frames = false, poseBytes = false, transitions = false) {
+export function encodeReplicaRowDelta(body, base, frames = false, poseBytes = false, transitions = false, poseTransitions = false) {
   if (!base || body.delta !== true || !encodableRange(body, base, frames && transitions)) return body;
   const compact = frames && !!base.travel;
   const day = compact ? shanghaiDay(body.world.tick) : null;
@@ -264,6 +296,11 @@ export function encodeReplicaRowDelta(body, base, frames = false, poseBytes = fa
     bondRows = { before, length, kept: Array.from(kept), added: Array.from(added), keys };
   }
   let fishIndices = poses?.indices;
+  let fishRows;
+  if (poses) {
+    if (!poseBytes || !supportsPoseBytes) fishRows = poses.encode();
+    else fishRows = poseTransitions ? poses.transitions() : poses.packed();
+  }
   const world = mapTables(body.world, (table, index) => {
     if (!rowTable(table)) return;
     let known;
@@ -293,7 +330,7 @@ export function encodeReplicaRowDelta(body, base, frames = false, poseBytes = fa
       rows[next++] = encodeRow(id, row, reference, base.rows[index][reference]?.[1]);
     }
     return rows;
-  }, poses && (poseBytes && supportsPoseBytes ? poses.packed() : poses.encode()), step?.trips, bondRows);
+  }, fishRows, step?.trips, bondRows);
   if (world && compact) {
     for (const field of ['roots', 'terrain']) if (world[field] && world[field] === base[field]) world[field] = true;
     if (rowTable(world.contacts)) world.contacts = Object.entries(world.contacts).map(([id, row]) => {
@@ -323,6 +360,37 @@ function decodeRow(encoded, known) {
   return [id, row];
 }
 
+function applyPoseTransitions(encoded, base, tick) {
+  const { moves, increments, literals = [], full = [] } = encoded;
+  const ids = base.fishIds, n = ids.length, previous = base.fishTable;
+  if (typeof moves !== 'string' || moves.length !== 4 * Math.ceil(5 * n / 3) ||
+      !Array.isArray(increments) || increments.length > 252 || !increments.every(Number.isFinite) ||
+      !Array.isArray(literals) || literals.length > 5 * n || !Array.isArray(full) || full.length > n) throw new Error('实时鱼位变化长度无效');
+  const codes = Uint8Array.fromBase64(moves, { lastChunkHandling: 'strict' });
+  if (codes.length !== n * 5) throw new Error('实时鱼位变化数量不符');
+  const rows = {};
+  let copied = 0, literal = 0;
+  for (let i = 0; i < n; i++) {
+    const id = ids[i];
+    if (!safeId(id)) throw new Error('无效的实时鱼标识');
+    if (codes[i] === 2 && rowTable(full[copied])) { rows[id] = full[copied++]; continue; }
+    const before = previous[id];
+    if (!rowTable(before)) throw new Error('缺少实时鱼位基准');
+    const fish = { ...before };
+    for (let k = 0; k < poseFields.length; k++) {
+      const code = codes[k * n + i], field = poseFields[k];
+      if (!code) continue;
+      const value = code === 1 ? 0 : code === 3 ? literals[literal++] : before[field] + increments[code - 4];
+      if (!Number.isFinite(value)) throw new Error('实时鱼坐标须为有限数值');
+      fish[field] = value;
+    }
+    fish.posAt = tick;
+    rows[id] = fish;
+  }
+  if (copied !== full.length || literal !== literals.length) throw new Error('实时鱼位例外数量不符');
+  return rows;
+}
+
 function unpackPoses(encoded, base, tick) {
   const ids = base.fishIds, previous = base.fishTable;
   const { poses, full = [] } = encoded, n = ids.length;
@@ -349,7 +417,7 @@ function unpackPoses(encoded, base, tick) {
   return rows;
 }
 
-export function decodeReplicaRowDelta(body, base, frames = false, poseBytes = false, transitions = false) {
+export function decodeReplicaRowDelta(body, base, frames = false, poseBytes = false, transitions = false, poseTransitions = false) {
   if (typeof body.rowBase !== 'string' || body.rowBase.length !== 36 || body.delta !== true) throw new Error('无效的实时变更版本');
   if (base?.id !== body.rowBase) return null;
   if (!encodableRange(body, base, frames && body.frameRows === true && transitions)) throw new Error('实时变更不连续');
@@ -361,7 +429,10 @@ export function decodeReplicaRowDelta(body, base, frames = false, poseBytes = fa
       const table = base.tables[rowsIndex];
       return table instanceof BondFrame ? table.table() : table;
     }
-    if (frameRows && rowsIndex === 0 && poseBytes && rowTable(encoded)) return unpackPoses(encoded, base, message.world.tick);
+    if (frameRows && rowsIndex === 0 && poseBytes && rowTable(encoded)) {
+      if (poseTransitions && Object.hasOwn(encoded, 'moves')) return applyPoseTransitions(encoded, base, message.world.tick);
+      return unpackPoses(encoded, base, message.world.tick);
+    }
     if (frameRows && rowsIndex === 3 && rowTable(encoded)) {
       const { before, length, kept, added, keys } = encoded;
       return applyBondIntervals(base.tables[rowsIndex], { at: message.world.life.at, keys, intervals: { before, length, kept, added } });
@@ -399,7 +470,9 @@ export function decodeReplicaRowDelta(body, base, frames = false, poseBytes = fa
     return table;
   });
   if (frameRows) {
-    if (poseBytes && rowTable(message.world.fishes) && Object.hasOwn(message.world.fishes, 'poses')) confirmedRosters.set(world, base.travel.indices);
+    if (poseBytes && rowTable(message.world.fishes) && (Object.hasOwn(message.world.fishes, 'poses') || poseTransitions && Object.hasOwn(message.world.fishes, 'moves'))) {
+      confirmedRosters.set(world, base.travel.indices);
+    }
     for (const field of ['roots', 'terrain']) if (world[field] === true) {
       if (!base[field]) throw new Error('缺少实时世界来源');
       world[field] = base[field];

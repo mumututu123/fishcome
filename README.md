@@ -159,6 +159,10 @@
 
 ## 开发
 
+鱼的试路顺序、转身、横纵位移和速度余量统一维护在 `native/swimming.c`。进食意向、配对、旧存档坐标和移动后的生态记录由 `www/swimming.js` 接入。稠密鱼群的接触和局部密度维护在 `native/contacts.c`，直接读取游动更新后的占格。发行包直接包含编译后的 `www/swim-program.js`，日常打包沿用原命令。修改游动源码后，用 Zig 0.17.0 运行 `node scripts/build-swimming.mjs` 重新生成，追加 `--check` 可核对字节；编译器路径可通过 `ZIG` 指定。
+
+使用五千鱼的真实备份运行 `node scripts/replay-swimming.mjs 备份.json 原版工作区 当前工作区`，会逐步比对两边完整世界、泳路、行程和投喂版本，覆盖普通游动、上海整点、跨界极远坐标、小数坐标及全鱼刚进食。
+
 源文件 `www/engine.js` 是生态、账本与世界合流，`fish-status.js` 管理鱼况统计口径和记录合并，`chat.js` 管理聊天记录和海底沉积鱼元，`lifecycle.js` 管理 240 小时离线期限与存档恢复，`network.js` 是配对及 WebRTC 传输，`app.js` 管理浏览器副本和界面，`launcher/`（Go）负责静态发布、临时信令、便携包导出、热更新与桌面托盘。
 
 构建需要 Go 1.25 或更高版本。运行 `./build.ps1` 默认按当前系统构建（Windows 在 PowerShell 下生成 `dist/鱼来/鱼来.exe` 与 `fishcome-VERSION-windows.zip`，Linux 使用 `pwsh` 生成 `dist/鱼来/fishcome` 与 `fishcome-VERSION-linux-amd64.zip`），也可通过 `-TargetOS windows` 或 `-TargetOS linux` 指定目标系统。

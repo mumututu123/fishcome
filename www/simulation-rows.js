@@ -28,6 +28,11 @@ export class SimulationRows {
     return slot?.frame && Object.getOwnPropertyDescriptor(table, id)?.get === slot.read ? slot.frame.readForCheckpoint(slot.index) : table[id];
   }
 
+  static current(table) {
+    const rows = tables.get(table);
+    if (rows?.knownFish) return rows;
+  }
+
   static invalidate(table) {
     const existing = tables.get(table);
     if (existing) existing.knownFish = null;

@@ -14,7 +14,7 @@ const server = http.createServer((request, response) => {
 });
 async function main() {
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve)); origin = `http://127.0.0.1:${server.address().port}`;
-  browser = await chromium.launch({ executablePath: 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe', headless: true });
+  browser = await chromium.launch({ channel: 'chromium', headless: true });
   const context = await browser.newContext({ viewport: { width: 1440, height: 900 } }); const setup = await context.newPage(); await setup.goto(origin + '/welcome.html');
   const fixture = await setup.evaluate(async () => {
     const { World } = await import('./engine.js'), { newIdentity, signer, set } = await import('./storage.js'), { Network } = await import('./network.js');

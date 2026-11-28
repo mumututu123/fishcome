@@ -1,6 +1,7 @@
 import { bounds, hash } from './engine.js';
-import { fishNeighbors } from './life-neighbors.js';
-import { advanceBond, bondLimit } from './bond-interval.js';
+import { fishNeighbors, placeSchoolCenter, schoolBuckets } from './life-neighbors.js';
+import { schoolMembership } from './fish-school.js';
+import { advanceBond, bondLimit, compareBondIntervals } from './bond-interval.js';
 import { WORLD_WIDTH, wrapX, deltaX, worldKey } from './geography.js';
 import { EVENTS, activeEvent, updateEvents, validEvent, eventSchedule, eventNarration, eventMotion } from './random-events.js';
 import { validLegendStory } from './legends.js';
@@ -47,10 +48,45 @@ function makeStory(kind, fish, at, extra) {
   return { id, kind, fish, at, ...extra };
 }
 export function recordStory(world, kind, fish, at, extra = {}) {
+  if (world.activeStoryWriter) return world.activeStoryWriter(world, kind, fish, at, extra);
   const life = state(world, at), story = makeStory(kind, fish, at, extra);
   life.stories[story.id] = choose(life.stories[story.id], story);
   if (Object.keys(life.stories).length > LIFE.storyLimit) life.stories = trim(life.stories, LIFE.storyLimit);
   world.dirty = true;
+}
+export function withStoryBatch(world, work) {
+  if (world.activeStoryWriter) return work(world.activeStoryWriter);
+  let life, stories, storyCount;
+  function retainStories() {
+    if (storyCount <= LIFE.storyLimit) return;
+    stories = trim(stories, LIFE.storyLimit);
+    storyCount = LIFE.storyLimit;
+  }
+  function record(_, kind, fish, at, extra = {}) {
+    if (!stories) {
+      life = state(world, at);
+      stories = { ...(world.readStories?.() ?? life.stories) };
+      storyCount = Object.keys(stories).length;
+    }
+    const story = makeStory(kind, fish, at, extra), id = story.id;
+    // Distinct additions commute with keeping the first 512 ranked stories.
+    // A repeated ID must first see whether its previous story survived.
+    if (stories[id]) retainStories();
+    if (stories[id]) stories[id] = choose(stories[id], story);
+    else { stories[id] = story; storyCount++; }
+    if (storyCount >= 2 * LIFE.storyLimit) retainStories();
+  }
+  world.activeStoryWriter = record;
+  try {
+    return work(record);
+  } finally {
+    world.activeStoryWriter = undefined;
+    if (stories) {
+      retainStories();
+      life.stories = stories;
+      world.dirty = true;
+    }
+  }
 }
 function clearLine(a, b, blockedRows) {
   const dx = deltaX(b.x, a.x), dy = b.y - a.y, steps = Math.ceil(Math.max(Math.abs(dx), Math.abs(dy)));
@@ -89,9 +125,27 @@ function indexPoints(points) {
     return found;
   };
 }
-function schoolGeometry(world, layout, roster) {
+function schoolGeometry(world, layout, roster, previous) {
+  const centerByBody = previous?.centerByBody ?? new WeakMap();
+  if (layout.reshaped && previous?.roster === roster && previous.groups === layout.reshaped.before) {
+    for (const id of layout.reshaped.ids) {
+      const point = previous.points.get(id);
+      if (!point) continue;
+      const cells = layout.groups.get(id), box = layout.hull(cells)?.bounds ?? bounds(cells);
+      const center = previous.centers[point.order];
+      point.halfWidth = (box.maxX - box.minX) / 2;
+      point.halfHeight = (box.maxY - box.minY) / 2;
+      center.localX = (box.maxX + box.minX) / 2;
+      center.localY = (box.maxY + box.minY) / 2;
+      centerByBody.delete(layout.reshaped.before.get(id));
+      centerByBody.set(cells, center);
+      // The radius is a search bound. The exact gaps are tested for each fish.
+      previous.maxRadius = Math.max(previous.maxRadius, point.halfWidth, point.halfHeight);
+    }
+    previous.groups = layout.groups;
+    return previous;
+  }
   const points = new Map(), centers = [], ordered = [], ranks = new Map();
-  const previous = layout.school, centerByBody = previous?.centerByBody ?? new WeakMap();
   let subset = !!previous?.orderedPairs, maxRadius = 0, rank = 0;
   for (const [id, cells] of layout.groups) {
     const fish = world.readFish(id);
@@ -100,7 +154,7 @@ function schoolGeometry(world, layout, roster) {
     if (!center || center.fish !== fish) {
       const box = layout.hull(cells)?.bounds ?? bounds(cells);
       const point = { id, x: 0, y: 0, halfWidth: (box.maxX - box.minX) / 2, halfHeight: (box.maxY - box.minY) / 2 };
-      center = { fish, point, localX: (box.minX + box.maxX) / 2, localY: (box.minY + box.maxY) / 2 };
+      center = { fish, point, ordinal: world.swimOrdinal?.(id), localX: (box.minX + box.maxX) / 2, localY: (box.minY + box.maxY) / 2 };
       centerByBody.set(cells, center);
     }
     if (subset && !previous.points.has(id)) subset = false;
@@ -127,12 +181,16 @@ function schoolGeometry(world, layout, roster) {
   return { groups: layout.groups, roster, points, centers, centerByBody, ordered, ranks, orderedPairs, ordinalIds, maxRadius };
 }
 
+export function indexSchoolBodies(world, layout) {
+  const roster = world.fishValues(), previous = layout.school;
+  if (previous?.groups === layout.groups && previous.roster === roster) return previous;
+  return layout.school = schoolGeometry(world, layout, roster, previous);
+}
 export function lifeContext(world, now, scenery, groups, sharedLayout) {
-  const layout = sharedLayout || world.bodyLayout(groups), roster = world.fishValues();
+  const layout = sharedLayout || world.bodyLayout(groups);
   // Only the simulation loop lends its workspace to the next tick. Public
   // contexts requested by tools and the renderer retain their own positions.
-  const geometry = sharedLayout?.school?.groups === groups && sharedLayout.school.roster === roster ? sharedLayout.school : schoolGeometry(world, layout, roster);
-  if (sharedLayout) sharedLayout.school = geometry;
+  const geometry = sharedLayout ? indexSchoolBodies(world, layout) : schoolGeometry(world, layout, world.fishValues());
   const { points, ordered, maxRadius } = geometry;
   const sortedNeighbors = new Map(), scenes = new Map();
   const sceneryPoints = [], blockedRows = [], nearWalls = [], wallSectors = new Set();
@@ -156,9 +214,19 @@ export function lifeContext(world, now, scenery, groups, sharedLayout) {
   }
   const nearScenery = sceneryPoints.length ? indexPoints(sceneryPoints) : null;
   const nearObstacle = geometry.obstacles ??= new Uint8Array(ordered.length);
-  for (const { fish, point: p, localX, localY } of geometry.centers) {
-    p.x = wrapX(fish.x + fish.facing * localX);
-    p.y = fish.y + localY;
+  const buckets = schoolBuckets(geometry);
+  const poses = world.currentSwimColumns?.(), data = poses?.grid.doubles, base = poses?.grid.poseOffset / 8;
+  for (const { fish, point: p, ordinal, localX, localY } of geometry.centers) {
+    const row = poses?.index[ordinal];
+    if (row) {
+      const i = base + (row - 1) * 5;
+      p.x = wrapX(data[i] + data[i + 2] * localX);
+      p.y = data[i + 1] + localY;
+    } else {
+      p.x = wrapX(fish.x + fish.facing * localX);
+      p.y = fish.y + localY;
+    }
+    placeSchoolCenter(buckets, p);
     nearObstacle[p.slot] = nearWalls[Math.floor(p.y / sectorSize)]?.[Math.floor(p.x / sectorSize)] || 0;
     if (!nearScenery || !nearObstacle[p.slot]) continue;
     const spots = nearScenery(p, 16);
@@ -191,21 +259,24 @@ export function lifeContext(world, now, scenery, groups, sharedLayout) {
     const radius = Math.min(12, 2 + maxRadius + Math.max(p.halfWidth, p.halfHeight));
     return neighborhood().crowded(p, radius, nearObstacle[p.slot]);
   }
+  const schoolSlot = Math.floor(now / 60000);
+  function leaderMotion(p) {
+    if (geometry.schoolSlot !== schoolSlot) { geometry.schoolSlot = schoolSlot; geometry.leaders = []; }
+    if (!geometry.leaders[p.slot]) {
+      const r = hash(`school:${p.id}:${schoolSlot}`);
+      geometry.leaders[p.slot] = { dx: r % 2 ? 1 : -1, dy: [0, 0, -1, 1][Math.floor(r / 2) % 4], leader: p.id };
+    }
+    return geometry.leaders[p.slot];
+  }
   const makeSchool = () => {
     const school = new Map();
     if (now % 60000 >= 18000) return school;
     const available = Uint8Array.from(ordered, p => !world.breedingState(p.id));
-    const slot = Math.floor(now / 60000);
-    if (geometry.schoolSlot !== slot) { geometry.schoolSlot = slot; geometry.leaders = []; }
     for (const p of ordered) {
       if (!available[p.slot]) continue;
       const companions = neighborhood().sorted(p, nearObstacle[p.slot], available);
       if (companions.length < 2) continue;
-      let motion = geometry.leaders[p.slot];
-      if (!motion) {
-        const r = hash(`school:${p.id}:${slot}`);
-        motion = geometry.leaders[p.slot] = { dx: r % 2 ? 1 : -1, dy: [0, 0, -1, 1][Math.floor(r / 2) % 4], leader: p.id };
-      }
+      const motion = leaderMotion(p);
       school.set(p.id, motion); available[p.slot] = 0;
       for (const q of companions) { school.set(q.id, motion); available[q.slot] = 0; }
     }
@@ -214,6 +285,14 @@ export function lifeContext(world, now, scenery, groups, sharedLayout) {
   // Public callers retain a snapshot. In a step the school is consulted only
   // after hunger, environmental events and collision avoidance have all passed.
   let school = sharedLayout ? undefined : makeSchool();
+  let membership;
+  function schoolFor(p) {
+    if (school) return school.get(p.id);
+    if (now % 60000 >= 18000) return;
+    membership ??= schoolMembership(ordered, q => neighborhood().schoolSources(q, nearObstacle),
+      q => neighbors.get(q.id), q => !world.breedingState(q.id), leaderMotion, () => school ??= makeSchool());
+    return membership(p);
+  }
   const memories = new Map();
   for (const [id, home] of Object.entries(world.data.life?.haunts || {})) {
     const p = points.get(id); if (!p) continue;
@@ -269,36 +348,16 @@ export function lifeContext(world, now, scenery, groups, sharedLayout) {
     }
     return name;
   }
-  return { points, neighbors, visitBonds, visiblePair, orderEncounters, orderedPairs: geometry.orderedPairs, crowdedNeighbor, scenes, memories, get school() { return school ??= makeSchool(); },
+  return { points, neighbors, visitBonds, visiblePair, orderEncounters, orderedPairs: geometry.orderedPairs, crowdedNeighbor, scenes, memories, schoolFor, get school() { return school ??= makeSchool(); },
     weather: weatherAt(world.data, now), event: activeEvent(world.data, now) };
 }
 export function updateLife(world, now, context) {
   const life = state(world, now), elapsed = now - life.at;
   if (elapsed < 1000 && elapsed >= 0) return;
+  return withStoryBatch(world, record => observeLife(world, now, context, life, elapsed, record));
+}
+function observeLife(world, now, context, life, elapsed, record) {
   const dt = elapsed > 0 && elapsed <= 2500 ? Math.min(1, elapsed / 1000) : 0;
-  let stories, storyOrder, storyCount, orderChanged = false;
-  const compareStories = (a, b) => stories[b].at - stories[a].at || a.localeCompare(b);
-  function record(_, kind, fish, at, extra) {
-    if (!stories) { stories = { ...(world.readStories?.() ?? life.stories) }; storyCount = Object.keys(stories).length; }
-    const story = makeStory(kind, fish, at, extra), id = story.id, old = stories[id];
-    if (old) {
-      stories[id] = choose(old, story);
-      if (old.at !== stories[id].at) orderChanged = true;
-    } else { stories[id] = story; storyCount++; }
-    if (storyCount <= LIFE.storyLimit) return;
-    if (!storyOrder) storyOrder = Object.keys(stories).sort(compareStories);
-    else if (orderChanged) { if (!old) storyOrder.push(id); storyOrder.sort(compareStories); }
-    else if (!old) {
-      let low = 0, high = storyOrder.length;
-      while (low < high) {
-        const mid = (low + high) >>> 1;
-        if (compareStories(id, storyOrder[mid]) < 0) high = mid; else low = mid + 1;
-      }
-      storyOrder.splice(low, 0, id);
-    }
-    while (storyOrder.length > LIFE.storyLimit) delete stories[storyOrder.pop()];
-    storyCount = storyOrder.length; orderChanged = false;
-  }
   const encounters = new Map();
   const previousAt = life.at;
   const spans = elapsed === 1000 && context.orderedPairs && world.activeBondSpans?.(previousAt);
@@ -347,8 +406,9 @@ export function updateLife(world, now, context) {
   // pair-key ranges disjoint. A previous row outside the cap can still cause
   // a reunion or participate in an event before it leaves the retained table.
   const tail = new Map(), inactive = [];
-  if (context.orderedPairs) for (const key in previous) {
-    if (active[key]) continue;
+  const intervals = spans && compareBondIntervals(spans.keys, head, now);
+  if (context.orderedPairs) for (const key of intervals ? intervals.removed : Object.keys(previous)) {
+    if (!intervals && active[key]) continue;
     const old = previous[key];
     if (head.length === limit && context.visiblePair(old.a, old.b)) {
       tail.set(key, near(old.a, old.b, key, old));
@@ -383,13 +443,9 @@ export function updateLife(world, now, context) {
     if (row) return spans ? advanceBond(row, now) : row;
     return spans && previous[key] ? advanceBond(previous[key], previousAt) : previous[key];
   });
-  if (stories) {
-    life.stories = storyOrder ? Object.fromEntries(storyOrder.map(id => [id, stories[id]])) : stories;
-    world.dirty = true;
-  }
   life.at = now;
   if (context.orderedPairs && !inactive.length) {
-    if (world.writeActiveBonds) world.writeActiveBonds(active, head, now, spans);
+    if (world.writeActiveBonds) world.writeActiveBonds(active, head, now, intervals?.patch);
     else life.bonds = active;
   } else {
     if (spans) for (const key of head) active[key] = advanceBond(active[key], now);
@@ -402,6 +458,10 @@ export function updateLife(world, now, context) {
   life.haunts = trim(Object.fromEntries(Object.entries(life.haunts || {}).filter(([id]) => world.data.fishes[id])), LIFE.bondLimit);
 }
 const wandering = new WeakMap();
+const directions = Array.from({ length: 9 }, (_, i) => Object.freeze({ dx: i % 3 - 1, dy: Math.floor(i / 3) - 1 }));
+export function wanderDirection(prefix, phaseText) {
+  return directions[hash(phaseText, prefix) % directions.length];
+}
 export function swimPattern(fish, now) {
   const phase = Math.floor((now - fish.created) / LIFE.wanderPeriod);
   let pattern = wandering.get(fish);
@@ -410,10 +470,10 @@ export function swimPattern(fish, now) {
     wandering.set(fish, pattern);
   }
   if (pattern.phase !== phase) {
-    const r = hash(String(phase), pattern.prefix);
+    const direction = wanderDirection(pattern.prefix, String(phase));
     pattern.phase = phase;
-    pattern.dx = r % 3 - 1;
-    pattern.dy = Math.floor(r / 3) % 3 - 1;
+    pattern.dx = direction.dx;
+    pattern.dy = direction.dy;
   }
   return pattern;
 }
@@ -425,13 +485,13 @@ export function idleMotion(world, fish, now, context, center) {
   const life = state(world, now);
   const breeding = world.breedingState(fish.id);
   if (!breeding) { const motion = eventMotion(fish.id, now, context); if (motion) return motion; }
-  const point = context.points.get(fish.id) || center;
+  const body = context.points.get(fish.id), point = body || center;
   // Leave water between bodies before following friends or a school. Center
   // distance alone makes larger fish keep trying to swim into each other.
   const gap = q => Math.max(Math.abs(deltaX(q.x, point.x)) - (point.halfWidth || 0) - (q.halfWidth || 0), Math.abs(q.y - point.y) - (point.halfHeight || 0) - (q.halfHeight || 0));
-  const crowded = !breeding && context.crowdedNeighbor(context.points.get(fish.id));
+  const crowded = !breeding && context.crowdedNeighbor(body);
   if (crowded) return { dx: Math.sign(deltaX(point.x, crowded.x)), dy: Math.sign(point.y - crowded.y) };
-  const school = context.school.get(fish.id); if (school) return school;
+  const school = body && (context.schoolFor ? context.schoolFor(body) : context.school.get(fish.id)); if (school) return school;
   let neighbors;
   if (now % 180000 < 45000) for (const q of neighbors = context.neighbors.get(fish.id) || []) {
     const pair = fish.id < q.id ? fish.id + '|' + q.id : q.id + '|' + fish.id;
@@ -517,7 +577,7 @@ export function validateLife(life, sources, now = Date.now() + 60000) {
   for (const r of Object.values(life.stories)) if (['captured', 'cthulhuDepart', 'atomicSurvivor', 'shipMeal'].includes(r.kind) && !validLegendStory(r, sources.roots)) return false;
   return true;
 }
-function mergeBonds(left, right) {
+export function mergeBonds(left, right) {
   const ids = Object.keys(right), limit = LIFE.bondLimit;
   const time = id => Math.max(left[id]?.at ?? -Infinity, right[id]?.at ?? -Infinity);
   let priorAt = Infinity, priorId, ordered = ids.length <= limit;

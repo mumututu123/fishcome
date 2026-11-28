@@ -37,8 +37,8 @@ test('页面写入完整运动记录，视窗只处理改变占格的鱼，旧�
     frame.commit(fishes);
     viewport.update(patch.tables);
     assert.equal(frame.pairs, undefined);
-    assert.equal(viewport.owners.fish.get('a').x, 5);
-    assert.equal(viewport.owners.fish.get('b').x, x);
+    assert.equal(fishes.a.x, 5);
+    assert.equal(fishes.b.x, x);
     return patch.tables.fishes;
   }
   const first = commit(500, 33);
@@ -183,6 +183,24 @@ test('鱼身横跨两个分区时，只在某个鱼元真的越界后重新定�
   assert.deepEqual(index.query(32, 32, 5, 5), Object.values(data.chars));
 });
 
+test('画面筛选保留跨海界的完整鱼体和旧存档的小数鱼元', () => {
+  const body = (id, entity, x) => ({ id, entity, kind: 'fish', x, y: 0 });
+  const data = { fishes: { f: { x: 999, y: 5, facing: 1 }, old: { x: 31.5, y: 8, facing: 1 } }, scenes: {},
+    chars: { a: body('a', 'f', -2), b: body('b', 'old', .5), c: body('c', 'f', 4), d: body('d', 'old', 1000 + 64.5) } };
+  const index = new ViewportCells(data);
+  const query = (left, right = left) => index.query(left, right, 0, 10).map(cell => cell.id);
+  assert.deepEqual(query(999), ['a', 'c']);
+  assert.deepEqual(query(1), ['a', 'c']);
+  assert.deepEqual(query(996, 1005), ['a', 'c']);
+  assert.deepEqual(query(32), ['b', 'd']);
+  assert.deepEqual(query(96), ['b', 'd']);
+  assert.deepEqual(query(64), []);
+  data.fishes.f = { x: 1, y: 5, facing: -1 };
+  index.update({ fishes: { set: [['f', data.fishes.f]], remove: [] } });
+  assert.deepEqual(query(999), ['a', 'c']);
+  assert.deepEqual(query(1), ['a', 'c']);
+});
+
 test('画面依次播放已结算的横移、下潜，海域接缝上点击跟随绘制位置', async () => {
   const { World } = await import('../www/engine.js');
   const { Renderer } = await import('../www/renderer.js');
@@ -198,13 +216,13 @@ test('画面依次播放已结算的横移、下潜，海域接缝上点击跟�
   renderer.worldChanged(world, { values: { tick: world.data.tick }, tables: {}, swims });
   const start = renderer.swimStart;
   renderer.draw(world, start + 125);
-  assert.deepEqual(renderer.paintedFish.slice(0, 2), [55, 50]);
+  assert.deepEqual(Array.from(renderer.paintedCoordinates.slice(0, 2)), [55, 50]);
   assert.deepEqual(renderer.hit(56, 52), { kind: 'fish', id: 'f' });
   assert.equal(renderer.hit(65, 62), null);
   renderer.worldChanged(world, null);
   renderer.presentSwims(world, swims, start);
   renderer.draw(world, start + 375);
-  assert.deepEqual(renderer.paintedFish.slice(0, 2), [60, 55]);
+  assert.deepEqual(Array.from(renderer.paintedCoordinates.slice(0, 2)), [60, 55]);
   assert.equal(renderer.fishPose(world, 'f', start + 501), fish);
   assert.deepEqual([fish.x, fish.y], [0, 11]);
   renderer.worldChanged(world, null);
@@ -335,9 +353,7 @@ test('追随端提交合流后，鱼体换主人、食物沉积和跨接缝镜�
   runtime.draw(world);
   assert.deepEqual(runtime.hit(71, 51), { kind: 'fish', id: 'g' });
 
-  const movedOwners = [];
-  const moveOwner = index.moveOwner.bind(index);
-  index.moveOwner = (group, pose) => { movedOwners.push(pose?.id); moveOwner(group, pose); };
+  const before = index.query(997, 1002, 0, 31);
   const nextTick = tick + 500;
   const next = { ...incoming, tick: nextTick, chars: {}, scenes: {},
     fishes: Object.fromEntries(Object.entries(world.data.fishes).map(([id, fish]) => [id, { ...fish, posAt: nextTick, cx: 0.25 }])) };
@@ -345,10 +361,10 @@ test('追随端提交合流后，鱼体换主人、食物沉积和跨接缝镜�
   // left its anchor. Hit-testing and drawing still use the latest fish rows.
   const steady = world.merge(next, {}, 'replica', true);
   runtime.applyMerge(world, index, steady);
-  assert.deepEqual(movedOwners, []);
+  assert.equal(index.query(997, 1002, 0, 31), before);
   const cross = { ...next, tick: nextTick + 500, fishes: { g: { ...next.fishes.g, x: 35, posAt: nextTick + 500 } } };
   runtime.applyMerge(world, index, world.merge(cross, {}, 'replica', true));
-  assert.deepEqual(movedOwners, ['g']);
+  assert(index.query(35, 35, 0, 31).some(cell => cell.entity === 'g'));
   const rebuilt = new ViewportCells(world.data);
   for (const x of [0, 33, 997]) assert.deepEqual(rows(index.query(x, x + 5, 0, 31)), rows(rebuilt.query(x, x + 5, 0, 31)));
   runtime.camera.x = 35;

@@ -3,9 +3,11 @@ import test from 'node:test';
 import { BodyMembership } from '../www/body-membership.js';
 import { CONFIG, World, indexEcologyCharacters } from '../www/engine.js';
 import { WorkerSimulation } from '../www/simulation-worker.js';
+import { expandSimulationPatch } from '../www/simulation-delta.js';
 import { POPULATION } from '../www/population.js';
 import { CONTACT_TIME, updateContacts } from '../www/breeding.js';
 import { makeFishWorld } from './capacity-fish.mjs';
+import { LIFE, recordStory } from '../www/life.js';
 
 test('入体、换鱼、删除再加入只更新涉事字块，保留原表和整数键的顺序', () => {
   const fish = (id, entity) => ({ id, entity, kind: 'fish', path: [], x: 0, y: 0 });
@@ -41,6 +43,59 @@ function open(reference) {
   return worker;
 }
 
+test('同一步多鱼进食和饿死共用一次故事提交，逐条内容和先后次序一致', () => {
+  const now = Date.UTC(2026, 0, 1), at = now + CONFIG.step;
+  const world = makeFishWorld(World, 48, 1000, { now, spacingX: 16 });
+  world.ambient = false;
+  const expected = new World(now, 'stories', { populate: false });
+  for (let i = 0; i < LIFE.storyLimit; i++) recordStory(expected, 'arrive', 'old-' + i, now);
+  let stories = structuredClone(expected.data.life.stories), commits = 0;
+  Object.defineProperty(world.data.life, 'stories', { get: () => stories, set(value) { commits++; stories = value; } });
+  const fishes = Object.values(world.data.fishes);
+  for (const [index, fish] of fishes.entries()) {
+    if (index % 2 === 0) { fish.hungerAt = at; continue; }
+    const id = 'food-' + index;
+    world.data.chars[id] = { id, kind: 'food', entity: '', ch: '饵',
+      x: fish.x + 2, y: fish.y, born: now, fall: 0, path: [] };
+  }
+  world.step(at);
+  for (const [index, fish] of fishes.entries()) {
+    if (index % 2 === 0) assert.equal(world.data.fishes[fish.id], undefined);
+    else assert.equal(world.data.chars['food-' + index].entity, fish.id);
+    recordStory(expected, index % 2 === 0 ? 'depart' : 'meal', fish.id, at);
+  }
+  assert.deepEqual(Object.entries(stories), Object.entries(expected.data.life.stories));
+  assert.equal(commits, 1);
+});
+
+test('连续两步进食保留鱼群顺序，之后的转向、避让和结伴与完整重算一致', () => {
+  const now = Date.UTC(2026, 0, 1);
+  const reference = makeFishWorld(World, 24, 1000, { now, spacingX: 7, mixedGenders: true });
+  for (const fish of Object.values(reference.data.fishes)) {
+    fish.created = fish.lastFed = now - CONFIG.hunger;
+    fish.hungerAt = now + CONFIG.hunger;
+  }
+  const worker = open(reference), roster = worker.world.stableFishRoster();
+  const knownFish = Object.keys(reference.data.fishes), diners = knownFish.slice(0, 2);
+  for (let step = 0; step < 14; step++) {
+    const base = reference.data.tick, foods = [], paths = [];
+    if (step === 4 || step === 5) {
+      const fish = reference.data.fishes[diners[step - 4]];
+      const cell = { id: 'meal-' + step, kind: 'food', entity: '', ch: '饵',
+        x: (fish.x + 2 * fish.facing + CONFIG.width) % CONFIG.width, y: fish.y, born: base, fall: 0, path: [] };
+      reference.data.chars[cell.id] = cell;
+      foods.push([cell.id, structuredClone(cell)]);
+    }
+    const before = reference.serialize();
+    reference.step(base + CONFIG.step, paths);
+    const reply = worker.receive({ kind: 'step', base, names: [], foods });
+    if (foods.length) assert.equal(reference.data.chars[foods[0][0]].entity, diners[step - 4]);
+    assert.equal(worker.world.stableFishRoster(), roster);
+    assert.deepEqual(expandSimulationPatch(before, reply.patch, knownFish).swims || [], paths);
+    assert.deepEqual(JSON.parse(JSON.stringify(worker.world.data)), reference.serialize());
+  }
+});
+
 test('进食、饥饿和疾病只撤销变形鱼的画面路径，其余鱼仍逐步游动', () => {
   const now = Date.UTC(2026, 0, 1);
   for (const cause of ['food', 'hunger', 'illness']) {
@@ -54,7 +109,8 @@ test('进食、饥饿和疾病只撤销变形鱼的画面路径，其余鱼仍�
     const reply = sim.receive({ kind: 'step', base: now, names: [], foods: [] });
     if (cause === 'food') assert.equal(reference.data.chars.food.entity, changed);
     else assert.equal(reference.data.fishes[changed], undefined);
-    assert.deepEqual(reply.patch.swims, paths);
+    const committed = expandSimulationPatch(before, reply.patch, Object.keys(before.fishes));
+    assert.deepEqual(committed.swims, paths);
     assert(paths.flat().length > 0 && !paths.flat().includes(changed));
     paths.forEach((ids, d) => {
       for (const id of ids) {

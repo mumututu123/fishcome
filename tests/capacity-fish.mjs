@@ -1,11 +1,12 @@
 // Loaded only by the isolated browser benchmark. The app keeps its normal
 // renderer, controls, coordinator, storage and worker after this world is installed.
 const defaultBody = [{ x: 0, y: 0, ch: 'o', color: '#8be7df' }, { x: 1, y: 0, ch: '鱼', color: '#8be7df' }];
+export const capacityWorldId = '00000000-0000-4000-8000-000000000001';
 
 export function makeFishWorld(World, count, width, {
   now = Date.now(), body = defaultBody, spacingX = 6, spacingY = 4, rows = 16, mixedGenders = false
 } = {}) {
-  const world = new World(now, '00000000-0000-4000-8000-000000000001', { populate: false });
+  const world = new World(now, capacityWorldId, { populate: false });
   const columns = Math.floor(width / spacingX);
   if (columns * rows < count) throw new Error('测试海域不足');
   for (let i = 0; i < count; i++) {

@@ -1,6 +1,7 @@
 import { SimulationRows } from './simulation-rows.js';
 
 const revisions = new WeakMap();
+const characterRevisions = new WeakMap();
 const listeners = new Set();
 const beforePatch = new Set();
 
@@ -19,15 +20,29 @@ export function subscribeSimulationChanges(listener) {
 }
 
 export function worldRevision(world) { return revisions.get(world) || 0; }
+export function characterRevision(world) { return characterRevisions.get(world) || 0; }
+function charactersChanged(world) { characterRevisions.set(world, characterRevision(world) + 1); }
 
 export function worldEdited(world, origin, merge) {
+  charactersChanged(world);
   SimulationRows.invalidate(world.data.fishes);
   SimulationRows.invalidate(world.data.travel);
   revisions.set(world, worldRevision(world) + 1);
   for (const listener of listeners) listener(world, null, origin, merge);
 }
 
+// A verified history replacement has no geometry or table-membership edits.
+// Prepared steps must still observe the new revision before they can run.
+export function replaceCheckedHistory(world, changes) {
+  const patch = { values: changes, tables: {} };
+  simulationWillApply(world, patch);
+  revisions.set(world, worldRevision(world) + 1);
+  Object.assign(world.data, changes);
+  simulationApplied(world, patch);
+}
+
 export function simulationApplied(world, patch) {
+  if (patch.tables.chars || patch.values?.chars) charactersChanged(world);
   if (!patch.workerChanges) {
     for (const field of ['fishes', 'travel']) {
       const remove = patch.tables[field]?.remove;
@@ -52,6 +67,7 @@ export function applyInputRows(world, entries) {
     patch.tables[field] = { set: [...group], remove: [], addedCount, removedCount: 0 };
   }
   simulationWillApply(world, patch);
+  if (patch.tables.chars) charactersChanged(world);
   for (const [field, group] of groups) for (const [id, value] of group) world.data[field][id] = value;
   world.dirty = true;
   for (const listener of listeners) listener(world, patch, 'input');
@@ -67,3 +83,5 @@ export function setParticipantName(world, actor, nick) {
 // (e.g. the current ecology hour) are replaced as a value.
 export const worldTables = new Set(['roots', 'participants', 'fishes', 'chars', 'scenes',
   'ops', 'breeding', 'contacts', 'travel', 'chats', 'chatSources', 'bubbles', 'rocks']);
+
+export const characterPositionFields = ['x', 'y', 'moveAt', 'fall'];

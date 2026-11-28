@@ -1,17 +1,20 @@
+import { densityPrefix } from './contact-field.js';
+import { hash } from './world-hash.js';
 import { wrapX } from './geography.js';
 
 export const ECOLOGY = Object.freeze({ radius: 15, weedMinLife: 72 * 3600000, weedLifeRange: 48 * 3600000, looseLife: 75000, sedimentGrace: 48 * 3600000 });
-const hash = text => { let n = 2166136261; for (const c of text) n = Math.imul(n ^ c.codePointAt(0), 16777619); return n >>> 0; };
 export function newEcology(now, legacy = false) { return { version: 1, activated: now, legacy, hour: Math.floor(now / 3600000) }; }
 export function ensureEcology(world, now, legacy = false) { return world.data.ecology ||= newEcology(now, legacy); }
 export function validEcology(state, now = Date.now() + 60000) { return state === undefined || !!state && state.version === 1 && typeof state.legacy === 'boolean' && Number.isFinite(state.activated) && state.activated >= 0 && state.activated <= now && Number.isInteger(state.hour) && state.hour >= 0 && state.hour <= Math.floor(now / 3600000); }
 export function mergeEcology(a, b) { if (!a) return b; if (!b) return a; return { version: 1, activated: Math.min(a.activated, b.activated), legacy: a.legacy || b.legacy, hour: Math.max(a.hour, b.hour) }; }
 // A query covers at most (2r+1)² cells. A rectangle sum therefore holds both
 // exact counts without a carry from its water count into its occupied count.
-const densityScale = 2 ** Math.ceil(Math.log2((2 * ECOLOGY.radius + 1) ** 2 + 1));
-export function densityField(world, scenery = world.sceneryMap(), occupiedByFish) {
+export const densityScale = 2 ** Math.ceil(Math.log2((2 * ECOLOGY.radius + 1) ** 2 + 1));
+export const breedingThreshold = Object.freeze({ numerator: 2, denominator: 5 });
+const crowded = breedingThreshold.numerator / breedingThreshold.denominator;
+export function densityField(world, scenery = world.sceneryMap(), occupiedByFish, field) {
   const width = 1000, floors = Array.from({ length: width }, (_, x) => world.floorAt(x)), height = Math.max(...floors), stride = width + 1;
-  const occupied = new Uint8Array(width * height), totals = new Uint32Array(stride * (height + 1));
+  const occupied = field ? field.occupied.fill(0) : new Uint8Array(width * height);
   const mark = (x, y) => { if (Number.isInteger(y) && y >= 0 && y < height) occupied[y * width + wrapX(x)] = 1; };
   for (const { scene, cell } of scenery.values()) mark(scene.x + cell.x, scene.y + cell.y);
   for (const c of occupiedByFish ? world.charValues('food', 'seaweed', 'scene') : world.charValues()) {
@@ -20,15 +23,7 @@ export function densityField(world, scenery = world.sceneryMap(), occupiedByFish
   }
   const monument = world.monument; for (const [dy, row] of monument.rows.entries()) for (const [dx, ch] of Array.from(row).entries()) if (ch !== ' ') mark(monument.x + dx, monument.y + dy);
   // Summed-area tables make every local density query constant-time, even on hourly turnover.
-  for (let y = 0; y < height; y++) {
-    let row = 0;
-    for (let x = 0; x < width; x++) {
-      const cell = y * width + x;
-      if (y < floors[x]) row += occupied[cell] || occupiedByFish?.[cell] ? densityScale + 1 : 1;
-      const index = (y + 1) * stride + x + 1;
-      totals[index] = totals[index - stride] + row;
-    }
-  }
+  const totals = field ? field.prefix(floors, height, densityScale) : densityPrefix(occupied, occupiedByFish, floors, height, densityScale);
   const rectangle = (left, right, top, bottom) => totals[(bottom + 1) * stride + right + 1] - totals[top * stride + right + 1] - totals[(bottom + 1) * stride + left] + totals[top * stride + left];
   function windowArea(x, y) {
     const r = ECOLOGY.radius, left = x - r, right = x + r;
@@ -46,7 +41,7 @@ export function densityField(world, scenery = world.sceneryMap(), occupiedByFish
   };
   const allowsBreeding = (x, y) => {
     const total = windowArea(x, y);
-    return Math.floor(total / densityScale) * 5 < (total % densityScale) * 2;
+    return Math.floor(total / densityScale) * breedingThreshold.denominator < (total % densityScale) * breedingThreshold.numerator;
   };
   // Each row prefix counts centers that permit breeding. One range check
   // covers all possible contact midpoints on that row of a fish's body.
@@ -70,8 +65,8 @@ export function densityField(world, scenery = world.sceneryMap(), occupiedByFish
   density.allowsBreedingAt = allowsBreeding;
   return density;
 }
-export const contactTime = density => density >= .4 ? Infinity : density >= .2 ? 20000 : 5000;
-export const growthChance = density => density >= .4 ? 0 : density >= .2 ? .005 : .01;
+export const contactTime = density => density >= crowded ? Infinity : density >= .2 ? 20000 : 5000;
+export const growthChance = density => density >= crowded ? 0 : density >= .2 ? .005 : .01;
 export function weedExpires(cell, state) {
   const ordinary = cell.created + ECOLOGY.weedMinLife + hash(`weed-life:${cell.id}`) % (ECOLOGY.weedLifeRange + 1);
   const activated = cell.ecoGraceAt ?? (state?.legacy && cell.created < state.activated ? state.activated : undefined);
@@ -79,24 +74,55 @@ export function weedExpires(cell, state) {
   return Math.max(ordinary, grace);
 }
 export function weedAlpha(cell, state, now) { const remaining = weedExpires(cell, state) - now; return Math.max(.25, Math.min(1, .25 + remaining / (12 * 3600000) * .75)); }
-export function looseWither(cell) { const lastEat = cell.path.reduce((at, event) => event.reason === 'eat' ? Math.max(at, event.t) : at, -Infinity), lastWither = cell.path.reduce((at, event) => event.reason === 'wither-loose' ? Math.max(at, event.t) : at, -Infinity); return lastWither > lastEat; }
+export function looseWither(cell) {
+  let lastEat = -Infinity, lastWither = -Infinity;
+  for (const event of cell.path) {
+    if (event.reason === 'eat') lastEat = Math.max(lastEat, event.t);
+    else if (event.reason === 'wither-loose') lastWither = Math.max(lastWither, event.t);
+  }
+  return lastWither > lastEat;
+}
 export function naturalSediment(cell, data) {
   if (cell.kind !== 'scene' || cell.chat || !cell.path.some(event => event.reason === 'expire')) return false;
   return !Object.values(data.ops).some(op => op.kind === 'sceneEdit' && op.cell === cell.id);
 }
 export function settleAt(cell) { return Math.max(...cell.path.filter(event => event.reason === 'expire').map(event => event.t)); }
-export function updateEcology(world, now, transition) {
-  const state = ensureEcology(world, now), deadPlants = new Map();
+function settleWithering(world, state, now, transition) {
+  const schedule = world.witherSchedule;
+  const grace = state.legacy ? state.activated : null;
+  if (schedule && schedule.grace === grace && now < schedule.due) return;
+  const deadPlants = new Map();
+  let due = Infinity;
   for (const c of world.charValues('food', 'seaweed')) {
-    if (c.kind === 'seaweed' && now >= weedExpires(c, state)) { if (!deadPlants.has(c.entity)) deadPlants.set(c.entity, []); deadPlants.get(c.entity).push({ index: c.wild.index, at: weedExpires(c, state) }); transition(c, { kind: 'burn', entity: '' }, { id: `wither:${c.id}`, t: weedExpires(c, state), reason: 'wither' }); world.foodRevision++; world.dirty = true; }
-    else if (c.kind === 'food' && looseWither(c) && now >= c.born + ECOLOGY.looseLife) { transition(c, { kind: 'burn', entity: '' }, { id: `wither-dissolve:${c.id}:${c.born}`, t: c.born + ECOLOGY.looseLife, reason: 'wither-dissolve' }); world.dirty = true; }
+    if (c.kind === 'seaweed') {
+      const at = weedExpires(c, state);
+      if (now < at) { due = Math.min(due, at); continue; }
+      if (!(now >= at)) continue;
+      if (!deadPlants.has(c.entity)) deadPlants.set(c.entity, []);
+      deadPlants.get(c.entity).push({ index: c.wild.index, at });
+      transition(c, { kind: 'burn', entity: '' }, { id: `wither:${c.id}`, t: at, reason: 'wither' });
+      world.foodRevision++; world.dirty = true;
+    } else if (c.kind === 'food' && looseWither(c)) {
+      const at = c.born + ECOLOGY.looseLife;
+      if (now < at) { due = Math.min(due, at); continue; }
+      if (now >= at) {
+        transition(c, { kind: 'burn', entity: '' }, { id: `wither-dissolve:${c.id}:${c.born}`, t: at, reason: 'wither-dissolve' });
+        world.dirty = true;
+      }
+    }
   }
   if (deadPlants.size) for (const c of world.charValues('seaweed')) {
     const cuts = (deadPlants.get(c.entity) || []).filter(cut => cut.index < c.wild.index); if (!cuts.length) continue;
     const at = Math.min(...cuts.map(cut => cut.at)); transition(c, { kind: 'food', entity: '', born: at, fall: 0 }, { id: `wither-loose:${c.id}:${at}`, t: at, reason: 'wither-loose' });
     if (now >= at + ECOLOGY.looseLife) transition(c, { kind: 'burn', entity: '' }, { id: `wither-dissolve:${c.id}:${at}`, t: at + ECOLOGY.looseLife, reason: 'wither-dissolve' });
+    else due = Math.min(due, at + ECOLOGY.looseLife);
     world.foodRevision++; world.dirty = true;
   }
+  if (schedule) { schedule.grace = grace; schedule.due = due; }
+}
+export function updateEcology(world, now, transition) {
+  const state = ensureEcology(world, now);
+  settleWithering(world, state, now, transition);
   const hour = Math.floor(now / 3600000); if (hour <= state.hour) return;
   let density;
   const edited = new Set(Object.values(world.data.ops).filter(op => op.kind === 'sceneEdit').map(op => op.cell));

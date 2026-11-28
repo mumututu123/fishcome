@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import './browser-byte-arrays.mjs';
 import { changesSince, coalesceWorld, fitsLegacyEnvelope, PAGE_UNITS, replicaPages, ReplicaReader, ReplicaTransfers } from '../www/replica-stream.js';
-import { committedStepFields, decodeReplicaRowDelta, encodeReplicaRowDelta, replicaRowBase } from '../www/replica-row-delta.js';
+import { committedStepFields, decodeReplicaRowDelta, encodeReplicaRowDelta, replicaFishIds, replicaRowBase } from '../www/replica-row-delta.js';
 import { mergeTravel } from '../www/fish-status.js';
 import { mergeBreeding } from '../www/breeding.js';
 import { ARCHIVE_FIELDS, ArchiveStore } from '../www/archive.js';
@@ -267,6 +267,36 @@ test('连续合流跳过未变的鱼元归属，仍与完整合流同样处理�
   merge();
   assert.equal(live.data.fishes[fish], undefined);
   assert.equal(live.data.chars[fish + ':1'].kind, 'food');
+});
+
+test('一条鱼消散时仅核对它的鱼元，剩下一字的鱼仍在原位置变为鱼食', () => {
+  const at = Date.now() - 10000, full = new World(at), live = new World(at, full.id);
+  const lost = crypto.randomUUID(), lone = crypto.randomUUID();
+  for (const [i, id] of [lost, lone].entries()) {
+    const cells = [0, 1, 2].map(x => ({ x, y: 0, ch: x ? '鱼' : 'o', color: '#88aacc' }));
+    for (const world of [full, live]) assert(world.apply({ id, actor: id, kind: 'fish', t: at, x: 40 + 10 * i, y: 20, cost: cells.length, cells }).ok);
+  }
+  let tick = at, scans = 0;
+  const all = live.charValues.bind(live);
+  live.charValues = (...kinds) => { if (!kinds.length) scans++; return all(...kinds); };
+  function remove(ids) {
+    tick += CONFIG.step;
+    const chars = {};
+    for (const id of ids) chars[id] = { ...full.data.chars[id], kind: 'burn', entity: '', path: [{ reason: 'ecoDeath', t: tick }] };
+    const packet = { protocol: 1, roots: full.data.roots, tick, chars, fishes: {}, scenes: {}, ops: {} };
+    scans = 0;
+    full.merge(packet);
+    live.merge(packet, {}, 'replica', true);
+    assert.deepEqual(live.serialize(), full.serialize());
+  }
+  remove([]);
+  remove([lost + ':0', lost + ':1', lost + ':2', lone + ':0']);
+  assert.equal(scans, 0);
+  assert.equal(live.data.fishes[lost], undefined);
+  assert(live.data.fishes[lone]);
+  remove([lone + ':1']);
+  assert.equal(live.data.fishes[lone], undefined);
+  assert.equal(live.data.chars[lone + ':2'].kind, 'food');
 });
 
 test('日常广播只读取变化行，签名时的新变化进入下一包，未知前台编辑只重建一次', async () => {
@@ -664,14 +694,15 @@ test('连续工作线程更新保留旧快照，将完整位置与稀疏字符�
   const sink = { live: () => [1], broadcast: (_, body) => body };
   data.fishes.a = { id: 'a', x: 1, y: 2, facing: 1, cx: 1, cy: 2, posAt: 100, parents: ['p'] };
   data.chars.c = { id: 'c', x: 1, path: ['north'], old: true };
+  const still = data.chars.still = { id: 'still', x: 4, path: ['east'] };
   const first = await sender.send(sink, data, 100);
   data.tick += CONFIG.step;
   const { a } = data.fishes, { c } = data.chars;
   a.x = a.cx = 2; a.posAt = data.tick;
   c.x = 2; c.new = { info: 'retained' }; delete c.old;
-  notify(world, { values: { tick: data.tick }, tables: { fishes: { set: [['a', a]], remove: [] }, chars: { set: [['c', c]], remove: [] } },
+  notify(world, { values: { tick: data.tick }, tables: { fishes: { set: [['a', a]], remove: [] }, chars: { set: [['c', c], ['still', still]], remove: [] } },
     workerChanges: { values: { tick: data.tick }, tables: { fishes: { set: [0], remove: [], motion: Float64Array.of(2, 2, 1, 2, 2) },
-      chars: { set: [['c', { x: 2, new: c.new }, ['old']]] } } } });
+      chars: { set: [['c', { x: 2, new: c.new }, ['old']], ['still', { x: 4, path: ['east'] }, ['absent']]] } } } });
   const next = await sender.send(sink, data, 200);
   const base = replicaRowBase(crypto.randomUUID(), first.world, true), encoded = encodeReplicaRowDelta(next, base, true);
   assert(encoded.world.fishes[0][1] < 0);
@@ -693,6 +724,7 @@ test('连续工作线程更新保留旧快照，将完整位置与稀疏字符�
   assert.deepEqual(first.world.fishes.a.parents, ['p']);
   assert.equal(first.world.fishes.a.x, 1);
   assert.deepEqual(next.world.fishes.a.parents, ['p']);
+  assert.deepEqual(Object.keys(next.world.chars), ['c']);
   assert.deepEqual(next.world.chars.c, { id: 'c', x: 2, path: ['north'], new: { info: 'retained' } });
   // A foreground correction at the same clock compares against the last actual
   // motion rather than the cold columns saved before the worker started.
@@ -853,11 +885,12 @@ test('游动顺序与收包顺序不同，亲鱼、进食与旧字段例外仍�
   const sink = { live: () => [1], broadcast: (_, body) => body };
   const ids = ['z', 'a', 'b'];
   for (const id of ids) data.fishes[id] = { id, x: 1, y: 4, facing: 1, cx: 0, cy: 0, posAt: data.tick };
+  data.fishes.a.cx = 0.9;
   let previous = await sender.send(sink, data, 100), base = replicaRowBase(crypto.randomUUID(), previous.world, true);
   const first = previous.world.fishes.z;
   for (let step = 1; step <= 2; step++) {
     const tick = data.tick += CONFIG.step;
-    const a = data.fishes.a = { ...data.fishes.a, x: step + 1, posAt: tick };
+    const a = data.fishes.a = { ...data.fishes.a, x: step + 1, cx: 1e-18, posAt: tick };
     const b = data.fishes.b = { ...data.fishes.b, x: step + 2, posAt: tick };
     const z = data.fishes.z = { ...data.fishes.z, x: step + 3, posAt: tick, lastFed: 600, cx: 0 };
     let raw;
@@ -878,6 +911,16 @@ test('游动顺序与收包顺序不同，亲鱼、进食与旧字段例外仍�
     assert.deepEqual(decoded.world.fishes, data.fishes);
     const packed = encodeReplicaRowDelta(next, base, true, true);
     assert.deepEqual(decodeReplicaRowDelta(packed, base, true, true), decoded);
+    const transitions = encodeReplicaRowDelta(next, base, true, true, true, true);
+    assert.equal(typeof transitions.world.fishes.moves, 'string');
+    if (step === 1) assert.deepEqual(transitions.world.fishes.literals, [1e-18]);
+    const restored = decodeReplicaRowDelta(transitions, base, true, true, true, true);
+    assert.deepEqual(restored, decoded);
+    assert.equal(replicaFishIds(restored.world), base.fishIds);
+    assert.throws(() => decodeReplicaRowDelta(transitions, base, true, true));
+    const corrupt = structuredClone(transitions);
+    corrupt.world.fishes.increments = [];
+    assert.throws(() => decodeReplicaRowDelta(corrupt, base, true, true, true, true));
     assert.deepEqual(Object.keys(decoded.world.fishes), ids);
     if (step === 2) assert.equal(Object.hasOwn(previous.world.fishes.z, 'cx'), false);
     base = replicaRowBase(crypto.randomUUID(), next.world, true, base);

@@ -1,6 +1,125 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { readPresentations, frameSummary, bothDisplays, scheduledSteps } from './browser-refresh-budget.cjs';
+import { readPresentations, frameSummary, bothDisplays, scheduledSteps, matchStepStarts, calibrateTraceClock, traceClockSkew } from './browser-refresh-budget.cjs';
+import { decodeGraphicsTrace, readGraphicsEvents } from './offscreen-presentation.cjs';
+
+test('连续多轮的图层跟踪可跨块读取，保留原始帧编号并拒绝截断', async () => {
+  const event = { name: 'Graphics.Pipeline', args: { chrome_graphics_pipeline: { step: 'STEP_DRAW_AND_SWAP', display_trace_id: 0 }, text: '}"[\\' } };
+  const source = JSON.stringify({ traceEvents: [event] }).replace('"display_trace_id":0', '"display_trace_id":9223372036854775701');
+  const result = await readGraphicsEvents([...source]);
+  assert.deepEqual(result, decodeGraphicsTrace(source));
+  await assert.rejects(readGraphicsEvents([source.slice(0, -2)]), /截断/);
+});
+
+test('只采入场时仍按相同步号核对双方实际提交，并保留未提交和旧通道', () => {
+  const requests = [500, 1000, 1500].map(tick => ({ tick, agreed: true, committed: true }));
+  const peers = [{ tick: 500, agreed: true, committed: true }, { tick: 1000, agreed: true, committed: false }];
+  matchStepStarts(requests, peers);
+  assert.equal(requests[0].peerSteps[0].committed, true);
+  assert.equal(requests[1].peerSteps[0].committed, false);
+  assert.equal(requests[2].peerSteps, undefined);
+  assert.equal(requests[0].peerSteps[0].startFromHost, undefined);
+  assert.equal(requests[0].traceAt, undefined);
+});
+
+test('两段宿主单调时钟夹测交叉验证偏移，并拒绝缺失或矛盾的标记', () => {
+  const sample = (id, ts, low, high) => [
+    { name: 'clock_sync', ph: 'c', ts, args: { sync_id: 'tide.clock.' + id } },
+    { id: 'tide.clock.' + id, kind: 'native', before: ts + low, after: ts + high },
+  ];
+  const rows = [sample('a', 1000, 12, 50), sample('b', 1200, 20, 60),
+    sample('c', 100000, 30, 70), sample('d', 100200, 10, 60)];
+  const events = rows.map(([event]) => event);
+  const brackets = { before: rows.slice(0, 2).map(row => row[1]), after: rows.slice(2).map(row => row[1]) };
+  const clock = calibrateTraceClock(events, brackets);
+  assert.deepEqual(clock.intersection, [28, 52]);
+  assert.deepEqual(clock.bounds, [18, 62]);
+  assert.deepEqual(clock.traceRange, [1200, 100000]);
+  assert.equal(clock.driftUs, 44);
+  assert.equal(traceClockSkew([clock, clock]), .046);
+  assert.equal(calibrateTraceClock(events.slice(0, 3), brackets), undefined);
+  assert.equal(calibrateTraceClock(events.concat(events[0]), brackets), undefined);
+  assert.equal(calibrateTraceClock(events, { ...brackets, after: brackets.after.map(row => ({ ...row, before: row.before + 200, after: row.after + 200 })) }), undefined);
+  assert.equal(traceClockSkew([clock, undefined]), undefined);
+  assert.equal(traceClockSkew([clock, { ...clock, bounds: [1000, 1020] }]), undefined);
+  const pageEvents = events.map(event => ({ name: event.args.sync_id, ts: event.ts - 75, args: { data: { callTime: event.ts } } }));
+  const pageBrackets = Object.fromEntries(Object.entries(brackets).map(([phase, entries]) =>
+    [phase, entries.map(row => ({ ...row, kind: 'page' }))]));
+  assert.deepEqual(calibrateTraceClock(pageEvents, pageBrackets), clock);
+});
+
+test('计入独立夹测上界，名义20毫秒以内的真实同一步也可能超时', () => {
+  const clocks = [{ offsetUs: 25, bounds: [0, 50], traceRange: [0, 80000] },
+    { offsetUs: 5, bounds: [-20, 30], traceRange: [0, 80000] }];
+  const requests = [{ tick: 500, marker: 0, agreed: true, committed: true }];
+  const peers = [{ tick: 500, marker: 0, agreed: true, committed: true }];
+  matchStepStarts(requests, peers,new Map([[0, 10000]]), new Map([[0, 10001]]), clocks);
+  assert.equal(requests[0].traceAt, 10006);
+  assert.deepEqual(requests[0].traceStartBounds, [9980, 10032]);
+  for (const [i, node] of ['host','peer'].entries()) {
+    const rows = [{ tick: 500, at: 35, traceTs: 29970, drawStartTs: 28000, drawEndTs: 29000, poses: ['鱼', 4, 6] }];
+    frameSummary({ node, leader: 'host', frames: [], steps: [] }, { drawn: [], rows, moving: [], clock: clocks[i] }, 0, 100, [], requests);
+  }
+  const report = bothDisplays(requests);
+  assert.equal(report.over20, 1);
+  assert.equal(report.max, 20.041);
+  assert.equal(report.slowest.host.presented, 19.989);
+  const missing = [{ tick:500, marker:0, agreed: true, committed:true }];
+  matchStepStarts(missing, peers, new Map([[0,10000]]), new Map([[0,10001]]), [clocks[0], undefined]);
+  assert.equal(missing[0].traceAt, undefined);
+  assert.equal(bothDisplays(missing).missing, 1);
+});
+
+test('独立画布必须找到同一子图层与实际合成器呈现', () => {
+  const worker = (name, ts) => ({ name, ts, pid: 1, tid: 2, tts: ts, args: { data: { callTime: ts } } });
+  const viz = (name, ts, fields = {}) => ({ name, ts, pid: 3, tid: 4, ...fields });
+  const pipeline = (step, ts, fields) => viz('Graphics.Pipeline', ts, { dur: 30, args: { chrome_graphics_pipeline: { step, ...fields } } });
+  const child = '9223372036854775701', other = '9223372036854775702', display = '21';
+  const trace = [worker('tide.refresh.A.owner.0.start', 1000), worker('tide.refresh.A.owner.0.end', 2000),
+    worker('CanvasResourceDispatcher::DispatchFrame', 2010),
+    pipeline('STEP_RECEIVE_COMPOSITOR_FRAME', 2015, { surface_frame_trace_id: child, frame_sink_id: { frame_sink_client_id: 6, frame_sink_id: 2147483648 } }),
+    pipeline('STEP_DRAW_AND_SWAP', 2020, { display_trace_id: display }),
+    pipeline('STEP_SURFACE_AGGREGATION', 2025, { display_trace_id: display, aggregated_surface_frame_trace_ids: [other, child] }),
+    viz('Graphics.Pipeline.DrawAndSwap', 2030, { ph: 'b', id2: { local: '0x1' } }),
+    viz('Graphics.Pipeline.DrawAndSwap', 8000, { ph: 'e', id2: { local: '0x1' } }), viz('Display::FrameDisplayed', 8000)];
+  const raw = JSON.stringify(trace).replace(/"(922337203685477570[12]|21)"/g, '$1');
+  const events = decodeGraphicsTrace(raw), page = { page: 'A', frames: [{ at: 1, sequence: 0, owner: true, poses: [1, 20, 30] }] };
+  assert.equal(readPresentations(events, page, 0, 15).rows[0].traceTs, 8000);
+  assert.equal(readPresentations(events.slice(0, -1), page, 0, 15).rows.length, 0);
+  events[7].args = { status: 'canceled' };
+  assert.equal(readPresentations(events, page, 0, 15).rows.length, 0);
+  delete events[7].args;
+  events[5].args.chrome_graphics_pipeline.aggregated_surface_frame_trace_ids.pop();
+  assert.equal(readPresentations(events, page, 0, 15).rows.length, 0);
+});
+
+test('低延迟主线程画布不能拿先于自身提交的页面回执验收', () => {
+  const worker = (name, ts, args = {}, ph) => ({ name, ts, pid: 1, tid: 2, args, ph });
+  const page = { page: 'A', surface: { desynchronized: true }, frames: [{ sequence: 0, at: 1.1, poses: [1, 4, 7] }] };
+  const blink = [worker('AnimationFrame', 1000, { id: 4 }, 'b'),
+    worker('tide.refresh.A.0.start', 1100, { data: { callTime: 1100 } }),
+    worker('tide.refresh.A.0.end', 2000, { data: { callTime: 2000 } }),
+    worker('AnimationFrame', 2020, { id: 4 }, 'e'), worker('AnimationFrame::Presentation', 2100, { id: 4 })];
+  const frames = [...blink, worker('CanvasResourceDispatcher::DispatchFrame', 2120),
+    { name: 'Graphics.Pipeline', ts: 2200, pid: 3, tid: 4, args: { chrome_graphics_pipeline: {
+      step: 'STEP_RECEIVE_COMPOSITOR_FRAME', surface_frame_trace_id: '-1', frame_sink_id: { frame_sink_client_id: 6, frame_sink_id: 2147483648 }
+    } } }, { name: 'Display::FrameDisplayed', ts: 8250, pid: 3, tid: 4 }];
+  assert.equal(readPresentations(blink, { ...page, surface: { desynchronized: false } }, 0, 15).rows[0].traceTs, 2100);
+  assert.equal(readPresentations(blink, page, 0, 15).rows.length, 0);
+  const unverified = readPresentations(frames, page, 0, 15);
+  assert.equal(unverified.rows.length, 0);
+  assert.equal(unverified.unverifiedCanvas, 1);
+  assert.equal(readPresentations(frames, { ...page, surface: undefined }, 0, 15).rows.length, 0);
+});
+
+test('双端本地结算从最先发起的请求计时，遗漏对方的时标或确认均不能通过', () => {
+  const requests = [500, 1000, 1500, 2000].map((tick, sequence) => ({ tick, sequence, agreed: sequence > 0 }));
+  const peers = [{ tick: 1000, sequence: 4, agreed: true, committed: true },
+    { tick: 2000, sequence: 5, agreed: true, committed: true }];
+  matchStepStarts(requests, peers, new Map([[0, 900], [1, 10000], [2, 20000], [3, 30000]]), new Map([[4, 6000]]));
+  assert.deepEqual(requests.map(r => r.traceAt), [900, 6000, undefined, undefined]);
+  assert.equal(requests[1].peerSteps[0].startFromHost, -4);
+});
 
 test('从实际呈现的同一鱼元坐标核实游动，切换可见鱼元不会伪造运动', () => {
   const frames = [
@@ -17,9 +136,16 @@ test('从实际呈现的同一鱼元坐标核实游动，切换可见鱼元不�
       { name: 'AnimationFrame::Presentation', ts: at + 4, args: { id } }
     ].map(event => ({ ...event, pid: 1, tid: 2 }));
   });
-  const { rows, moving } = readPresentations(events, { frames, page: 'A' }, 0, 40);
+  // A scheduling delay inside the mark widens just that observation.
+  frames[2].beforeMark = frames[2].at;
+  frames[2].at += 2;
+  frames[2].afterMark = frames[2].at;
+  const { rows, moving, clockOffsets } = readPresentations(events, { frames, page: 'A' }, 0, 40);
+  assert.ok(clockOffsets[0] < 0 && clockOffsets[1] > 0 && clockOffsets[1] - clockOffsets[0] <= .201);
   assert.equal(rows.length, 4);
   assert.deepEqual(moving.map(frame => frame.sequence), [3]);
+  frames[2].beforeMark = frames[2].at;
+  assert.equal(readPresentations(events, { frames, page: 'A' }, 0, 40).clockOffsets, undefined);
 });
 
 test('按海洋的半秒时钟计数，采样首尾从未请求的步也算缺失', () => {
@@ -78,4 +204,6 @@ test('同一步取较迟呈现的一端，任一端缺帧都算缺失', () => {
   assert.equal(result.max, 28);
   assert.equal(result.slowest.tick, 1000);
   assert.deepEqual(result.slowest.host, { drawStart: 6, drawEnd: 8, presented: 28 });
+  assert.equal(result.afterFirstDraw.host.max, 20);
+  assert.equal(result.afterFirstDraw.peer.max, 16);
 });

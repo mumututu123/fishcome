@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Network } from '../www/network.js';
-import { ReplicaReader, replicaPages } from '../www/replica-stream.js';
+import { LIVE_FRAME_UNITS, ReplicaReader, replicaPages } from '../www/replica-stream.js';
+import { encodeReplicaRowDelta, replicaRowBase } from '../www/replica-row-delta.js';
 import { WorldBroadcast } from '../www/world-broadcast.js';
 import { actorId, signer, verifyEnvelope } from '../www/storage.js';
 
@@ -91,6 +92,49 @@ test('页内容只编码一次，发送的完整信封与旧格式逐字节相�
     assert(await verifyEnvelope(JSON.parse(new TextDecoder().decode(bytes))));
     assert.equal(await verifyEnvelope({ ...signed, body: { ...signed.body, text: text + 'x' } }), false);
   }
+});
+
+test('直达实时帧验签后才合流，缺少基准、超大或未协商的帧仍按原协议补齐', async t => {
+  const keys = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
+  const pub = await crypto.subtle.exportKey('jwk', keys.publicKey);
+  const identity = { actor: await actorId(pub), pub, secret: await crypto.subtle.exportKey('jwk', keys.privateKey) };
+  const received = [], receipts = [], frames = [];
+  const sender = new Network(identity), receiver = new Network({ actor: 'follower' }, {}, message => { received.push(message.body); return true; });
+  sender.sign = await signer(identity);
+  const dest = { queued: 0, sendQueue: Promise.resolve(), dc: { readyState: 'open', bufferedAmount: 0, send: frame => frames.push(frame.buffer) } };
+  const via = { node: sender.node, packets: new Map(), replicaSignedFrames: true, replicaFrames: true, replicaRows: true };
+  receiver.directControl = async (_, kind, receipt) => { assert.equal(kind, 'replicaReceipt'); receipts.push(receipt); };
+  t.after(() => receiver.replicas.stop());
+  const world = { tick: 500, fishes: { fish: { id: 'fish', x: 1 } }, chars: {}, travel: {}, archives: { chunks: { old: {} } } };
+  const base = replicaRowBase(crypto.randomUUID(), world, true);
+  sender.recentArchivePacks = () => new Map([['old', '已有'], ['new', '新包'], ['unpublished', '尚未发布'], ['large', 'a'.repeat(65537)]]);
+  for (const notes of ['', '海'.repeat(8192)]) {
+    const next = { delta: true, fromTick: 500, world: { ...world, tick: 1000, fishes: { fish: { id: 'fish', x: 2 } }, notes,
+      archives: { chunks: { ...world.archives.chunks, new: {}, large: {} } } } };
+    const body = encodeReplicaRowDelta(next, base, true), id = crypto.randomUUID();
+    const wire = await sender.encodeLiveFrame(id, body, base.archives);
+    assert.equal(wire[0], notes ? 3 : 2);
+    await sender.send(dest, id, wire, true);
+    assert.equal(frames.length, 1);
+    const packet = frames.pop(), tampered = packet.slice(0);
+    new Uint8Array(tampered)[45] ^= 1;
+    const before = received.length;
+    await assert.rejects(receiver.receive(via, tampered));
+    await assert.rejects(receiver.receive({ ...via, replicaSignedFrames: false }, packet));
+    await assert.rejects(receiver.receive({ ...via, node: 'different' }, packet));
+    assert.equal(received.length, before);
+    receiver.replicas.rowsReceived.delete(via);
+    await receiver.receive(via, packet);
+    assert.equal(receipts.at(-1).next, -2);
+    assert.equal(received.length, before);
+    receiver.replicas.rowsReceived.set(via, base);
+    const retry = crypto.randomUUID();
+    await sender.send(dest, retry, await sender.encodeLiveFrame(retry, body, base.archives), true);
+    await receiver.receive(via, frames.pop());
+    assert.deepEqual(received.at(-1), { ...next, archivePacks: { new: '新包' } });
+    assert.deepEqual(receipts.at(-1), { id: retry, index: 0, next: 1 });
+  }
+  assert.equal(await sender.encodeLiveFrame(crypto.randomUUID(), { text: 'a'.repeat(LIVE_FRAME_UNITS) }), undefined);
 });
 
 test('旧伙伴接收已截取的世界时复用快照，并在签名前固定握手资料', async () => {

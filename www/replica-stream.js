@@ -237,7 +237,7 @@ export class ReplicaTransfers {
         if (snapshot && lane.snapshot !== snapshot) continue;
         lane.sending = body;
         let prior = this.rowsSent.get(peer);
-        const encoded = peer.replicaRows ? encodeReplicaRowDelta(body, prior, peer.replicaFrames, peer.replicaPoseBytes, peer.replicaTransitions) : body;
+        const encoded = peer.replicaRows ? encodeReplicaRowDelta(body, prior, peer.replicaFrames, peer.replicaPoseBytes, peer.replicaTransitions, peer.replicaSignedFrames) : body;
         let receipt = await this.sendLivePacket(peer, lane, encoded);
         if (!receipt && encoded !== body) { prior = null; receipt = await this.sendLivePacket(peer, lane, body); }
         if (!receipt) throw new Error('伙伴拒绝世界增量');
@@ -258,18 +258,26 @@ export class ReplicaTransfers {
     const id = crypto.randomUUID();
     let index = 0;
     const frame = peer.replicaFrames && body.frameRows === true;
-    for (const page of replicaPages(body, frame)) {
-      const packet = { id, kind: 'live', index: index++, ...page, ...(frame && { frame: true }) };
-      if (!page.last) { await this.network.directControl(peer, 'replicaPage', packet); continue; }
-      const applied = new Promise((resolve, reject) => { lane.receipt = { id, index: packet.index, resolve, reject }; });
-      const timeout = setTimeout(() => lane.receipt?.reject(new Error('伙伴应用世界增量超时')), body.delta ? ACK_MS : RESUME_MS);
-      try {
-        const [, next] = await Promise.all([this.network.directControl(peer, 'replicaPage', packet), applied]);
-        if (next === -2 && body.rowBase) return null;
-        if (next !== index) throw new Error('伙伴拒绝世界增量');
-        return { id, committed: lane.receipt.committed !== false };
-      } finally { clearTimeout(timeout); lane.receipt = null; }
+    const direct = frame && peer.replicaSignedFrames && await this.network.encodeLiveFrame(id, body, this.rowsSent.get(peer)?.archives);
+    let sendLast;
+    if (direct) {
+      sendLast = () => this.network.send(peer, id, direct, true);
+    } else {
+      for (const page of replicaPages(body, frame)) {
+        const packet = { id, kind: 'live', index, ...page, ...(frame && { frame: true }) };
+        if (page.last) { sendLast = () => this.network.directControl(peer, 'replicaPage', packet); break; }
+        await this.network.directControl(peer, 'replicaPage', packet);
+        index++;
+      }
     }
+    const applied = new Promise((resolve, reject) => { lane.receipt = { id, index, resolve, reject }; });
+    const timeout = setTimeout(() => lane.receipt?.reject(new Error('伙伴应用世界增量超时')), body.delta ? ACK_MS : RESUME_MS);
+    try {
+      const [, next] = await Promise.all([sendLast(), applied]);
+      if (next === -2 && body.rowBase) return null;
+      if (next !== index + 1) throw new Error('伙伴拒绝世界增量');
+      return { id, committed: lane.receipt.committed !== false };
+    } finally { clearTimeout(timeout); lane.receipt = null; }
   }
   discardPendingLive() {
     this.unpublished = new WeakMap();
@@ -335,7 +343,39 @@ export class ReplicaTransfers {
     clearTimeout(state.timer);
     state.timer = setTimeout(() => this.incoming.delete(key), RESUME_MS);
   }
+  async applyLive(message, peer, body, frame) {
+    const { id, from, actor, key } = message;
+    const prior = this.rowsReceived.get(peer);
+    if (frame !== (body.frameRows === true) || frame && !Object.hasOwn(body, 'rowBase')) throw new Error('实时帧格式不一致');
+    if (Object.hasOwn(body, 'rowBase')) {
+      if (!peer.replicaRows) throw new Error('伙伴未确认实时变更格式');
+      body = decodeReplicaRowDelta(body, prior, frame, peer.replicaPoseBytes, peer.replicaTransitions, peer.replicaSignedFrames);
+      if (!body) return { next: -2 };
+    }
+    const committed = await this.network.onMessage({ id, kind: 'world', actor, from, key, body }, peer);
+    if (peer.replicaRows) this.rowsReceived.set(peer, replicaRowBase(id, body.world, peer.replicaFrames, frame && prior));
+    return committed === true ? {} : { committed: false };
+  }
   async receive(message, peer) {
+    if (message.kind === 'replicaFrame') {
+      if (!peer.replicaSignedFrames || message.from !== peer.node || peer.applyingFrame) throw new Error('实时帧来源或顺序无效');
+      const { id, body } = message;
+      const receipt = { id, index: 0, next: 1 };
+      peer.applyingFrame = true;
+      try {
+        if (!body?.world || typeof body.world !== 'object' || Array.isArray(body.world)) throw new Error('实时帧世界无效');
+        for (const [field, table] of Object.entries(body.world)) {
+          if (!safeKey(field) || table && typeof table === 'object' && !Array.isArray(table) &&
+              !Object.keys(table).every(safeKey)) throw new Error('实时帧表名或记录标识无效');
+        }
+        Object.assign(receipt, await this.applyLive(message, peer, body, true));
+      } catch (error) {
+        await this.network.directControl(peer, 'replicaReceipt', { ...receipt, next: -1 }).catch(() => {});
+        throw error;
+      } finally { peer.applyingFrame = false; }
+      await this.network.directControl(peer, 'replicaReceipt', receipt);
+      return false;
+    }
     const { kind, id, index, text, last } = message.body;
     if (message.kind === 'replicaReceipt') {
       const live = this.live.get(peer)?.receipt;
@@ -387,24 +427,20 @@ export class ReplicaTransfers {
         if (!body) continue;
         if (state.pending.size) throw new Error('世界分块结束位置无效');
         if (kind === 'catchup' && body.base !== peer.confirmedReplica) throw new Error('分块变更引用了未确认的世界版本');
-        const prior = body.frameRows && this.rowsReceived.get(peer);
-        if (frame !== (body.frameRows === true) || frame && !Object.hasOwn(body, 'rowBase')) throw new Error('实时帧格式不一致');
-        if (Object.hasOwn(body, 'rowBase')) {
-          if (!live || !peer.replicaRows) throw new Error('伙伴未确认实时变更格式');
-          body = decodeReplicaRowDelta(body, this.rowsReceived.get(peer), frame, peer.replicaPoseBytes, peer.replicaTransitions);
-        }
-        let committed;
-        if (body) {
-          state.applying = this.network.onMessage({ id, kind: kind === 'catchup' ? 'merge' : live ? 'world' : kind, actor: message.actor, from: message.from, key: message.key, body }, peer);
-          committed = await state.applying;
-          if (live && peer.replicaRows) this.rowsReceived.set(peer, replicaRowBase(id, body.world, peer.replicaFrames, prior));
+        let receipt;
+        if (live) {
+          state.applying = this.applyLive({ ...message, id }, peer, body, frame);
+          receipt = await state.applying;
+        } else {
+          if (body.frameRows === true || Object.hasOwn(body, 'rowBase')) throw new Error('伙伴未确认实时变更格式');
+          state.applying = this.network.onMessage({ id, kind: kind === 'catchup' ? 'merge' : kind, actor: message.actor, from: message.from, key: message.key, body }, peer);
+          await state.applying;
         }
         if (kind === 'hello') { peer.confirmedReplica = id; this.resumeLive(peer); }
         clearTimeout(state.timer); this.incoming.delete(key);
         const timer = setTimeout(() => this.completed.delete(key), RESUME_MS);
         this.completed.set(key, { next: state.next, timer });
-        if (live) await this.network.directControl(peer, 'replicaReceipt', { id, index: state.endIndex, next: body ? state.next : -2,
-          ...(body && committed !== true && { committed: false }) });
+        if (live) await this.network.directControl(peer, 'replicaReceipt', { id, index: state.endIndex, next: state.next, ...receipt });
         break;
       }
       await acknowledge(state.next);

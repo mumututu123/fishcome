@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { World, key } from '../www/engine.js';
-import { motionOrder } from '../www/breeding.js';
+import { lifeContext } from '../www/life.js';
+import { motionOrder, writeBreedingRecord } from '../www/breeding.js';
 import { BodyLayout, compileHull, fitsHullAt, sweepsHullAt } from '../www/motion-hull.js';
 import { MovementGrid } from '../www/movement-grid.js';
 import { wrapX } from '../www/geography.js';
@@ -74,6 +75,72 @@ test('游动意向跨过饥饿与换相边界，投食、改时和丢弃缓存�
   assert(planned);
 });
 
+test('可转移的泳姿、独立观察与后续鱼位修正使用各自正确的鱼行', () => {
+  const at = Date.UTC(2025, 5, 15, 12), reference = makeFishWorld(World, 24, 1000, { now: at });
+  const ids = Object.keys(reference.data.fishes);
+  const worker = new WorkerSimulation();
+  worker.receive({ kind: 'open', values: reference.serialize(), tables: [], ambient: true });
+  worker.receive({ kind: 'ready' });
+  const observe = w => lifeContext(w, w.data.tick, w.sceneryMap(), w.fishGroups()).points;
+  const positions = points => [...points].map(([id, p]) => [id, p.x, p.y]);
+  let retained, original;
+  for (let step = 0; step < 7; step++) {
+    for (const w of [reference, worker.world]) {
+      const fish = w.data.fishes[ids[3]];
+      if (step === 1) { fish.cx = 0.3; fish.cy = 0.7; }
+      if (step === 2) { fish.x += 0.25; fish.facing *= -1; }
+      if (step === 3) { fish.x = Math.round(fish.x); fish.lastFed = w.data.tick; }
+      if (step === 4) {
+        delete w.data.fishes[ids[1]];
+        delete w.data.chars[ids[1] + ':0'];
+        delete w.data.chars[ids[1] + ':1'];
+      }
+      if (step === 5) w.data.fishes[ids[6]] = { ...w.data.fishes[ids[6]], x: 973 };
+    }
+    const base = reference.data.tick;
+    reference.step(base + 500);
+    const reply = worker.receive({ kind: 'step', base, names: [], foods: [] });
+    const wire = reply.patch.tables.fishes.motion;
+    assert(wire?.length);
+    wire.fill(999);
+    structuredClone(wire, { transfer: [wire.buffer] });
+    assert.deepEqual(positions(observe(worker.world)), positions(observe(reference)), '鱼体中心第 ' + step + ' 步');
+    assert.deepEqual(JSON.parse(JSON.stringify(worker.world.data)), JSON.parse(JSON.stringify(reference.data)), '生态第 ' + step + ' 步');
+    if (step === 0) { retained = observe(worker.world); original = positions(retained); }
+    assert.deepEqual(positions(retained), original);
+  }
+});
+
+test('旧坐标回到普通行、配对开始结束、暂时投食和修改余量后，仍逐鱼按当前的食物和游向前进', () => {
+  const at = Date.UTC(2025, 5, 15, 12) + 1200;
+  const reference = makeFishWorld(World, 32, 1000, { now: at, spacingX: 10, mixedGenders: true });
+  const fish = Object.values(reference.data.fishes);
+  for (const row of fish) { row.created = at - 2 * 86400000; row.lastFed = at - 86400001; }
+  fish[0].x += 3000;
+  const worker = new WorkerSimulation();
+  worker.receive({ kind: 'open', values: reference.serialize(), tables: [], ambient: true });
+  worker.receive({ kind: 'ready' });
+  for (let step = 0; step < 10; step++) {
+    for (const w of [reference, worker.world]) {
+      if (step === 1) w.data.chars.bait = {
+        id: 'bait', kind: 'food', entity: '', x: 24, y: 11, ch: '*', color: '#fff', born: at, fall: 0, moveAt: at, path: []
+      };
+      if (step === 2) delete w.data.chars.bait;
+      if (step === 3) writeBreedingRecord(w.data.breeding, '临时配对', {
+        id: '临时配对', male: fish[10].id, female: fish[11].id, started: at, ends: at + 60000, at, status: 'active', motion: { cx: 0, cy: 0 }
+      });
+      if (step === 4) w.data.fishes[fish[7].id].cx = 1.8;
+      if (step === 5) writeBreedingRecord(w.data.breeding, '临时配对', { ...w.data.breeding['临时配对'], at: w.data.tick, status: 'cancelled' });
+      if (step === 6) w.data.fishes[fish[9].id].lastFed = w.data.tick;
+    }
+    const base = reference.data.tick, swims = [];
+    reference.step(base + 500, swims);
+    const { patch } = worker.receive({ kind: 'step', base, names: [], foods: [] });
+    assert.deepEqual((patch.swims || []).map(ids => ids.map(i => typeof i === 'number' ? fish[i].id : i)), swims);
+    assert.deepEqual(JSON.parse(JSON.stringify(worker.world.data)), JSON.parse(JSON.stringify(reference.data)), '第 ' + step + ' 步');
+  }
+});
+
 test('亲鱼跨海界平移、转身、被分开或恢复旧小数位置，联合鱼体始终与重新摆放相同', () => {
   const world = new World(100, 'test', { populate: false });
   const male = { id: 'a' }, female = { id: 'b' };
@@ -95,6 +162,37 @@ test('亲鱼跨海界平移、转身、被分开或恢复旧小数位置，联�
     Object.assign(female, { x: fx, y: fy, facing: ff });
     assert.deepEqual(motionOrder(world, groups, layout), motionOrder(fresh, groups, new BodyLayout(groups)));
   }
+});
+
+test('相同配对每步取新位置，亲鱼替换、配对结束和鱼序更换即时生效', () => {
+  const world = new World(100, 'test', { populate: false });
+  const groups = new Map();
+  for (const [i, id] of ['a', 'b', 'c', 'd', 'e', 'f'].entries()) {
+    world.data.fishes[id] = { id, x: i * 3, y: 10, facing: 1 };
+    groups.set(id, [{ id: id + '-eye', ch: 'O', x: 0, y: 0 }]);
+  }
+  const layout = new BodyLayout(groups);
+  world.stableFishRoster = () => Object.values(world.data.fishes);
+  const pair = { id: 'cc', male: 'a', female: 'e', status: 'active', started: 100 };
+  writeBreedingRecord(world.data.breeding, 'cc', pair);
+  const assertOrder = (singles = layout.ordered) => {
+    const actual = motionOrder(world, groups, layout, singles);
+    assert.deepEqual(actual, motionOrder({ data: world.data }, groups, new BodyLayout(groups), singles));
+    return actual;
+  };
+  const initial = assertOrder();
+  const lastPose = initial.find(([id]) => id === 'cc')[2].fish;
+  world.data.fishes.a.x++;
+  world.data.fishes.e.x++;
+  assert.notEqual(assertOrder().find(([id]) => id === 'cc')[2].fish.x, lastPose.x);
+  pair.female = 'b';
+  assert.deepEqual(assertOrder().map(row => row[0]), ['c', 'cc', 'd', 'e', 'f']);
+  writeBreedingRecord(world.data.breeding, 'cc', { ...pair, status: 'cancelled' });
+  assert.deepEqual(assertOrder().map(row => row[0]), ['a', 'b', 'c', 'd', 'e', 'f']);
+  writeBreedingRecord(world.data.breeding, 'cc', { ...pair, male: 'c' });
+  assertOrder(layout.ordered.filter(([id]) => id !== 'e'));
+  delete world.data.fishes.c;
+  assertOrder();
 });
 
 test('逐行转身和占位与逐鱼元判定一致，包括越界、重叠、食物和鱼体内部空隙', () => {
@@ -174,4 +272,48 @@ test('平移或翻转空心鱼体后，全海占格与逐格重新摆放一致',
       assert.deepEqual(updated.cells, rebuilt.cells, JSON.stringify({ start, next }));
     }
   }
+});
+test('后台绝食日程跟随旧档、投喂、鱼行回填与绝食后延期，缺失行程按原顺序补齐', () => {
+  const now = Date.UTC(2025, 5, 15, 12, 17);
+  const reference = makeFishWorld(World, 4, 1000, { now, mixedGenders: true });
+  reference.ambient = false;
+  const [legacy, eater, due, missing] = Object.keys(reference.data.fishes);
+  for (const fish of Object.values(reference.data.fishes)) {
+    fish.hungerAt = now + 60000;
+    fish.lastFed = now - 86400000;
+  }
+  delete reference.data.fishes[legacy].hungerAt;
+  delete reference.data.travel[missing];
+  reference.data.fishes[eater].hungerAt = now + 500;
+  reference.data.chars.bait = { id: 'bait', kind: 'food', entity: '', payer: 'local', x: 8, y: 3,
+    ch: '*', color: '#ffffff', created: now, born: now, fall: 0, moveAt: now, path: [] };
+  const worker = new WorkerSimulation();
+  worker.receive({ kind: 'open', values: reference.serialize(), tables: [], ambient: false });
+  worker.receive({ kind: 'ready' });
+  function advance() {
+    const base = reference.data.tick;
+    reference.step(base + 500);
+    worker.receive({ kind: 'step', base, names: [], foods: [] });
+    for (const key of ['fishes', 'chars', 'travel']) {
+      assert.equal(JSON.stringify(worker.world.data[key]), JSON.stringify(reference.data[key]), key);
+    }
+  }
+  advance();
+  assert.equal(worker.world.data.chars.bait.entity, eater);
+  assert.equal(worker.world.data.fishes[eater].hungerAt, now + 500 + 86400000);
+  assert.equal(worker.world.data.travel[missing].since, now + 500);
+  assert.equal(worker.world.hungerDue(now + 1000), false);
+
+  const replacement = { ...reference.data.fishes[due], hungerAt: now + 1000 };
+  reference.data.fishes[due] = replacement;
+  worker.receive({ kind: 'restore', rows: [['fishes', due, structuredClone(replacement)]] });
+  assert.equal(worker.world.hungerDue(now + 1000), true);
+  advance();
+  assert(Object.values(worker.world.data.chars).some(c => c.path.some(event => event.reason === 'starve')));
+  assert.equal(worker.world.hungerDue(now + 1500), false);
+
+  delete reference.data.travel[legacy];
+  worker.receive({ kind: 'restore', rows: [['travel', legacy, undefined]] });
+  advance();
+  assert.equal(worker.world.data.travel[legacy].since, now + 1500);
 });

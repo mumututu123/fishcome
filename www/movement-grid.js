@@ -26,14 +26,31 @@ export class MovementGrid {
   swimmers(world, speed) {
     const roster = world.stableFishRoster?.();
     if (!roster) return this.layout.ordered;
-    if (this.roster !== roster) {
-      this.roster = roster;
-      const entries = this.swimmerBodies ??= new WeakMap();
-      this.swimmersById = this.layout.ordered.map(([id, cells]) => {
-        const fish = world.readFish(id), cached = entries.get(cells);
-        if (cached && cached[0] === id && cached[3].fish === fish) return cached;
+    const changed = this.layout.reshaped;
+    if (changed && this.roster === roster && this.swimmerGroups === changed.before) {
+      for (const id of changed.ids) {
+        const entry = this.swimmerBodies.get(changed.before.get(id)), cells = this.layout.groups.get(id);
+        this.swimmerBodies.delete(entry[1]);
         const hull = this.layout.hull(cells);
-        const entry = [id, cells, null, { fish, ordinal: world.swimOrdinal?.(id), hull, slot: this.slots.get(id),
+        entry[1] = cells;
+        Object.assign(entry[3], { hull, speedX: hull && speed * hull.bounds.width / cells.length,
+          speedY: hull && speed * hull.bounds.height / cells.length });
+        this.swimmerBodies.set(cells, entry);
+      }
+      this.swimmerGroups = this.layout.groups;
+    }
+    if (this.roster !== roster || this.swimmerGroups !== this.layout.groups) {
+      this.roster = roster;
+      this.swimmerGroups = this.layout.groups;
+      const entries = this.swimmerBodies ??= new WeakMap();
+      this.swimmersById = this.layout.ordered.map(([id, cells], rank) => {
+        const fish = world.readFish(id), cached = entries.get(cells);
+        if (cached && cached[0] === id && cached[3].fish === fish) {
+          cached[3].rank = rank;
+          return cached;
+        }
+        const hull = this.layout.hull(cells);
+        const entry = [id, cells, null, { fish, rank, ordinal: world.swimOrdinal?.(id), hull, slot: this.slots.get(id),
           speedX: hull && speed * hull.bounds.width / cells.length, speedY: hull && speed * hull.bounds.height / cells.length,
           intended: undefined, avoidanceSeed: undefined }];
         entries.set(cells, entry);
@@ -52,6 +69,36 @@ export class MovementGrid {
     const slot = this.cells[k];
     if (slot <= 0) return slot && this.overlaps.get(k) || undefined;
     return this.singles[slot] ??= new Set([this.owners[slot]]);
+  }
+  has(x, y) {
+    const cell = this.index(x, y);
+    return typeof cell === 'number' ? this.cells[cell] !== 0 : this.fractional.has(cell);
+  }
+  foodContacts(food, scenery, canEat) {
+    const { x, y } = food;
+    if (!this.integerCells || this.overlapped || this.unsafeHorizontal || !Number.isInteger(x) ||
+        !Number.isInteger(y) || x < 0 || x >= WORLD_WIDTH || y <= 0 || y >= occupancyRows - 1) return;
+    if (scenery.has(worldKey(x, y))) return [];
+    const center = this.cells[y * WORLD_WIDTH + x], slots = [], eligible = [];
+    // Preserve the first occurrence even if that cell's diagonal is blocked.
+    // A second cell of the same body can still have a clear edge to the food.
+    for (let dx = -1; dx <= 1; dx++) {
+      const column = dx < 0 && !x ? WORLD_WIDTH - 1 : dx > 0 && x === WORLD_WIDTH - 1 ? 0 : x + dx;
+      for (let dy = -1; dy <= 1; dy++) {
+        if (!dx && !dy) continue;
+        const owner = this.cells[(y + dy) * WORLD_WIDTH + column];
+        if (!owner || owner === center) continue;
+        let index = slots.indexOf(owner);
+        if (index < 0) { index = slots.length; slots.push(owner); }
+        if (!dx || !dy || !scenery.has(worldKey(column, y)) && !scenery.has(worldKey(x, y + dy))) eligible[index] = true;
+      }
+    }
+    const found = [];
+    for (let i = 0; i < slots.length; i++) {
+      const id = this.owners[slots[i]];
+      if (eligible[i] && canEat(id)) found.push(id);
+    }
+    return found;
   }
   clear(x, y) {
     const k = this.index(x, y);
@@ -122,7 +169,6 @@ export class MovementGrid {
       }
     }
     // Movement order and the adjacent-pair search use the same current body collection.
-    if (this.layout !== layout) this.roster = undefined;
     this.layout = layout;
     for (const id of changed) {
       const fish = world.readFish(id), body = layout.groups.get(id);

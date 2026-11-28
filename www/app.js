@@ -1,14 +1,17 @@
 import { World, CONFIG, clone, EYES, bounds, validGlyph, displayNick, hash, sceneryCount, chooseClaim } from './engine.js';
 import { SimulationClient, startSimulationClock, subscribeSimulationChanges } from './simulation-client.js';
-import { setParticipantName, subscribeBeforeSimulationPatch, worldEdited } from './simulation-changes.js';
+import { setParticipantName, subscribeBeforeSimulationPatch, worldEdited, worldRevision } from './simulation-changes.js';
 import { atCheckpointBoundary, get, getMany, readCheckpointVersion, sameStoredCheckpoint, putMany, readHandoffCheckpoint, replaceFromBackup, getOldBranch, LEGACY_NOTICE_SEEN, claimLegacyNotice, newIdentity, signer, verifyEnvelope, actorId, download } from './storage.js';
 import { beforeCheckpointPatch, noteCheckpointChanges, noteCheckpointMerge } from './checkpoint-pages.js';
 import { CheckpointPictures } from './checkpoint-picture.js';
 import { Network } from './network.js';
+import { OrderedSession } from './ordered-session.js';
+import { prepareOrderedArchive } from './ordered-archive.js';
 import { ReplicaInventory, ReplicaRecovery, ReplicaSwims, WorldBroadcast } from './world-broadcast.js';
 import { DiagnosticLog, inspectFishOrigins, repairFishOriginIssues, diagnosticSummary } from './diagnostics.js';
 import { loadReplicaArchives, verifyChats, verifyLocalCheckpoint, verifyReplica } from './replica.js';
-import { Renderer } from './renderer.js';
+import { Renderer, observationCamera } from './renderer.js';
+import { RenderClient } from './render-client.js';
 import { Creator } from './creator.js';
 import { restoreCheckpoint } from './lifecycle.js';
 import { CHAT_FLOOR, orderedChats, chatColor, mergeChatRecords } from './chat.js';
@@ -18,8 +21,8 @@ import { defaultFishName, displayFishName, fishCatalog } from './fish-profile.js
 import { drawPedigree, setupPedigreeViewport } from './pedigree.js';
 import { normalizeInvite, encodeInvite, decodeInvite, inviteDetails } from './invite.js';
 import { verifyReferral } from './referral.js';
-import { wrapX, nearX } from './geography.js';
-import { weatherAt, fishLifeText, storiesFor, storyText, returnStory } from './life.js';
+import { wrapX } from './geography.js';
+import { weatherAt, fishLifeText, storiesFor, storyText, returnStory, mergeBonds, newLife, validateLife } from './life.js';
 import { memoryForCell, ancestralGlyph, ancestralText } from './easter-eggs.js';
 import { activeEvent, eventSchedule, eventTitle, eventPosition, eventLetter, radioTranscript, eventNarration } from './random-events.js';
 import { activeLegend, legendSchedule, legendTitle, legendPosition, capturedFish } from './legends.js';
@@ -29,9 +32,15 @@ import { WORLD_RULES, rulesCompatible } from './rules.js';
 import { assetPlatformLabel, classifyPeerCompatibility, detectUpdateSource, formatUpdateBytes, normalizeAssetSuffix, pickHigherVersionPeers } from './update.js';
 const $ = id => document.getElementById(id);
 const renderer = new Renderer($('sea'));
+const renderClient = new RenderClient(renderer);
 const simulation = new SimulationClient();
+simulation.displayStep = (world, roster) => renderClient.offer(world, roster);
 let displayedWorld, displayedFish, displayedScenes;
-subscribeSimulationChanges((target, patch, origin) => renderer.worldChanged(target, patch, origin));
+subscribeSimulationChanges((target, patch, origin, merge) => {
+  const shownAt = performance.now();
+  renderClient.changed(target, patch, origin, merge, performance.timeOrigin + shownAt);
+  renderer.worldChanged(target, patch, origin, shownAt);
+});
 subscribeSimulationChanges((target, patch) => {
   if (target !== displayedWorld) return;
   if (!patch) { displayedWorld = null; return; }
@@ -58,7 +67,10 @@ const replicaRecovery = new ReplicaRecovery();
 const replicaInventory = new ReplicaInventory();
 subscribeSimulationChanges((target, patch) => {
   if (target === world && started && !updateFrozen && !replacingCheckpoint && Number.isFinite(patch?.values?.tick)) {
-    broadcastWorld(patch.swims);
+    if (!ordered.current?.running) {
+      broadcastWorld(patch.swims);
+      if (amLeader()) queueMicrotask(() => runOrdered(() => ordered.probe()));
+    }
   }
 });
 async function captureReplica() {
@@ -97,10 +109,116 @@ const historyQueues = new Map();
 function authorNick(actor, fallback) { return actor === identity?.actor ? identity.nick : active().find(member => member.actor === actor)?.nick || world.data.participants[actor] || displayNick(fallback) || '匿名'; }
 function rememberAuthor(actor, nick) { if (setParticipantName(world, actor, nick)) { renderedChatCount = -1; renderChat(); } }
 function toast(text) { $('toast').textContent = text; $('toast').hidden = false; clearTimeout(toast.timer); toast.timer = setTimeout(() => $('toast').hidden = true, 5000); }
-function member() { return { replicaPages: 1, id: network.node, actor: identity.actor, nick: displayNick(identity.nick), url: meta.url, at: Date.now(), visible: !document.hidden, peers: network.live().length }; }
+const orderedProtocol = 3;
+function sameOrderedProtocol(other) { return other?.orderedSteps === orderedProtocol && other.build === meta.version; }
+function member() { return { replicaPages: 1, orderedSteps: orderedProtocol, build: meta.version, id: network.node, actor: identity.actor, nick: displayNick(identity.nick), url: meta.url, at: Date.now(), visible: !document.hidden, peers: network.live().length }; }
 function active() { return [...members.values()].filter(m => Date.now() - m.at < 120000); }
 function leader() { return active().sort((a, b) => +b.visible - +a.visible || a.id.localeCompare(b.id))[0]?.id || network.node; }
 function amLeader() { return !!network && leader() === network.node; }
+let resumingInputs;
+function orderedPeer(observing = false) {
+  if (!started || updateFrozen || replacingCheckpoint || !meta.version || !network) return;
+  if (!observing && (resumingInputs || archiveImports || archiveBusy)) return;
+  const peers = network.live(), people = active();
+  if (peers.length !== 1 || people.length !== 2 || network.hasRelayedWorldPeer(peers)) return;
+  const peer = peers[0], other = members.get(peer.node);
+  if (sameOrderedProtocol(other) && peer.replicaLive && peer.sentHello && peer.confirmedReplica && other.peers <= 1 &&
+      (observing || !peer.replicaCatchingUp && (!amLeader() || !geometryRepair && !world.data.pendingChatGlyphs))) return peer;
+}
+function mayRetainWorker() {
+  const peers = network.live(), winner = leader(), other = members.get(winner);
+  return peers.length === 1 && active().length === 2 && peers[0].node === winner && peers[0].replicaLive &&
+    sameOrderedProtocol(other) && other.peers <= 1;
+}
+function followVerifiedReplica(target, tick, revision, changes) {
+  const follower = () => target === world && !updateFrozen && !replacingCheckpoint && mayRetainWorker();
+  if (ordered.current?.steps || !follower()) return;
+  simulation.followVerifiedReplica(target, tick, revision, changes, follower)
+    .catch(error => diagnostics.record('warn', 'replica', error.message));
+}
+function orderedInputs(limit = 64) {
+  return [...inbox.values()].filter(op => !rejectedOps.has(op.body.id) && (op.body.kind === 'referral' || !world.data.ops[op.body.id] && !archiveStore.ids.ops.has(op.body.id)))
+    .sort((a, b) => a.body.t - b.body.t || a.body.id.localeCompare(b.body.id)).slice(0, limit);
+}
+function resumeOrderedInputs() {
+  if (resumingInputs) return resumingInputs;
+  const ops = orderedInputs(Infinity);
+  if (!ops.length) return Promise.resolve();
+  const target = world;
+  resumingInputs = (async () => {
+    const receipts = [];
+    for (const op of ops) {
+      if (!amLeader() || world !== target || ordered.current?.steps) break;
+      const result = await applyAtBoundary(op, true);
+      if (!result) break;
+      if (!result.ok) rejectOperation(op.body.id);
+      if (inbox.get(op.body.id)?.id === op.id) inbox.delete(op.body.id);
+      if (pending.delete(op.body.id) && !result.ok) toast(result.error);
+      receipts.push({ id: op.body.id, result });
+    }
+    if (receipts.some(({ result }) => result.ok)) await save({ reusePicture: true });
+    if (world === target && amLeader()) {
+      for (const receipt of receipts) await network.broadcast('ack', receipt);
+    }
+  })().finally(() => { resumingInputs = undefined; });
+  return resumingInputs;
+}
+const ordered = new OrderedSession({
+  world: () => world, store: () => archiveStore, peer: orderedPeer, leader, isLeader: amLeader, inputs: orderedInputs,
+  send: (peer, body) => network.directControl(peer, 'orderedStep', body),
+  validOp: async (target, op) => op.body.roots?.some(root => Object.hasOwn(target.data.roots, root)) &&
+    !target.validOp(op.body) && (op.body.kind !== 'referral' || await verifyReferral(op.body)),
+  async bondHistory(s, bonds) {
+    const life = { ...newLife(s.base), bonds };
+    const prior = await s.store.dependencies({ life }, s.world.data);
+    const sources = { ops: { ...prior.ops, ...s.world.data.ops }, breeding: { ...prior.breeding, ...s.world.data.breeding }, roots: s.world.data.roots };
+    if (!validateLife(life, sources)) throw new Error('伙伴历史缺少有效来源');
+    const records = mergeBonds(s.world.data.life.bonds, bonds);
+    return JSON.stringify(records) === JSON.stringify(s.world.data.life.bonds) ? s.world.data.life.bonds : records;
+  },
+  install: (target, changes, valid, apply) => atCheckpointBoundary(target.data, () => simulation.atStepBoundary(() => {
+    if (valid()) apply(() => {
+      if (Object.keys(changes).every(key => key === 'life' || key === 'participants')) simulation.installCheckedHistory(target, changes);
+      else { worldEdited(target); Object.assign(target.data, changes); target.dirty = true; }
+    });
+  })),
+  apply(target, op, archived) {
+    const result = target.apply({ ...clone(op.body), proof: clone(op) }, archived);
+    inbox.delete(op.body.id);
+    if (!result.ok) rejectOperation(op.body.id);
+    if (pending.delete(op.body.id) && !result.ok) toast(result.error);
+    return result;
+  },
+  async inputsCommitted(ops, outcomes, owner) {
+    if (outcomes.some(result => result.ok)) await save({ reusePicture: true });
+    if (owner && amLeader()) for (const [i, op] of ops.entries()) await network.broadcast('ack', { id: op.body.id, result: outcomes[i] });
+  },
+  prepareArchive: (s, boundary) => prepareOrderedArchive(s.world, s.store, boundary,
+    async id => await get('archive:' + id) || await requestArchive(id, s.peer),
+    async chunks => putMany(chunks.map(chunk => ['archive:' + chunk.manifest.id, chunk.encoded]), { generation: await saveGeneration }),
+    diagnostics),
+  archiveBoundary: (target, commit) => atCheckpointBoundary(target.data, () => simulation.archiveAtStepBoundary(target, commit)),
+  archiveConfirmed: () => { renderChat(); save({ reusePicture: true }).catch(error => diagnostics.record('warn', 'archive', error.message)); },
+  firstCommit: () => worldBroadcast.reset(),
+  resumeInputs: () => resumeOrderedInputs().catch(error => diagnostics.record('warn', 'ordered-steps', error.message)),
+  checkRetained: target => simulation.checkRetained(target, () => target === world && mayRetainWorker()),
+  hasSavedCharacters: target => simulation.hasSavedCharacters(target),
+  prepare: (target, valid, pages) => simulation.prepareAgreed(target, valid, pages),
+  advance: (target, nextTick, valid, handle) => simulation.advanceAgreed(target, nextTick, valid, handle),
+  stopped(session, reason) {
+    diagnostics.record('info', 'ordered-steps', reason);
+    if (session.executed && amLeader()) worldBroadcast.reset();
+    if (amLeader()) resumeOrderedInputs().catch(error => diagnostics.record('warn', 'ordered-steps', error.message));
+  }
+});
+subscribeSimulationChanges((target, patch, origin, merge) => ordered.changed(target, patch, origin, merge));
+function runOrdered(action) {
+  const task = action(), session = ordered.current;
+  return task.catch(error => {
+    if (ordered.current === session) ordered.stop(error.message);
+    diagnostics.record('warn', 'ordered-steps', error.message);
+  });
+}
 function pendingCost() {
   let total = 0;
   for (const [id, operation] of pending) if (!world.data.ops[id] && !archiveStore.ids.ops.has(id)) total += operation.cost || 0;
@@ -119,6 +237,7 @@ function balance() {
   return world.wallet(identity.actor) - pendingCost();
 }
 function updateCameraLabels() {
+  renderClient.cameraChanged(trackedFish);
   $('depthLabel').textContent = `水深 ${Math.max(0, Math.round(renderer.camera.y))} 格 · ${renderer.camera.y < CONFIG.shallow ? '浅水区' : '深水区'}`;
   $('zoomLabel').textContent = Math.round(renderer.scale * 100) + '%';
   if (selected?.kind === 'fish') $('followFish').textContent = trackedFish === selected.id ? '停止跟随' : '跟随观察';
@@ -150,7 +269,7 @@ async function requestArchive(id, peer) {
     throw new Error('缺少历史归档，等待持有记忆的伙伴重新接入');
   })(); archiveRequests.set(id, task); try { return await task; } finally { archiveRequests.delete(id); }
 }
-async function ensureArchives(data, peer, bundle, target = archiveStore, current = {}, beforeIngest) {
+async function ensureArchives(data, peer, bundle, target = archiveStore, current = {}, beforeIngest, archivePacks) {
   const load = async id => bundle ? bundle[id] : await get('archive:' + id) || (peer && await requestArchive(id, peer));
   const persist = peer && (chunks => putMany(chunks.map(chunk => ['archive:' + chunk.manifest.id, chunk.encoded])));
   const ingest = async chunks => {
@@ -164,7 +283,7 @@ async function ensureArchives(data, peer, bundle, target = archiveStore, current
       }
     }
   };
-  return loadReplicaArchives(data, target, load, { current, persist, diagnostics, beforeIngest, ingest });
+  return loadReplicaArchives(data, target, load, { current, persist, diagnostics, beforeIngest, ingest, archivePacks });
 }
 async function archiveWorld(now = Date.now()) {
   if (updateFrozen || archiveScanning || replacingCheckpoint || !amLeader() || now - archiveCheckAt < 60000) return;
@@ -181,13 +300,20 @@ async function archiveWorld(now = Date.now()) {
     const plan = await archivePlanAsync(target.data, now, { pressure, dependencies });
     if (!canArchive()) return;
     const hasNewRecords = Object.values(plan).some(table => Object.keys(table).length);
+    const chunks = hasNewRecords ? await archiveChunks(plan, target.data.roots) : [];
+    if (!canArchive()) return;
+    if (chunks.length) await putMany(chunks.map(chunk => ['archive:' + chunk.manifest.id, chunk.encoded]), { generation: await saveGeneration });
+    if (!canArchive()) return;
+    const session = ordered.current;
+    if (session?.steps && await ordered.whenJoined(session)) {
+      const boundary = { version: 1, at: now, chunks: Object.fromEntries(chunks.map(({ manifest }) => [manifest.id, manifest])) };
+      if (await ordered.proposeArchive(boundary)) return;
+      if (!canArchive()) return;
+    }
     const mealTargets = new Set();
     if (hasNewRecords) {
+      ordered.archiveChanging('历史归档发生变化');
       archiveBusy = true;
-      const chunks = await archiveChunks(plan, target.data.roots);
-      if (!canArchive()) return;
-      await putMany(chunks.map(chunk => ['archive:' + chunk.manifest.id, chunk.encoded]), { generation: await saveGeneration });
-      if (!isCurrent()) return;
       for (const chunk of chunks) await store.ingest(chunk, chooseClaim, mealTargets);
       target.data.archives ||= emptyArchiveState();
       for (const { manifest } of chunks) target.data.archives.chunks[manifest.id] = manifest;
@@ -195,6 +321,7 @@ async function archiveWorld(now = Date.now()) {
     const compact = await prepareCompaction(target, store, dependencies);
     const changed = await simulation.archiveAtStepBoundary(target, () => {
       if (!isCurrent() || (!hasNewRecords && !canArchive())) return;
+      ordered.archiveChanging('历史归档时刻已更新');
       const removed = compact();
       (target.data.archives ||= emptyArchiveState()).at = now;
       if (!hasNewRecords && !removed) return;
@@ -220,7 +347,7 @@ function needsReplicaSave(incoming, current, store) {
   if (['chars', 'travel'].some(field => store.ids[field].size && Object.keys(incoming[field] || {}).some(id => store.ids[field].has(id)))) return true;
   return Object.keys(priorCheckpoint?.world?.roots || {}).some(root => Object.hasOwn(current.roots, root));
 }
-async function mergeVerifiedWorld(data, peer, context, { local = false, worldMessage } = {}) {
+async function mergeVerifiedWorld(data, peer, context, { local = false, worldMessage, joined } = {}) {
   const target = world, store = archiveStore, revision = store.revision;
   const delta = context === 'world-delta';
   let incoming = data, archived, checkedRules;
@@ -229,7 +356,7 @@ async function mergeVerifiedWorld(data, peer, context, { local = false, worldMes
     const options = { context, current, diagnostics };
     if (local) incoming = await verifyLocalCheckpoint(data, sources, store, options);
     else checkedRules = await verifyReplica(data, sources, store, { ...options, mergeCut: delta && current === target.data });
-  });
+  }, worldMessage?.body.archivePacks);
   // Overlapping archive rows have a canonical winner after ingestion.
   if (revision !== store.revision) archived = await store.dependencies(incoming, target.data);
   const commit = () => {
@@ -239,14 +366,21 @@ async function mergeVerifiedWorld(data, peer, context, { local = false, worldMes
       return { ignored: true };
     }
     const rootCount = target.roots.length;
+    const priorRevision = worldRevision(target), priorTick = target.data.tick;
     const routine = delta && !needsReplicaSave(incoming, target.data, store);
     const apply = () => {
+      if (worldMessage && peer?.node === worldMessage.from && worldMessage.from === leader()) ordered.replaceUnsealed(target, incoming.tick);
       const index = delta && renderer.currentIndex(target);
       let changes;
-      try { changes = target.merge(incoming, archived, delta ? 'replica' : undefined, delta, checkedRules); }
+      try { changes = target.merge(incoming, archived, delta ? 'replica' : undefined, delta || (joined && 'join'), checkedRules); }
       finally { if (delta) noteCheckpointMerge(target.data, changes, incoming, archived); }
+      if (worldMessage && peer?.node === worldMessage.from && worldMessage.from === leader()) {
+        ordered.appliedReplica(target, changes, incoming, archived);
+      }
       if (delta) pictures.merged(target, changes);
       if (index) renderer.applyMerge(target, index, changes);
+      joined?.(target, priorTick, priorRevision, changes);
+      if (worldMessage && delta) followVerifiedReplica(target, priorTick, priorRevision, changes);
     };
     let movement;
     if (worldMessage && worldMessage.from !== network.node) movement = replicaSwims.merge(target.data, worldMessage, apply);
@@ -263,11 +397,12 @@ async function mergeVerifiedWorld(data, peer, context, { local = false, worldMes
 function presentReplicaMovement(movement) {
   if (movement && movement === replicaSwims.latest && movement.data === world.data && movement.tick === world.data.tick && movement.from === leader()) {
     renderer.presentSwims(world, movement.directions, movement.startedAt);
-  }
+    renderClient.merged(world, movement);
+  } else renderClient.merged(world);
 }
-async function mergeReplica(data, peer, context = 'merge', worldMessage) {
+async function mergeReplica(data, peer, context = 'merge', worldMessage, joined) {
   const previousTerrain = world.data.terrain?.seed;
-  const { joinedWorld, movement, routine, ignored } = await mergeVerifiedWorld(data, peer, context, { worldMessage });
+  const { joinedWorld, movement, routine, ignored } = await mergeVerifiedWorld(data, peer, context, { worldMessage, joined });
   if (ignored) return;
   presentReplicaMovement(movement);
   if (context === 'world-delta' && worldMessage) {
@@ -354,6 +489,11 @@ async function onMessage(message, peer) {
   await resumeAfterInactivity();
   if (members.has(message.from) && members.get(message.from).actor !== message.actor) return false;
   const body = message.body;
+  if (message.kind === 'orderedStep') {
+    if (peer.node !== message.from || members.get(message.from)?.actor !== message.actor) return;
+    await runOrdered(() => ordered.receive(peer, body));
+    return;
+  }
   if (message.kind === 'hello') {
     if (!body.world?.terrain || !rulesCompatible(body.rules)) {
       if (!peer.silent) { status = '对方使用不兼容的世界规则，请双方更新后再连接'; toast(status); }
@@ -361,9 +501,12 @@ async function onMessage(message, peer) {
     }
     if (message.from !== peer.node || body.member?.id !== message.from || body.member.actor !== message.actor) return;
     const newKnowledge = Object.keys(body.world.roots || {}).some(r => !world.data.roots[r]) || Object.keys(body.world.ops || {}).some(id => !world.data.ops[id]) || Object.keys(body.world.chats || {}).some(id => !world.data.chats[id]) || Object.keys(body.world.chatSources || {}).some(id => !world.data.chatSources[id]);
-    await mergeReplica(body.world, peer, 'hello'); geometryRepair = true;
+    let joined;
+    const retain = peer.replicaLive && sameOrderedProtocol(body.member) && simulation.owner === world;
+    await mergeReplica(body.world, peer, 'hello', undefined, retain ? (...state) => { joined = state; } : undefined); geometryRepair = true;
     replicaRecovery.covered(message);
     const own = body.member; members.set(own.id, { ...own, url: peer.url, at: Date.now() }); remember(peer.url);
+    if (joined) followVerifiedReplica(...joined); else followVerifiedReplica(world);
     rememberAuthor(message.actor, own.nick);
     for (const m of body.members || []) remember(m.url);
     if (newKnowledge) await network.broadcast('merge', { world: body.world }, { capturedWorld: true });
@@ -403,6 +546,7 @@ async function onMessage(message, peer) {
     }
     try {
       const changed = await mergeReplica(body.world, peer, body.delta ? 'world-delta' : 'world-full', message);
+      if (changed !== undefined) runOrdered(() => ordered.afterReplica());
       if (changed) update();
       if (changed !== undefined && body.settledRecords && peer?.replicaLive && peer.node === message.from && message.from === leader()) {
         checkReplicaInventory(body, message.from, true);
@@ -421,7 +565,7 @@ async function onMessage(message, peer) {
     if (rejectedOps.has(body.id)) return;
     if (body.kind === 'referral' && !await verifyReferral(body)) return;
     inbox.set(body.id, clone(message));
-    if (amLeader()) {
+    if (amLeader() && !ordered.current?.steps) {
       const result = await applyAtBoundary(message, true);
       if (!result) return;
       if (result.ok) await save({ reusePicture: true }); else rejectOperation(body.id);
@@ -507,7 +651,7 @@ async function submit(payload) {
     const message = await network.broadcast('op', op);
     if (rejectedOps.has(op.id)) { pending.delete(op.id); update(); return; }
     inbox.set(op.id, clone(message));
-    const result = amLeader() && await applyAtBoundary(message, true);
+    const result = amLeader() && !ordered.current?.steps && await applyAtBoundary(message, true);
     if (result) {
       pending.delete(op.id);
       if (!result.ok) { rejectOperation(op.id); toast(result.error); }
@@ -539,9 +683,8 @@ function observationRect() {
   if (innerWidth <= 700) return { left: tools.right + 12, right: innerWidth - 16, top: Math.max(120, inspector.bottom + 16), bottom: innerHeight - 100 };
   return { left: tools.right + 20, right: Math.max(tools.right + 160, inspector.left - 20), top: 128, bottom: innerHeight - 52 };
 }
-function moveCameraToFish(fish, body) {
-  const rect = observationRect(), size = renderer.cell * renderer.scale, x = (rect.left + rect.right) / 2, y = (rect.top + rect.bottom) / 2;
-  renderer.camera = { x: nearX(fish.x + fish.facing * (body.minX + body.maxX) / 2, renderer.camera.x) + (renderer.width / 2 - x) / size, y: fish.y + (body.minY + body.maxY) / 2 + (renderer.height / 2 - y) / size };
+function moveCameraToFish(fish, body, rect = observationRect()) {
+  renderer.camera = observationCamera(fish, body, renderer.camera, rect, renderer.width, renderer.height, renderer.cell * renderer.scale);
 }
 function focusFish(id, follow = false) {
   const fish = world.data.fishes[id]; if (!fish) { toast('这条鱼已不再存活'); renderMyFishes(); return; }
@@ -942,7 +1085,7 @@ async function start() {
   network = new Network(identity, meta, onMessage, networkChange, (error, peer) => {
     diagnostics.record('warn', 'network', `已拒绝来自 ${peer?.node || 'unknown'} 的消息：${error?.message || error}`);
     if ($('diagnosticsDialog').open) renderDiagnosticsLogs();
-  }); await network.start(displayNick(identity.nick)); members.set(network.node, member());
+  }, () => archiveStore.packs); await network.start(displayNick(identity.nick)); members.set(network.node, member());
   $('myUrl').value = meta.url;
   creator = new Creator(placement, balance, size => defaultFishName(identity.nick, world.myFishes(identity.actor).length + 1, size));
   syncIncomeSerial(); renderChat(); await saveHandoff({ startup: true });
@@ -969,8 +1112,21 @@ async function tick() {
   if (replacingCheckpoint) return;
   if (!updateFrozen && identity.remainder >= 3600) { identity.remainder -= 3600; identity.serial = (identity.serial || 0) + 1; await submit({ kind: 'earn', cost: 0, serial: identity.serial }); }
   members.set(network.node, member());
-  const currentLeader = leader(); if (currentLeader !== lastLeader) { simulation.close(); lastLeader = currentLeader; worldBroadcast.reset(); replicaSwims.reset(); renderer.presentSwims(world); if (amLeader()) { geometryRepair = true; world.data.tick = Math.max(world.data.tick, now - 2000); for (const envelope of [...inbox.values()].sort((a, b) => a.body.t - b.body.t || a.body.id.localeCompare(b.body.id))) { if (!world.data.ops[envelope.body.id]) { const result = world.apply({ ...clone(envelope.body), proof: clone(envelope) }); if (!result.ok) rejectOperation(envelope.body.id); network.broadcast('ack', { id: envelope.body.id, result }).catch(() => {}); } } for (const id of pending.keys()) if (world.data.ops[id]) pending.delete(id); } }
+  const currentLeader = leader();
+  if (currentLeader !== lastLeader) {
+    ordered.stop('权威成员已更换');
+    if (!mayRetainWorker()) simulation.close();
+    lastLeader = currentLeader;
+    worldBroadcast.reset(); replicaSwims.reset(); renderer.presentSwims(world);
+    if (amLeader()) {
+      geometryRepair = true;
+      world.data.tick = Math.max(world.data.tick, now - 2000);
+      await resumeOrderedInputs();
+      for (const id of pending.keys()) if (world.data.ops[id] || archiveStore.ids.ops.has(id)) pending.delete(id);
+    }
+  }
   if (amLeader() && fishRepairWaiting && now - lastSave > 5000) geometryRepair = true;
+  if (ordered.run(now)) return;
   if (amLeader() && !updateFrozen && !replacingCheckpoint) {
     const target = world;
     simulation.advance(target, now, () => target === world && amLeader() && !updateFrozen && !replacingCheckpoint && !archiveImports, {
@@ -985,7 +1141,7 @@ async function tick() {
         status = '后台模拟已暂停，刷新页面可重试。' + error.message;
         toast(status);
       });
-  } else simulation.close();
+  } else if (!ordered.current && !mayRetainWorker()) simulation.close();
 }
 // Start periodic storage, presence and HUD work between ecology deadlines.
 // Foreground edits, pagehide and explicit archive requests keep their own cuts.
@@ -1666,7 +1822,17 @@ $('deleteScene').onclick = () => { if (!selected) return; submit({ kind: 'sceneD
 $('sea').oncontextmenu = e => { e.preventDefault(); cancelMode(); };
 $('sea').addEventListener('pointerdown', e => { if (e.button !== 0) return; if (mode) { const p = renderer.point(e.clientX, e.clientY); if (mode.kind === 'food') { if (p.y !== 0) { toast('请在亮蓝色水面行点击投食'); return; } submit({ kind: 'food', ch: mode.ch, color: mode.color, x: p.x, y: 0, cost: 1 }); } else { const b = bounds(mode.cells), x = wrapX(p.x - b.minX), y = p.y - b.minY; submit({ kind: mode.kind, cells: mode.cells, ...(mode.kind === 'fish' ? { gender: mode.gender, name: mode.name } : {}), scene: mode.scene, x, y, cost: mode.kind === 'sceneMove' ? 0 : mode.cells.length }); cancelMode(); } return; } dragging = { startX: e.clientX, startY: e.clientY, x: renderer.camera.x, y: renderer.camera.y, moved: false }; $('sea').setPointerCapture(e.pointerId); });
 $('sea').addEventListener('pointermove', e => { if (mode) { const p = renderer.point(e.clientX, e.clientY), b = bounds(mode.cells || []); renderer.preview = { ...mode, x: mode.kind === 'food' ? p.x : wrapX(p.x - b.minX), y: mode.kind === 'food' ? 0 : p.y - b.minY }; if (mode.kind === 'fish') renderer.preview.valid = world.canOccupy({ id: '', x: renderer.preview.x, y: renderer.preview.y, facing: 1 }, mode.cells); } else if (dragging) { const s = renderer.cell * renderer.scale; renderer.camera.x = wrapX(dragging.x - (e.clientX - dragging.startX) / s); renderer.camera.y = Math.min(CONFIG.depth, Math.max(0, dragging.y - (e.clientY - dragging.startY) / s)); dragging.moved ||= Math.hypot(e.clientX - dragging.startX, e.clientY - dragging.startY) > 4; if (dragging.moved) trackedFish = null; updateCameraLabels(); } });
-$('sea').addEventListener('pointerup', e => { if (dragging && !dragging.moved) { const hit = renderer.hit(e.clientX, e.clientY); if (hit) inspect(hit); else { selected = null; renderer.selected = null; $('inspector').hidden = true; } } dragging = null; });
+let lastHit = 0;
+$('sea').addEventListener('pointerup', async e => {
+  const click = dragging && !dragging.moved;
+  dragging = null;
+  const request = ++lastHit;
+  if (!click) return;
+  const target = world, hit = await renderClient.hit(e.clientX, e.clientY);
+  if (request !== lastHit || world !== target) return;
+  if (hit) inspect(hit);
+  else { selected = null; renderer.selected = null; $('inspector').hidden = true; }
+});
 $('sea').addEventListener('wheel', e => { e.preventDefault(); renderer.zoom(renderer.scale * (e.deltaY < 0 ? 1.1 : .9)); updateCameraLabels(); }, { passive: false });
 function renderDiagnosticsLogs() {
   $('diagLogs').textContent = diagnostics.format();
@@ -1865,12 +2031,20 @@ document.addEventListener('keydown', e => {
 document.addEventListener('keyup', e => heldShortcuts.delete(e.code || e.key.toLowerCase()));
 window.addEventListener('blur', () => heldShortcuts.clear());
 function render(now) {
+  let follow;
   if (trackedFish) {
     const fish = renderer.fishPose(world, trackedFish, now);
-    if (fish && followBounds) moveCameraToFish(fish, followBounds);
+    if (fish && followBounds) {
+      const rect = observationRect();
+      moveCameraToFish(fish, followBounds, rect);
+      follow = { id: trackedFish, body: followBounds, rect };
+    }
     else { trackedFish = null; toast('这条鱼已不再存活'); }
   }
-  try { renderer.draw(world, now); }
+  try {
+    if (started && renderClient.frame(world, follow)) renderer.cellIndex(world).advance();
+    else renderer.draw(world, now);
+  }
   catch (error) {
     if (!renderer.scene3d) throw error;
     applyScene3d(null);

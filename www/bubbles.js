@@ -1,3 +1,4 @@
+import { hash } from './world-hash.js';
 import { MAX_FLOOR, WORLD_WIDTH, wrapX } from './geography.js';
 
 export const MINUTE = 60000, BUBBLE_SPEED = 1, BUBBLE_GROWTH = 25;
@@ -7,7 +8,6 @@ export function bubbleGlyph(bubble) {
   const roll = hash(`bubble-secret:${bubble.id}`) % 1000;
   return roll < 5 ? '？' : roll < 35 ? '咕' : roll < 65 ? '噜' : BUBBLE_GLYPH;
 }
-function hash(text) { let value = 2166136261; for (const ch of text) value = Math.imul(value ^ ch.codePointAt(0), 16777619); return value >>> 0; }
 export const bubbleId = (source, minute) => `bubble:${source}:${minute}`;
 export const bubbleChance = depth => Math.max(0, Math.min(100, 100 - depth)) / 100;
 export function bubbleRoll(source, minute, depth) { return hash(`bubble-roll:${source}:${minute}`) % 10000 < Math.round(bubbleChance(depth) * 10000); }

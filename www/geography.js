@@ -1,3 +1,4 @@
+import { hash as random } from './world-hash.js';
 export const WORLD_WIDTH = 1000;
 export const MIN_FLOOR = 80, MAX_FLOOR = 100;
 export function wrapX(x) {
@@ -20,7 +21,6 @@ export function worldKey(x, y) {
 }
 export const deltaX = (x, reference) => wrapX(x - reference + WORLD_WIDTH / 2) - WORLD_WIDTH / 2;
 export const nearX = (x, reference) => reference + deltaX(x, reference);
-function random(seed) { let value = 2166136261; for (const ch of seed) value = Math.imul(value ^ ch.codePointAt(0), 16777619); return value >>> 0; }
 export function makeTerrain(seed, createdAt) {
   const span = 50, anchors = Array.from({ length: WORLD_WIDTH / span }, (_, i) => MIN_FLOOR + random(`seabed:${seed}:${i}`) % (MAX_FLOOR - MIN_FLOOR + 1));
   const depths = Array.from({ length: WORLD_WIDTH }, (_, x) => { const index = Math.floor(x / span), fraction = (x % span) / span; return Math.round(anchors[index] * (1 - fraction) + anchors[(index + 1) % anchors.length] * fraction); });

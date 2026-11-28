@@ -118,6 +118,31 @@ test('同形鱼按各自鱼元编号选择接触点', () => {
   const legacy = w.movementGrid(new Map(groups).set('dad1', repeated));
   assert.equal(collectGridPairs(w, legacy, scenery, roster, new Set(), new Set(), new Map()), false);
 });
+test('同一相对鱼形的规范接触点仍受每对鱼所在海域的墙角影响', () => {
+  const w = sea(), groups = new Map(), males = [], females = new Set(), scenery = new Map();
+  const setScene = (x, y) => {
+    x = (x + 1000) % 1000;
+    scenery.set(x + ',' + y, { scene: { x, y }, cell: { x: 0, y: 0 } });
+  };
+  for (const [i, x] of [100, 999].entries()) {
+    const father = { id: 'dad' + i, x, y: 25, facing: 1 };
+    const mother = { id: 'mum' + i, x: (x + 1) % 1000, y: 26, facing: 1 };
+    w.data.fishes[father.id] = father;
+    w.data.fishes[mother.id] = mother;
+    groups.set(father.id, [{ id: 'a' + i, x: 0, y: 0 }]);
+    groups.set(mother.id, [{ id: 'a' + i, x: 0, y: 0 }, { id: 'b' + i, x: 0, y: -1 }]);
+    males.push(father);
+    females.add(mother.id);
+    for (let n = 0; n < 185; n++) setScene(x - 14 + n % 31, 12 + Math.floor(n / 31));
+    for (let dx = -4; dx < 6; dx++) setScene(x + dx, 41);
+  }
+  setScene(999, 26);
+  const grid = w.movementGrid(groups), pairs = new Map();
+  const roster = { males, females, probeCount: grid.cells.length };
+  assert(collectGridPairs(w, grid, scenery, roster, new Set(), new Set(), pairs));
+  assert.equal(pairs.get('dad0|mum0')?.wait, 20000);
+  assert.equal(pairs.get('dad1|mum1')?.wait, 5000);
+});
 test('已经开始的繁殖不因后来的拥挤被取消，出生不增加鱼元', () => {
   const w = sea(), male = fish(w, 'male', 20); fish(w, 'female', 23); for (let e = 0; e <= 5000; e += 500) updateContacts(w, now + e, w.fishGroups(), w.sceneryMap()); const r = w.breedingState(male); fill(w, 22, 20, 400); const count = Object.keys(w.data.chars).length;
   finishBreeding(w, r.ends, transition); assert.equal(r.status, 'born'); assert.equal(Object.keys(w.data.chars).length, count);
@@ -205,4 +230,13 @@ test('旧鱼体重复编号仍按原来的首个鱼元寻找接触点', () => {
   assert.equal(contactTime(densityField(w)(23, 20)), Infinity);
   updateContacts(w, now, w.fishGroups(), w.sceneryMap());
   assert.deepEqual(w.data.contacts[male + '|' + female], { male, female, since: now, lastAt: now });
+});
+test('密度快照在下一次按整海占格统计后仍保持原值', () => {
+  const w = sea();
+  fill(w, 998, 20, 100);
+  const before = densityField(w), expected = before(998, 20);
+  const empty = densityField(sea());
+  assert.equal(empty(998, 20), 0);
+  assert.equal(before(998, 20), expected);
+  assert.equal(expected, 100 / 961);
 });

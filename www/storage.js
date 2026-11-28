@@ -189,8 +189,23 @@ export async function signer(identity) {
   return Object.assign(value => signBytes(enc.encode(JSON.stringify(value))), { bytes: signBytes });
 }
 const keys = new Map();
+async function verifySignedBytes(message, signature, bytes) {
+  if (typeof message?.actor !== 'string' || typeof message.from !== 'string' || message.from.slice(0, 16) !== message.actor.slice(0, 16) ||
+      typeof message.id !== 'string' || message.id.length !== 36 || !message.key) return false;
+  const actor = await actorId(message.key);
+  if (actor !== message.actor) return false;
+  if (!keys.has(actor)) keys.set(actor, await crypto.subtle.importKey('jwk', message.key, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify']));
+  return crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, keys.get(actor), signature, bytes);
+}
 export async function verifyEnvelope(message) {
-  if (typeof message?.actor !== 'string' || message.from?.slice(0, 16) !== message.actor.slice(0, 16)) return false;
-  if (!message || typeof message.id !== 'string' || message.id.length !== 36 || typeof message.from !== 'string' || !message.key || typeof message.signature !== 'string') return false;
-  try { const actor = await actorId(message.key); if (actor !== message.actor) return false; if (!keys.has(actor)) keys.set(actor, await crypto.subtle.importKey('jwk', message.key, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify'])); const { signature, ...body } = message; const bytes = Uint8Array.from(atob(signature), c => c.charCodeAt(0)); return await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, keys.get(actor), bytes, enc.encode(JSON.stringify(body))); } catch { return false; }
+  if (typeof message?.signature !== 'string') return false;
+  try {
+    const { signature, ...body } = message;
+    return await verifySignedBytes(body, Uint8Array.from(atob(signature), c => c.charCodeAt(0)), enc.encode(JSON.stringify(body)));
+  } catch { return false; }
+}
+export async function readSignedFrame(bytes, signature) {
+  const message = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+  if (message?.kind !== 'replicaFrame' || !await verifySignedBytes(message, signature, bytes)) throw new Error('实时帧签名无效');
+  return message;
 }

@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { World, CONFIG, hash, cellPosition } from './empty-world.mjs';
+import { MovementGrid } from '../www/movement-grid.js';
+import { key, NEIGHBORS, touching } from '../www/engine.js';
 import { MEAL_INTERVAL, feedingStatus } from '../www/fish-status.js';
 import { restoreCheckpoint } from '../www/lifecycle.js';
 import { updateContacts, finishBreeding } from '../www/breeding.js';
@@ -17,6 +19,17 @@ function food(w, x, y, at = t, ch = '食') {
 function spot(w, id) { const p = w.fishCells(id).map(c => cellPosition(w.data.fishes[id], c)).sort((a, b) => a.y - b.y || a.x - b.x)[0]; return { x: (p.x + 1000) % 1000, y: p.y - 1 }; }
 function nearby(w, id, at) { const p = spot(w, id); return food(w, p.x, p.y, at); }
 function hold(w) { for (const f of Object.values(w.data.fishes)) { f.cx = f.cy = -10; } }
+test('两只眼睛跨越深浅水界线时，患病鱼仍能优先追到环绕边界的药食', () => {
+  for (const [depth, ill, expected] of [[59, true, 4], [60, true, 6], [59, false, 6]]) {
+    const w = new World(t), id = fish(w, 5, depth, 'alice', [cell(0, 0, 'o'), cell(0, 1, 'o')]);
+    Object.assign(w.data.fishes[id], { facing: 1, cx: 1 });
+    if (ill) w.data.population.illnesses[id] = { at: t, nextLossAt: t + HOUR, curedAt: 0 };
+    food(w, 987, depth, t, '乐');
+    food(w, 13, depth, t, '食');
+    w.step(t + 500);
+    assert.equal(w.data.fishes[id].x, expected);
+  }
+});
 function eat(w, id, at) { const meal = nearby(w, id, at); hold(w); w.step(at); assert.equal(w.data.chars[meal].entity, id); return meal; }
 
 test('第一餐可立即吃，同一结算步多颗食物也只吃一颗', () => {
@@ -72,4 +85,22 @@ test('繁殖中的双亲分别限一次；自然出生的小鱼立即可以吃�
   assert.equal(w.fishStatus(male, t + 5500).meals24, 1); assert.equal(w.fishStatus(female, t + 5500).meals24, 1); assert.equal(meals.filter(id => w.data.chars[id].kind === 'fish').length, 2);
   const transition = (c, next, event) => { Object.assign(c, next); c.path.push({ ...event, target: next.entity || '', x: next.x, y: next.y }); };
   finishBreeding(w, record.ends, transition); const baby = record.baby.id; assert(w.fishStatus(baby, record.ends).canEat); assert(w.fishStatus(baby, record.ends).neverFed);
+});
+test('从占格读取食物接触，环绕、墙角和同鱼多个字保留原候选次序', () => {
+  const food = { x: 0, y: 20 }, grid = new MovementGrid();
+  const fishes = { first: { id: 'first', x: 999, y: 19, facing: 1 }, second: { id: 'second', x: 0, y: 19, facing: 1 },
+    never: { id: 'never', x: 1, y: 21, facing: 1 }, center: { id: 'center', x: 0, y: 20, facing: 1 } };
+  const bodies = { first: [cell(0, 0), cell(0, 1)], second: [cell(0, 0)], never: [cell(0, 0)], center: [cell(0, 0), cell(0, 1)] };
+  for (const f of Object.values(fishes)) for (const c of bodies[f.id]) grid.add(f.x + c.x, f.y + c.y, f.id);
+  for (const walls of [[], ['999,20'], ['0,19'], ['0,19', '999,20'], ['0,20']]) {
+    const scenery = new Map(walls.map(k => [k, {}]));
+    const canEat = id => id !== 'never';
+    const neighbors = new Set();
+    for (const [dx, dy] of NEIGHBORS) for (const id of grid.get(food.x + dx, food.y + dy) || []) neighbors.add(id);
+    const expected = scenery.has(key(food.x, food.y)) ? [] : [...neighbors].filter(id => !grid.get(food.x, food.y)?.has(id) &&
+      canEat(id) && touching(fishes[id], bodies[id], food, scenery));
+    assert.deepEqual(grid.foodContacts(food, scenery, canEat), expected);
+  }
+  grid.add(999, 19, 'overlap');
+  assert.equal(grid.foodContacts(food, new Map(), () => true), undefined);
 });

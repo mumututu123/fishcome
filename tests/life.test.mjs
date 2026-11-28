@@ -3,9 +3,23 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { World, CONFIG, clone, hash } from '../www/engine.js';
 import { restoreCheckpoint } from '../www/lifecycle.js';
-import { LIFE, personality, personalityText, weatherAt, lifeContext, updateLife, idleMotion, fishLifeText, recordStory, mergeLife, newLife, validateLife, spawnPlankton, planktonSource, validPlankton, freshPlankton, pairKey, storiesFor, storyText, returnStory } from '../www/life.js';
+import { LIFE, personality, personalityText, weatherAt, lifeContext, updateLife, idleMotion, fishLifeText, recordStory, withStoryBatch, mergeLife, newLife, validateLife, spawnPlankton, planktonSource, validPlankton, freshPlankton, pairKey, storiesFor, storyText, returnStory } from '../www/life.js';
 import { fishCatalog } from '../www/fish-profile.js';
 const t = Math.floor((Date.now() - 3600000) / 180000) * 180000 + 80000;
+
+test('一批故事中再次遇到已裁掉或保留的同一条，与逐条裁剪顺序一致', () => {
+  const a = { data: { life: newLife(t) } }, b = { data: { life: newLife(t) } };
+  const write = (id, at) => { recordStory(a, 'meal', id, at); recordStory(b, 'meal', id, at); };
+  withStoryBatch(b, () => {
+    for (let i = 0; i <= LIFE.storyLimit; i++) write(String(i), t + i);
+    write('0', t + 2000);
+    write('1', t);
+    write('7', t + 2000);
+    write('7', t);
+    write('new', t);
+  });
+  assert.deepEqual(Object.entries(b.data.life.stories), Object.entries(a.data.life.stories));
+});
 
 test('密集鱼群只保留规定数量的关系，已熟悉的鱼即使最终被裁掉也能留下故事', () => {
   const at = Date.UTC(2025, 5, 15, 12, 17);
@@ -39,6 +53,17 @@ function context(w, now) { return lifeContext(w, now, w.sceneryMap(), w.fishGrou
 function track(w, seconds, start = t) { for (let i = 1; i <= seconds; i++) updateLife(w, start + i * 1000, context(w, start + i * 1000)); }
 function source(w) { return { roots: w.data.roots, ops: w.data.ops, breeding: w.data.breeding }; }
 function weatherTime(w, type) { let now = Math.ceil((t + 180000) / LIFE.weatherPeriod) * LIFE.weatherPeriod; while (weatherAt(w.data, now).type !== type) now += LIFE.weatherPeriod; return now; }
+
+test('繁殖合体的虚拟鱼无需查找整海普通队形，实际游动方向保持一致', () => {
+  const w = world(), at = Math.ceil(t / 60000) * 60000;
+  for (const [index, x] of [10, 18, 26].entries()) fish(w, x, 20, 'school-' + index);
+  const center = { x: 20, y: 23 }, pair = { ...center, id: 'breed:virtual', created: t, facing: 1 };
+  const eager = context(w, at), expected = idleMotion(w, pair, at, eager, center);
+  assert.equal(eager.school.size, 3);
+  const groups = w.fishGroups(), working = lifeContext(w, at, w.sceneryMap(), groups, w.bodyLayout(groups));
+  Object.defineProperty(working, 'school', { get() { throw new Error('虚拟鱼没有普通队形'); } });
+  assert.deepEqual(idleMotion(w, pair, at, working, center), expected);
+});
 
 test('每条鱼的小性格稳定，创建、自然出生标识和旧鱼都有自然描述', () => {
   const w = world(), id = fish(w), saved = w.serialize();
@@ -112,6 +137,24 @@ test('避让时隔着环形边界的鱼与同侧鱼相距相同，按标识选�
   scene(w, 0, 20);
   const blocked = lifeContext(w, t, w.sceneryMap(), groups);
   assert.equal(blocked.crowdedNeighbor(blocked.points.get('center')).id, 'second');
+});
+test('自然步移动和重建鱼群分区后，已打开的观察仍保留原来的鱼位与邻居', () => {
+  const w = world(), groups = new Map();
+  for (const [id, x] of [['center', 1], ['near', 999], ['far', 90]]) {
+    w.data.fishes[id] = { id, x, y: 20, facing: 1 };
+    groups.set(id, [cell(0, 0)]);
+  }
+  const layout = w.bodyLayout(groups), scenery = new Map();
+  lifeContext(w, t, scenery, groups, layout);
+  const observed = lifeContext(w, t, scenery, groups);
+  w.data.fishes.near.x = 98;
+  w.data.fishes.far.x = 2;
+  const working = lifeContext(w, t + 500, scenery, groups, layout);
+  for (const [ctx, id] of [[working, 'far'], [observed, 'near']]) {
+    for (let i = 0; i < 5; i++) assert.equal(ctx.crowdedNeighbor(ctx.points.get('center')).id, id);
+    assert.deepEqual(ctx.neighbors.get('center').map(p => p.id), [id]);
+  }
+  assert.equal(observed.points.get('near').x, 999);
 });
 test('旧存档的分数坐标保留距离边界上的单向视线', () => {
   const w = world(), a = fish(w, 7, 20), b = crypto.randomUUID();

@@ -9,8 +9,27 @@ const count = Number(process.argv[2] || 100000), duration = Number(process.argv[
 assert(Number.isSafeInteger(count) && count > 0 && duration >= 5 && duration <= 180);
 const width = Math.max(1000, Math.ceil(Math.ceil(count / 16) * 6 / 1000) * 1000);
 const www = path.resolve(__dirname, '../www');
+function observeCapacityDraw(target, worldId, surface, report) {
+  const draw = target.draw;
+  let previous, lastReport, batch = [], fishGlyphs = 0;
+  target.draw = function (world, ...args) {
+    const at = performance.now();
+    const result = draw.call(this, world, ...args);
+    if (!Object.hasOwn(world.data.roots, worldId)) return result;
+    const end = performance.now();
+    if (previous !== undefined) batch.push([at - previous, end - at]);
+    previous = at;
+    fishGlyphs += this.paintedFish?.length || 0;
+    if (lastReport === undefined || end - lastReport > 900) {
+      report({ kind: 'frames', surface, rows: batch, fishGlyphs, indexed: !this.viewport.remaining, clock: Date.now() });
+      batch = []; fishGlyphs = 0; lastReport = end;
+    }
+    return result;
+  };
+}
 const fixture = `
-import { makeFishWorld } from '/capacity-fish.mjs';
+import { capacityWorldId, makeFishWorld } from '/capacity-fish.mjs';
+window.capacitySurface = () => renderClient.visible ? 'worker' : 'page';
 window.installCapacityWorld = () => {
   const begin = performance.now();
   const next = makeFishWorld(World, ${count}, CONFIG.width);
@@ -29,27 +48,14 @@ window.installCapacityWorld = () => {
     }
     return result;
   };
-  let steps = 0, fishGlyphs = 0;
+  let steps = 0;
   subscribeSimulationChanges((target, patch) => {
     if (target === next && patch && Number.isFinite(patch.values.tick)) {
       steps++;
       window.capacityReport({ kind: 'step', steps });
     }
   });
-  const glyph = renderer.glyph.bind(renderer);
-  renderer.glyph = (...args) => { if (args[8] === 'fish') fishGlyphs++; return glyph(...args); };
-  let painted = false, previous = performance.now(), batch = [], start = previous;
-  const draw = renderer.draw.bind(renderer);
-  renderer.draw = (current, now) => {
-    const at = performance.now();
-    draw(current, now);
-    const end = performance.now();
-    batch.push([at - previous, end - at]); previous = at;
-    if (!painted || end - start > 900) {
-      window.capacityReport({ kind: 'frames', rows: batch, fishGlyphs, indexed: !renderer.viewport.remaining, clock: Date.now(), first: !painted });
-      batch = []; start = end; painted = true;
-    }
-  };
+  (${observeCapacityDraw.toString()})(renderer, capacityWorldId, 'page', window.capacityReport);
   for (const event of ['click', 'wheel', 'pointerup']) {
     document.addEventListener(event, e => {
       if (!e.isTrusted) return;
@@ -77,6 +83,9 @@ const server = http.createServer((req, res) => {
   res.setHeader('Content-Type', types[path.extname(file)] || 'application/octet-stream');
   let content = fs.readFileSync(file);
   if (route === '/app.js') content = content.toString() + fixture;
+  if (route === '/render-owner.js') content = content.toString() + `
+import { capacityWorldId } from '/capacity-fish.mjs';
+(${observeCapacityDraw.toString()})(Renderer.prototype, capacityWorldId, 'worker', frames => postMessage({ capacityFrames: frames }));`;
   if (route === '/geography.js') {
     assert(content.includes('WORLD_WIDTH = 1000;'));
     content = content.toString().replace('WORLD_WIDTH = 1000;', 'WORLD_WIDTH = ' + width + ';');
@@ -90,7 +99,8 @@ function stats(values) {
   return { n: samples.length, p50: at(.5), p95: at(.95), p99: at(.99), max: at(1), over50: samples.filter(n => n > 50).length };
 }
 async function main() {
-  const report = { count, width, duration, mode: '2D', inputs: [], errors: [], completedSteps: 0, worker: [] };
+  const report = { count, width, duration, mode: '2D', inputs: [], errors: [], completedSteps: 0, worker: [],
+    surfaces: { page: { frames: 0, fishGlyphs: 0 }, worker: { frames: 0, fishGlyphs: 0 } }, fishGlyphs: 0 };
   const frames = [], draws = [], screens = [], attempts = [];
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   browser = await chromium.launch({ headless: true, ...(process.env.TIDE_TEST_BROWSER ? { executablePath: process.env.TIDE_TEST_BROWSER } : {}) });
@@ -104,10 +114,12 @@ async function main() {
     else if (data.kind === 'step') report.completedSteps = data.steps;
     else if (data.kind === 'feed') report.feed = { ...report.feed, ...data };
     else {
-      if (data.first) report.firstDrawAt = data.clock;
+      report.firstDrawAt ??= data.clock;
       if (data.indexed && !report.fullyIndexedAt) report.fullyIndexedAt = data.clock;
       for (const [frame, draw] of data.rows) { frames.push(frame); draws.push(draw); }
-      report.fishGlyphs = data.fishGlyphs;
+      report.surfaces[data.surface].frames += data.rows.length;
+      report.surfaces[data.surface].fishGlyphs += data.fishGlyphs;
+      report.fishGlyphs += data.fishGlyphs;
       screens.push(data.clock);
     }
   });
@@ -117,6 +129,9 @@ async function main() {
       const post = Worker.prototype.postMessage;
       const states = new WeakMap();
       Worker.prototype.postMessage = function(message, ...rest) {
+        if (message?.canvas) this.addEventListener('message', ({ data }) => {
+          if (data.capacityFrames) window.capacityReport(data.capacityFrames);
+        });
         if (message?.kind === 'open') {
           const state = { phase: '', rows: 0, marked: 0, requests: [] };
           states.set(this, state);
@@ -202,6 +217,7 @@ async function main() {
       await pause(750);
     }
     report.elapsedMs = Math.round(performance.now() - start);
+    report.activeSurface = await page.evaluate(() => window.capacitySurface());
     // Include the unpainted tail when a stalled renderer stops reporting frames.
     report.unreportedTailMs = Date.now() - (screens.at(-1) || report.setup.start);
   } catch (error) { report.failure = error.message; }
@@ -212,7 +228,8 @@ async function main() {
   report.cameraMoved = new Set(report.inputs.map(input => input.x)).size > 1;
   console.log(JSON.stringify(report));
   const fed = report.feed?.signed && report.feed.charged === 1 && report.feed.cell === 'food' && report.feed.visibleBalance === report.feed.balanceBefore - 1;
-  if (!report.setup || !frames.length || !report.fishGlyphs || !report.inputs.length || !report.scaleChanged || !report.cameraMoved || !report.completedSteps || !fed || report.crash) process.exitCode = 1;
+  const painted = report.surfaces[report.activeSurface];
+  if (!report.setup || !painted?.frames || !painted.fishGlyphs || !report.inputs.length || !report.scaleChanged || !report.cameraMoved || !report.completedSteps || !fed || report.crash) process.exitCode = 1;
 }
 main().catch(error => { console.error(error); process.exitCode = 1; }).finally(async () => {
   if (browser) await browser.close();

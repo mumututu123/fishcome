@@ -5,9 +5,35 @@ import { worldTables } from '../www/simulation-changes.js';
 import { WorkerSimulation } from '../www/simulation-worker.js';
 import { expandSimulationPatch } from '../www/simulation-delta.js';
 import { updateContacts } from '../www/breeding.js';
+import { ECOLOGY, updateEcology, weedExpires } from '../www/ecology.js';
 
 const start = Date.UTC(2025, 5, 15, 12, 17);
 const root = '00000000-0000-4000-8000-000000000012';
+
+test('枯萎时钟响应食物履历、草龄修改和下段海草脱落', () => {
+  const { worker } = startWorker([food('loose', 4), food('root', 3), food('tip', 3)]);
+  const world = worker.world, chars = world.data.chars;
+  for (const [i, id] of ['root', 'tip'].entries()) Object.assign(chars[id], {
+    kind: 'seaweed', entity: 'plant', created: start, wild: { index: i }
+  });
+  const transition = (row, values, event) => { Object.assign(row, values); row.path.push(event); };
+  updateEcology(world, start, transition);
+  const expires = weedExpires(chars.tip, world.data.ecology);
+  chars.loose.path.push({ reason: 'wither-loose', t: start });
+  updateEcology(world, start + ECOLOGY.looseLife - 1, transition);
+  assert.equal(chars.loose.kind, 'food');
+  chars.loose.path[0].reason = 'eat';
+  updateEcology(world, start + ECOLOGY.looseLife, transition);
+  assert.equal(chars.loose.kind, 'food');
+  chars.loose.path[0].reason = 'wither-loose';
+  updateEcology(world, start + ECOLOGY.looseLife, transition);
+  assert.equal(chars.loose.kind, 'burn');
+  chars.root.created -= 200 * 3600000;
+  updateEcology(world, start + ECOLOGY.looseLife, transition);
+  assert.equal(chars.root.kind, 'burn');
+  assert.equal(chars.tip.kind, 'burn');
+  assert(expires > start + ECOLOGY.looseLife);
+});
 
 function food(id, x) {
   return { id, x, y: 0, kind: 'food', entity: '', ch: '*', color: '#ace123', payer: 'visitor',
@@ -27,6 +53,19 @@ function startWorker(initial) {
   send({ kind: 'ready' });
   return { worker, send };
 }
+
+test('后台连续替换与修改记录只传递世界字段，旧版嵌套数据仍可独立读取', () => {
+  const { worker } = startWorker([food('a', 4)]);
+  const table = worker.world.data.chars, original = table.a;
+  const retained = original.path;
+  table.a = { ...original, path: [{ reason: 'shed', t: start }] };
+  table.a.path[0].t += 500;
+  const copy = structuredClone(worker.tracker.changes());
+  const row = copy.tables.chars.set.find(([id]) => id === 'a')[1];
+  assert.deepEqual(row.path, [{ reason: 'shed', t: start + 500 }]);
+  assert.deepEqual(Object.keys(row), Object.keys(food('a', 4)));
+  assert.deepEqual(retained, []);
+});
 
 test('后台接触查询随性别编辑和恢复更新', () => {
   const cells = ['a', 'b'].map(id => ({ ...food(id, 0), kind: 'fish', entity: id }));

@@ -3,15 +3,61 @@ import test from 'node:test';
 import { CONFIG, World, chooseClaim } from '../www/engine.js';
 import { ARCHIVE_FIELDS, ArchiveStore, encodeArchive, prepareCompaction } from '../www/archive.js';
 import { SimulationClient, startSimulationClock, subscribeSimulationChanges } from '../www/simulation-client.js';
-import { WorkerSimulation } from '../www/simulation-worker.js';
+import { WorkerSimulation, simulationBuffers } from '../www/simulation-worker.js';
 import { expandSimulationPatch } from '../www/simulation-delta.js';
-import { applyBondIntervals } from '../www/bond-interval.js';
+import { applyBondIntervals, compareBondIntervals } from '../www/bond-interval.js';
 import { LIFE, lifeContext, updateLife } from '../www/life.js';
-import { applyInputRows, setParticipantName, subscribeBeforeSimulationPatch, worldEdited } from '../www/simulation-changes.js';
+import { applyInputRows, setParticipantName, subscribeBeforeSimulationPatch, worldEdited, worldRevision } from '../www/simulation-changes.js';
 import { CONTACT_TIME, updateContacts } from '../www/breeding.js';
+import { orderedCheckpoint } from '../www/ordered-session.js';
+import { FishStepProof } from '../www/fish-step-proof.js';
 
 const start = Date.UTC(2025, 5, 15, 12, 17);
 const root = '00000000-0000-4000-8000-000000000012';
+
+test('连续观察只提交按原次序留下、新增和离开的伙伴', () => {
+  const names = Array.from({ length: 300 }, (_, i) => 'a|' + String(i).padStart(4, '0'));
+  for (const [before, after] of [[[], names], [names, []], [names, names],
+    [names.filter((_, i) => i % 3), names.filter((_, i) => i % 5)]]) {
+    const { removed, patch } = compareBondIntervals(before, after, start);
+    assert.deepEqual(removed, before.filter(key => !after.includes(key)));
+    assert.deepEqual(patch.keys, after.filter(key => !before.includes(key)));
+    const selected = (rows, bits) => rows.filter((_, i) => bits[i >>> 3] & (1 << (i & 7)));
+    assert.deepEqual(selected(before, patch.intervals.kept), after.filter(key => before.includes(key)));
+    assert.deepEqual(selected(after, patch.intervals.added), patch.keys);
+  }
+});
+
+test('同一步从权威鱼行核对位置、字段顺序、旧档扩展和跨页鱼序', async () => {
+  const rows = Array.from({ length: 130 }, (_, i) => ({
+    id: 'fish' + i, x: i, y: 20, facing: 1, cx: 0, cy: 0, posAt: start, lineage: { parents: ['甲'] }
+  }));
+  const refs = rows.map((_, i) => i), observer = new FishStepProof();
+  const prove = (writer = observer) => writer.records(refs, i => 'f' + i, id => rows[Number(id.slice(1))]);
+  let prior = await prove();
+  const equalCold = async () => {
+    const next = await prove();
+    assert.deepEqual(next, await prove(new FishStepProof()));
+    return next;
+  };
+  rows[129].x += 0.125;
+  let next = await equalCold();
+  assert.deepEqual(next.pages, prior.pages);
+  assert.notEqual(next.positions, prior.positions);
+  for (const edit of [
+    () => { rows[129].lineage.parents[0] = '乙'; },
+    () => { rows[129].extra = null; },
+    () => { rows[129].extra = undefined; },
+    () => { const { id } = rows[129]; delete rows[129].id; rows[129].id = id; },
+    () => { rows[129].facing = '旧档值'; },
+    () => { refs.reverse(); }
+  ]) {
+    prior = next;
+    edit();
+    next = await equalCold();
+    assert.notDeepEqual(next.pages, prior.pages);
+  }
+});
 
 test('半秒时钟对齐存档步，提前醒来只等剩余时间，迟醒也不累积偏移', t => {
   let now = 1320, base = 1000, wake;
@@ -65,13 +111,330 @@ function localWorker(beforeReceive = () => {}, simulation = new WorkerSimulation
       setImmediate(async () => {
         try {
           await beforeReceive(message);
-          if (!closed) this.onmessage({ data: { result: structuredClone(simulation.receive(message)) } });
+          if (!closed) {
+            const result = await simulation.receive(message);
+            this.onmessage({ data: { result: structuredClone(result, { transfer: simulationBuffers(result?.patch) }) } });
+          }
         }
         catch (error) { this.onmessage({ data: { error: error.message } }); }
       });
     }
   };
 }
+
+test('连续两次已核合流只更新热线程里变过的鱼元，保留旧字段、顺序和后续生态结果', async () => {
+  const make = () => new World(start, root, { populate: false, ambient: false });
+  const replica = make(), authority = make();
+  const op = { id: crypto.randomUUID(), kind: 'food', actor: 'visitor', nick: '甲', x: 5, y: 0, ch: '鱼', color: '#ace123', t: start, cost: 1 };
+  for (const world of [replica, authority]) {
+    world.attachArchives(new ArchiveStore());
+    assert.ok(world.apply(op).ok);
+    world.data.chars[op.id].former = { words: ['旧记录'] };
+  }
+  const workers = [], sent = [], cold = new SimulationClient(() => localWorker());
+  const client = new SimulationClient(() => {
+    const simulation = new WorkerSimulation();
+    workers.push(simulation);
+    return localWorker(message => sent.push(message), simulation);
+  });
+  try {
+    await client.prepareAgreed(replica, () => true);
+    const revisionAtHello = worldRevision(replica);
+    const hello = authority.serialize();
+    hello.chars[op.id].ecoGraceAt = start + 500;
+    replica.data.chars[op.id].ecoGraceAt = start + 1000;
+    const unchanged = { ...op, id: crypto.randomUUID(), t: start };
+    assert.ok(replica.apply(unchanged).ok);
+    assert.ok(authority.apply(unchanged).ok);
+    hello.chars[unchanged.id] = authority.data.chars[unchanged.id];
+    hello.ops[unchanged.id] = authority.data.ops[unchanged.id];
+    // A locally winning claim can still take the earlier grace time from its
+    // peer. An equal new foreground operation remains in the client's input queue.
+    const joined = replica.merge(hello, {}, undefined, 'join');
+    assert.deepEqual([...joined.chars], [op.id]);
+    await client.followVerifiedReplica(replica, start, revisionAtHello, joined, () => true);
+    assert.equal(workers.length, 1);
+    assert.equal(JSON.stringify(workers[0].world.data.chars), JSON.stringify(replica.data.chars));
+    for (let n = 1; n <= 2; n++) {
+      const prior = replica.data.tick, revision = worldRevision(replica);
+      const input = { ...op, id: crypto.randomUUID(), t: prior };
+      assert.ok(authority.apply(input).ok);
+      const incoming = { ...authority.serialize(), chars: { [input.id]: authority.data.chars[input.id] }, tick: prior + CONFIG.step };
+      const changes = replica.merge(incoming, {}, 'replica', true);
+      assert.deepEqual([...changes.chars], [input.id]);
+      sent.length = 0;
+      await client.followVerifiedReplica(replica, prior, revision, changes, () => true);
+      assert.ok(sent.find(message => message.kind === 'open').rebase);
+      assert.deepEqual(sent.flatMap(message => (message.rows || []).filter(row => row[0] === 'chars').map(row => row[1])), [input.id]);
+      assert.ok(sent.every(message => message.kind !== 'step'));
+      assert.equal(workers.length, 1);
+      assert.equal(JSON.stringify(workers[0].world.data.chars), JSON.stringify(replica.data.chars));
+    }
+    const copy = make();
+    copy.data = replica.serialize();
+    copy.attachArchives(new ArchiveStore());
+    for (let n = 0; n < 3; n++) {
+      const results = await Promise.all([[client, replica], [cold, copy]].map(async ([sim, world]) =>
+        sim.advanceAgreed(world, world.data.tick + CONFIG.step, () => true, await sim.prepareAgreed(world, () => true))));
+      assert.equal(results[0].changesDigest, results[1].changesDigest);
+      assert.equal(JSON.stringify(replica.data), JSON.stringify(copy.data));
+    }
+    const revision = worldRevision(replica), prior = replica.data.tick;
+    worldEdited(replica);
+    await client.followVerifiedReplica(replica, prior - CONFIG.step, revision, { chars: new Set() }, () => true);
+    assert.equal(workers.length, 1);
+    await client.prepareAgreed(replica, () => true);
+    assert.equal(workers.length, 2);
+    assert.equal(sent.findLast(message => message.kind === 'open').rebase, undefined);
+  } finally { client.close(); cold.close(); }
+});
+
+test('旧伙伴线程只复用逐页一致的鱼元，补齐换序、增删和未知字段，过期检查点重装', async () => {
+  const world = new World(start, root, { populate: false, ambient: false });
+  const store = new ArchiveStore();
+  world.attachArchives(store);
+  const make = id => ({ id, payer: 'a', kind: 'burn', entity: '', x: 1, y: 1, path: [], created: start, old: { nested: [id] } });
+  const ids = Array.from({ length: 300 }, (_,i) => 'c' + i);
+  world.data.chars = Object.fromEntries(ids.map(id => [id, make(id)]));
+  const simulations = [], opens = [], sent = [];
+  const client = new SimulationClient(() => {
+    const worker = new WorkerSimulation();
+    simulations.push(worker);
+    return localWorker(message => {
+      if (message.kind === 'open') opens.push(message);
+      if (message.kind === 'rows') for (const [field, id] of message.rows) if (field === 'chars') sent.push(id);
+    }, worker);
+  });
+  try {
+    await client.prepareAgreed(world, () => true);
+    await client.checkRetained(world);
+    // The middle page is unchanged but now comes first. A revised legacy field
+    // and a removed/replaced record require sending the two other pages.
+    const reordered = [...ids.slice(128, 256), ...ids.slice(0,128), ...ids.slice(256, 299), 'new'];
+    worldEdited(world);
+    world.data.chars = Object.fromEntries(reordered.map(id => [id, world.data.chars[id] || make(id)]));
+    world.data.chars.c3.old.nested.push('变更');
+    const before = sent.length;
+    const cut = await orderedCheckpoint(world, store);
+    await client.prepareAgreed(world, () => true, cut.characterPages);
+    assert.equal(simulations.length, 1);
+    assert.equal(opens.at(-1).characters[0], 1);
+    assert.deepEqual(sent.slice(before), reordered.slice(128));
+    assert.equal(JSON.stringify(simulations[0].world.data.chars), JSON.stringify(world.data.chars));
+
+    await client.checkRetained(world);
+    worldEdited(world);
+    const stale = await orderedCheckpoint(world, store);
+    applyInputRows(world, [['chars', 'added', make('added')]]);
+    await client.prepareAgreed(world, () => true, stale.characterPages);
+    assert.equal(simulations.length, 2);
+    assert.equal(opens.at(-1).characters, undefined);
+    assert.equal(JSON.stringify(simulations[1].world.data.chars), JSON.stringify(world.data.chars));
+  } finally { client.close(); }
+});
+
+test('尚未在本机计算过的伙伴提前装鱼元，沿途普通同步继续提交，到共同点只补差异', async () => {
+  const world = new World(start, root, { populate: false, ambient: false });
+  const store = new ArchiveStore();
+  world.attachArchives(store);
+  const ids = Array.from({length:640},(_,i)=>'id' + i);
+  for (const id of ids) world.data.chars[id] = { id, kind:'burn', entity:'', created:start, path:[] };
+  let inSeed = true, changed = false, steps = 0;
+  const loads = [], workers = [];
+  const client = new SimulationClient(() => {
+    const worker = new WorkerSimulation();
+    workers.push(worker);
+    return localWorker(message => {
+      if (message.kind === 'open') loads.push(message);
+      if (message.kind === 'step') steps++;
+      if (inSeed && message.kind === 'rows' && !changed) {
+        changed = true;
+        worldEdited(world);
+        world.data.tick += CONFIG.step;
+        world.data.chars[ids[0]] = { ...world.data.chars[ids[0]], olderField: 1 };
+      }
+    },worker);
+  });
+  try {
+    await client.checkRetained(world);
+    inSeed = false;
+    assert.equal(changed,true);
+    assert.equal(client.owner,null);
+    assert.equal(client.hasSavedCharacters(world),true);
+    const cut = await orderedCheckpoint(world,store);
+    assert.ok(await client.prepareAgreed(world,()=>true,cut.characterPages));
+    assert.equal(workers.length,1);
+    assert.equal(steps,0);
+    assert.deepEqual(loads.at(-1).characters[0],ids.slice(0,128));
+    assert.deepEqual(loads.at(-1).characters.slice(1),[1,2,3,4]);
+    assert.equal(JSON.stringify(workers[0].world.data.chars),JSON.stringify(world.data.chars));
+  } finally { client.close(); }
+});
+
+test('靠前两条鱼元被移除导致各页整体移位，逐页验证真实目标顺序只重送实际改写的一页', async () => {
+  const world = new World(start, root, {populate:false,ambient:false}), store = new ArchiveStore();
+  world.attachArchives(store);
+  const ids = Array.from({length:800},(_,i)=>'x' + i);
+  for (const id of ids) world.data.chars[id] = { id,kind:'burn',entity:'',created:start,path:[] };
+  const worker = new WorkerSimulation(), sent = [];
+  let checking = false;
+  const client = new SimulationClient(()=>localWorker(message => {
+    if (checking && message.kind === 'rows') for (const [field,id] of message.rows) if (field === 'chars') sent.push(id);
+  },worker));
+  try {
+    await client.checkRetained(world);
+    worldEdited(world);
+    delete world.data.chars[ids[0]]; delete world.data.chars[ids[5]];
+    world.data.chars[ids[131]].former = { phase:1 };
+    checking = true;
+    const cut = await orderedCheckpoint(world,store);
+    const handle = await client.prepareAgreed(world,()=>true,cut.characterPages);
+    assert.ok(handle);
+    assert.deepEqual(sent,Object.keys(world.data.chars).slice(128,256));
+    assert.equal(JSON.stringify(worker.world.data.chars),JSON.stringify(world.data.chars));
+  } finally { client.close(); }
+});
+
+test('已预装的鱼元继续上报真实下落，未知历史字段参与页面证明', async () => {
+  const worlds = [new World(start,root,{populate:false,ambient:false}),new World(start,root,{populate:false,ambient:false})];
+  const id = crypto.randomUUID();
+  const food = { id,kind:'food',actor:'visitor',nick:'甲',x:5,y:0,ch:'鱼',color:'#ace123',t:start,cost:1 };
+  for (const world of worlds) {
+    world.attachArchives(new ArchiveStore());
+    assert.equal(world.apply(food).ok,true);
+    world.data.chars[id].legacy = { ['旧\n栏']: ['$', '"', null, true] };
+  }
+  const clients = worlds.map(()=>new SimulationClient(()=>localWorker()));
+  try {
+    await clients[0].checkRetained(worlds[0]);
+    const cut = await orderedCheckpoint(worlds[0],worlds[0].archives);
+    for (let i=1;i<=4;i++) {
+      const outputs = await Promise.all(clients.map(async (client,n) => {
+        const world = worlds[n], handle = await client.prepareAgreed(world,()=>true,n===0 && i===1 ? cut.characterPages : undefined);
+        return client.advanceAgreed(world,start+i*CONFIG.step,()=>true,handle);
+      }));
+      assert.equal(outputs[0].changesDigest,outputs[1].changesDigest);
+      assert.equal(JSON.stringify(worlds[0].data),JSON.stringify(worlds[1].data));
+    }
+    assert.ok(worlds[0].data.chars[id].y + worlds[0].data.chars[id].fall > 0);
+  } finally { for (const client of clients) client.close(); }
+});
+
+test('同一权威基准中食物位置和下落实时量散在每页，只补送路径等其他内容真正不同的页', async () => {
+  const world = new World(start,root,{populate:false,ambient:false}), store = new ArchiveStore();
+  world.attachArchives(store);
+  const ids = Array.from({length:512},(_,index)=>'food' + index);
+  for (const [i,id] of ids.entries()) world.data.chars[id] = {
+    id,kind:'food',entity:'',x:i,y:2,moveAt:start,fall:0.2,path:[],old:{unknown:i}
+  };
+  const worker = new WorkerSimulation(), sent = [];
+  let loading = false;
+  const client = new SimulationClient(()=>localWorker(message=>{
+    if (loading && message.kind === 'rows') for (const [field,id] of message.rows) if (field === 'chars') sent.push(id);
+  },worker));
+  try {
+    await client.checkRetained(world);
+    worldEdited(world);
+    for (const [i,id] of ids.entries()) {
+      const cell = world.data.chars[id];
+      cell.y++; cell.moveAt+=500; cell.fall=0; cell.x++;
+      if (i%2===0) delete cell.fall;
+    }
+    world.data.chars[ids[134]].old.unknown++;
+    world.data.chars[ids[204]].path.push({reason:'eat',target:'some fish',t:start});
+    loading = true;
+    const cut = await orderedCheckpoint(world,store);
+    const handle = await client.prepareAgreed(world,()=>true,cut.characterPages);
+    assert.ok(handle);
+    assert.deepEqual(sent,ids.slice(128,256));
+    assert.equal(JSON.stringify(worker.world.data.chars),JSON.stringify(world.data.chars));
+  } finally { client.close(); }
+});
+
+test('确认输入只装载基准，到点双方各提交一个相同的生态步，过期约定无法再用', async () => {
+  const makeWorld = () => new World(start, root, { populate: false, ambient: false });
+  const worlds = [makeWorld(), makeWorld()];
+  const requested = [];
+  const clients = worlds.map(() => new SimulationClient(() => localWorker(message => {
+    if (message.kind === 'step') requested.push(message.base);
+  })));
+  try {
+    const ready = await Promise.all(clients.map((client, i) => client.prepareAgreed(worlds[i], () => true)));
+    assert.deepEqual(requested, []);
+    assert.equal(await clients[0].advanceAgreed(worlds[0], start + 2 * CONFIG.step, () => true, ready[0]), null);
+    const advance = (i, time, base) => clients[i].advanceAgreed(worlds[i], time, () => true, base);
+    const next = start + CONFIG.step;
+    const result = await Promise.all(ready.map((base, i) => advance(i, next, base)));
+    assert.deepEqual(requested, [start, start]);
+    assert.equal(result[0].tick, next);
+    assert.match(result[0].changesDigest, /^[0-9a-f]{64}$/);
+    assert.equal(result[0].changesDigest, result[1].changesDigest);
+    assert.deepEqual(worlds[0].serialize(), worlds[1].serialize());
+    assert.equal(await advance(0, next, ready[0]), null);
+    const stale = await clients[0].prepareAgreed(worlds[0], () => true);
+    worldEdited(worlds[0]);
+    assert.equal(await advance(0, next + CONFIG.step, stale), null);
+    assert.equal(worlds[0].data.tick, next);
+  } finally { for (const client of clients) client.close(); }
+});
+
+test('按实际鱼逐步确认结果，老线程保留已经离开的鱼的序号也能接入同一海洋', async () => {
+  const worlds = [new World(start, root), new World(start, root)];
+  worlds[1].data = structuredClone(worlds[0].data);
+  const id = Object.keys(worlds[0].data.fishes)[0], gone = '已离开的鱼';
+  const fishes = worlds[0].data.fishes;
+  worlds[0].data.fishes = { [gone]: { ...fishes[id], id: gone }, ...fishes };
+  const workers = worlds.map(() => new WorkerSimulation());
+  const clients = workers.map(worker => new SimulationClient(() => localWorker(undefined, worker)));
+  try {
+    await clients[0].open(worlds[0], () => true);
+    delete worlds[0].data.fishes[gone];
+    workers[0].receive({ kind: 'restore', rows: [['fishes', gone, undefined]] });
+    for (let i = 1; i <= 4; i++) {
+      if (i === 4) workers[1].world.data.fishes[id].name = '同一步出现不同鱼名';
+      const results = await Promise.all(clients.map(async (client, side) => {
+        const world = worlds[side], ready = await client.prepareAgreed(world, () => true);
+        return client.advanceAgreed(world, start + i * CONFIG.step, () => true, ready);
+      }));
+      assert.notEqual(clients[0].knownFish.indexOf(id), clients[1].knownFish.indexOf(id));
+      if (i === 4) assert.notEqual(results[0].changesDigest, results[1].changesDigest);
+      else {
+        assert.equal(results[0].changesDigest, results[1].changesDigest);
+        assert.deepEqual(worlds[0].serialize(), worlds[1].serialize());
+      }
+    }
+  } finally { for (const client of clients) client.close(); }
+});
+
+test('同一基准同时归并伙伴历史和参与者顺序，旧约定失效、已有线程无需重装', async () => {
+  const world = new World(start, root);
+  setParticipantName(world, 'first', '甲');
+  setParticipantName(world, 'second', '乙');
+  const worker = new WorkerSimulation(), requests = [];
+  const client = new SimulationClient(() => localWorker(msg => requests.push(msg.kind), worker));
+  const replica = new World(start, root);
+  const cold = new SimulationClient(() => localWorker());
+  try {
+    await client.advance(world, start + CONFIG.step);
+    const old = await client.prepareAgreed(world, () => true);
+    const [a,b] = Object.keys(world.data.fishes).sort();
+    const bond = { a, b, seconds: 42, at: world.data.tick, lastNear: world.data.tick, run: 8 };
+    const participants = Object.fromEntries(Object.entries(world.data.participants).reverse());
+    client.installCheckedHistory(world, { participants, life: { ...world.data.life, bonds: { ...world.data.life.bonds, [a + '|' + b]: bond } } });
+    const tick = world.data.tick + CONFIG.step;
+    assert.equal(await client.advanceAgreed(world, tick, () => true, old), null);
+    replica.data = structuredClone(world.data);
+    const results = await Promise.all([[client, world], [cold, replica]].map(async ([c,w]) => {
+      const base = await c.prepareAgreed(w, () => true);
+      return c.advanceAgreed(w, tick, () => true, base);
+    }));
+    assert.equal(requests.filter(kind => kind === 'open').length, 1);
+    assert.equal(requests.filter(kind => kind === 'history').length, 1);
+    assert.deepEqual(Object.keys(worker.world.data.participants), Object.keys(participants));
+    assert.equal(results[0].changesDigest, results[1].changesDigest);
+    assert.deepEqual(world.serialize(), replica.serialize());
+  } finally { client.close(); cold.close(); }
+});
 
 test('半秒结算把接触顺序完整交给页面，包括仍保留的旧配对', async () => {
   const world = new World(start, root, { populate: false, ambient: false });
@@ -256,7 +619,7 @@ test('后台只发送变化的鱼记录与当日行程，订阅者收到完整�
   class ObservedWorker extends WorkerSimulation {
     receive(message) {
       const reply = super.receive(message);
-      if (reply) sent.push(reply.patch);
+      if (reply?.patch) sent.push(structuredClone(reply.patch));
       return reply;
     }
   }
@@ -523,6 +886,24 @@ test('连续关系只交付进出名单，时间跳变、逐项编辑和回滚�
   assert.equal(update(start + 6000, 32).intervals, undefined);
   worker.receive({ kind: 'restore', rows: [], previous: { life: structuredClone(replica.life) }, foodRevision: 0 });
   assert.equal(update(start + 7000, 32).intervals, undefined);
+});
+
+test('连续提交的故事沿用顺序，旧版本仍可独立改写字典', () => {
+  const a = { id: 'a', kind: 'friend' }, b = { id: 'b', kind: 'friend' }, c = { id: 'c', kind: 'friend' };
+  const data = { life: { stories: { a, b } } };
+  function commit(stories) {
+    const { values } = expandSimulationPatch(data, { values: {}, tables: {}, life: { properties: [{}], stories } }, [], true);
+    return data.life = values.life;
+  }
+  const first = commit([1, ['c', c], 0]);
+  const second = commit([2, 1]);
+  assert.deepEqual(Object.keys(first.stories), ['b', 'c', 'a']);
+  assert.deepEqual(Object.keys(second.stories), ['a', 'c']);
+  assert.equal(second.stories.c, c);
+  delete first.stories.c;
+  assert.deepEqual(structuredClone(second).stories, { a, c });
+  second.stories = { b };
+  assert.equal(commit([0]).stories.b, b);
 });
 
 test('伙伴变更拒绝多余的位、不匹配的记录数、重复加入和中断的基准', () => {

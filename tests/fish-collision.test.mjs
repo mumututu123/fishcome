@@ -54,6 +54,25 @@ test('同一步中实时释放和占用位置，顺序不依赖快照的鱼记�
   for (let i = 1; i <= 10; i++) { a.step(t + i * 500); b.step(t + i * 500); unique(a); unique(b); }
   for (const id of Object.keys(a.data.fishes)) assert.deepEqual(a.data.fishes[id], b.data.fishes[id]);
 });
+test('同格过期的食物依次沉积，移开的食物仍占住新格', () => {
+  const world = new World(t);
+  const x = 30, y = world.floorAt(x) - 1;
+  const ids = Array.from({ length: 3 }, () => food(world, x, y));
+  for (const id of ids) world.data.chars[id].born = t - CONFIG.foodLife;
+  world.step(t + CONFIG.step);
+  const positions = ids.map(id => {
+    const cell = world.data.chars[id], scene = world.data.scenes[cell.entity];
+    assert.equal(cell.kind, 'scene');
+    return [scene.x + cell.x, scene.y + cell.y];
+  });
+  const occupied = new Set(positions.map(([x,y]) => x + ',' + y));
+  assert.equal(occupied.size, ids.length);
+  assert(occupied.has(x + ',' + y));
+  for (const [col, row] of positions) {
+    assert(world.waterAt(col, row));
+    assert(row === world.floorAt(col) - 1 || occupied.has(col + ',' + (row + 1)));
+  }
+});
 test('旧存档和独立世界合流重叠自动整体分开，保留作品、额度、运动统计并稳定去重', () => {
   const a = new World(t), b = new World(t); fish(a, 20, 20); fish(b, 20, 20);
   const aa = a.serialize(), bb = b.serialize(); a.merge(bb); b.merge(aa);

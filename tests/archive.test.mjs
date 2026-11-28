@@ -82,6 +82,33 @@ test('并发吸收同一归档只更新一次余额、归档版本和起源索�
   assert.deepEqual([...store.rootsByChunk.values()], [roots, roots]);
 });
 
+test('公告内的新增归档逐份验真并写入，未附带的正文才另外读取', async () => {
+  const data = new World(now).serialize();
+  const [a, b] = Object.entries(data.ops).slice(0, 2);
+  const chunks = await Promise.all([a, b].map(async ([id, op]) => {
+    const records = blank();
+    records.ops[id] = op;
+    delete data.ops[id];
+    const chunk = await encodeArchive(records, data.roots);
+    data.archives.chunks[chunk.manifest.id] = chunk.manifest;
+    return chunk;
+  }));
+  const [first, second] = chunks, store = new ArchiveStore(), loads = [], writes = [];
+  const load = id => { loads.push(id); return second.encoded; };
+  const persist = saved => writes.push(...saved.map(chunk => chunk.manifest.id));
+  await assert.rejects(loadReplicaArchives(data, store, load, {
+    archivePacks: { [first.manifest.id]: second.encoded, [second.manifest.id]: first.encoded }, persist
+  }));
+  assert.deepEqual(writes, []);
+  assert.deepEqual(loads, []);
+  assert.deepEqual(store.manifests, {});
+  await loadReplicaArchives(data, store, load, { archivePacks: { [first.manifest.id]: first.encoded }, persist });
+  assert.deepEqual(loads, [second.manifest.id]);
+  assert.deepEqual(new Set(writes), new Set(chunks.map(chunk => chunk.manifest.id)));
+  assert.deepEqual(await store.get('ops', a[0]), a[1]);
+  assert.deepEqual(await store.get('ops', b[0]), b[1]);
+});
+
 test('热记录未通过校验时，新归档不会写入磁盘或运行世界', async () => {
   const data = new World(now).serialize(), store = new ArchiveStore();
   const records = blank(), [id, op] = Object.entries(data.ops)[0];

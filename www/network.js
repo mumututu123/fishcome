@@ -1,11 +1,11 @@
-import { signer, verifyEnvelope } from './storage.js';
+import { signer, verifyEnvelope, readSignedFrame } from './storage.js';
 import { normalizeInvite, decodeInvite } from './invite.js';
-import { changesSince, coalesceWorld, fitsLegacyEnvelope, ReplicaTransfers } from './replica-stream.js';
+import { changesSince, coalesceWorld, fitsLegacyEnvelope, LIVE_FRAME_UNITS, PAGE_UNITS, ReplicaTransfers } from './replica-stream.js';
 import { supportsPoseBytes } from './replica-row-delta.js';
 const CHUNK = 16000, MAX_PEERS = 8, MAX_RAW = 32 * 1024 * 1024, encoder = new TextEncoder(), decoder = new TextDecoder();
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const replicaRowsVersion = 1;
-const replicaOffer = { replicaPages: 1, replicaLive: 1, replicaRows: replicaRowsVersion, replicaFrames: 1, replicaPoseBytes: Number(supportsPoseBytes), replicaTransitions: 1 };
+const replicaOffer = { replicaPages: 1, replicaLive: 1, replicaRows: replicaRowsVersion, replicaFrames: 1, replicaPoseBytes: Number(supportsPoseBytes), replicaTransitions: 1, replicaSignedFrames: 1 };
 const signedPageBytes = new WeakMap();
 function replicaCapabilities(peer, signal) {
   peer.replicaPages = signal.replicaPages === 1;
@@ -13,6 +13,7 @@ function replicaCapabilities(peer, signal) {
   peer.replicaRows = peer.replicaLive && replicaRowsVersion === 1 && signal.replicaRows === 1;
   peer.replicaFrames = peer.replicaRows && signal.replicaFrames === 1;
   peer.replicaTransitions = peer.replicaFrames && signal.replicaTransitions === 1;
+  peer.replicaSignedFrames = peer.replicaFrames && signal.replicaSignedFrames === 1;
   peer.replicaPoseBytes = peer.replicaFrames && supportsPoseBytes && signal.replicaPoseBytes === 1;
 }
 const DIRECT_ERROR = '入口可访问，但浏览器直连未建立，请检查双方网络及防火墙后重试';
@@ -23,9 +24,9 @@ export async function lanDescription(description, fromUrl) {
   const sdp = description.sdp.replace(/^(a=candidate:\S+[ \t]+\d+[ \t]+udp[ \t]+\d+[ \t]+)\S+\.local([ \t]+\d+[ \t]+typ[ \t]+host(?=[ \t\r\n]|$)[^\r\n]*)/gim, (_, prefix, suffix) => prefix + ip + suffix);
   return sdp === description.sdp ? description : { ...description, sdp };
 }
-async function inflateBounded(bytes) { const reader = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip')).getReader(), chunks = []; let size = 0; while (true) { const { done, value } = await reader.read(); if (done) break; size += value.length; if (size > MAX_RAW) { await reader.cancel(); throw new Error('解压数据过大'); } chunks.push(value); } const result = new Uint8Array(size); let offset = 0; for (const chunk of chunks) { result.set(chunk, offset); offset += chunk.length; } return result; }
+async function inflateBounded(bytes, limit = MAX_RAW) { const reader = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip')).getReader(), chunks = []; let size = 0; while (true) { const { done, value } = await reader.read(); if (done) break; size += value.length; if (size > limit) { await reader.cancel(); throw new Error('解压数据过大'); } chunks.push(value); } const result = new Uint8Array(size); let offset = 0; for (const chunk of chunks) { result.set(chunk, offset); offset += chunk.length; } return result; }
 export class Network {
-  constructor(identity, meta, onMessage, onChange, onReject) { this.identity = identity; this.meta = meta; this.node = identity.actor.slice(0, 16) + '-' + crypto.randomUUID().replace(/-/g, '').slice(0, 19); this.onMessage = onMessage; this.onChange = onChange; this.onReject = onReject; this.replicas = new ReplicaTransfers(this); this.lastLegacyBeat = 0; this.worldMembers = new Map(); this.connections = new Map(); this.seen = new Map(); this.pending = new Map(); this.stats = { sent: 0, received: 0, rejected: 0 }; }
+  constructor(identity, meta, onMessage, onChange, onReject, recentArchivePacks) { this.recentArchivePacks = recentArchivePacks; this.identity = identity; this.meta = meta; this.node = identity.actor.slice(0, 16) + '-' + crypto.randomUUID().replace(/-/g, '').slice(0, 19); this.onMessage = onMessage; this.onChange = onChange; this.onReject = onReject; this.replicas = new ReplicaTransfers(this); this.lastLegacyBeat = 0; this.worldMembers = new Map(); this.connections = new Map(); this.seen = new Map(); this.pending = new Map(); this.stats = { sent: 0, received: 0, rejected: 0 }; }
   async local(route, payload = {}) { const response = await fetch('/local/' + route, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: this.meta.token, node: this.node, ...payload }) }); const result = await response.json(); if (!response.ok) throw new Error(result.error || '本地配对通道不可用'); return result; }
   async start(nick) { this.sign = await signer(this.identity); await this.local('register', { nick, actor: this.identity.actor }); this.events = new EventSource(`/local/events?node=${this.node}&token=${encodeURIComponent(this.meta.token)}`); this.events.onmessage = e => { try { this.signal(JSON.parse(e.data)).catch(error => this.onChange(error.message)); } catch { } }; }
   live() { return [...this.connections.values()].filter(p => p.dc?.readyState === 'open'); }
@@ -102,6 +103,32 @@ export class Network {
     let offset = 1;
     for (const part of parts) { result.set(part, offset); offset += part.length; }
     return result;
+  }
+  async encodeLiveFrame(id, body, knownArchives) {
+    if (knownArchives && this.recentArchivePacks) {
+      let left = PAGE_UNITS, archivePacks;
+      for (const [hash, encoded] of this.recentArchivePacks()) {
+        if (encoded.length > left || Object.hasOwn(knownArchives, hash) || !Object.hasOwn(body.world.archives?.chunks ?? {}, hash)) continue;
+        (archivePacks ??= {})[hash] = encoded;
+        left -= encoded.length;
+      }
+      if (archivePacks) body = { ...body, archivePacks };
+    }
+    const message = { id, kind: 'replicaFrame', from: this.node, actor: this.identity.actor, key: this.identity.pub, body };
+    const text = JSON.stringify(message);
+    if (text.length > LIVE_FRAME_UNITS) return;
+    const raw = encoder.encode(text);
+    if (raw.length > LIVE_FRAME_UNITS) return;
+    const compressed = raw.length > 2048 && typeof CompressionStream !== 'undefined';
+    const [signature, payload] = await Promise.all([
+      this.sign.bytes(raw),
+      compressed ? new Response(new Blob([raw]).stream().pipeThrough(new CompressionStream('gzip'))).arrayBuffer() : raw
+    ]);
+    const wire = new Uint8Array(65 + payload.byteLength);
+    wire[0] = compressed ? 3 : 2;
+    wire.set(Uint8Array.from(atob(signature), c => c.charCodeAt(0)), 1);
+    wire.set(compressed ? new Uint8Array(payload) : raw, 65);
+    return wire;
   }
   replicaPeers() { return this.live().filter(p => !p.replicaPages || p.sentHello && p.confirmedReplica); }
   worldReplicaPeers() {
@@ -213,12 +240,31 @@ export class Network {
     for (const [pid, entry] of p.packets) if (Date.now() - entry.at > 30000) p.packets.delete(pid);
     if (record.size > 32 * 1024 * 1024) { p.packets.delete(id); return; } if (record.count !== total) return;
     p.packets.delete(id); const bytes = new Uint8Array(record.size); let offset = 0; for (const part of record.parts) { bytes.set(part, offset); offset += part.length; }
-    let raw = bytes.slice(1); if (bytes[0] === 1) raw = await inflateBounded(raw); if (raw.length > MAX_RAW) return;
-    const message = JSON.parse(decoder.decode(raw));
-    if (message?.id !== id || !await verifyEnvelope(message)) throw new Error('消息标识或签名无效');
+    const signedFrame = bytes[0] === 2 || bytes[0] === 3;
+    let message;
+    if (signedFrame) {
+      if (!p.replicaSignedFrames || bytes.length <= 65) throw new Error('伙伴未确认直达实时帧格式');
+      const payload = bytes.subarray(65);
+      const raw = bytes[0] === 3 ? await inflateBounded(payload, LIVE_FRAME_UNITS) : payload;
+      if (raw.length > LIVE_FRAME_UNITS) throw new Error('实时帧超过接收容量');
+      message = await readSignedFrame(raw, bytes.subarray(1, 65));
+      if (message.id !== id || message.from !== p.node) throw new Error('实时帧来源无效');
+    } else {
+      let raw = bytes.subarray(1);
+      if (bytes[0] === 1) raw = await inflateBounded(raw);
+      if (bytes[0] > 1 || raw.length > MAX_RAW) return;
+      message = JSON.parse(decoder.decode(raw));
+      if (message?.id !== id || message.kind === 'replicaFrame' || !await verifyEnvelope(message)) throw new Error('消息标识或签名无效');
+    }
+    if (this.seen.has(id)) return;
     this.seen.set(id, Date.now()); if (this.seen.size > 20000) { for (const [k, at] of this.seen) if (Date.now() - at > 120000) this.seen.delete(k); }
+    if (message.kind === 'orderedStep') {
+      if (message.from !== p.node) throw new Error('共同结算只能来自已验证的直连伙伴');
+      await this.onMessage(message, p);
+      return;
+    }
     const replicaPage = message.kind === 'replicaPage';
-    if (replicaPage || message.kind === 'replicaReceipt') {
+    if (signedFrame || replicaPage || message.kind === 'replicaReceipt') {
       const relayingWorld = replicaPage && message.body?.kind === 'world' && this.liveReplicaFrom(message.from);
       if (!relayingWorld && !await this.replicas.receive(message, p)) return;
     } else {

@@ -1,12 +1,22 @@
 import { BodyMembership } from './body-membership.js';
 import { BodyLayout } from './motion-hull.js';
+import { contactRoster } from './breeding.js';
+import { indexContactBodies } from './breeding-contacts.js';
+import { indexSchoolBodies } from './life.js';
 import { World, CONFIG, indexEcologyCharacters } from './engine.js';
 import { shanghaiDay } from './fish-status.js';
-import { worldTables } from './simulation-changes.js';
+import { characterPositionFields, worldTables } from './simulation-changes.js';
 import { encodeFields, motionFields } from './simulation-delta.js';
-import { advanceBond, encodeBondIntervals } from './bond-interval.js';
+import { advanceBond } from './bond-interval.js';
+import { renderEdits } from './render-view.js';
+import { digestJsonText, jsonDigest } from './step-digest.js';
+import { FishStepProof } from './fish-step-proof.js';
 
 const motionEdit = { properties: motionFields };
+const fallFields = ['fall', 'y', 'moveAt'];
+const foodEdits = Array.from({ length: 8 }, (_, bits) => ({
+  properties: fallFields.filter((_, bit) => bits & (1 << bit))
+}));
 
 // Only a user operation, a verified replica or archiving writes these fields.
 // Natural simulation and geometry repair use them as lookup tables.
@@ -15,15 +25,46 @@ const inputFields = new Set(['ops', 'terrain', 'roots', 'participants', 'archive
 // Track writes on the worker's private copy. Reads of old records do not put
 // them in a message. Collections can be replaced by the simulation as a whole
 // (notably contacts), in which case additions and removals must both be sent.
-function trackWorld(source) {
-  const knownFish = new Map(Object.keys(source.fishes).map((id, index) => [id, index]));
-  const daysByOrdinal = new Array(knownFish.size);
-  const proxies = new WeakMap(), originals = new WeakMap();
+function trackWorld() {
+  const fishProof = new FishStepProof();
+  let source, knownFish, fishIds, daysByOrdinal, firstHunger = Infinity, travelComplete;
+  function includeHunger(at) {
+    // The original comparison ignores missing and nonnumeric deadlines.
+    const deadline = Number(at);
+    if (deadline < firstHunger) firstHunger = deadline;
+  }
+  function hungerDue(now) {
+    if (now < firstHunger) return false;
+    // Postponing a meal deadline or removing a fish can leave an earlier bound.
+    // Refresh it only once that bound is reached.
+    firstHunger = Infinity;
+    const fishes = raw(source.fishes);
+    for (const id in fishes) includeHunger(raw(fishes[id])?.hungerAt);
+    return now >= firstHunger;
+  }
+  // These are the worker's private, mutable records. Keeping the observation
+  // with its record avoids growing a world-sized hash table on a step.
+  const observation = Symbol('simulation observation');
   const values = new Set(), rows = new Map(), lifeFields = new Set(), bondRows = new Map();
-  const raw = object => originals.get(object) || object;
+  const populationFields = new Set(), patients = new Set();
+  const illnessSchedule = {
+    due: -Infinity,
+    records: () => raw(source.population.illnesses),
+    admit(table, id, patient) {
+      // Reintroducing a patient deleted earlier in this step also changes
+      // the dictionary order. A full replacement preserves that ordering.
+      if (patients.has(id) && !Object.hasOwn(table, id)) populationFields.add('illnesses');
+      patients.add(id);
+      table[id] = patient;
+      this.due = Math.min(this.due, patient.nextLossAt);
+    }
+  };
+  const witherSchedule = { due: -Infinity };
+  const raw = object => object?.[observation]?.target ?? object;
   const bondTimes = new WeakMap();
   let characters, ecology, membership, meals, previousBonds, activeBonds, publishedBonds, orderedBonds = false;
   let fishRoster, previousStories, poseRevision = 0, originRevision = 0;
+  const mealEdits = new Set();
   const characterViews = new Map();
   const activeKinds = ['food', 'seaweed', 'scene'];
   const activeKey = JSON.stringify(activeKinds);
@@ -67,6 +108,10 @@ function trackWorld(source) {
   }
   function mealPath(path) { return path?.some(event => event?.reason === 'eat'); }
   function noteCharacterChange(target, parent, key, value, deleting) {
+    // Falling food changes y, fall and moveAt every tick. None changes
+    // withering. A new life stage, provenance or deadline does.
+    if (parent.table || parent.property === 'path' || parent.property === undefined &&
+        ['kind', 'born', 'created', 'ecoGraceAt', 'id', 'path'].includes(key)) witherSchedule.due = -Infinity;
     if (parent.table) {
       const previous = target[key];
       membership?.mark(key, true, deleting);
@@ -84,8 +129,8 @@ function trackWorld(source) {
         meals.pastMeals.add(diner);
         if (source.chars[parent.id]?.wild) meals.pastGrass.add(diner);
         if (Number.isFinite(t) && t > (meals.latestMeals.get(diner) ?? -Infinity)) {
-          meals = { ...meals, latestMeals: new Map(meals.latestMeals).set(diner, t) };
-          ecology = undefined;
+          meals.latestMeals.set(diner, t);
+          mealEdits.add(diner);
         }
       } else if (changesMeal) meals = ecology = undefined;
       return;
@@ -106,7 +151,6 @@ function trackWorld(source) {
     if (!rows.has(field)) rows.set(field, new Map());
     return rows.get(field);
   }
-  const locations = new WeakMap();
   function child(location, key) {
     if (location.root) return { field: key, table: worldTables.has(key) };
     const { field, id, property, part, bond } = location;
@@ -114,9 +158,14 @@ function trackWorld(source) {
     if (field === 'chars' && property === undefined) return { field, id, property: key };
     if (location.editable && property === undefined) return { ...location, property: key };
     if (field === 'travel' && property === 'days' && location.day === undefined) return { ...location, day: key };
+    if (field === 'population') {
+      if (part === undefined) return { field, part: key };
+      if (part === 'illnesses' && id === undefined) return { ...location, id: key };
+    }
     if (field === 'life') {
       if (part === undefined) return { field, part: key };
       if (part === 'bonds' && bond === undefined) return { ...location, bond: key };
+      if (part === 'stories' && id === undefined) return { ...location, id: key };
     }
     return location;
   }
@@ -151,14 +200,25 @@ function trackWorld(source) {
   }
   function mark(target, parent, key, value, deleting = false) {
     const { field, id, property } = parent;
+    if (parent.root && key === 'breeding') swimChanges = undefined;
+    else if (field === 'fishes' && !parent.table && !property && (key === 'cx' || key === 'cy' || key === 'lastFed')) swimChanges?.add(id);
+    else if (field === 'breeding' && (parent.table || key === 'status')) swimChanges?.add(parent.table ? key : id);
+    if (parent.root && key === 'fishes') firstHunger = -Infinity;
+    else if (field === 'fishes') {
+      if (parent.table) includeHunger(value?.hungerAt);
+      else if (!property && key === 'hungerAt') includeHunger(value);
+    }
+    if (parent.root && (key === 'population' || key === 'fishes') ||
+        field === 'fishes' && parent.table && deleting && source.population?.illnesses[key]) illnessSchedule.due = -Infinity;
     if (parent.root && key === 'life') activeBonds = publishedBonds = undefined;
     if (parent.root && (key === 'fishes' || key === 'ops' || key === 'breeding') ||
         field === 'fishes' && (parent.table || !property && (key === 'id' || key === 'gender')) ||
         field === 'breeding' && (key === 'baby' || key === 'gender' || key === 'status' ||
           parent.table && (target[key]?.status === 'born' || value?.status === 'born'))) originRevision++;
     if (parent.root && (key === 'fishes' || key === 'travel') ||
-        field === 'fishes' && (parent.table || !property && (key === 'id' || key === 'created' || key === 'lastFed' || key === 'lastMealAt')) ||
+        field === 'fishes' && (parent.table || !property && (key === 'id' || key === 'created')) ||
         field === 'travel' && parent.table && !value) fishRoster = undefined;
+    if (field === 'fishes' && !parent.table && !property && (key === 'lastFed' || key === 'lastMealAt')) mealEdits.add(id);
     if (parent.root && key === 'travel') daysByOrdinal.fill(undefined);
     else if (field === 'travel' && (parent.table || !property && key === 'days')) {
       const ordinal = knownFish.get(parent.table ? key : id);
@@ -173,6 +233,7 @@ function trackWorld(source) {
       if (poses && !poses.has(moved)) poses.set(moved, fish && { x: fish.x, y: fish.y, facing: fish.facing });
     }
     if (parent.root && key === 'chars') {
+      witherSchedule.due = -Infinity;
       ecology = membership = meals = undefined;
       characters = undefined;
       characterViews.clear();
@@ -193,12 +254,27 @@ function trackWorld(source) {
       if (!changed.has(id)) changed.set(id, { properties: new Set() });
       let edit = changed.get(id);
       if (!edit) return;
+      if (typeof edit === 'number') {
+        edit = { properties: new Set(foodEdits[edit].properties) };
+        changed.set(id, edit);
+      }
       if (edit === motionEdit || typeof edit === 'string') {
         edit = edit === motionEdit ? { properties: new Set(motionFields) } : { properties: new Set(), days: new Set([edit]) };
         changed.set(id, edit);
       }
       if (field === 'travel' && property === 'days') (edit.days ||= new Set()).add(parent.day ?? key);
       else edit.properties.add(property ?? key);
+    } else if (field === 'population') {
+      const part = parent.part ?? key;
+      if (part === 'illnesses') {
+        if (parent.part === 'illnesses' && id === undefined && !deleting && source.fishes[key] &&
+            value && value.deadline === undefined && Number.isFinite(value.nextLossAt)) {
+          if (!value.curedAt) illnessSchedule.due = Math.min(illnessSchedule.due, value.nextLossAt);
+        } else illnessSchedule.due = -Infinity;
+      }
+      // Replacing the table, or reinserting a removed patient, establishes a new order.
+      if (parent.part === 'illnesses' && (id !== undefined || !patients.has(key) || Object.hasOwn(target, key))) patients.add(id ?? key);
+      else populationFields.add(part);
     } else if (field === 'life') markLife(parent, target, key, value);
     else if (id === undefined) values.add(field);
     else tableChanges(field).set(id, null);
@@ -207,29 +283,34 @@ function trackWorld(source) {
   const writes = {
     set(target, key, value) {
       if (raw(target[key]) === raw(value) && Object.hasOwn(target, key)) return true;
-      const parent = locations.get(target);
+      const parent = target[observation].location;
       mark(target, parent, key, value);
-      target[key] = value && typeof value === 'object' ? watch(value, child(parent, key)) : value;
+      target[key] = value && typeof value === 'object' && !deferredRows(parent) ? watch(value, child(parent, key)) : value;
       return true;
     },
     deleteProperty(target, key) {
       if (!Object.hasOwn(target, key)) return true;
-      mark(target, locations.get(target), key, undefined, true);
+      mark(target, target[observation].location, key, undefined, true);
       return delete target[key];
     }
   };
+  function deferredRows({ field, part, id }) {
+    return id === undefined && (field === 'population' && part === 'illnesses' || field === 'life' && part === 'stories');
+  }
   function watch(object, location) {
     if (!object || typeof object !== 'object' || inputFields.has(location.field)) return object;
     // Terminal proofs are immutable during natural simulation. Keep the table
     // observed so a new active record or a replacement still enters the patch.
     if (location.field === 'breeding' && location.id !== undefined && object.status && object.status !== 'active') return object;
-    object = raw(object);
-    if (proxies.has(object)) return proxies.get(object);
+    const existing = object[observation];
+    if (existing) return existing.proxy;
     const bondTable = location.field === 'life' && location.part === 'bonds' && location.bond === undefined;
     const contactTable = location.field === 'contacts' && location.table;
-    const proxy = new Proxy(object, bondTable || contactTable ? {
+    const lazy = bondTable || contactTable || deferredRows(location);
+    const proxy = new Proxy(object, lazy ? {
       ...writes,
       get(table, key, receiver) {
+        if (key === observation) return table[key];
         let value = Reflect.get(table, key, receiver);
         if (bondTable && value && typeof value === 'object') {
           const at = bondTimes.get(table);
@@ -238,14 +319,14 @@ function trackWorld(source) {
             // A caller may still hold an older table. Its first mutable read
             // owns a private row even when several observations share an anchor.
             if (at !== null && row.at !== at) value = table[key] = advanceBond(row, at);
-            else if (!proxies.has(row)) value = table[key] = { ...row };
+            else if (!row[observation]) value = table[key] = { ...row };
           }
         }
         return Object.hasOwn(table, key) && value && typeof value === 'object' ? watch(value, child(location, key)) : value;
       }
     } : writes);
-    proxies.set(object, proxy); originals.set(proxy, object); locations.set(object, location);
-    if (bondTable || contactTable) return proxy;
+    Object.defineProperty(object, observation, { value: { target: object, location, proxy } });
+    if (lazy) return proxy;
     for (const key of Object.keys(object)) {
       const value = object[key];
       if (value && typeof value === 'object') object[key] = watch(value, child(location, key));
@@ -262,6 +343,40 @@ function trackWorld(source) {
     const result = {};
     for (const key of Object.keys(value)) result[key] = plain(value[key]);
     return result;
+  }
+  function proveChanges(patch) {
+    // Ordinals belong to one worker's roster. A worker retained across a
+    // connection and one opened from the same current checkpoint can assign
+    // different numbers to the same fish and encode equal bonds differently.
+    const idOf = ref => typeof ref === 'number' ? fishIds[ref] : Array.isArray(ref) ? ref[0] : ref;
+    const tables = { ...patch.tables };
+    let fish;
+    for (const field of ['fishes', 'travel']) {
+      const changes = tables[field];
+      if (!changes) continue;
+      const rows = raw(source[field]);
+      if (field === 'fishes') {
+        fish = fishProof.records(changes.set, idOf, id => raw(rows[id]));
+        tables.fishes = { remove: changes.remove };
+        continue;
+      }
+      tables[field] = { remove: changes.remove, set: changes.set.map(ref => {
+        const id = idOf(ref), row = raw(rows[id]);
+        return [id, row && Object.hasOwn(row, 'days') ? { ...row, days: raw(row.days) } : row];
+      }) };
+    }
+    const logical = { ...patch, tables };
+    if (patch.life?.bonds) {
+      const table = raw(source.life.bonds), at = bondTimes.get(table);
+      const bonds = Object.keys(table).map(key => {
+        const row = raw(table[key]);
+        return [key, at == null ? row : advanceBond(row, at)];
+      });
+      logical.life = { ...patch.life, bonds };
+    }
+    if (patch.swims) logical.swims = patch.swims.map(ids => ids.map(idOf));
+    const other = jsonDigest(logical);
+    return fish ? Promise.all([other, fish]).then(jsonDigest) : other;
   }
   function encodeRow(id, row, edit) {
     if (!edit) return [id, plain(row)];
@@ -294,9 +409,9 @@ function trackWorld(source) {
   function encodeBonds(table) {
     table = raw(table);
     if (activeBonds?.table === table) {
-      const { keys, at, base } = activeBonds;
-      publishedBonds = { table, keys, at, retain: row => proxies.has(row) ? { ...row } : row };
-      if (base) return encodeBondIntervals(base, table, keys, at);
+      const { keys, at, intervals } = activeBonds;
+      publishedBonds = { table, keys, at, retain: row => row[observation]?.target === row ? { ...row } : row };
+      if (intervals) return intervals;
       const counters = new Float64Array(keys.length * 2);
       for (let i = 0; i < keys.length; i++) {
         const row = table[keys[i]];
@@ -342,21 +457,40 @@ function trackWorld(source) {
     poseRevision++;
     return raw(fish);
   }
+  function setFoodMotion(cell, y, fall, now) {
+    const row = raw(cell);
+    let bits = 0;
+    if (row.fall !== fall || !Object.hasOwn(row, 'fall')) { row.fall = fall; bits |= 1; }
+    if (row.y !== y) { row.y = y; bits |= 2; }
+    if (row.moveAt !== now || !Object.hasOwn(row, 'moveAt')) { row.moveAt = now; bits |= 4; }
+    if (!bits) return;
+    const edits = tableChanges('chars'), id = row[observation].location.id, old = edits.get(id);
+    if (old === undefined || typeof old === 'number') edits.set(id, (old || 0) | bits);
+    else if (old) for (const key of foodEdits[bits].properties) old.properties.add(key);
+  }
   // Ordinary fish publish their motion directly in the wire format. Later
   // feeding, death or repairs can still supersede that row in the same step.
-  let swimming;
+  let swimming, swimColumns, swimChanges = new Set();
+  function currentSwimColumns() {
+    return swimColumns?.revision === poseRevision ? swimColumns : undefined;
+  }
   function readDays(id, ordinal) {
     const record = raw(source.travel[id]);
     if (record) return daysByOrdinal[ordinal] = raw(record.days);
   }
   function beginSwimBatch() {
-    const count = knownFish.size;
-    return { motion: new Float64Array(count * 5), poses: [], travel: [], distances: new Float64Array(count),
+    const count = knownFish.size, inputs = swimChanges;
+    swimChanges = new Set();
+    swimColumns = undefined;
+    return { inputs, motion: new Float64Array(count * 5), poses: [], travel: [], distances: new Float64Array(count),
       poseIndex: new Int32Array(count), tripIndex: new Int32Array(count), daysByOrdinal, readDays };
   }
-  function completeSwimBatch(frame, day) {
+  function completeSwimBatch(frame, day, packed) {
     if (frame.poses.length) {
       poseRevision++;
+      // Edit compaction and delivery may overwrite or detach the wire buffer.
+      // The grid still owns the complete ordered result until the next movement.
+      if (packed) swimColumns = { revision: poseRevision, grid: packed, index: frame.nativeIndex };
       tableChanges('fishes');
     }
     if (frame.travel.length) {
@@ -393,23 +527,71 @@ function trackWorld(source) {
   }
   function reset() {
     swimming = undefined;
+    populationFields.clear(); patients.clear();
     previousStories = undefined;
     values.clear(); rows.clear(); lifeFields.clear(); bondRows.clear(); previousBonds = activeBonds = undefined; orderedBonds = false;
   }
   return {
-    data: watch(source, { root: true }),
+    rebaseCharacters(changed, removed) {
+      const table = source.chars;
+      for (const id of removed) delete table[id];
+      for (const [id, row] of Object.entries(changed)) {
+        const prior = table[id], keys = Object.keys(row), oldKeys = prior && Object.keys(prior);
+        if (!oldKeys || keys.length !== oldKeys.length || keys.some((key, i) => key !== oldKeys[i])) {
+          table[id] = row;
+          continue;
+        }
+        // Preserve live body/meal indexes for loose food whose only edit was a
+        // scalar position. Older and nested fields still compare in full.
+        for (const key of keys) {
+          const before = prior[key], after = row[key];
+          if (before === after || before && after && typeof before === 'object' && typeof after === 'object' &&
+              JSON.stringify(before) === JSON.stringify(after)) continue;
+          prior[key] = after;
+        }
+      }
+      reset();
+      publishedBonds = fishRoster = undefined;
+      poses = new Map();
+      mealEdits.clear();
+      illnessSchedule.due = witherSchedule.due = -Infinity;
+      return table;
+    },
+    attach(data) {
+      source = data;
+      fishIds = Object.keys(source.fishes);
+      knownFish = new Map();
+      daysByOrdinal = new Array(fishIds.length);
+      travelComplete = true;
+      firstHunger = Infinity;
+      for (let i = 0; i < fishIds.length; i++) {
+        const id = fishIds[i], fish = source.fishes[id];
+        knownFish.set(id, i);
+        includeHunger(fish.hungerAt);
+        const travel = source.travel?.[id];
+        if (travel) daysByOrdinal[i] = raw(travel.days);
+        if (!travel || fish.id !== id) travelComplete = false;
+      }
+      return watch(source, { root: true });
+    },
+    // These detached records can acquire observers before a tick is selected.
+    // Their writes use the roster and world installed at admission.
+    observeCharacter: (id, record) => watch(record, { field: 'chars', id }),
     // Callers enumerate this read-only list. Its rows still carry tracked writes.
     charValues,
+    copyCharacter: id => plain(source.chars[id]),
+    illnessSchedule,
+    witherSchedule,
     readBonds: () => materializeBonds(raw(source.life.bonds)),
     readStories: () => raw(source.life.stories),
     activeBondSpans: at => publishedBonds?.at === at && publishedBonds.table === raw(source.life.bonds) ? publishedBonds : null,
-    writeActiveBonds(table, keys, at, base) {
+    writeActiveBonds(table, keys, at, intervals) {
       const previous = raw(source.life.bonds);
       previousBonds ??= previous;
       raw(source.life).bonds = watch(table, { field: 'life', part: 'bonds' });
       orderedBonds = true;
-      bondTimes.set(table, base ? at : null);
-      activeBonds = { table, keys, at, base };
+      bondTimes.set(table, intervals ? at : null);
+      activeBonds = { table, keys, at, intervals };
     },
     ecologyCharacters,
     bodyEdits: (before, after) => membership?.edits(before, after),
@@ -418,15 +600,20 @@ function trackWorld(source) {
     poseRevision: () => poseRevision,
     readFish: id => raw(source.fishes[id]),
     readContacts: () => raw(source.contacts),
+    initialTravelComplete: () => travelComplete,
+    hungerDue,
     fishValues: () => fishRoster ??= Object.values(raw(source.fishes)),
+    mealEdits,
     originRevision: () => originRevision,
     invalidateOrigins: () => { originRevision++; },
     // Swimming owns these six scalar fields until the ordered movement pass
     // completes. Other writes to the same fish still join the ordinary edit.
     movingFish,
+    setFoodMotion,
     swimOrdinal: id => knownFish.get(id),
     beginSwimBatch,
     completeSwimBatch,
+    currentSwimColumns,
     recordMovement(id, distance, now, day) {
       if (!Number.isFinite(distance) || distance <= 0 || !source.fishes[id]) return;
       day ??= shanghaiDay(now);
@@ -443,9 +630,17 @@ function trackWorld(source) {
       }
     },
     reset,
+    proveChanges,
     changes() {
       const patch = { values: {}, tables: {} };
       for (const field of values) patch.values[field] = plain(source[field]);
+      if (!values.has('population') && (populationFields.size || patients.size)) {
+        const population = raw(source.population);
+        patch.population = { properties: encodeFields(population, populationFields, plain) };
+        if (patients.size && !populationFields.has('illnesses')) {
+          patch.population.illnesses = encodeFields(raw(population.illnesses), patients, plain);
+        }
+      }
       for (const [field, edits] of rows) {
         if (values.has(field)) continue;
         const set = frameRows(field, edits), remove = [];
@@ -468,7 +663,7 @@ function trackWorld(source) {
             motion[offset++] = row.facing;
             motion[offset++] = row.cx;
             motion[offset++] = row.cy;
-          } else set.push(encodeRow(id, row, edit));
+          } else set.push(encodeRow(id, row, typeof edit === 'number' ? foodEdits[edit] : edit));
         }
         if (motion && offset * 2 < motion.length) motion = motion.slice(0, offset);
         patch.tables[field] = { set, remove };
@@ -494,8 +689,73 @@ function trackWorld(source) {
 }
 
 export class WorkerSimulation {
+  characterPageHash(rows) { return digestJsonText('[' + rows.map(row => row.json).join(',') + ']'); }
+  async installCharacters(table, order, hashes, positions) {
+    const pages = this.characterPages;
+    this.characterPages = undefined;
+    const byId = this.characterRows;
+    this.characterRows = undefined;
+    const missing = [], checks = [];
+    for (const [id, fields] of positions) {
+      const row = byId.get(id);
+      if (!row) continue;
+      if (characterPositionFields.every(key => Object.hasOwn(fields, key) === Object.hasOwn(row.record, key) && fields[key] === row.record[key])) continue;
+      // Coordinate and fall-time fields cover routine movement of loose food.
+      // Any other difference must still fail the complete target page hash.
+      const cell = { ...row.record };
+      for (const key of characterPositionFields) {
+        if (Object.hasOwn(fields, key)) cell[key] = fields[key]; else delete cell[key];
+      }
+      row.json = JSON.stringify([id, cell]);
+      row.record = this.preparedTracker.observeCharacter(id, cell);
+    }
+    for (const [index, page] of order.entries()) {
+      if (typeof page === 'number') {
+        for (const row of pages[page]) table[row.id] = row.record;
+        continue;
+      }
+      // Removing an early row shifts all following page boundaries. Preserve
+      // the checkpoint's order and check its actual page bytes again using
+      // old rows by ID before asking the UI for replacement records.
+      const candidate = page.map(id => byId.get(id));
+      for (let i = 0; i < page.length; i++) table[page[i]] = candidate[i]?.record;
+      if (candidate.some(row => !row)) missing.push(index);
+      else checks.push(this.characterPageHash(candidate).then(hash => { if (hash !== hashes[index]) missing.push(index); }));
+    }
+    await Promise.all(checks);
+    return missing.sort((a,b) => a - b);
+  }
   receive(message) {
+    if (message.kind === 'step-proof') {
+      const patch = this.agreedPatch;
+      if (!patch || patch.values.tick !== message.tick) throw new Error('没有此步待确认的生态变化');
+      this.agreedPatch = undefined;
+      return this.tracker.proveChanges(patch);
+    }
+    this.agreedPatch = undefined;
+    if (message.kind === 'characterWitness') {
+      const ids = Object.keys(this.world.data.chars);
+      this.characterPages = [];
+      this.characterRows = new Map();
+      this.preparedTracker = trackWorld();
+      for (let start = 0; start < ids.length; start += 128) {
+        this.characterPages.push(ids.slice(start, start + 128).map(id => {
+          const record = message.cold ? this.world.data.chars[id] : this.tracker.copyCharacter(id);
+          const json = JSON.stringify([id, record]);
+          const row = { id, json, record: this.preparedTracker.observeCharacter(id, record) };
+          this.characterRows.set(id, row);
+          return row;
+        }));
+      }
+      return Promise.all(this.characterPages.map(page => this.characterPageHash(page)));
+    }
     if (message.kind === 'open') {
+      if (message.rebase && (!this.generation || this.generation !== message.rebase.generation || this.world?.data.tick !== message.rebase.base)) {
+        throw new Error('后台线程失去了已验证的上一基准');
+      }
+      this.generation = undefined;
+      this.openGeneration = message.generation;
+      this.rebase = message.rebase;
       this.world = new World(message.values.tick, 'worker', { populate: false, ambient: message.ambient });
       this.world.data = message.values;
       for (const field of message.tables) this.world.data[field] = {};
@@ -506,6 +766,10 @@ export class WorkerSimulation {
         get: (overrides, id) => Object.hasOwn(overrides, id) ? overrides[id] || undefined : fishes[id]
       });
       this.archive = { summary: { catalog, lastMeals: new Map(), grassMeals: new Set() } };
+      if (message.characters) return this.installCharacters(this.world.data.chars, message.characters, message.hashes, message.positions);
+      this.characterPages = undefined;
+      this.characterRows = undefined;
+      this.preparedTracker = undefined;
     } else if (message.kind === 'rows') {
       for (const [field, id, value, origin] of message.rows) {
         if (field === '@lastMeals') this.archive.summary.lastMeals.set(id, value);
@@ -514,9 +778,15 @@ export class WorkerSimulation {
         if (field === 'fishes' && origin !== undefined) this.archive.summary.catalog[id] = origin;
       }
     } else if (message.kind === 'ready') {
+      if (this.rebase) {
+        this.world.data.chars = this.tracker.rebaseCharacters(this.world.data.chars, this.rebase.removed);
+        this.preparedTracker = this.tracker;
+        this.rebase = undefined;
+      }
       this.world.attachArchives(this.archive);
-      this.tracker = trackWorld(this.world.data);
-      this.world.data = this.tracker.data;
+      this.tracker = this.preparedTracker || trackWorld();
+      this.preparedTracker = undefined;
+      this.world.data = this.tracker.attach(this.world.data);
       this.world.charValues = this.tracker.charValues;
       this.world.readBonds = this.tracker.readBonds;
       this.world.readStories = this.tracker.readStories;
@@ -527,22 +797,44 @@ export class WorkerSimulation {
       this.world.poseRevision = this.tracker.poseRevision;
       this.world.originRevision = this.tracker.originRevision;
       this.world.stableFishRoster = this.tracker.fishValues;
+      this.world.hungerDue = this.tracker.hungerDue;
+      if (this.tracker.initialTravelComplete()) this.world.trackedRoster = this.world.stableFishRoster();
+      this.world.illnessSchedule = this.tracker.illnessSchedule;
+      this.world.witherSchedule = this.tracker.witherSchedule;
+      this.world.mealEdits = this.tracker.mealEdits;
       this.world.readFish = this.tracker.readFish;
       this.world.readContacts = this.tracker.readContacts;
       let layout;
       this.world.bodyLayout = groups => {
-        if (layout?.groups !== groups) layout = layout
-          ? layout.updated(groups, this.tracker.bodyEdits(layout.groups, groups)) : new BodyLayout(groups);
+        if (layout?.groups !== groups) {
+          const previous = layout;
+          const change = previous && this.tracker.bodyEdits(previous.groups, groups);
+          layout = previous ? previous.updated(groups, change?.ids, change?.sameOrder) : new BodyLayout(groups);
+        }
         return layout;
       };
       this.world.bodyEdits = this.tracker.bodyEdits;
       this.world.poseEdits = this.tracker.poseEdits;
       this.world.clearPoseEdits = this.tracker.clearPoseEdits;
       this.world.movingFish = this.tracker.movingFish;
+      this.world.setFoodMotion = this.tracker.setFoodMotion;
       this.world.swimOrdinal = this.tracker.swimOrdinal;
       this.world.beginSwimBatch = this.tracker.beginSwimBatch;
+      this.world.currentSwimColumns = this.tracker.currentSwimColumns;
       this.world.completeSwimBatch = this.tracker.completeSwimBatch;
       this.world.recordMovement = this.tracker.recordMovement;
+      // Index the checkpoint's existing bodies while loading it. Building
+      // these lookups needs no future time, input, or simulated movement.
+      const groups = this.world.ecologyCharacters().groups;
+      const grid = this.world.movementGrid(groups);
+      grid.swimmers(this.world, CONFIG.speed);
+      indexContactBodies(grid, contactRoster(this.world, groups));
+      if (this.world.ambient) indexSchoolBodies(this.world, grid.layout);
+      this.generation = this.openGeneration;
+    } else if (message.kind === 'history') {
+      Object.assign(this.world.data.life, message.parts);
+      if (message.participants) this.world.data.participants = message.participants;
+      this.tracker.reset();
     } else if (message.kind === 'restore') {
       this.tracker.invalidateOrigins();
       for (const [field, id, value] of message.rows) {
@@ -582,21 +874,39 @@ export class WorkerSimulation {
       else if (message.geometry) geometry = this.world.reconcileGeometry(message.now);
       else this.world.reconcileChatFloor(message.now);
       const patch = this.tracker.changes();
-      if (swims.length) patch.swims = swims;
+      if (swims.length) {
+        // The page and worker already share this roster for position rows.
+        // Fish born since the worker opened still use their full ID.
+        for (const ids of swims) if (ids) {
+          for (let i = 0; i < ids.length; i++) ids[i] = this.tracker.swimOrdinal(ids[i]) ?? ids[i];
+        }
+        patch.swims = swims;
+      }
+      if (message.agreed) this.agreedPatch = patch;
       return { patch, foodRevision: this.world.foodRevision - foodRevision, geometry };
     }
   }
 }
 
+export function simulationBuffers(patch) {
+  const bonds = patch?.life?.bonds;
+  return [patch?.tables.fishes?.motion?.buffer, patch?.tables.travel?.distances?.buffer, bonds?.counters?.buffer,
+    bonds?.intervals?.kept.buffer, bonds?.intervals?.added.buffer].filter(Boolean);
+}
+
 if (typeof WorkerGlobalScope !== 'undefined' && globalThis instanceof WorkerGlobalScope) {
   const simulation = new WorkerSimulation();
-  globalThis.onmessage = ({ data }) => {
+  globalThis.onmessage = async ({ data }) => {
     try {
-      const result = simulation.receive(data), patch = result?.patch;
-      const bonds = patch?.life?.bonds;
-      const buffers = [patch?.tables.fishes?.motion?.buffer, patch?.tables.travel?.distances?.buffer, bonds?.counters?.buffer,
-        bonds?.intervals?.kept.buffer, bonds?.intervals?.added.buffer].filter(Boolean);
-      postMessage({ result }, buffers);
+      const result = await simulation.receive(data), patch = result?.patch;
+      if (patch && data.renderPort) {
+        data.renderPort.postMessage(renderEdits(patch));
+        data.renderPort.close();
+        result.renderCut = true;
+      }
+      // The page owns display columns. The signed proof reads the independent
+      // authoritative records and changed IDs still held by this worker.
+      postMessage({ result }, simulationBuffers(patch));
     }
     catch (error) { postMessage({ error: error.message }); }
   };
