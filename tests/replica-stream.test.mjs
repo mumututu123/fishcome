@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import './browser-byte-arrays.mjs';
 import { changesSince, coalesceWorld, fitsLegacyEnvelope, PAGE_UNITS, replicaPages, ReplicaReader, ReplicaTransfers } from '../www/replica-stream.js';
 import { committedStepFields, decodeReplicaRowDelta, encodeReplicaRowDelta, replicaRowBase } from '../www/replica-row-delta.js';
 import { mergeBreeding } from '../www/breeding.js';

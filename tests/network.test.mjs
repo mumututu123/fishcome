@@ -29,6 +29,19 @@ const flush = () => new Promise(resolve => setImmediate(resolve));
 async function until(check) { for (let i = 0; i < 10000; i++) { if (check()) return; await flush(); } throw new Error('握手未进入预期状态'); }
 const url = 'http://127.0.0.1:39241';
 
+test('双方具备字节帧能力才启用紧凑鱼群位置，旧伙伴继续使用行格式', async () => {
+  const network = new Network({ actor: 'local' });
+  const peer = { pc: { async setRemoteDescription() {} } };
+  network.connections.set('link', peer);
+  const answer = { type: 'answer', from: 'peer', fromUrl: url, connection: 'link', sdp: { type: 'answer', sdp: 'test' },
+    replicaPages: 1, replicaLive: 1, replicaRows: 1, replicaFrames: 1 };
+  await network.signal({ ...answer, replicaPoseBytes: 1 });
+  assert.equal(peer.replicaPoseBytes, typeof Uint8Array.prototype.toBase64 === 'function' && typeof Uint8Array.fromBase64 === 'function');
+  await network.signal({ ...answer });
+  assert.equal(peer.replicaFrames, true);
+  assert.equal(peer.replicaPoseBytes, false);
+});
+
 test('未通过签名校验的消息只记录一次拒收原因', async () => {
   const reasons = [], frames = [];
   const receiver = new Network({ actor: 'receiver' }, {}, () => assert.fail('无效消息进入了世界'), () => {},
