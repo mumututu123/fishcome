@@ -1,4 +1,5 @@
 import { worldTables } from './simulation-changes.js';
+import { CONFIG } from './engine.js';
 import { DAY, shanghaiDay } from './fish-status.js';
 import { decodeReplicaRowDelta, encodeReplicaRowDelta, replicaRowBase } from './replica-row-delta.js';
 
@@ -192,7 +193,7 @@ export class ReplicaTransfers {
   }
   liveLane(peer) {
     let lane = this.live.get(peer);
-    if (!lane) this.live.set(peer, lane = { pending: null, receipt: null, running: false });
+    if (!lane) this.live.set(peer, lane = { pending: [], receipt: null, running: false });
     return lane;
   }
   publishLive(body, peers) {
@@ -200,7 +201,14 @@ export class ReplicaTransfers {
       const packet = this.unpublished.get(peer) ?? body;
       this.unpublished.delete(peer);
       const lane = this.liveLane(peer);
-      lane.pending = coalesceWorld(lane.pending, packet);
+      const queue = lane.pending;
+      if (!packet.delta) queue.length = 0;
+      const last = queue.at(-1), elapsed = packet.world.tick - packet.fromTick;
+      const nextCut = last?.delta && last.world.tick === packet.fromTick &&
+        (elapsed === CONFIG.step || elapsed === 0 && last.fromTick < last.world.tick);
+      if (!last || nextCut && lane.running && !peer.replicaCatchingUp && !lane.snapshot &&
+          packet.world.tick - queue[0].world.tick <= ACK_MS) queue.push(packet);
+      else queue[queue.length - 1] = coalesceWorld(last, packet);
       this.resumeLive(peer);
     }
   }
@@ -219,13 +227,12 @@ export class ReplicaTransfers {
   async sendLive(peer, lane) {
     let waitForPublication = false;
     try {
-      while (lane.pending || lane.snapshot) {
+      while (lane.pending.length || lane.snapshot) {
         // Take the full snapshot on the same ordered stream as subsequent
         // changes. Accumulate live publications while capturing and sending it.
         const snapshot = lane.snapshot;
-        const pending = lane.pending;
-        lane.pending = null;
-        const body = snapshot ? await snapshot() : pending;
+        if (snapshot) lane.pending.length = 0;
+        const body = snapshot ? await snapshot() : lane.pending.shift();
         if (this.live.get(peer) !== lane) return;
         if (snapshot && lane.snapshot !== snapshot) continue;
         lane.sending = body;
@@ -237,8 +244,8 @@ export class ReplicaTransfers {
         if (peer.replicaRows) this.rowsSent.set(peer, replicaRowBase(receipt.id, body.world, peer.replicaFrames, encoded.frameRows && prior));
         if (snapshot && lane.snapshot === snapshot) lane.snapshot = null;
         if (!receipt.committed && lane.sending === body) {
-          if (lane.pending) lane.pending = coalesceWorld(body, lane.pending);
-          else if (!lane.snapshot) { lane.pending = body; waitForPublication = true; return; }
+          if (lane.pending.length) lane.pending[0] = coalesceWorld(body, lane.pending[0]);
+          else if (!lane.snapshot) { lane.pending.push(body); waitForPublication = true; return; }
         }
       }
     } finally {
@@ -267,7 +274,7 @@ export class ReplicaTransfers {
   discardPendingLive() {
     this.unpublished = new WeakMap();
     for (const [peer, lane] of this.live) {
-      if (lane.running) { lane.pending = null; lane.snapshot = null; lane.sending = null; }
+      if (lane.running) { lane.pending.length = 0; lane.snapshot = null; lane.sending = null; }
       else this.live.delete(peer);
     }
   }
@@ -414,7 +421,7 @@ export class ReplicaTransfers {
     this.unpublished.delete(peer);
     peer.replicaAck?.reject(error);
     const lane = this.live.get(peer);
-    if (lane) { lane.pending = null; lane.receipt?.reject(error); this.live.delete(peer); }
+    if (lane) { lane.pending.length = 0; lane.receipt?.reject(error); this.live.delete(peer); }
   }
   stop() {
     this.unpublished = new WeakMap();

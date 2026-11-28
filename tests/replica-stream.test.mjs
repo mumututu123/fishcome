@@ -414,7 +414,7 @@ test('只播放同一来源相邻确认步的泳姿，跨缝可游动，转向�
   assert.equal(animation.latest, null);
 });
 
-test('等各伙伴应用回执后才继续发送，慢伙伴合并积压行而不阻塞其他伙伴', async t => {
+test('伙伴暂时等候归档提交时，后续每个连续世界步和游动路径仍按序交付，两端独立前进', async t => {
   const received = { slow: [], fast: [] }, forwarded = [], errors = [];
   const peers = ['slow', 'fast'].map(node => ({ node, confirmedReplica: 'joined' }));
   let releaseSlow;
@@ -436,7 +436,7 @@ test('等各伙伴应用回执后才继续发送，慢伙伴合并积压行而�
       onMessage(message) {
         assert.equal(message.kind, 'world');
         received[peer.node].push(message.body);
-        if (peer.node === 'slow' && message.body.world.tick === 1) return hold.then(() => true);
+        if (peer.node === 'slow' && message.body.world.tick === 500) return hold.then(() => true);
         return true;
       },
       directControl(_, kind, body) { return sender.receive({ kind, from: peer.node, body }, peer); }
@@ -446,24 +446,47 @@ test('等各伙伴应用回执后才继续发送，慢伙伴合并积压行而�
     for (let i = 0; i < 100 && !check(); i++) await new Promise(resolve => setImmediate(resolve));
     assert(check());
   };
-  sender.publishLive({ delta: true, world: { tick: 1, fishes: { a: { x: 1 } } } }, peers);
+  sender.publishLive({ delta: true, fromTick: 0, world: { tick: 500, fishes: { a: { x: 1 } } } }, peers);
   await wait(() => received.slow.length === 1 && received.fast.length === 1);
   assert.equal(receivers.get('slow').replica.incoming.size, 1);
   await wait(() => !sender.live.has(peers[1]));
-  sender.publishLive({ delta: true, swims: [null, [0]], world: { tick: 2, chars: { c: { x: 7 } }, fishes: { a: { x: 2 } }, contacts: { aged: {} } } }, peers);
+  sender.publishLive({ delta: true, fromTick: 500, swims: [null, [0]], world: { tick: 1000, chars: { c: { x: 7 } }, fishes: { a: { x: 2 } }, contacts: { aged: {} } } }, peers);
   await wait(() => received.fast.length === 2 && !sender.live.has(peers[1]));
-  sender.publishLive({ delta: true, swims: [null, [0]], world: { tick: 3, breeding: { finished: { status: 'born' } }, fishes: { b: { x: 3 } }, contacts: {} } }, peers);
+  sender.publishLive({ delta: true, fromTick: 1000, world: { tick: 1000, archives: { chunks: { income: {} } }, ops: {} } }, peers);
   await wait(() => received.fast.length === 3 && !sender.live.has(peers[1]));
-  assert.deepEqual(received.fast.map(body => body.world.tick), [1, 2, 3]);
+  sender.publishLive({ delta: true, fromTick: 1000, swims: [null, [0]], world: { tick: 1500, breeding: { finished: { status: 'born' } }, fishes: { b: { x: 3 } }, contacts: {} } }, peers);
+  await wait(() => received.fast.length === 4 && !sender.live.has(peers[1]));
+  assert.deepEqual(received.fast.map(body => body.world.tick), [500, 1000, 1000, 1500]);
   assert.equal(received.slow.length, 1);
   assert.equal(receivers.get('slow').replica.incoming.size, 1);
   releaseSlow();
   await wait(() => !sender.live.size);
-  assert.deepEqual(received.slow.map(body => body.world.tick), [1, 3]);
-  assert.deepEqual(received.slow[1], { delta: true, world: { tick: 3, breeding: { finished: { status: 'born' } },
-    fishes: { a: { x: 2 }, b: { x: 3 } }, contacts: {}, chars: { c: { x: 7 } } } });
+  assert.deepEqual(received.slow, received.fast);
   assert.deepEqual(errors, []);
   assert(forwarded.length && forwarded.every(value => value === false));
+});
+
+test('长时间积压有界，最后的合并仍保留每次提交的独有记录', async t => {
+  const peer = { node: 'slow', confirmedReplica: 'joined' }, seen = [], sender = new ReplicaTransfers({});
+  let release;
+  const hold = new Promise(resolve => { release = resolve; });
+  sender.sendLivePacket = async (_, __, body) => {
+    seen.push(body);
+    if (seen.length === 1) await hold;
+    return { id: crypto.randomUUID(), committed: true };
+  };
+  t.after(() => { release(); sender.stop(); });
+  const records = {};
+  for (let tick = 500; tick <= 120000; tick += 500) {
+    records[tick] = tick;
+    sender.publishLive({ delta: true, fromTick: tick - 500, world: { tick, ops: { [tick]: tick } } }, [peer]);
+  }
+  release();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(seen.slice(0, 4).map(body => body.world.tick), [500, 1000, 1500, 2000]);
+  assert.equal(seen.at(-1).world.tick, 120000);
+  assert(seen.length < Object.keys(records).length);
+  assert.deepEqual(Object.assign({}, ...seen.map(body => body.world.ops)), records);
 });
 
 test('定期全量接替积压增量，回执丢失会释放连接并由新连接的完整状态恢复', async t => {
@@ -864,6 +887,12 @@ test('游动顺序与收包顺序不同，亲鱼、进食与旧字段例外仍�
   assert.equal(first.lastFed, undefined);
 });
 
+function pendingPublication(transfers, peer) {
+  const queue = transfers.live.get(peer)?.pending ?? [];
+  assert(queue.length <= 1);
+  return queue[0];
+}
+
 test('漏掉一次发布的伙伴直接补足上一帧独有的行程，不必等待重新加入', () => {
   const transfers = new ReplicaTransfers({}), peer = {}, other = {};
   const packet = (fromTick, tick, travel) => ({ delta: true, fromTick, world: { tick, travel } });
@@ -876,8 +905,8 @@ test('漏掉一次发布的伙伴直接补足上一帧独有的行程，不必�
   transfers.live.clear();
   transfers.stageLive(next, [peer, other]);
   transfers.publishLive(next, [peer, other]);
-  assert.deepEqual(transfers.live.get(peer).pending, { ...next, fromTick: 500, world: { tick: 1500, travel: { ...missing.world.travel, ...next.world.travel } } });
-  assert.equal(transfers.live.get(other).pending, next);
+  assert.deepEqual(pendingPublication(transfers, peer), { ...next, fromTick: 500, world: { tick: 1500, travel: { ...missing.world.travel, ...next.world.travel } } });
+  assert.equal(pendingPublication(transfers, other), next);
 });
 
 test('归档多次发布同一步，漏收这一步的伙伴仍能在下一步取得全部变化', async () => {
@@ -889,7 +918,7 @@ test('归档多次发布同一步，漏收这一步的伙伴仍能在下一步�
   const publish = async tick => {
     data.tick = tick;
     await sender.send(sink, data, tick);
-    const pending = [peer, other].map(p => transfers.live.get(p)?.pending);
+    const pending = [peer, other].map(p => pendingPublication(transfers, p));
     transfers.live.clear();
     return pending;
   };
@@ -958,7 +987,7 @@ test('修复只占用该伙伴的实时通道，取全海和等待确认期间�
   releaseCapture();
   await sending;
   transfers.publishLive(packet(1500, 2000, 'b'), [peer, other]);
-  assert.equal(transfers.live.get(other).pending.fromTick, 1500);
+  assert.equal(pendingPublication(transfers, other).fromTick, 1500);
   assert.deepEqual(sent, [full]);
   acknowledgeFull();
   await running;
@@ -971,7 +1000,7 @@ test('伙伴已收到游动却错过同一步的收入，下一步仍会带上�
   const publish = (body, recipients) => {
     transfers.stageLive(body, peers);
     transfers.publishLive(body, recipients);
-    const result = peers.map(peer => transfers.live.get(peer)?.pending);
+    const result = peers.map(peer => pendingPublication(transfers, peer));
     transfers.live.clear();
     return result;
   };
@@ -985,7 +1014,7 @@ test('伙伴已收到游动却错过同一步的收入，下一步仍会带上�
   transfers.discardPendingLive();
   const fresh = { delta: true, fromTick: 3000, world: { tick: 3500, ops: {} } };
   transfers.publishLive(fresh, [peer, other]);
-  for (const target of [peer, other]) assert.equal(transfers.live.get(target).pending, fresh);
+  for (const target of [peer, other]) assert.equal(pendingPublication(transfers, target), fresh);
 });
 
 test('仅对确认同一关系基准的伙伴发送区间，新增行与延续行均还原到原序', async () => {
