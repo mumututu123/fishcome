@@ -190,21 +190,51 @@ function planFreeSwimming(grid, singles, now) {
   }
   plan.last = now;
 }
-function chooseDirection(world, id, fish, cells, pair, center, now, ambient, bins, canEat) {
-  const found = bins?.size && (pair ? pair.members.some(member => canEat(member.id)) : canEat(id)) ? new Map() : null;
-  if (found) for (const eye of cells) if (EYES.has(eye.ch)) {
-    const p = cellPosition(fish, eye), r = sightRadius(p.y), binWidth = CONFIG.width / 10;
-    for (let bx = Math.floor((p.x - r) / 10); bx <= Math.floor((p.x + r) / 10); bx++) for (let by = Math.floor((p.y - r) / 10); by <= Math.floor((p.y + r) / 10); by++) {
-      for (const food of bins.get(key((bx % binWidth + binWidth) % binWidth, by)) || []) if (Math.max(Math.abs(deltaX(food.x, p.x)), Math.abs(food.y - p.y)) <= r) found.set(food.id, food);
+function foodSight(edible) {
+  if (!edible.length) return null;
+  const bins = new Map(), views = new Map(), width = CONFIG.width / 10;
+  for (const food of edible) {
+    const bin = key(Math.floor(wrapX(food.x) / 10), Math.floor(food.y / 10));
+    if (!bins.has(bin)) bins.set(bin, []);
+    bins.get(bin).push(food);
+  }
+  // Eyes in the same ten-cell square visit the same bins in the same order.
+  // The exact distance from each eye is still checked before choosing a meal.
+  return (x, y, radius) => {
+    const bx = Math.floor(x / 10), by = Math.floor(y / 10), bin = key(bx, by);
+    let view = views.get(bin);
+    if (view) return view;
+    view = [];
+    const reach = radius / 10;
+    for (let i = bx - reach; i <= bx + reach; i++) for (let j = by - reach; j <= by + reach; j++) {
+      const foods = bins.get(key((i % width + width) % width, j));
+      if (foods) for (const food of foods) view.push(food);
     }
-  }
-  const visible = found?.size ? [...found.values()] : null;
+    views.set(bin, view);
+    return view;
+  };
+}
+function chooseDirection(world, id, fish, cells, pair, center, now, ambient, foodsNear, canEat, planned) {
   const midX = fish.x + fish.facing * (center.minX + center.maxX) / 2, midY = fish.y + (center.minY + center.maxY) / 2;
-  if (visible) {
-    const needsRemedy = visible.length > 1 && (pair ? pair.members.some(member => illnessOf(world.data, member.id)) : illnessOf(world.data, id));
-    visible.sort((a, b) => (needsRemedy ? Number(b.ch === POPULATION.remedy) - Number(a.ch === POPULATION.remedy) : 0) || (Math.abs(deltaX(a.x, midX)) + Math.abs(a.y - midY)) - (Math.abs(deltaX(b.x, midX)) + Math.abs(b.y - midY)) || a.id.localeCompare(b.id));
-    return { dx: Math.sign(deltaX(visible[0].x, midX)), dy: Math.sign(visible[0].y - midY) };
+  if (foodsNear && (pair ? pair.members.some(member => canEat(member.id)) : canEat(id))) {
+    let best, distance, needsRemedy;
+    for (const eye of cells) if (EYES.has(eye.ch)) {
+      const p = cellPosition(fish, eye), radius = sightRadius(p.y);
+      for (const food of foodsNear(p.x, p.y, radius)) {
+        if (food === best || Math.max(Math.abs(deltaX(food.x, p.x)), Math.abs(food.y - p.y)) > radius) continue;
+        const nextDistance = Math.abs(deltaX(food.x, midX)) + Math.abs(food.y - midY);
+        if (best) {
+          needsRemedy ??= pair ? pair.members.some(member => illnessOf(world.data, member.id)) : !!illnessOf(world.data, id);
+          const rank = (needsRemedy ? Number(best.ch === POPULATION.remedy) - Number(food.ch === POPULATION.remedy) : 0) ||
+            nextDistance - distance || food.id.localeCompare(best.id);
+          if (rank >= 0) continue;
+        }
+        best = food; distance = nextDistance;
+      }
+    }
+    if (best) return { dx: Math.sign(deltaX(best.x, midX)), dy: Math.sign(best.y - midY) };
   }
+  if (planned) return planned;
   if (ambient) return idleMotion(world, fish, now, ambient, { x: midX, y: midY });
   const phase = Math.floor((now - fish.created) / LIFE.wanderPeriod), r = hash(`${id}:${phase}`);
   return { dx: r % 3 - 1, dy: Math.floor(r / 3) % 3 - 1 };
@@ -712,8 +742,7 @@ export class World {
     const edible = [...foods.filter(c => c.kind === 'food' && now - c.born < CONFIG.foodLife), ...seaweed].sort((a, b) => (a.born ?? a.created) - (b.born ?? b.created) || a.id.localeCompare(b.id)), foodPositions = new Set([...foods.filter(c => c.kind === 'food'), ...edible].map(c => key(c.x, c.y)));
     const turningObstacles = new Map(scenery); for (const cell of edible) if (cell.kind === 'seaweed') turningObstacles.set(key(cell.x, cell.y), {});
     const waitingToEat = new Set(); for (const food of edible) for (const id of contact(food)) waitingToEat.add(id);
-    const bins = new Map();
-    for (const food of edible) { const bin = key(Math.floor(wrapX(food.x) / 10), Math.floor(food.y / 10)); if (!bins.has(bin)) bins.set(bin, []); bins.get(bin).push(food); }
+    const foodsNear = foodSight(edible);
     fishOccupancy.prepareMovement(this.data, scenery, foodPositions, seaweed);
     const layout = fishOccupancy.layout;
     const { fishes, breeding } = this.data, hasMagma = magma.size > 0;
@@ -721,10 +750,10 @@ export class World {
     let travelDay, starvationDue = false;
     const singles = fishOccupancy.swimmers(this, CONFIG.speed);
     const freeIntents = ambient && this.stableFishRoster;
-    const nearFood = freeIntents && bins.size && fishOccupancy.ownersNear(edible, Math.max(CONFIG.sightShallow, CONFIG.sightDeep));
+    const nearFood = freeIntents && foodsNear && fishOccupancy.ownersNear(edible, Math.max(CONFIG.sightShallow, CONFIG.sightDeep));
     if (freeIntents) planFreeSwimming(fishOccupancy, singles, now);
     const ordered = motionOrder(this, groups, layout, singles), batch = this.beginSwimBatch?.();
-    const hasCaptives = captured.size > 0, hasWaiting = waitingToEat.size > 0, hasFood = bins.size > 0;
+    const hasCaptives = captured.size > 0, hasWaiting = waitingToEat.size > 0;
     const avoidanceText = String(avoidancePhase);
     const avoidance = AVOID_DIRECTIONS.map((_, seed) => hash(avoidanceText, seed) % AVOID_DIRECTIONS.length);
     for (let index = 0; index < ordered.length; index++) {
@@ -744,9 +773,9 @@ export class World {
         const center = hull?.bounds || bounds(cells);
         slot = hull && !pair && breeding[id]?.status !== 'active' ? swimmer?.slot ?? fishOccupancy.slots.get(id) : undefined;
         const legacy = slot === undefined ? { world: this, id, cells, scenery, foodPositions, turningObstacles, center } : null;
-        const visibleBins = hasFood && (!nearFood || swimmer?.slot === undefined || nearFood[swimmer.slot]) ? bins : null;
-        const intended = !visibleBins && freeIntents && now - f.lastFed >= CONFIG.hunger && swimmer?.intended ||
-          chooseDirection(this, id, f, cells, pair, center, now, ambient, visibleBins, canEat);
+        const sight = foodsNear && (!nearFood || swimmer?.slot === undefined || nearFood[swimmer.slot]) ? foodsNear : null;
+        const planned = freeIntents && now - f.lastFed >= CONFIG.hunger && swimmer?.intended;
+        const intended = !sight && planned || chooseDirection(this, id, f, cells, pair, center, now, ambient, sight, canEat, planned);
         let dx = intended.dx, dy = intended.dy;
         if (pair) for (const member of pair.members) fishOccupancy.update(member, groups.get(member.id) || [], true);
         const turnX = beforeX + beforeFacing * (center.minX + center.maxX);

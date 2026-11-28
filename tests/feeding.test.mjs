@@ -17,6 +17,17 @@ function food(w, x, y, at = t, ch = '食') {
 function spot(w, id) { const p = w.fishCells(id).map(c => cellPosition(w.data.fishes[id], c)).sort((a, b) => a.y - b.y || a.x - b.x)[0]; return { x: (p.x + 1000) % 1000, y: p.y - 1 }; }
 function nearby(w, id, at) { const p = spot(w, id); return food(w, p.x, p.y, at); }
 function hold(w) { for (const f of Object.values(w.data.fishes)) { f.cx = f.cy = -10; } }
+test('两只眼睛跨越深浅水界线时，患病鱼仍能优先追到环绕边界的药食', () => {
+  for (const [depth, ill, expected] of [[59, true, 4], [60, true, 6], [59, false, 6]]) {
+    const w = new World(t), id = fish(w, 5, depth, 'alice', [cell(0, 0, 'o'), cell(0, 1, 'o')]);
+    Object.assign(w.data.fishes[id], { facing: 1, cx: 1 });
+    if (ill) w.data.population.illnesses[id] = { at: t, nextLossAt: t + HOUR, curedAt: 0 };
+    food(w, 987, depth, t, '乐');
+    food(w, 13, depth, t, '食');
+    w.step(t + 500);
+    assert.equal(w.data.fishes[id].x, expected);
+  }
+});
 function eat(w, id, at) { const meal = nearby(w, id, at); hold(w); w.step(at); assert.equal(w.data.chars[meal].entity, id); return meal; }
 
 test('第一餐可立即吃，同一结算步多颗食物也只吃一颗', () => {
