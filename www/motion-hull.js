@@ -1,15 +1,17 @@
 import { WORLD_WIDTH, MAX_FLOOR } from './geography.js';
 
 export class BodyLayout {
-  constructor(groups, hulls = new WeakMap()) {
+  constructor(groups, hulls = new WeakMap(), geometries = new Map()) {
     this.groups = groups;
     this.hulls = hulls;
+    this.geometries = geometries;
   }
   get ordered() {
     return this.byId ??= [...this.groups].sort(([a], [b]) => a.localeCompare(b));
   }
   updated(groups, changed) {
-    const layout = new BodyLayout(groups, this.hulls);
+    const layout = new BodyLayout(groups, this.hulls, this.geometries);
+    if (layout.geometries.size >= layout.geometryLimit) layout.pruneGeometries();
     layout.school = this.school;
     if (!changed || !this.byId || [...changed].some(id => groups.has(id) && !this.groups.has(id))) return layout;
     // A locale may collate two different legacy names equally. Their tie order
@@ -28,10 +30,32 @@ export class BodyLayout {
   hull(cells) {
     let shape = this.hulls.get(cells);
     if (shape === undefined) {
-      shape = compileHull(cells);
+      const xy = readCoordinates(cells);
+      shape = null;
+      if (xy) {
+        const signature = xy.map(value => Object.is(value, -0) ? '-0' : value).join(',');
+        shape = this.geometries.get(signature);
+        if (!shape) {
+          shape = buildHull(xy);
+          if (shape) {
+            if (this.geometries.size >= this.geometryLimit) this.pruneGeometries();
+            shape.signature = signature;
+            this.geometries.set(signature, shape);
+          }
+        }
+      }
       this.hulls.set(cells, shape);
     }
     return shape;
+  }
+  get geometryLimit() { return 2 * Math.max(1, this.groups.size); }
+  pruneGeometries() {
+    // An old movement grid can still read its bodies through the weak cache.
+    this.geometries.clear();
+    for (const cells of this.groups.values()) {
+      const shape = this.hulls.get(cells);
+      if (shape) this.geometries.set(shape.signature, shape);
+    }
   }
 }
 
@@ -47,19 +71,28 @@ export function obstacleMask(scenery, foods, weeds, mask = new Uint8Array(WORLD_
   return mask;
 }
 
+function readCoordinates(cells) {
+  const xy = [];
+  for (const { x, y } of cells) {
+    if (!Number.isInteger(x) || !Number.isInteger(y) || Math.abs(x) >= WORLD_WIDTH || Math.abs(y) > MAX_FLOOR) return null;
+    xy.push(x, y);
+  }
+  return xy;
+}
+export function compileHull(cells) {
+  const xy = readCoordinates(cells);
+  return xy && buildHull(xy);
+}
+
 // A body turns about the same vertical axis on every row. Each cell sweeps
 // across that axis, so all its row's swept intervals form one interval.
-export function compileHull(cells) {
-  const xy = [], rows = new Map(), used = new Set();
-  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity, duplicate = false, namedCells = true;
-  for (const cell of cells) {
-    const { x, y } = cell;
-    if (typeof cell.id !== 'string' || used.has(cell.id)) namedCells = false;
-    else used.add(cell.id);
-    if (!Number.isInteger(x) || !Number.isInteger(y) || Math.abs(x) >= WORLD_WIDTH || Math.abs(y) > MAX_FLOOR) return null;
+function buildHull(xy) {
+  const rows = new Map(), used = new Set();
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity, duplicate = false;
+  for (let i = 0; i < xy.length; i += 2) {
+    const x = xy[i], y = xy[i + 1];
     minX = Math.min(minX, x); maxX = Math.max(maxX, x);
     minY = Math.min(minY, y); maxY = Math.max(maxY, y);
-    xy.push(x, y);
     const key = y * (2 * WORLD_WIDTH) + x;
     if (used.has(key)) duplicate = true;
     used.add(key);
@@ -78,7 +111,7 @@ export function compileHull(cells) {
     offsetsRight.push(xy[i + 1] * WORLD_WIDTH + xy[i]);
     offsetsLeft.push(xy[i + 1] * WORLD_WIDTH - xy[i]);
   }
-  return { xy, sweep, duplicate, namedCells, offsetsRight, offsetsLeft, moveEdges: [],
+  return { xy, sweep, duplicate, offsetsRight, offsetsLeft, moveEdges: [],
     bounds: { minX, maxX, minY, maxY, width: maxX - minX + 1, height: maxY - minY + 1 } };
 }
 export function fitsHull(hull, fish, grid, pair) {

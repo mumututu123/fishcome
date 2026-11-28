@@ -85,6 +85,39 @@ test('海图四条接触边跨越接缝，墙角遮挡与拥挤区都不触发�
     assert.equal(pairs(w.sceneryMap()).size, 0);
   }
 });
+test('同形鱼按各自鱼元编号选择接触点', () => {
+  const w = sea(), groups = new Map(), males = [], females = new Set(), scenery = new Map();
+  for (const [i, x] of [20, 100].entries()) {
+    const father = { id: 'dad' + i, x, y: 20, facing: 1 };
+    const mother = { id: 'mum' + i, x, y: 20, facing: 1 };
+    w.data.fishes[father.id] = father;
+    w.data.fishes[mother.id] = mother;
+    groups.set(father.id, [
+      { id: (i ? 'Z' : 'a') + i, x: 4, y: 0 },
+      { id: (i ? 'a' : 'Z') + i, x: 0, y: 0 },
+      { id: 'spare' + i, x: 8, y: 0 }
+    ]);
+    groups.set(mother.id, [
+      { id: 'a' + i, x: 1, y: 0 },
+      { id: 'Z' + i, x: -1, y: 0 },
+      { id: 'spare' + i, x: 5, y: 0 }
+    ]);
+    males.push(father); females.add(mother.id);
+    for (let n = 0; n < 187; n++) {
+      const px = x - 14 + n % 31, py = 5 + Math.floor(n / 31);
+      scenery.set(px + ',' + py, { scene: { x: px, y: py }, cell: { x: 0, y: 0 } });
+    }
+  }
+  const grid = w.movementGrid(groups), pairs = new Map();
+  const roster = { males, females, probeCount: grid.cells.length };
+  assert(collectGridPairs(w, grid, scenery, roster, new Set(), new Set(), pairs));
+  assert.equal(pairs.get('dad0|mum0')?.wait, 20000);
+  assert.equal(pairs.get('dad1|mum1')?.wait, 5000);
+
+  const repeated = groups.get('dad1').map(glyph => ({ ...glyph, id: 'same' }));
+  const legacy = w.movementGrid(new Map(groups).set('dad1', repeated));
+  assert.equal(collectGridPairs(w, legacy, scenery, roster, new Set(), new Set(), new Map()), false);
+});
 test('已经开始的繁殖不因后来的拥挤被取消，出生不增加鱼元', () => {
   const w = sea(), male = fish(w, 'male', 20); fish(w, 'female', 23); for (let e = 0; e <= 5000; e += 500) updateContacts(w, now + e, w.fishGroups(), w.sceneryMap()); const r = w.breedingState(male); fill(w, 22, 20, 400); const count = Object.keys(w.data.chars).length;
   finishBreeding(w, r.ends, transition); assert.equal(r.status, 'born'); assert.equal(Object.keys(w.data.chars).length, count);

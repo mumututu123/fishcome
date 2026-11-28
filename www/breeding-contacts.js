@@ -3,6 +3,21 @@ import { contactTime, densityField } from './ecology.js';
 
 const indexedLayouts = new WeakMap();
 const glyphOrders = new WeakMap();
+const namedBodies = new WeakMap();
+
+export function hasNamedGlyphs(cells) {
+  let named = namedBodies.get(cells);
+  if (named === undefined) {
+    const ids = new Set();
+    named = cells.every(({ id }) => {
+      if (typeof id !== 'string' || ids.has(id)) return false;
+      ids.add(id);
+      return true;
+    });
+    namedBodies.set(cells, named);
+  }
+  return named;
+}
 
 function gridBodies(layout) {
   if (!indexedLayouts.has(layout)) {
@@ -11,17 +26,16 @@ function gridBodies(layout) {
     let usable = true;
     for (const [id, cells] of layout.groups) {
       const hull = layout.hull(cells);
-      if (!/^[\w:-]+$/.test(id) || !hull?.namedCells || hull.duplicate) { usable = false; break; }
+      if (!/^[\w:-]+$/.test(id) || !hull || hull.duplicate || !hasNamedGlyphs(cells)) { usable = false; break; }
     }
     indexedLayouts.set(layout, usable);
   }
   return indexedLayouts.get(layout);
 }
 
-function glyphOrder(layout, cells, mother) {
-  const hull = layout.hull(cells);
-  let orders = glyphOrders.get(hull);
-  if (!orders) glyphOrders.set(hull, orders = {});
+function glyphOrder(cells, mother) {
+  let orders = glyphOrders.get(cells);
+  if (!orders) glyphOrders.set(cells, orders = {});
   const side = mother ? 'mother' : 'father';
   // Male contact uses the ordinal minimum ID. Mothers use the first ID in locale order.
   return orders[side] ??= cells.map(({ x, y, id }) => ({ x, y, id })).sort(mother
@@ -29,9 +43,9 @@ function glyphOrder(layout, cells, mother) {
 }
 
 function waitingTime(density, grid, father, mother, scenery) {
-  const layout = grid.layout, groups = layout.groups;
-  const fatherCells = glyphOrder(layout, groups.get(father.id), false);
-  const motherCells = glyphOrder(layout, groups.get(mother.id), true);
+  const groups = grid.layout.groups;
+  const fatherCells = glyphOrder(groups.get(father.id), false);
+  const motherCells = glyphOrder(groups.get(mother.id), true);
   for (const male of fatherCells) {
     const x = father.x + father.facing * male.x, y = father.y + male.y;
     for (const female of motherCells) {

@@ -8,6 +8,34 @@ import { wrapX } from '../www/geography.js';
 import { WorkerSimulation } from '../www/simulation-worker.js';
 import { makeFishWorld } from './capacity-fish.mjs';
 
+test('同形鱼复用轮廓，布局缩小后旧占格仍能读取已缓存的几何', () => {
+  const first = [{ x: 0, y: -0 }, { x: 1, y: 0 }];
+  const second = first.map(cell => ({ ...cell }));
+  const initial = new Map([['first', first], ['second', second]]);
+  const old = new BodyLayout(initial);
+  const same = old.hull(first);
+  assert.equal(old.hull(second), same);
+  assert(Object.is(same.xy[1], -0));
+  assert.notEqual(old.hull([{ x: 0, y: 0 }, { x: 1, y: 0 }]), same);
+  assert.equal(old.hull([{ x: 0.25, y: 0 }]), null);
+
+  const removed = [{ x: -1, y: -2 }, { x: 0, y: -2 }];
+  const full = old.updated(new Map(initial).set('removed', removed), new Set(['removed']));
+  const previous = full.hull(removed);
+  let layout = full;
+  for (let x = 1; x <= 20; x++) {
+    const body = [{ x, y: 0 }, { x: x + 1, y: 1 }];
+    layout = layout.updated(new Map(initial).set('changing', body), new Set(['removed', 'changing']));
+    assert(layout.hull(body));
+    assert.equal(layout.hull(first), same);
+    assert.equal(layout.hull(second), same);
+    assert(layout.geometries.size <= 2 * layout.groups.size);
+  }
+  layout = layout.updated(new Map([['first', first]]), new Set(['second', 'changing']));
+  assert.deepEqual([...layout.geometries.values()], [same]);
+  assert.equal(full.hull(removed), previous);
+});
+
 test('游动意向跨过饥饿与换相边界，投食、改时和丢弃缓存后仍与逐鱼判向一致', () => {
   const start = Date.UTC(2025, 5, 15, 12, 17), day = 86400000;
   const reference = makeFishWorld(World, 12, 1000, { now: start, mixedGenders: true, spacingX: 3 });

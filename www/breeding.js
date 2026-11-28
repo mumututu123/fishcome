@@ -4,7 +4,7 @@ import { wrapX, nearX, deltaX } from './geography.js';
 import { recordStory } from './life.js';
 import { capturedFishIds } from './legends.js';
 import { densityField, contactTime } from './ecology.js';
-import { collectGridPairs } from './breeding-contacts.js';
+import { collectGridPairs, hasNamedGlyphs } from './breeding-contacts.js';
 
 export const CONTACT_TIME = 5000;
 export const BREEDING_TIME = 3600000;
@@ -188,7 +188,7 @@ export function updateContacts(world, now, groups, scenery, captured = capturedF
     if (taken.has(id) || captured.has(id)) continue;
     const cells = groups.get(id);
     const hull = density && occupancy.integerCells && !ambiguousIds && occupancy.layout?.hull(cells);
-    if (hull?.namedCells) {
+    if (hull && hasNamedGlyphs(cells)) {
       const b = hull.bounds;
       const left = fish.x + fish.facing * (fish.facing === 1 ? b.minX : b.maxX);
       // For integer cells the rounded midpoint lies on the cell or one step right/down.
