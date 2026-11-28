@@ -9,26 +9,46 @@ const orderedTables = [...worldTables, 'life.events', 'life.bonds', 'life.storie
 const tableAt = (data, name) => name.startsWith('life.') ? data.life?.[name.slice(5)] : data[name];
 
 const largeTables = new Set(['chars', 'fishes', 'ops', 'travel']);
-const snapshotCharacters = new WeakMap();
+const snapshotPages = new WeakMap();
+const proofTables = new WeakMap();
+export function capturedOrderedRows(data, name) {
+  return snapshotPages.get(name === undefined ? data : proofTables.get(data)?.[name]);
+}
+
+function prepareCheckpointPages(world) {
+  return Promise.all([prepareCharacterProof(world), prepareCharacterProof(world, 'ops')]);
+}
 
 export function captureOrderedWorld(world, store) {
-  const characters = capturedCharacterProof(world);
-  const data = structuredClone({ ...world.data, chars: null });
-  if (characters) {
-    data.chars = {};
-    snapshotCharacters.set(data.chars, characters);
-  } else data.chars = structuredClone(world.data.chars);
+  const source = { ...world.data }, prepared = [];
+  for (const name of ['chars', 'ops']) {
+    const pages = capturedCharacterProof(world, name);
+    if (pages) { prepared.push([name, pages]); source[name] = null; }
+  }
+  const data = structuredClone(source);
+  const proof = { ...data };
+  for (const [name, pages] of prepared) {
+    proof[name] = {};
+    snapshotPages.set(proof[name], pages);
+    Object.defineProperty(data, name, { configurable: true, enumerable: true, get() {
+      const rows = pages.materialize();
+      Object.defineProperty(data, name, { configurable: true, enumerable: true, writable: true, value: rows });
+      return rows;
+    } });
+  }
+  proofTables.set(data, proof);
   const archives = structuredClone({ manifests: store.manifests, summary: store.summary, overrides: store.overrides });
   return { world: { data, ambient: world.ambient }, store: archives };
 }
 
 export function checkpointOrder(data, requested) {
+  data = proofTables.get(data) ?? data;
   const order = {};
   for (const name of requested || orderedTables) {
     if (!orderedTables.includes(name) || !requested && largeTables.has(name)) continue;
     const rows = tableAt(data, name);
     if (!rows) continue;
-    const captured = snapshotCharacters.get(rows);
+    const captured = capturedOrderedRows(rows);
     if (captured) { order[name] = captured.keys; continue; }
     const keys = [];
     for (const id in rows) {
@@ -65,7 +85,8 @@ async function checkpointProof(world, store, data, valid) {
   const fields = [], tableProofs = {};
   let bondOrder;
   async function proveTable(name, value) {
-    const prepared = name === 'chars' && (snapshotCharacters.get(value) || value === world.data.chars && capturedCharacterProof(world));
+    const prepared = capturedOrderedRows(value) || !proofTables.has(world.data) && (name === 'chars' || name === 'ops') &&
+      value === world.data[name] && capturedCharacterProof(world, name);
     const pages = await (prepared ? prepared.hashes : table(value));
     if (valid() && orderedTables.includes(name) && (largeTables.has(name) || pages.length > 1)) tableProofs[name] = await stepDigest(pages);
     if (name === 'life.bonds' && pages?.length > 1) bondOrder = await jsonDigest(Object.keys(value));
@@ -109,12 +130,12 @@ async function checkpointProof(world, store, data, valid) {
 // order matters to subsequent simulation and conflict ties. Only rearrange
 // local rows, and only install them after the complete checkpoint hash agrees.
 export async function orderedCheckpoint(world, store, orders, valid = () => true) {
-  const changes = {}, data = { ...world.data };
+  const changes = {}, data = { ...(proofTables.get(world.data) ?? world.data) };
   if (orders) {
     for (const [name, keys] of Object.entries(orders)) {
       if (!orderedTables.includes(name)) throw new Error('共同检查点包含未知表');
       let table = tableAt(data, name);
-      const captured = snapshotCharacters.get(table), local = captured?.keys || Object.keys(table || {});
+      const captured = capturedOrderedRows(table), local = captured?.keys || Object.keys(table || {});
       // Separate legitimate histories can retain a different set of pairs.
       // Preserve our full local table until the ordinary history join verifies.
       if (name === 'life.bonds' && table && Array.isArray(keys) &&
@@ -202,7 +223,7 @@ export class OrderedSession {
       if (possible?.peer === peer && !possible.acknowledged && now - possible.askedAt < CONFIG.step / 2) return;
       const id = crypto.randomUUID();
       this.candidate = { peer, world, leader, id, askedAt: now };
-      prepareCharacterProof(world).catch(() => {});
+      prepareCheckpointPages(world).catch(() => {});
       // An unanswered enquiry never reserves an ecology tick. The existing
       // authority keeps publishing while the other tab finishes its hello.
       await this.io.send(peer, { action: 'available?', id, leader });
@@ -234,7 +255,7 @@ export class OrderedSession {
     // step. The final preparation below rechecks inputs, revision and tick.
     if (!this.io.hasSavedCharacters?.(s.world)) this.preload(s);
     s.cut = await orderedCheckpoint(s.snapshot.world, s.snapshot.store, s.order, () => this.valid(s));
-    if (!s.changedAfterCut && s.cut.characterPages?.table === s.snapshot.world.data.chars) {
+    if (!s.changedAfterCut && s.cut.characterPages?.table === proofTables.get(s.snapshot.world.data).chars) {
       s.cut.characterPages.table = s.world.data.chars;
       s.cut.characterPages.revision = characterRevision(s.world);
     }
@@ -348,7 +369,7 @@ export class OrderedSession {
     if (b.action === 'available?') {
       if (!s && !this.io.isLeader() && b.leader === this.io.leader() && typeof b.id === 'string' && b.id.length === 36) {
         const world = this.io.world();
-        await Promise.all([prepareCharacterProof(world), this.io.checkRetained?.(world)]);
+        await Promise.all([prepareCheckpointPages(world), this.io.checkRetained?.(world)]);
         if (!this.current && this.io.peer() === peer && !this.io.isLeader() && b.leader === this.io.leader()) {
           await this.io.send(peer, { action: 'available', id: b.id, leader: b.leader });
         }

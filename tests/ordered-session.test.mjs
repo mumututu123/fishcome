@@ -6,7 +6,7 @@ import { mergeBonds } from '../www/life.js';
 import { WorldBroadcast } from '../www/world-broadcast.js';
 import { actorId, signer } from '../www/storage.js';
 import { prepareOrderedArchive } from '../www/ordered-archive.js';
-import { OrderedSession } from '../www/ordered-session.js';
+import { OrderedSession, captureOrderedWorld, capturedOrderedRows, orderedCheckpoint } from '../www/ordered-session.js';
 import { stepDigest } from '../www/step-digest.js';
 import { capturedCharacterProof, prepareCharacterProof } from '../www/ordered-characters.js';
 import { applyInputRows, simulationApplied, worldEdited } from '../www/simulation-changes.js';
@@ -36,6 +36,36 @@ test('鱼元页证明跨越已提交的新步，后到的签名输入、删除�
   assert.deepEqual(await third.hashes, await merged);
   worldEdited(world);
   assert.equal(capturedCharacterProof(world), undefined);
+});
+
+test('共同检查点保留签名操作的内容和次序，旧步的出生凭据仍可读取', async () => {
+  const world = new World(Date.now(), crypto.randomUUID(), { populate: false }), store = new ArchiveStore();
+  const op = i => ({ id: 'fish-' + i, kind: 'fish', cells: [{ x: i }], extension: { missing: undefined } });
+  for (let i = 0; i < 256; i++) world.data.ops['fish-' + i] = op(i);
+  world.data.chars.cell = { id: 'cell', kind: 'burn' };
+  await Promise.all([prepareCharacterProof(world), prepareCharacterProof(world, 'ops')]);
+  const captured = captureOrderedWorld(world, store);
+  const old = structuredClone(world.data), reverse = Object.keys(old.ops).reverse();
+  const expected = await orderedCheckpoint({ data: old, ambient: world.ambient }, store);
+  applyInputRows(world, [['ops', 'fish-0', { ...op(0), cells: [] }]]);
+  const changes = {};
+  worldEdited(world, 'replica', changes);
+  delete world.data.ops['fish-1'];
+  world.data.ops['fish-257'] = op(257);
+  changes.ops = new Set(['fish-1', 'fish-257']);
+  changes.chars = new Set();
+  const later = captureOrderedWorld(world, store);
+  const pages = capturedOrderedRows(captured.world.data, 'ops');
+  assert.deepEqual([...pages.encodedRows().values()], Object.entries(old.ops).map(entry => JSON.stringify(entry)));
+  assert.equal((await orderedCheckpoint(captured.world, captured.store)).proof, expected.proof);
+  assert.deepEqual(captured.world.data.ops, old.ops);
+  assert.deepEqual(captured.world.data.chars, old.chars);
+  const aligned = await orderedCheckpoint(captured.world, captured.store, { ops: reverse });
+  assert.deepEqual(Object.keys(aligned.changes.ops), reverse);
+  assert.deepEqual(aligned.changes.ops['fish-0'], old.ops['fish-0']);
+  aligned.changes.ops['fish-0'].extension.extra = true;
+  assert.deepEqual(captured.world.data.ops, old.ops);
+  assert.deepEqual(later.world.data.ops, world.data.ops);
 });
 
 async function earn(world, serial) {

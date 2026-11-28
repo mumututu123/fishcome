@@ -733,7 +733,7 @@ export class World {
   merge(other, archived = {}, origin, trackChanges = false, checkedRules) {
     const joining = trackChanges === 'join';
     let cellIndex = origin === 'replica' ? replicaCellIndexes.get(this) : undefined;
-    const changes = trackChanges ? { chars: undefined, fishes: new Set(), scenes: new Set() } : undefined;
+    const changes = trackChanges ? { chars: undefined, fishes: new Set(), scenes: new Set(), ops: new Set() } : undefined;
     let changedChars = trackChanges ? new Set() : undefined;
     if (!other || other.protocol !== 1 || !other.chars || !other.fishes || !other.scenes || !other.ops) throw new Error('世界协议不兼容');
     if (other.terrain && !validTerrain(other.terrain, other.roots)) throw new Error('固定海底地形被修改或无效');
@@ -756,8 +756,16 @@ export class World {
     for (const [id, op] of Object.entries(other.ops)) {
       if (op.kind === 'referral' && (id !== op.id || this.validOp(op))) throw new Error('推广奖励记录无效');
       const cold = archived.ops?.[id], old = this.data.ops[id] || cold;
-      if (!old) this.data.ops[id] = clone(op);
-      else if (op.kind === 'referral' && old.kind === 'referral') { const winner = chooseReferral(old, op); if (this.data.ops[id] || JSON.stringify(winner) !== JSON.stringify(cold)) this.data.ops[id] = clone(winner); }
+      if (!old) {
+        this.data.ops[id] = clone(op);
+        changes?.ops.add(id);
+      } else if (op.kind === 'referral' && old.kind === 'referral') {
+        const winner = chooseReferral(old, op);
+        if (this.data.ops[id] || JSON.stringify(winner) !== JSON.stringify(cold)) {
+          this.data.ops[id] = clone(winner);
+          changes?.ops.add(id);
+        }
+      }
     }
     Object.assign(this.data.participants, other.participants);
     this.data.seaweedHour = Math.max(this.data.seaweedHour ?? Math.floor(this.data.tick / HOUR), other.seaweedHour ?? Math.floor(other.tick / HOUR));
