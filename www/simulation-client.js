@@ -56,7 +56,8 @@ function* initialRows(world) {
 }
 
 function applyResult(world, { patch: delta, foodRevision }, knownFish) {
-  const patch = expandSimulationPatch(world.data, delta, knownFish);
+  const patch = expandSimulationPatch(world.data, delta, knownFish, true);
+  patch.workerChanges = delta;
   simulationWillApply(world, patch);
   for (const [field, changes] of Object.entries(patch.tables)) {
     const table = world.data[field] ||= {};
@@ -65,6 +66,11 @@ function applyResult(world, { patch: delta, foodRevision }, knownFish) {
     for (const id of changes.remove) if (Object.hasOwn(table, id)) {
       changes.removedCount++;
       delete table[id];
+    }
+    if (changes.frame) {
+      changes.addedCount = changes.frame.added.length;
+      changes.frame.commit(table);
+      continue;
     }
     for (const [id, record] of changes.set) {
       if (!Object.hasOwn(table, id)) changes.addedCount++;

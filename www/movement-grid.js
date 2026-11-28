@@ -22,6 +22,16 @@ export class MovementGrid {
   overlapped = false;
   integerCells = true;
   constructor(layout) { this.layout = layout; }
+  swimmers(world) {
+    const roster = world.stableFishRoster?.();
+    if (!roster) return this.layout.ordered;
+    if (this.roster !== roster) {
+      this.roster = roster;
+      this.swimmersById = this.layout.ordered.map(([id, cells]) =>
+        [id, cells, null, { fish: world.readFish(id), ordinal: world.swimOrdinal?.(id), hull: this.layout.hull(cells), slot: this.slots.get(id) }]);
+    }
+    return this.swimmersById;
+  }
   index(x, y) {
     if (!Number.isInteger(x) || !Number.isInteger(y) || y < 0 || y >= occupancyRows) return worldKey(x, y);
     return y * WORLD_WIDTH + (x >= 0 && x < WORLD_WIDTH ? x : wrapX(x));

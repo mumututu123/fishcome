@@ -32,14 +32,27 @@ export function beforeCheckpointPatch(data, patch) {
   for (const [field, changes] of Object.entries(patch.tables || {})) {
     const source = capture.sources.get(field);
     if (!source) continue;
+    if (capture.snapshots.has(field)) continue;
+    const frame = changes.frame;
+    const prior = frame && committed?.tables.get(field);
+    if (prior?.source.deref() === source && frame.length >= PAGE_SIZE && frame.length * 2 >= prior.byId.size) {
+      // Freeze table membership and references once during this active cut.
+      // Prior sparse changes, if any, still win in lookup().
+      const saved = { ...source };
+      capture.snapshots.set(field, saved);
+      if (!capture.keys.has(field)) capture.keys.set(field, Object.keys(saved));
+      continue;
+    }
     let old = capture.before.get(field);
     if (!old) capture.before.set(field, old = new Map());
     const keep = id => { if (!old.has(id)) old.set(id, Object.hasOwn(source, id) ? source[id] : ABSENT); };
-    if (!capture.keys.has(field) && (changes.remove.length || changes.set.some(([id]) => !Object.hasOwn(source, id)))) {
+    const addsRows = frame ? frame.added.length : !capture.keys.has(field) && changes.set.some(([id]) => !Object.hasOwn(source, id));
+    if (!capture.keys.has(field) && (changes.remove.length || addsRows)) {
       capture.keys.set(field, Object.keys(source));
     }
     for (const id of changes.remove) keep(id);
-    for (const [id] of changes.set) keep(id);
+    if (frame) { for (const id of frame.ids) keep(id); }
+    else for (const [id] of changes.set) keep(id);
   }
 }
 
@@ -56,6 +69,23 @@ function recordChange(dirty, field, ids, id, exists) {
   return true;
 }
 
+function noteFramePages(data, dirty, field, frame) {
+  const table = committed?.data.deref() === data && committed.tables.get(field);
+  if (!table || table.source.deref() !== data[field] || captures.has(data)) return false;
+  const fields = dirty.framePages ??= new Map();
+  let saved = fields.get(field);
+  if (!saved) fields.set(field, saved = { table, pages: new Set() });
+  if (saved.table !== table) return false;
+  // When every existing page is already dirty, subsequent motion in this cut
+  // takes constant time. Insertions and deletions keep their ordered ID journal.
+  const { pages } = saved;
+  for (let i = 0; i < frame.length && pages.size < table.pages.length; i++) {
+    const page = table.byId.get(frame.idAt(i));
+    if (page !== undefined) pages.add(page);
+  }
+  return true;
+}
+
 export function noteCheckpointChanges(data, patch, merge) {
   let dirty = pending.get(data);
   if (!dirty) pending.set(data, dirty = { scan: false, tables: new Map() });
@@ -64,6 +94,7 @@ export function noteCheckpointChanges(data, patch, merge) {
     dirty.merge = merge && knownChars ? { handle: merge, chars: dirty.tables.get('chars') || new Map() } : undefined;
     dirty.scan = true;
     dirty.tables.clear();
+    dirty.framePages?.clear();
     // Foreground edits may mutate arbitrary records in place. A partial copy
     // must never become durable. Retry from a fresh boundary after this edit.
     captures.get(data)?.abort(checkpointChanged);
@@ -75,7 +106,11 @@ export function noteCheckpointChanges(data, patch, merge) {
     let ids = dirty.tables.get(field);
     if (!ids) dirty.tables.set(field, ids = new Map());
     for (const id of updates.remove) ids.set(id, 'removed');
-    for (const [id] of updates.set) if (!recordChange(dirty, field, ids, id, true)) break;
+    if (updates.frame) {
+      const frame = updates.frame;
+      const changed = noteFramePages(data, dirty, field, frame) ? frame.added : frame.ids;
+      for (const id of changed) if (!recordChange(dirty, field, ids, id, true)) break;
+    } else for (const [id] of updates.set) if (!recordChange(dirty, field, ids, id, true)) break;
   }
 }
 
@@ -91,6 +126,7 @@ export function noteCheckpointMerge(data, merge) {
 
 function lookup(capture, field, source, id) {
   const old = capture.before.get(field);
+  source = capture.snapshots.get(field) || source;
   return old?.has(id) ? old.get(id) : Object.hasOwn(source, id) ? source[id] : ABSENT;
 }
 
@@ -193,8 +229,11 @@ function* writePages(store, head, capture, dirty, reuse, incremental) {
       continue;
     }
     let table = prior, touched;
-    if (incremental && prior?.source.deref() === source && trackedField(dirty, field)) {
+    const framePages = dirty?.framePages?.get(field);
+    if (incremental && prior?.source.deref() === source && trackedField(dirty, field) &&
+        (!framePages || framePages.table === prior)) {
       touched = yield* updateLayout(capture, field, source, table, dirty?.tables.get(field));
+      if (framePages) for (const page of framePages.pages) touched.add(page);
       if (table.pages.length > 1 && table.byId.size < (table.pages.length - 1) * table.capacity / 2) touched = null;
     }
     const dense = field === 'chars' && prior?.capacity === DENSE_CHAR_PAGE;
@@ -289,7 +328,7 @@ export function beginCheckpoint(store, prior, checkpoint, options, done, fail) {
     if (captures.get(data) === capture) captures.delete(data);
     release();
   };
-  const capture = { sources, keys: new Map(), before: new Map(), read, abort(error) { finishRead(); fail(error); } };
+  const capture = { sources, keys: new Map(), before: new Map(), snapshots: new Map(), read, abort(error) { finishRead(); fail(error); } };
   if (options.simulationChanges) captures.set(data, capture);
   // A stale tab may still send its own signed replica. It cannot replace the
   // version that another tab saved, including identity/metadata in this batch.

@@ -1,7 +1,31 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { World, key } from '../www/engine.js';
-import { compileHull, fitsHullAt, sweepsHullAt } from '../www/motion-hull.js';
+import { motionOrder } from '../www/breeding.js';
+import { BodyLayout, compileHull, fitsHullAt, sweepsHullAt } from '../www/motion-hull.js';
+
+test('亲鱼跨海界平移、转身、被分开或恢复旧小数位置，联合鱼体始终与重新摆放相同', () => {
+  const world = new World(100, 'test', { populate: false });
+  const male = { id: 'a' }, female = { id: 'b' };
+  world.data.fishes = { a: male, b: female };
+  world.data.breeding = { pair: { id: 'pair', status: 'active', male: 'a', female: 'b', started: 100, motion: { cx: 0, cy: 0 } } };
+  const groups = new Map([
+    ['a', [{ id: 'eye', ch: 'O', x: -1, y: 0 }, { id: 'tail', ch: '鱼', x: 1, y: 1 }]],
+    ['b', [{ id: 'brow', ch: '头', x: 0, y: -1 }]]
+  ]);
+  const layout = new BodyLayout(groups), roster = [male, female];
+  world.stableFishRoster = () => roster;
+  const fresh = { data: world.data };
+  for (const [mx, my, mf, fx, fy, ff] of [
+    [998, 50, 1, 1, 50, 1], [999, 51, 1, 2, 51, 1], [0, 52, 1, 3, 52, 1],
+    [10, 51, -1, 7, 51, -1], [11, 51, -1, 500, 52, 1], [10.3, 51.25, -1, 8.4, 52.25, 1],
+    [12, 50, 1, 15, 50, 1]
+  ]) {
+    Object.assign(male, { x: mx, y: my, facing: mf });
+    Object.assign(female, { x: fx, y: fy, facing: ff });
+    assert.deepEqual(motionOrder(world, groups, layout), motionOrder(fresh, groups, new BodyLayout(groups)));
+  }
+});
 
 test('逐行转身和占位与逐鱼元判定一致，包括越界、重叠、食物和鱼体内部空隙', () => {
   const world = new World(100, 'test', { populate: false });

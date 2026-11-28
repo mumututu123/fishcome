@@ -5,17 +5,37 @@ import { decodeReplicaRowDelta, encodeReplicaRowDelta, replicaRowBase } from './
 // One record per line lets the receiver assemble tables without retaining the wire text.
 // A record may span several signed pages, including in the middle of a surrogate pair.
 export const PAGE_UNITS = 64 * 1024;
+export const LIVE_FRAME_UNITS = 1024 * 1024;
 export const MAX_RECORD_UNITS = 32 * 1024 * 1024;
 export const MAX_STREAM_UNITS = 256 * 1024 * 1024;
 const REPLICA_KINDS = new Set(['hello', 'catchup', 'merge', 'world', 'live']);
 const line = row => JSON.stringify(row) + '\n';
 const safeKey = key => typeof key === 'string' && !['__proto__', 'prototype', 'constructor'].includes(key);
+const frameArrays = new Set(['fishes', 'chars', 'travel', 'contacts']);
 
-function* lines(body) {
+function* batches(rows) {
+  const prefix = '["batch",[';
+  let parts = [], length = prefix.length + 3;
+  for (const row of rows) {
+    const text = JSON.stringify(row);
+    if (parts.length && (parts.length === 128 || length + text.length + 1 > MAX_RECORD_UNITS)) {
+      yield prefix + parts.join(',') + ']]\n';
+      parts = []; length = prefix.length + 3;
+    }
+    parts.push(text);
+    length += text.length + 1;
+  }
+  if (parts.length) yield prefix + parts.join(',') + ']]\n';
+}
+
+function* lines(body, frame) {
   const { world, ...header } = body;
   yield line(['header', header]);
   for (const [field, value] of Object.entries(world)) {
-    if (value && typeof value === 'object' && !Array.isArray(value)) {
+    if (frame && Array.isArray(value) && frameArrays.has(field)) {
+      yield line(['array', field]);
+      yield* batches(value);
+    } else if (value && typeof value === 'object' && !Array.isArray(value)) {
       yield line(['table', field]);
       // Do not materialize a second array containing every record or entry.
       for (const id in value) if (Object.hasOwn(value, id) && value[id] !== undefined) yield line(['row', id, value[id]]);
@@ -23,30 +43,32 @@ function* lines(body) {
   }
 }
 
-export function* replicaPages(body) {
+export function* replicaPages(body, frame = false) {
+  const size = frame ? LIVE_FRAME_UNITS : PAGE_UNITS;
   let page = '', total = 0;
-  for (const row of lines(body)) {
+  for (const row of lines(body, frame)) {
     total += row.length;
     if (row.length > MAX_RECORD_UNITS || total > MAX_STREAM_UNITS) throw new Error('世界分块超过接收容量');
     let offset = 0;
     while (offset < row.length) {
-      const end = Math.min(row.length, offset + PAGE_UNITS - page.length);
+      const end = Math.min(row.length, offset + size - page.length);
       page += row.slice(offset, end);
       offset = end;
-      if (page.length === PAGE_UNITS) { yield { text: page, last: false }; page = ''; }
+      if (page.length === size) { yield { text: page, last: false }; page = ''; }
     }
   }
   yield { text: page, last: true };
 }
 
 export class ReplicaReader {
+  constructor(frame = false) { this.frame = frame; }
   tail = '';
   units = 0;
   table = null;
   body = null;
   append(text, last) {
     this.units += text.length;
-    if (text.length > PAGE_UNITS || this.units > MAX_STREAM_UNITS) throw new Error('世界分块超过接收容量');
+    if (text.length > (this.frame ? LIVE_FRAME_UNITS : PAGE_UNITS) || this.units > MAX_STREAM_UNITS) throw new Error('世界分块超过接收容量');
     const rows = text.split('\n');
     rows[0] = this.tail + rows[0];
     this.tail = rows.pop();
@@ -56,10 +78,14 @@ export class ReplicaReader {
       const [op, key, value] = JSON.parse(row);
       if (op === 'header' && !this.body && key && typeof key === 'object' && !Array.isArray(key) && !Object.hasOwn(key, 'world')) {
         this.body = { ...key, world: {} };
+      } else if (this.frame && op === 'array' && this.body && frameArrays.has(key) && !Object.hasOwn(this.body.world, key)) {
+        this.body.world[key] = this.table = [];
+      } else if (this.frame && op === 'batch' && Array.isArray(this.table) && Array.isArray(key) && key.length <= 128) {
+        this.table.push(...key);
       } else if (this.body && safeKey(key) && (op === 'value' || op === 'table') && !Object.hasOwn(this.body.world, key)) {
         this.table = op === 'table' ? {} : null;
         this.body.world[key] = op === 'table' ? this.table : value;
-      } else if (op === 'row' && this.table && safeKey(key) && !Object.hasOwn(this.table, key)) {
+      } else if (op === 'row' && this.table && !Array.isArray(this.table) && safeKey(key) && !Object.hasOwn(this.table, key)) {
         this.table[key] = value;
       } else throw new Error('世界分块格式无效');
     }
@@ -145,7 +171,7 @@ export function coalesceWorld(pending, next) {
     if (field === 'roots' || field === 'bubbles' || field === 'contacts' || !pending.world[field]) continue;
     world[field] = { ...pending.world[field], ...world[field] };
   }
-  return { ...header, delta: pending.delta, world };
+  return { ...header, ...(Number.isFinite(pending.fromTick) && { fromTick: pending.fromTick }), delta: pending.delta, world };
 }
 
 export class ReplicaTransfers {
@@ -157,12 +183,19 @@ export class ReplicaTransfers {
     this.live = new Map();
     this.rowsSent = new WeakMap();
     this.rowsReceived = new WeakMap();
+    this.queuedTicks = new WeakMap();
   }
-  publishLive(body, peers) {
+  publishLive(body, peers, previousStep) {
     for (const peer of peers) {
+      // A single missed publication can be filled immediately from the last
+      // immutable cut. A longer gap requests the peer's verified full world.
+      const tick = this.queuedTicks.get(peer);
+      const packet = body.delta && tick < body.fromTick && previousStep?.world.tick === body.fromTick && previousStep.fromTick <= tick
+        ? coalesceWorld(previousStep, body) : body;
+      this.queuedTicks.set(peer, body.world.tick);
       const current = this.live.get(peer);
-      if (current) current.pending = coalesceWorld(current.pending, body);
-      else this.live.set(peer, { pending: body, receipt: null, running: false });
+      if (current) current.pending = coalesceWorld(current.pending, packet);
+      else this.live.set(peer, { pending: packet, receipt: null, running: false });
       this.resumeLive(peer);
     }
   }
@@ -177,19 +210,21 @@ export class ReplicaTransfers {
       while (lane.pending) {
         const body = lane.pending;
         lane.pending = null;
-        const encoded = peer.replicaRows ? encodeReplicaRowDelta(body, this.rowsSent.get(peer)) : body;
+        let prior = this.rowsSent.get(peer);
+        const encoded = peer.replicaRows ? encodeReplicaRowDelta(body, prior, peer.replicaFrames) : body;
         let id = await this.sendLivePacket(peer, lane, encoded);
-        if (!id && encoded !== body) id = await this.sendLivePacket(peer, lane, body);
+        if (!id && encoded !== body) { prior = null; id = await this.sendLivePacket(peer, lane, body); }
         if (!id) throw new Error('伙伴拒绝世界增量');
-        if (peer.replicaRows) this.rowsSent.set(peer, replicaRowBase(id, body.world));
+        if (peer.replicaRows) this.rowsSent.set(peer, replicaRowBase(id, body.world, peer.replicaFrames, encoded.frameRows && prior));
       }
     } finally { if (this.live.get(peer) === lane) this.live.delete(peer); }
   }
   async sendLivePacket(peer, lane, body) {
     const id = crypto.randomUUID();
     let index = 0;
-    for (const page of replicaPages(body)) {
-      const packet = { id, kind: 'live', index: index++, ...page };
+    const frame = peer.replicaFrames && body.frameRows === true;
+    for (const page of replicaPages(body, frame)) {
+      const packet = { id, kind: 'live', index: index++, ...page, ...(frame && { frame: true }) };
       if (!page.last) { await this.network.directControl(peer, 'replicaPage', packet); continue; }
       const applied = new Promise((resolve, reject) => { lane.receipt = { id, index: packet.index, resolve, reject }; });
       const timeout = setTimeout(() => lane.receipt?.reject(new Error('伙伴应用世界增量超时')), body.delta ? ACK_MS : RESUME_MS);
@@ -273,10 +308,12 @@ export class ReplicaTransfers {
       return false;
     }
     const direct = kind === 'hello' || kind === 'catchup', live = kind === 'live';
+    const frame = message.body.frame === true;
+    const size = frame ? LIVE_FRAME_UNITS : PAGE_UNITS;
     if (!REPLICA_KINDS.has(kind) || typeof id !== 'string' || id.length !== 36 ||
-        !Number.isSafeInteger(index) || index < 0 || index > Math.ceil(MAX_STREAM_UNITS / PAGE_UNITS) ||
-        typeof last !== 'boolean' || typeof text !== 'string' || text.length > PAGE_UNITS ||
-        (!last && text.length !== PAGE_UNITS) || ((direct || live) && message.from !== peer.node) ||
+        !Number.isSafeInteger(index) || index < 0 || index > Math.floor(MAX_STREAM_UNITS / size) ||
+        typeof last !== 'boolean' || typeof text !== 'string' || text.length > size || frame && (!live || !peer.replicaFrames) ||
+        (!last && text.length !== size) || ((direct || live) && message.from !== peer.node) ||
         (live && !peer.replicaLive)) throw new Error('无效的世界分块');
     const key = message.from + ':' + id;
     const acknowledge = next => direct && this.network.directControl(peer, 'replicaReceipt', { id, index, next });
@@ -286,12 +323,12 @@ export class ReplicaTransfers {
     if (!state) {
       if (direct && index > 0) { await acknowledge(0); return false; }
       if (this.incoming.size >= 16 || !live && index > 16) throw new Error('世界分块接收队列已满');
-      state = { kind, actor: message.actor, next: 0, pending: new Map(), reader: new ReplicaReader() };
+      state = { kind, actor: message.actor, next: 0, pending: new Map(), reader: new ReplicaReader(frame) };
       this.incoming.set(key, state);
     }
     // A live edge has one update in flight, but decompressing and verifying
     // its pages can finish out of order. The shared byte budget below still applies.
-    if (state.kind !== kind || state.actor !== message.actor || !live && index > state.next + 16 ||
+    if (state.kind !== kind || state.actor !== message.actor || state.reader.frame !== frame || !live && index > state.next + 16 ||
         state.endIndex !== undefined && (index > state.endIndex || last && index !== state.endIndex)) throw new Error('世界分块版本不一致');
     if (last) state.endIndex = index;
     if (index < state.next || state.pending.has(index)) {
@@ -299,7 +336,7 @@ export class ReplicaTransfers {
       await acknowledge(state.next);
       return false;
     }
-    const inFlight = [...this.incoming.values()].reduce((sum, s) => sum + s.reader.units + s.pending.size * PAGE_UNITS, 0);
+    const inFlight = [...this.incoming.values()].reduce((sum, s) => sum + s.reader.units + s.pending.size * (s.reader.frame ? LIVE_FRAME_UNITS : PAGE_UNITS), 0);
     if (inFlight + text.length > MAX_STREAM_UNITS) throw new Error('世界分块接收容量已满');
     this.expire(key, state);
     state.pending.set(index, { text, last });
@@ -311,14 +348,16 @@ export class ReplicaTransfers {
         if (!body) continue;
         if (state.pending.size) throw new Error('世界分块结束位置无效');
         if (kind === 'catchup' && body.base !== peer.confirmedReplica) throw new Error('分块变更引用了未确认的世界版本');
+        const prior = body.frameRows && this.rowsReceived.get(peer);
+        if (frame !== (body.frameRows === true) || frame && !Object.hasOwn(body, 'rowBase')) throw new Error('实时帧格式不一致');
         if (Object.hasOwn(body, 'rowBase')) {
           if (!live || !peer.replicaRows) throw new Error('伙伴未确认实时变更格式');
-          body = decodeReplicaRowDelta(body, this.rowsReceived.get(peer));
+          body = decodeReplicaRowDelta(body, this.rowsReceived.get(peer), frame);
         }
         if (body) {
           state.applying = this.network.onMessage({ id, kind: kind === 'catchup' ? 'merge' : live ? 'world' : kind, actor: message.actor, from: message.from, key: message.key, body }, peer);
           await state.applying;
-          if (live && peer.replicaRows) this.rowsReceived.set(peer, replicaRowBase(id, body.world));
+          if (live && peer.replicaRows) this.rowsReceived.set(peer, replicaRowBase(id, body.world, peer.replicaFrames, prior));
         }
         if (kind === 'hello') { peer.confirmedReplica = id; this.resumeLive(peer); }
         clearTimeout(state.timer); this.incoming.delete(key);

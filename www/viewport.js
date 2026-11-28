@@ -180,7 +180,10 @@ export class ViewportCells {
     for (const [changes, owners] of [[fishes, this.owners.fish], [scenes, this.owners.scene]]) {
       if (!changes) continue;
       for (const id of changes.remove || []) this.moveOwner(owners.get(id));
-      for (const [id, pose] of changes.set || []) this.moveOwner(owners.get(id), pose);
+      const frame = changes.frame;
+      if (frame?.moved) {
+        for (const i of frame.moved) this.moveOwner(owners.get(frame.idAt(i)), frame.records[i]);
+      } else for (const [id, pose] of changes.set || []) this.moveOwner(owners.get(id), pose);
     }
   }
 

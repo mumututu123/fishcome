@@ -4,6 +4,7 @@ import { wrapX, nearX, deltaX } from './geography.js';
 import { recordStory } from './life.js';
 import { capturedFishIds } from './legends.js';
 import { densityField, contactTime } from './ecology.js';
+import { collectGridPairs } from './breeding-contacts.js';
 
 export const CONTACT_TIME = 5000;
 export const BREEDING_TIME = 3600000;
@@ -157,22 +158,34 @@ function contactWait(density, father, fatherCells, mother, motherCells, scenery,
   const p = cellPosition(father, maleCell);
   return contactTime(density((p.x + nearX(q.x, p.x)) / 2, (p.y + q.y) / 2));
 }
+const contactRosters = new WeakMap();
+function contactRoster(world, groups) {
+  const revision = world.originRevision?.(), previous = contactRosters.get(world);
+  if (previous && previous.revision === revision && previous.groups === groups) return previous;
+  const males = [], females = new Set();
+  let ambiguousIds = false, probeCount = 0;
+  for (const [id, cells] of groups) {
+    const fish = world.readFish(id);
+    if (!fish) continue;
+    if (typeof id !== 'string' || id.includes('|')) ambiguousIds = true;
+    const gender = fishOrigin(world.data, id)?.gender;
+    if (gender === 'male') { males.push(fish); probeCount += cells.length * NEIGHBORS.length; }
+    if (gender === 'female') females.add(id);
+  }
+  const roster = { revision, groups, males, females, probeCount, ambiguousIds };
+  if (revision !== undefined) contactRosters.set(world, roster);
+  return roster;
+}
 export function updateContacts(world, now, groups, scenery, captured = capturedFishIds(world.data, now), occupancy) {
   world.data.contacts ||= {}; world.data.breeding ||= {};
   const taken = new Set(activeRecords(world.data).flatMap(record => [record.male, record.female]));
-  const males = [], females = new Set(), pairs = new Map();
-  let density, ambiguousIds = false;
-  for (const id of groups.keys()) {
-    const fish = world.data.fishes[id];
-    if (!fish || taken.has(id) || captured.has(id)) continue;
-    if (typeof id !== 'string' || id.includes('|')) ambiguousIds = true;
-    const op = world.data.ops[id], gender = op?.kind === 'fish' ? op.gender : fishOrigin(world.data, id)?.gender;
-    if (gender === 'male') males.push(fish);
-    if (gender === 'female') females.add(id);
-  }
+  const roster = contactRoster(world, groups), { males, females, ambiguousIds } = roster, pairs = new Map();
+  let density;
   if (males.length && females.size) occupancy ||= world.movementGrid(groups);
-  if (females.size) for (const fish of males) {
+  const scanned = !ambiguousIds && collectGridPairs(world, occupancy, scenery, roster, taken, captured, pairs);
+  if (!scanned && females.size) for (const fish of males) {
     const id = fish.id;
+    if (taken.has(id) || captured.has(id)) continue;
     const cells = groups.get(id);
     const hull = density && occupancy.integerCells && !ambiguousIds && occupancy.layout?.hull(cells);
     if (hull?.namedCells) {
@@ -189,7 +202,7 @@ export function updateContacts(world, now, groups, scenery, captured = capturedF
         if (!occupants || dx && dy && (scenery.has(key(x, p.y)) || scenery.has(key(p.x, y)))) continue;
         const cellId = typeof cell.id === 'string' ? cell.id : null;
         for (const other of occupants) {
-          if (!females.has(other)) continue;
+          if (!females.has(other) || taken.has(other) || captured.has(other)) continue;
           if (world.ambient && !density) density = densityField(world, scenery, occupancy.integerCells ? occupancy.cells : undefined);
           const pairKey = `${id}|${other}`, pair = pairs.get(pairKey);
           if (!pair) pairs.set(pairKey, { male: id, female: other, firstMaleId: cellId });
@@ -199,13 +212,14 @@ export function updateContacts(world, now, groups, scenery, captured = capturedF
       }
     }
   }
-  const contacts = {};
-  for (const [key, { male, female, firstMaleId }] of [...pairs].sort(([a], [b]) => a.localeCompare(b))) {
+  const contacts = {}, previousContacts = world.readContacts?.() ?? world.data.contacts;
+  const alreadyTaken = taken.size;
+  for (const [key, { male, female, firstMaleId, wait: gridWait }] of [...pairs].sort(([a], [b]) => a.localeCompare(b))) {
     if (taken.has(male) || taken.has(female)) continue;
-    const father = world.data.fishes[male], mother = world.data.fishes[female], fc = groups.get(male), mc = groups.get(female);
-    const wait = contactWait(density, father, fc, mother, mc, scenery, firstMaleId);
+    const father = world.readFish(male), mother = world.readFish(female), fc = groups.get(male), mc = groups.get(female);
+    const wait = gridWait ?? contactWait(density, father, fc, mother, mc, scenery, firstMaleId);
     if (!Number.isFinite(wait)) continue;
-    const prior = world.data.contacts[key], since = prior && now >= prior.lastAt && now - prior.lastAt <= CONFIG.step * 2 ? prior.since : now;
+    const prior = previousContacts[key], since = prior && now >= prior.lastAt && now - prior.lastAt <= CONFIG.step * 2 ? prior.since : now;
     contacts[key] = { male, female, since, lastAt: now };
     if (now - since < wait) continue;
     const all = [...fc.map(cell => cellPosition(father, cell)), ...mc.map(cell => cellPosition(mother, cell))];
@@ -214,26 +228,60 @@ export function updateContacts(world, now, groups, scenery, captured = capturedF
     writeBreedingRecord(world.data.breeding, id, { id, male, female, started, ends: started + BREEDING_TIME, at: now, status: 'active', contact: contactCells(father, fc, mother, mc, scenery), initialPose, pose: clone(initialPose), motion: { cx: 0, cy: 0 } });
     taken.add(male); taken.add(female); delete contacts[key]; world.dirty = true;
   }
-  world.data.contacts = Object.fromEntries(Object.entries(contacts).filter(([, pair]) => !taken.has(pair.male) && !taken.has(pair.female)));
+  if (taken.size !== alreadyTaken) for (const key of Object.keys(contacts)) {
+    const pair = contacts[key];
+    if (taken.has(pair.male) || taken.has(pair.female)) delete contacts[key];
+  }
+  world.data.contacts = contacts;
   world.data.contactAt = now;
 }
-export function motionOrder(world, groups, layout = world.bodyLayout(groups)) {
+function integralPose(fish) {
+  return Number.isInteger(fish.x) && Math.abs(fish.x) < 2 * CONFIG.width &&
+    Number.isInteger(fish.y) && Math.abs(fish.y) < 2 * CONFIG.depth && Math.abs(fish.facing) === 1;
+}
+
+function pairBody(record, members, layout, cache) {
+  const [male, female] = members, maleBody = layout.groups.get(male.id), femaleBody = layout.groups.get(female.id);
+  const reusable = cache && integralPose(male) && integralPose(female);
+  const old = reusable && cache.get(record);
+  if (old && old.maleBody === maleBody && old.femaleBody === femaleBody) {
+    const [a, b] = old.offsets;
+    if (male.facing === a.facing && female.facing === b.facing &&
+        deltaX(female.x, male.x) === b.x - a.x && female.y - male.y === b.y - a.y) {
+      return { cells: old.cells, offsets: old.offsets, x: male.x - a.x, y: male.y - a.y };
+    }
+  }
+  const cells = [];
+  for (const fish of members) for (const cell of layout.groups.get(fish.id) || []) {
+    cells.push({ ...cell, x: nearX(fish.x + fish.facing * cell.x, male.x), y: fish.y + cell.y });
+  }
+  const { minX, minY } = bounds(cells);
+  for (const cell of cells) { cell.x -= minX; cell.y -= minY; }
+  const offsets = members.map(fish => ({ x: nearX(fish.x, male.x) - minX, y: fish.y - minY, facing: fish.facing }));
+  // Translation changes only the pair's anchor. A turn or an edit to either
+  // body builds its new shape; legacy fractional geometry retains its original rounding.
+  if (reusable && cells.length && maleBody && femaleBody && layout.hull(maleBody) && layout.hull(femaleBody)) {
+    cache.set(record, { cells, offsets, maleBody, femaleBody });
+  }
+  return { cells, offsets, x: minX, y: minY };
+}
+
+export function motionOrder(world, groups, layout = world.bodyLayout(groups), singles = layout.ordered) {
   const active = activeRecords(world.data);
-  if (!active.length) return layout.ordered;
+  if (!active.length) return singles;
   const result = [], paired = new Set();
+  const cache = world.stableFishRoster && (layout.pairBodies ??= new WeakMap());
   for (const record of active.sort((a, b) => a.id.localeCompare(b.id))) {
     const members = [world.data.fishes[record.male], world.data.fishes[record.female]];
     if (members.some(fish => !fish)) continue;
-    const placed = members.flatMap(fish => (groups.get(fish.id) || []).map(cell => { const p = cellPosition(fish, cell); return { ...cell, x: nearX(p.x, members[0].x), y: p.y }; })), b = bounds(placed);
-    const fish = { id: record.id, x: b.minX, y: b.minY, facing: 1, created: record.started, ...record.motion };
-    const cells = placed.map(cell => ({ ...cell, x: cell.x - b.minX, y: cell.y - b.minY }));
-    const offsets = members.map(member => ({ x: nearX(member.x, members[0].x) - b.minX, y: member.y - b.minY, facing: member.facing }));
+    const { cells, offsets, x, y } = pairBody(record, members, layout, cache);
+    const fish = { id: record.id, x, y, facing: 1, created: record.started, ...record.motion };
     result.push([record.id, cells, { id: record.id, fish, cells, members, offsets, record }]);
     for (const member of members) paired.add(member.id);
   }
   const units = [];
   let index = 0;
-  for (const entry of layout.ordered) {
+  for (const entry of singles) {
     const [id] = entry;
     if (paired.has(id)) continue;
     while (index < result.length && result[index][0].localeCompare(id) <= 0) units.push(result[index++]);

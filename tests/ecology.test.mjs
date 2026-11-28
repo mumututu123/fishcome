@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { World, hash, clone } from '../www/engine.js';
 import { updateContacts, finishBreeding } from '../www/breeding.js';
+import { collectGridPairs } from '../www/breeding-contacts.js';
 import { ECOLOGY, newEcology, densityField, contactTime, growthChance, weedExpires, weedAlpha, updateEcology, looseWither, mergeEcology, validEcology } from '../www/ecology.js';
 import { restoreCheckpoint } from '../www/lifecycle.js';
 const HOUR = 3600000, now = Date.now(), cell = (x, y, ch = 'Q') => ({ x, y, ch, color: '#88aacc' });
@@ -47,6 +48,10 @@ test('繁殖密度按公鱼编号和母鱼本地化编号取接触点，兼容�
     assert.equal(contactTime(density(25, 20)), 5000);
 
     const groups = w.fishGroups(), scenery = w.sceneryMap();
+    const grid = w.movementGrid(groups), pairs = new Map();
+    const roster = { males: [w.readFish(male)], females: new Set([female]), probeCount: grid.cells.length };
+    assert.equal(collectGridPairs(w, grid, scenery, roster, new Set(), new Set(), pairs), left === 19);
+    if (left === 19) assert.equal(pairs.get(male + '|' + female)?.wait, 20000);
     for (let elapsed = 0; elapsed < 20000; elapsed += 500) {
       updateContacts(w, now + elapsed, groups, scenery);
       assert.equal(w.breedingState(male), undefined);
@@ -56,6 +61,28 @@ test('繁殖密度按公鱼编号和母鱼本地化编号取接触点，兼容�
       male: ['Z-male', 'a-male'],
       female: left === 19 ? ['Z-female', 'a-female', 'extra-female'] : ['Z-female', 'extra-female']
     });
+  }
+});
+test('海图四条接触边跨越接缝，墙角遮挡与拥挤区都不触发繁殖', () => {
+  for (const [dx, dy] of [[1, 0], [0, 1], [1, 1], [-1, 1]]) {
+    const w = sea(), male = fish(w, 'male', 20), female = fish(w, 'female', 24);
+    const x = dx < 0 ? 0 : 999, y = 20;
+    const groups = w.fishGroups(), dad = w.readFish(male), mum = w.readFish(female);
+    dad.x = x; mum.x = (x + dx + 1000) % 1000; mum.y = y + dy;
+    for (const cells of groups.values()) cells.splice(1);
+    const grid = w.movementGrid(groups), females = new Set([female]);
+    const pairs = scenery => {
+      const rows = new Map();
+      assert(collectGridPairs(w, grid, scenery, { males: [dad], females, probeCount: grid.cells.length }, new Set(), new Set(), rows));
+      return rows;
+    };
+    assert.equal(pairs(new Map()).get(male + '|' + female)?.wait, 5000);
+    if (dx && dy) {
+      const corner = { scene: { x: mum.x, y }, cell: { x: 0, y: 0 } };
+      assert.equal(pairs(new Map([[mum.x + ',' + y, corner]])).size, 0);
+    }
+    fill(w, x, y, 500);
+    assert.equal(pairs(w.sceneryMap()).size, 0);
   }
 });
 test('已经开始的繁殖不因后来的拥挤被取消，出生不增加鱼元', () => {

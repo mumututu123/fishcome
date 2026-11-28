@@ -185,6 +185,7 @@ for (const [object, method, name] of [
 if (${Boolean(values['rebuild-viewport'])}) renderer.applyMergedChars = () => {};
 (${recordDraw.toString()})(renderer, testData.frames, window.densePage, ${Boolean(values.trace)});
 window.denseSurvey = () => ({ ...testData, node: network?.node, leader: network && leader(), peers: network?.live().length,
+  simulationFailure: simulation.failure?.error?.message,
   page: window.densePage, timeOrigin: performance.timeOrigin,
   tick: world.data.tick, fish: Object.keys(world.data.fishes).length, rejected: network?.stats.rejected,
   phases: window.densePhases, longTasks: window.denseLongTasks, replicaFailures: window.denseReplicaFailures,
@@ -529,7 +530,8 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
     const phases = {};
     for (const row of page.phases.filter(sampled)) (phases[row.phase] ||= []).push(row);
     const presentations = trace && readPresentations(trace.traceEvents, page, recent, ended);
-    return { leader: page.node === page.leader, fish: page.fish, ...frameSummary(page, presentations, recent, ended, coordinator.steps, requests),
+    return { leader: page.node === page.leader, fish: page.fish, simulationFailure: page.simulationFailure,
+      ...frameSummary(page, presentations, recent, ended, coordinator.steps, requests),
       visible: stats(frames.map(event => event.visible)), noFish, rejected: page.rejected, saves: stats(page.saves.filter(sampled).map(event => event.ms)),
       phases: Object.fromEntries(Object.entries(phases).map(([name, rows]) => [name, { sync: stats(rows.map(row => row.sync)), total: stats(rows.map(row => row.total)) }])),
       longestTasks: page.longTasks.filter(sampled).sort((a, b) => b.ms - a.ms).slice(0, 8),

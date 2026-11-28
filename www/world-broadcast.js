@@ -1,6 +1,9 @@
 import { breedingForBroadcast, stopBreedingBroadcast } from './breeding.js';
 import { replicaRowEquality } from './replica-stream.js';
-import { CONFIG } from './engine.js';
+import { committedStepFields, FishPoseFrame } from './replica-row-delta.js';
+import { shanghaiDay } from './fish-status.js';
+import { applyBondIntervals } from './bond-interval.js';
+import { CONFIG, detachReplicaRows } from './engine.js';
 import { deltaX } from './geography.js';
 import { capturedFishIds } from './legends.js';
 
@@ -21,7 +24,8 @@ function packet(data, rows, breeding) {
 function fullRows(data) { return Object.fromEntries(rowFields.map(field => [field, data[field] || {}])); }
 
 function baseline(world, at) {
-  return { rows: Object.fromEntries(rowFields.map(field => [field, new Map(Object.entries(world[field] || {}))])), fullAt: at, tick: world.tick };
+  return { rows: Object.fromEntries(rowFields.map(field => [field, new Map(Object.entries(world[field] || {}))])),
+    fishes: world.fishes, life: world.life, roots: world.roots, terrain: world.terrain, fullAt: at, tick: world.tick };
 }
 
 function changedRows(data, base, pending) {
@@ -48,39 +52,102 @@ function changedRows(data, base, pending) {
   return rows;
 }
 
-// A running sea sends thousands of fish and bond records with only scalar fields.
-// Detach those rows without serializing their fields a second time. Older fish
-// can carry nested ancestry, which still needs its own deep copy.
-function detachRows(rows) {
-  const result = { ...rows };
-  for (const id of Object.keys(result)) {
-    const row = result[id];
-    if (!row || Object.getPrototypeOf(row) !== Object.prototype) {
-      result[id] = structuredClone(row);
-      continue;
-    }
-    const copy = { ...row };
-    result[id] = copy;
-    for (const field in copy) {
-      const value = copy[field], type = typeof value;
-      if ((value !== null && type === 'object') || type === 'function' || type === 'symbol') {
-        result[id] = structuredClone(row);
-        break;
-      }
-    }
-  }
-  return result;
-}
-
 function captureDelta(delta) {
   const { fishes, life } = delta;
   const snapshot = structuredClone({ ...delta, fishes: null, life: life?.bonds ? { ...life, bonds: null } : life });
-  snapshot.fishes = detachRows(fishes);
-  if (life?.bonds) snapshot.life.bonds = detachRows(life.bonds);
+  snapshot.fishes = detachReplicaRows(fishes);
+  if (life?.bonds) snapshot.life.bonds = detachReplicaRows(life.bonds);
   return snapshot;
 }
 
-function encodeSwims(fishes, directions) {
+// The simulation already identified the exact fields it replaced. Reuse the
+// previous detached records as the static part of a contiguous publication.
+function captureStep(data, base, patch, breeding) {
+  const worker = patch.workerChanges, rows = fullRows({});
+  const source = { previousFishes: base.fishes, travelDay: shanghaiDay(data.tick), journeys: new Map() };
+  const poses = patch.tables.fishes && FishPoseFrame.capture(worker.tables.fishes, patch.tables.fishes, base.poseFrame, base.fishes, data.tick);
+  if (poses) source.poses = poses;
+  else reconcileFishRows(base);
+  const changed = replicaRowEquality(data.tick);
+  for (const field of rowFields) {
+    if (poses && field === 'fishes') continue;
+    const edits = patch.tables[field];
+    if (!edits) continue;
+    const last = base.rows[field];
+    for (const id of edits.remove) last.delete(id);
+    const frame = edits.frame, length = frame ? frame.length : edits.set.length;
+    for (let i = 0; i < length; i++) {
+      const id = frame ? frame.idAt(i) : edits.set[i][0], value = frame ? frame.records[i] : edits.set[i][1];
+      const prior = last.get(id);
+      if (prior !== undefined && changed(field, prior, value)) continue;
+      const edit = worker.tables[field]?.set[i];
+      if (prior && field === 'fishes' && edit !== undefined && !Array.isArray(edit)) {
+        rows.fishes[id] = { ...prior, x: value.x, y: value.y, facing: value.facing,
+          cx: value.cx, cy: value.cy, posAt: value.posAt };
+      } else if (prior && field === 'travel' && edit?.length === 3 && typeof edit[1] === 'string') {
+        const day = edit[1];
+        rows.travel[id] = { ...prior, days: { ...prior.days, [day]: value.days[day] } };
+        if (day === source.travelDay) source.journeys.set(id, prior);
+      } else if (prior && field === 'chars' && edit?.length === 3) {
+        const copy = { ...prior, ...edit[1] };
+        for (const key in edit[1]) {
+          const updated = copy[key];
+          if (updated !== null && typeof updated === 'object') copy[key] = structuredClone(updated);
+        }
+        for (const key of edit[2] || []) delete copy[key];
+        rows.chars[id] = copy;
+      } else {
+        rows[field][id] = field === 'fishes' || field === 'travel' || field === 'chars' ? structuredClone(value) : value;
+      }
+    }
+  }
+  const detached = structuredClone({ ...packet(data, rows, breeding), roots: null, terrain: null, life: null, fishes: null, chars: null, travel: null });
+  for (const field of ['roots', 'terrain']) detached[field] = Object.hasOwn(worker.values, field) || worker.tables[field]
+    ? structuredClone(data[field]) : base[field];
+  for (const field of ['fishes', 'chars', 'travel']) {
+    if (poses && field === 'fishes') {
+      Object.defineProperty(detached, field, { enumerable: true, configurable: true, get: () => poses.table() });
+      continue;
+    }
+    detached[field] = rows[field];
+  }
+  if (!base.life || Object.hasOwn(worker.values, 'life')) detached.life = structuredClone(data.life);
+  else if (!worker.life) detached.life = base.life;
+  else {
+    const { properties: [properties, remove], bonds } = worker.life;
+    const life = { ...base.life, ...structuredClone(properties) };
+    for (const key of remove || []) delete life[key];
+    if (bonds?.intervals) {
+      // Both cuts use the same order as the committed worker. Keep the
+      // operation alongside its result for peers that confirmed this cut.
+      source.bonds = { prior: base.life.bonds, changes: bonds };
+      life.bonds = applyBondIntervals(base.life.bonds, bonds);
+    } else if (bonds) {
+      const keys = bonds.keys;
+      const table = keys || bonds.ordered ? {} : { ...base.life.bonds };
+      for (const key of bonds.remove || []) delete table[key];
+      if (keys) {
+        for (let i = 0; i < keys.length; i++) {
+          const key = keys[i], value = data.life.bonds[key];
+          table[key] = Number.isNaN(bonds.counters[i * 2]) ? structuredClone(value) : { ...value };
+        }
+      } else for (const [key] of bonds.set) table[key] = structuredClone(data.life.bonds[key]);
+      life.bonds = table;
+    }
+    detached.life = life;
+  }
+  committedStepFields.set(detached, source);
+  return detached;
+}
+
+function reconcileFishRows(base) {
+  if (!base.poseFrame) return;
+  const table = base.poseFrame.table();
+  for (const id in table) base.rows.fishes.set(id, table[id]);
+  base.poseFrame = null;
+}
+
+function encodeSwims(ids, directions) {
   if (!directions?.length) return;
   // Ordinals refer to the fish rows already present in the signed world.
   const byFish = new Map(), result = [];
@@ -89,7 +156,7 @@ function encodeSwims(fishes, directions) {
     for (const id of directions[direction]) byFish.set(id, direction);
   }
   let index = 0;
-  for (const id in fishes) if (Object.hasOwn(fishes, id)) {
+  for (const id of ids) {
     const direction = byFish.get(id);
     if (direction !== undefined) (result[direction] ||= []).push(index);
     index++;
@@ -211,6 +278,15 @@ export class ReplicaRecovery {
 
   clear() { this.missed.clear(); }
 
+  gap(message, currentTick) {
+    const { delta, fromTick, world } = message.body;
+    if (delta !== true || fromTick === undefined) return false;
+    if (!Number.isFinite(fromTick) || !Number.isFinite(world?.tick) || fromTick > world.tick) throw new Error('世界增量起止时刻无效');
+    if (fromTick <= currentTick) return false;
+    this.ignore(message);
+    return true;
+  }
+
   ignore({ from, actor, body }) {
     const tick = body?.world?.tick;
     if (!Number.isFinite(tick)) return;
@@ -242,17 +318,25 @@ export class WorldBroadcast {
     this.observesChanges = !!subscribe;
     subscribe?.((world, patch) => {
       if (world.data !== this.source || !this.pending) return;
-      if (!patch) { this.pending = null; return; }
-      for (const field of rowFields) {
-        if (Object.hasOwn(patch.values || {}, field)) { this.pending = null; return; }
-        const changes = patch.tables?.[field];
-        if (!changes) continue;
-        let ids = this.pending.get(field);
-        if (!ids) this.pending.set(field, ids = new Set());
-        for (const [id] of changes.set) ids.add(id);
-        for (const id of changes.remove) ids.add(id);
-      }
+      if (!patch) { this.pending = null; this.step = null; return; }
+      if (this.step) { this.track(this.step); this.step = null; }
+      const onlyPatch = this.firstChange;
+      this.firstChange = false;
+      if (onlyPatch && patch.workerChanges && !rowFields.some(field => Object.hasOwn(patch.values, field))) this.step = patch;
+      else if (this.pending) this.track(patch);
     });
+  }
+
+  track(patch) {
+    for (const field of rowFields) {
+      if (Object.hasOwn(patch.values || {}, field)) { this.pending = null; return; }
+      const changes = patch.tables?.[field];
+      if (!changes) continue;
+      let ids = this.pending.get(field);
+      if (!ids) this.pending.set(field, ids = new Set());
+      for (const [id] of changes.set) ids.add(id);
+      for (const id of changes.remove) ids.add(id);
+    }
   }
 
   reset() {
@@ -264,7 +348,9 @@ export class WorldBroadcast {
     this.network = null;
     this.source = null;
     this.previous = null;
+    this.lastPacket = null;
     this.pending = null;
+    this.step = null;
     this.generation = (this.generation || 0) + 1;
   }
 
@@ -273,6 +359,7 @@ export class WorldBroadcast {
     this.source = data;
     this.trackedBreeding = data.breeding;
     this.pending = this.observesChanges ? new Map() : null;
+    this.firstChange = true;
     return pending;
   }
 
@@ -298,16 +385,29 @@ export class WorldBroadcast {
       if (this.source && (this.source !== data || this.trackedBreeding !== data.breeding)) this.reset();
       this.network = network;
       const previous = this.previous && (now - this.previous.fullAt <= 30000 || network.periodicWorldRequired?.() === false) ? this.previous : null;
+      const step = this.step;
+      this.step = null;
+      const contiguous = step && previous && data.tick === previous.tick + CONFIG.step && step.values.tick === data.tick;
+      if (step && !contiguous && this.pending) this.track(step);
       const pending = this.takeChanges(data);
       const generation = this.generation, breeding = breedingForBroadcast(data.breeding, !previous);
       let world, swims;
+      const fromTick = previous?.tick;
       if (previous) {
-        world = captureDelta(packet(data, changedRows(data, previous, pending), breeding));
-        if (world.tick === previous.tick + CONFIG.step) swims = encodeSwims(world.fishes, directions);
+        if (!contiguous) reconcileFishRows(previous);
+        world = contiguous ? captureStep(data, previous, step, breeding) : captureDelta(packet(data, changedRows(data, previous, pending), breeding));
+        const poses = committedStepFields.get(world)?.poses;
+        if (directions?.length && world.tick === previous.tick + CONFIG.step) swims = encodeSwims(poses ? poses.indices.keys() : Object.keys(world.fishes), directions);
         previous.tick = world.tick;
+        previous.life = world.life;
+        previous.poseFrame = poses;
+        previous.fishes = poses ? poses.token : world.fishes;
+        previous.roots = world.roots;
+        previous.terrain = world.terrain;
         // Retain only the latest detached value for each live row. Ongoing
         // joins keep their own immutable snapshot of the world.
         for (const field of rowFields) {
+          if (poses && field === 'fishes') continue;
           const rows = world[field], last = previous.rows[field];
           for (const id in rows) if (Object.hasOwn(rows, id)) last.set(id, rows[id]);
         }
@@ -319,7 +419,10 @@ export class WorldBroadcast {
         this.previous = baseline(world, now);
         this.needsFull = false;
       }
-      return await network.broadcast('world', { delta: !!previous, ...(swims ? { swims } : {}), world }, { capturedWorld: true });
+      const body = { delta: !!previous, ...(previous && { fromTick }), ...(swims ? { swims } : {}), world };
+      const prior = this.lastPacket;
+      this.lastPacket = body.delta ? body : null;
+      return await network.broadcast('world', body, { capturedWorld: true, previousStep: prior });
     } catch (error) {
       this.reset();
       throw error;

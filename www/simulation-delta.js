@@ -1,3 +1,5 @@
+import { applyBondIntervals } from './bond-interval.js';
+
 // A standalone swimmer publishes one fixed-width row. Ordinary edits and
 // lifecycle changes retain their sparse record format.
 export const motionFields = ['x', 'y', 'facing', 'cx', 'cy', 'posAt'];
@@ -37,13 +39,48 @@ export function rowId(row, knownFish) {
   return typeof row === 'number' ? knownFish[row] : row;
 }
 
-export function expandSimulationPatch(data, patch, knownFish) {
+// The page and its observers share one committed set of complete, immutable
+// records. Only readers of the older [id, record] interface allocate tuples.
+class CommittedRows {
+  constructor(field, table, change, knownFish, tick) {
+    const { set, motion } = change;
+    this.length = set.length;
+    this.ids = new Array(set.length);
+    this.records = new Array(set.length);
+    this.added = [];
+    if (field === 'fishes') this.moved = [];
+    for (let i = 0, offset = 0; i < set.length; i++) {
+      const row = set[i], id = this.ids[i] = rowId(row, knownFish), previous = table[id];
+      let record;
+      if (motion && !Array.isArray(row)) {
+        record = { ...previous };
+        record.x = motion[offset++]; record.y = motion[offset++]; record.facing = motion[offset++];
+        record.cx = motion[offset++]; record.cy = motion[offset++]; record.posAt = tick;
+      } else record = expandRow(table, row)[1];
+      this.records[i] = record;
+      if (previous === undefined && !Object.hasOwn(table, id)) this.added.push(id);
+      if (this.moved && (!previous || previous.x !== record.x || previous.y !== record.y || previous.facing !== record.facing)) this.moved.push(i);
+    }
+  }
+  idAt(i) { return this.ids[i]; }
+  commit(table) {
+    for (let i = 0; i < this.length; i++) table[this.ids[i]] = this.records[i];
+  }
+  entries() {
+    return this.pairs ??= this.ids.map((id, i) => [id, this.records[i]]);
+  }
+}
+
+export function expandSimulationPatch(data, patch, knownFish, commitRows = false) {
   const tables = { ...patch.tables }, values = { ...patch.values };
-  for (const field of ['fishes', 'travel']) {
+  for (const field of ['fishes', 'travel', 'chars']) {
     const change = tables[field];
     if (!change) continue;
     const table = data[field], motion = change.motion;
-    if (motion) {
+    if (commitRows && field !== 'chars') {
+      const frame = new CommittedRows(field, table, change, knownFish, patch.values.tick);
+      tables[field] = { frame, remove: change.remove, get set() { return frame.entries(); } };
+    } else if (motion) {
       let offset = 0;
       const set = change.set.map(row => {
         if (Array.isArray(row)) return expandRow(table, row);
@@ -61,10 +98,12 @@ export function expandSimulationPatch(data, patch, knownFish) {
     values.life = applyFields(data.life, properties);
     if (bonds) {
       const previous = data.life.bonds;
-      if (bonds.counters) {
+      if (bonds.intervals) values.life.bonds = applyBondIntervals(previous, bonds);
+      else if (bonds.counters) {
         const table = {}, { keys, counters, at } = bonds;
         let exception = 0;
-        for (const [i, key] of keys.entries()) {
+        for (let i = 0; i < counters.length / 2; i++) {
+          const key = keys[i];
           const seconds = counters[i * 2];
           if (Number.isNaN(seconds)) {
             Object.defineProperty(table, key, { value: expandRow(previous, bonds.set[exception++])[1], writable: true, enumerable: true, configurable: true });

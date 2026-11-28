@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { changesSince, fitsLegacyEnvelope, PAGE_UNITS, replicaPages, ReplicaReader, ReplicaTransfers } from '../www/replica-stream.js';
-import { decodeReplicaRowDelta, encodeReplicaRowDelta, replicaRowBase } from '../www/replica-row-delta.js';
+import { changesSince, coalesceWorld, fitsLegacyEnvelope, PAGE_UNITS, replicaPages, ReplicaReader, ReplicaTransfers } from '../www/replica-stream.js';
+import { committedStepFields, decodeReplicaRowDelta, encodeReplicaRowDelta, replicaRowBase } from '../www/replica-row-delta.js';
 import { mergeBreeding } from '../www/breeding.js';
 import { ArchiveStore } from '../www/archive.js';
 import { applyInputRows, simulationApplied } from '../www/simulation-changes.js';
@@ -503,9 +503,9 @@ test('紧凑更新重建字段和鱼行顺序，切主或缺步原样发送', ()
   assert.equal(encodeReplicaRowDelta(takeover, base), takeover);
 });
 
-test('一端遗失基准时仅原格式确认本轮，下一轮继续使用紧凑更新', async t => {
-  const peer = { node: 'follower', replicaLive: true, replicaRows: true, confirmedReplica: 'joined' };
-  const via = { node: 'leader', replicaLive: true, replicaRows: true };
+for (const frames of [false, true]) test(`一端遗失基准时原格式重发，随后恢复${frames ? '实时帧' : '旧伙伴格式'}`, async t => {
+  const peer = { node: 'follower', replicaLive: true, replicaRows: true, replicaFrames: frames, confirmedReplica: 'joined' };
+  const via = { node: 'leader', replicaLive: true, replicaRows: true, replicaFrames: frames };
   const received = [], packets = [], errors = [];
   const sender = new ReplicaTransfers({
     directControl(_, kind, body) {
@@ -530,7 +530,109 @@ test('一端遗失基准时仅原格式确认本轮，下一轮继续使用紧�
   await publish(1500);
   assert.deepEqual(received.map(world => [world.tick, world.fishes.a.x]), [[500, 1], [1000, 2], [1500, 3]]);
   assert.deepEqual(packets.map(packet => !!packet.rowBase), [false, true, false, true]);
+  assert.deepEqual(packets.map(packet => !!packet.frameRows), [false, frames, false, frames]);
   assert.deepEqual(errors, []);
+});
+
+test('实时帧保留隔步行程、关系顺序、异常旧格式和接触记录，失去确认后的序号不可用', () => {
+  const fishes = { a: { id: 'a' }, b: { id: 'b' }, c: { id: 'c' } };
+  const day = '1970-01-01', days = { '1969-12-31': 9, [day]: 2 };
+  const bond = (a, b, at) => ({ a, b, seconds: 4, at, lastNear: at, run: 1 });
+  const roots = { test: 1 }, terrain = { seed: 42 }, stories = { one: { text: '鱼' } };
+  const first = { tick: 500, roots, terrain, fishes, travel: { a: { since: 1, days } }, life: { at: 500, bonds: {}, stories } };
+  const initial = replicaRowBase(crypto.randomUUID(), first, true);
+  const second = { ...first, fishes: { ...fishes }, tick: 1000, travel: {}, life: { at: 1000, stories, bonds: { 'a|b': bond('a', 'b', 1000) } } };
+  const base = replicaRowBase(crypto.randomUUID(), second, true, initial);
+  const body = { delta: true, world: { ...second, fishes: { ...fishes }, tick: 1500,
+    travel: { a: { since: 1, days: { ...days, [day]: 5 } } }, contactAt: 1500,
+    contacts: { 'b|a': { male: 'b', female: 'a', since: 1450, lastAt: 1500 }, old: { extra: true } },
+    life: { at: 1500, stories, bonds: { 'a|c': bond('a', 'c', 1500), 'a|b': bond('a', 'b', 1500), old: { custom: true } } } } };
+  const compact = encodeReplicaRowDelta(body, base, true);
+  assert.equal(compact.world.roots, true);
+  assert.equal(compact.world.terrain, true);
+  assert.equal(compact.world.life.stories, true);
+  assert.deepEqual(compact.world.travel, [[0, -1, 5]]);
+  assert.deepEqual(compact.world.life.bonds, [['a|c', bond('a', 'c', 1500)], [0, 24, 1500, 1500], ['old', { custom: true }]]);
+  assert.deepEqual(compact.world.contacts, [[1, 0, 1450], ['old', { extra: true }]]);
+  const stream = [...replicaPages(compact, true)];
+  assert.equal(stream.length, 1);
+  assert.throws(() => new ReplicaReader().append(stream[0].text, true));
+  const received = new ReplicaReader(true).append(stream[0].text, true);
+  assert.deepEqual(decodeReplicaRowDelta(received, base, true), body);
+  assert.throws(() => decodeReplicaRowDelta(received, base, false));
+  for (const invalid of [{ travel: [[14, -1, 5]] }, { contacts: [[0, 22, 1250]] }, { fishes: [[0, -64]] },
+                         { life: { bonds: [[-1, 12, 15, 2, 3]] } }, { contacts: [[1, 0, 1450], [1, 0, 1450]] }]) {
+    assert.throws(() => decodeReplicaRowDelta({ ...compact, world: { ...compact.world, ...invalid } }, base, true));
+  }
+  assert.equal(replicaRowBase(crypto.randomUUID(), { tick: 1500, fishes: {} }, true, base).travel.size, 0);
+  assert.equal(decodeReplicaRowDelta(received, initial, true), null);
+});
+
+test('连续工作线程更新保留旧快照，将完整位置与稀疏字符变更交付伙伴', async () => {
+  let notify;
+  const sender = new WorldBroadcast(callback => { notify = callback; }), world = new World(100), data = world.data;
+  const sink = { live: () => [1], broadcast: (_, body) => body };
+  data.fishes.a = { id: 'a', x: 1, y: 2, facing: 1, cx: 1, cy: 2, posAt: 100, parents: ['p'] };
+  data.chars.c = { id: 'c', x: 1, path: ['north'], old: true };
+  const first = await sender.send(sink, data, 100);
+  data.tick += CONFIG.step;
+  const { a } = data.fishes, { c } = data.chars;
+  a.x = a.cx = 2; a.posAt = data.tick;
+  c.x = 2; c.new = { info: 'retained' }; delete c.old;
+  notify(world, { values: { tick: data.tick }, tables: { fishes: { set: [['a', a]], remove: [] }, chars: { set: [['c', c]], remove: [] } },
+    workerChanges: { values: { tick: data.tick }, tables: { fishes: { set: [0], remove: [], motion: Float64Array.of(2, 2, 1, 2, 2) },
+      chars: { set: [['c', { x: 2, new: c.new }, ['old']]] } } } });
+  const next = await sender.send(sink, data, 200);
+  const base = replicaRowBase(crypto.randomUUID(), first.world, true), encoded = encodeReplicaRowDelta(next, base, true);
+  assert(encoded.world.fishes[0][1] < 0);
+  const poses = committedStepFields.get(next.world).poses;
+  assert(poses);
+  replicaRowBase(crypto.randomUUID(), next.world, true, base);
+  assert.equal(poses.materialized, undefined);
+  assert.deepEqual(decodeReplicaRowDelta(encoded, base, true), next);
+  a.parents.push('later'); c.new.info = 'later';
+  assert.deepEqual(first.world.fishes.a.parents, ['p']);
+  assert.equal(first.world.fishes.a.x, 1);
+  assert.deepEqual(next.world.fishes.a.parents, ['p']);
+  assert.deepEqual(next.world.chars.c, { id: 'c', x: 2, path: ['north'], new: { info: 'retained' } });
+  // A foreground correction at the same clock compares against the last actual
+  // motion rather than the cold columns saved before the worker started.
+  a.x = 1; a.parents.pop();
+  notify(world, null);
+  const corrected = await sender.send(sink, data, 300);
+  assert.equal(corrected.world.fishes.a.x, 1);
+  assert.equal(next.world.fishes.a.x, 2);
+  const terrain = data.terrain = { ...data.terrain, seed: 'changed-at-boundary' };
+  notify(world, { values: { terrain }, tables: {} });
+  data.tick += CONFIG.step;
+  notify(world, { values: { tick: data.tick }, tables: {}, workerChanges: { values: { tick: data.tick }, tables: {} } });
+  assert.deepEqual((await sender.send(sink, data, 400)).world.terrain, terrain);
+});
+
+test('发布缺口锁住只覆盖较晚时刻的包，合包保留最早覆盖时刻', () => {
+  const recovery = new ReplicaRecovery(), actor = 'host', from = 'direct';
+  const packet = (fromTick, tick) => ({ delta: true, fromTick, world: { tick, travel: {} } });
+  const peer = { actor, from };
+  const merged = coalesceWorld(packet(1000, 1500), packet(1500, 2000));
+  assert.equal(merged.fromTick, 1000);
+  assert.equal(recovery.gap({ ...peer, body: merged }, 1000), false);
+  assert.throws(() => recovery.gap({ ...peer, body: packet(2500, 2000) }, 1000));
+  assert.equal(recovery.gap({ ...peer, body: merged }, 500), true);
+  assert.equal(recovery.request(peer).to, from);
+});
+
+test('漏掉一次发布的伙伴直接补足上一帧独有的行程，不必等待重新加入', () => {
+  const transfers = new ReplicaTransfers({}), peer = {}, other = {};
+  const packet = (fromTick, tick, travel) => ({ delta: true, fromTick, world: { tick, travel } });
+  const a = packet(0, 500, {}), missing = packet(500, 1000, { resting: { since: 0, days: { today: 3 } } });
+  const next = packet(1000, 1500, { swimmer: { since: 0, days: { today: 1 } } });
+  transfers.publishLive(a, [peer, other]);
+  transfers.live.clear();
+  transfers.publishLive(missing, [other], a);
+  transfers.live.clear();
+  transfers.publishLive(next, [peer, other], missing);
+  assert.deepEqual(transfers.live.get(peer).pending, { ...next, fromTick: 500, world: { tick: 1500, travel: { ...missing.world.travel, ...next.world.travel } } });
+  assert.equal(transfers.live.get(other).pending, next);
 });
 
 test('已确认直连持续发差量，归档删除后回收比较基线，旧网状成员仍定期补齐', async () => {

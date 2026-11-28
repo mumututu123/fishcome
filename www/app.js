@@ -406,6 +406,11 @@ async function onMessage(message, peer) {
     }
   } else if (message.kind === 'world') {
     if (message.from !== leader()) { replicaRecovery.ignore(message); return; }
+    if (replicaRecovery.gap(message, world.data.tick)) {
+      const repair = replicaRecovery.request(message);
+      if (repair) await network.broadcast('replicaRequest', repair);
+      return;
+    }
     try { if (await mergeReplica(body.world, peer, body.delta ? 'world-delta' : 'world-full', message)) update(); }
     catch (error) {
       if (body.delta && Date.now() - lastRepair > 5000) {

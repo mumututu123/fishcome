@@ -11,7 +11,7 @@ export function densityField(world, scenery = world.sceneryMap(), occupiedByFish
   const occupied = new Uint8Array(width * height), pressure = new Int32Array(stride * (height + 1)), wet = new Uint32Array(pressure.length);
   const mark = (x, y) => { if (Number.isInteger(y) && y >= 0 && y < height) occupied[y * width + wrapX(x)] = 1; };
   for (const { scene, cell } of scenery.values()) mark(scene.x + cell.x, scene.y + cell.y);
-  for (const c of occupiedByFish ? world.charValues('food', 'seaweed') : world.charValues()) {
+  for (const c of occupiedByFish ? world.charValues('food', 'seaweed', 'scene') : world.charValues()) {
     if (['food', 'seaweed'].includes(c.kind)) mark(c.x, c.y);
     if (c.kind === 'fish') { const f = world.data.fishes[c.entity]; if (f) mark(f.x + f.facing * c.x, f.y + c.y); }
   }
@@ -62,6 +62,7 @@ export function densityField(world, scenery = world.sceneryMap(), occupiedByFish
     }
     return true;
   };
+  density.allowsBreedingAt = (x, y) => windowArea(pressure, x, y) < 0;
   return density;
 }
 export const contactTime = density => density >= .4 ? Infinity : density >= .2 ? 20000 : 5000;

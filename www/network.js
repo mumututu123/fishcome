@@ -4,6 +4,12 @@ import { changesSince, coalesceWorld, fitsLegacyEnvelope, ReplicaTransfers } fro
 const CHUNK = 16000, MAX_PEERS = 8, MAX_RAW = 32 * 1024 * 1024, encoder = new TextEncoder(), decoder = new TextDecoder();
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const replicaRowsVersion = 1;
+function replicaCapabilities(peer, signal) {
+  peer.replicaPages = signal.replicaPages === 1;
+  peer.replicaLive = peer.replicaPages && signal.replicaLive === 1;
+  peer.replicaRows = peer.replicaLive && replicaRowsVersion === 1 && signal.replicaRows === 1;
+  peer.replicaFrames = peer.replicaRows && signal.replicaFrames === 1;
+}
 const DIRECT_ERROR = '入口可访问，但浏览器直连未建立，请检查双方网络及防火墙后重试';
 export async function lanDescription(description, fromUrl) {
   const ip = new URL(await decodeInvite(fromUrl)).hostname;
@@ -31,7 +37,7 @@ export class Network {
     const target = possible.sort((a, b) => a.peers - b.peers)[0];
     if (!target) { for (const hint of (status.hints || []).slice(0, 8)) { if (hint.id !== this.node && !this.has(hint.id)) { try { await this.connect(hint.url, hint.id, visited, entryInvite, silent); if (this.live().length) return; } catch { } } } throw new Error('入口可访问，但暂时没有正在玩的伙伴或空位'); }
     const id = crypto.randomUUID(), p = this.make(id, url, target.id); p.entryInvite = entryInvite; p.silent = silent; this.attach(p, p.pc.createDataChannel('tide'));
-    try { await p.pc.setLocalDescription(await p.pc.createOffer()); await this.ice(p.pc); const result = await this.local('relay', { url, signal: { type: 'offer', replicaPages: 1, replicaLive: 1, replicaRows: replicaRowsVersion, from: this.node, to: target.id, connection: id, sdp: p.pc.localDescription.toJSON() } }); if (!result.ok) throw new Error(result.error || '配对入口繁忙'); await this.waitForConnection(p); } catch (e) { this.close(p, e); throw e; }
+    try { await p.pc.setLocalDescription(await p.pc.createOffer()); await this.ice(p.pc); const result = await this.local('relay', { url, signal: { type: 'offer', replicaPages: 1, replicaLive: 1, replicaRows: replicaRowsVersion, replicaFrames: 1, from: this.node, to: target.id, connection: id, sdp: p.pc.localDescription.toJSON() } }); if (!result.ok) throw new Error(result.error || '配对入口繁忙'); await this.waitForConnection(p); } catch (e) { this.close(p, e); throw e; }
   }
   waitForConnection(p) { if (p.dc?.readyState === 'open') return Promise.resolve(); if (!this.connections.has(p.id)) return Promise.reject(p.error || new Error(DIRECT_ERROR)); return new Promise((resolve, reject) => p.waiters.add({ resolve, reject })); }
   make(id, url, node) {
@@ -46,8 +52,8 @@ export class Network {
     s.fromUrl = await normalizeInvite(s.fromUrl);
     if (s.type === 'offer') {
       if (this.connections.size >= MAX_PEERS || this.has(s.from)) { await this.local('relay', { url: s.fromUrl, signal: { type: 'reject', from: this.node, to: s.from, connection: s.connection } }); return; }
-      const p = this.make(s.connection, s.fromUrl, s.from); p.replicaPages = s.replicaPages === 1; p.replicaLive = p.replicaPages && s.replicaLive === 1; p.replicaRows = p.replicaLive && replicaRowsVersion === 1 && s.replicaRows === 1; try { await p.pc.setRemoteDescription(await lanDescription(s.sdp, s.fromUrl)); await p.pc.setLocalDescription(await p.pc.createAnswer()); await this.ice(p.pc); await this.local('relay', { url: p.url, signal: { type: 'answer', replicaPages: 1, replicaLive: 1, replicaRows: replicaRowsVersion, from: this.node, to: s.from, connection: s.connection, sdp: p.pc.localDescription.toJSON() } }); } catch (e) { this.close(p); throw e; }
-    } else { const p = this.connections.get(s.connection); if (!p) return; if (s.type === 'reject') { this.close(p, new Error('对方暂时无法接受连接，请稍后重试')); return; } p.node = s.from; p.url = s.fromUrl; p.replicaPages = s.replicaPages === 1; p.replicaLive = p.replicaPages && s.replicaLive === 1; p.replicaRows = p.replicaLive && replicaRowsVersion === 1 && s.replicaRows === 1; await p.pc.setRemoteDescription(await lanDescription(s.sdp, s.fromUrl)); }
+      const p = this.make(s.connection, s.fromUrl, s.from); replicaCapabilities(p, s); try { await p.pc.setRemoteDescription(await lanDescription(s.sdp, s.fromUrl)); await p.pc.setLocalDescription(await p.pc.createAnswer()); await this.ice(p.pc); await this.local('relay', { url: p.url, signal: { type: 'answer', replicaPages: 1, replicaLive: 1, replicaRows: replicaRowsVersion, replicaFrames: 1, from: this.node, to: s.from, connection: s.connection, sdp: p.pc.localDescription.toJSON() } }); } catch (e) { this.close(p); throw e; }
+    } else { const p = this.connections.get(s.connection); if (!p) return; if (s.type === 'reject') { this.close(p, new Error('对方暂时无法接受连接，请稍后重试')); return; } p.node = s.from; p.url = s.fromUrl; replicaCapabilities(p, s); await p.pc.setRemoteDescription(await lanDescription(s.sdp, s.fromUrl)); }
   }
   attach(p, dc) {
     p.dc = dc; dc.binaryType = 'arraybuffer'; dc.bufferedAmountLowThreshold = 65536;
@@ -131,7 +137,7 @@ export class Network {
         const live = peers.filter(peer => peer.replicaLive);
         if (live.length) {
           const snapshot = options?.capturedWorld ? body : structuredClone(body);
-          this.replicas.publishLive(snapshot, live);
+          this.replicas.publishLive(snapshot, live, options?.previousStep);
           if (live.length !== peers.length || this.hasRelayedWorldPeer(peers)) this.relayWorld(snapshot, { capturedWorld: true });
           return;
         }

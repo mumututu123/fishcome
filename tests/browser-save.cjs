@@ -140,6 +140,52 @@ async function exercisePages(page, count) {
   return result;
 }
 
+async function motionCheckpoint(page) {
+  await page.goto(origin + '/welcome.html');
+  await page.evaluate(async () => {
+    const { get, putMany } = await import('./storage.js');
+    const { beforeCheckpointPatch, noteCheckpointChanges } = await import('./checkpoint-pages.js');
+    const { expandSimulationPatch } = await import('./simulation-delta.js');
+    const ids = Array.from({ length: 768 }, (_, i) => 'fish-' + i);
+    const world = { tick: 0, fishes: {}, travel: {} }, day = '2026-11-28';
+    for (const id of ids) {
+      world.fishes[id] = { id, x: 0, y: 0, facing: 1, cx: 0, cy: 0, posAt: 0 };
+      world.travel[id] = { since: 0, days: { [day]: 0 } };
+    }
+    const save = () => putMany(() => [['checkpoint', { world }]], { simulationChanges: true });
+    await save();
+    function move(tick, indices) {
+      const motion = new Float64Array(indices.length * 5);
+      for (let i = 0; i < indices.length; i++) { motion[i * 5] = tick; motion[i * 5 + 2] = 1; }
+      const patch = expandSimulationPatch(world, { values: { tick }, tables: {
+        fishes: { set: indices, motion, remove: [] },
+        travel: { set: indices.map(i => [ids[i], day, tick]), remove: [] }
+      } }, ids, true);
+      beforeCheckpointPatch(world, patch);
+      for (const [field, updates] of Object.entries(patch.tables)) updates.frame.commit(world[field]);
+      world.tick = tick;
+      noteCheckpointChanges(world, patch);
+      if (Object.values(patch.tables).some(updates => updates.frame.pairs)) throw new Error('存档展开了额外的整批记录');
+    }
+    move(1, [0, 410]);
+    const cut = JSON.stringify(world), original = IDBObjectStore.prototype.put, pages = [];
+    let advanced = false;
+    IDBObjectStore.prototype.put = function (value, key) {
+      const request = original.call(this, value, key);
+      if (Array.isArray(key) && (key[1] === 'fishes' || key[1] === 'travel')) {
+        pages.push([key[1], key[2]]);
+        if (!advanced) { advanced = true; move(2, ids.map((_, i) => i)); }
+      }
+      return request;
+    };
+    try { await save(); } finally { IDBObjectStore.prototype.put = original; }
+    if (!advanced || pages.length !== 4) throw new Error('稀疏运动没有只写入对应四页');
+    if (JSON.stringify((await get('checkpoint', { observeCheckpoint: false })).world) !== cut) throw new Error('中途游动改变了正在写入的存档');
+    await save();
+    if (JSON.stringify((await get('checkpoint', { observeCheckpoint: false })).world) !== JSON.stringify(world)) throw new Error('下一次存档没有取得游动后的完整状态');
+  });
+}
+
 async function replicaCheckpointJournal(page) {
   await page.goto(origin + '/welcome.html');
   const result = await page.evaluate(async () => {
@@ -355,6 +401,7 @@ async function main() {
   try {
     console.log(JSON.stringify(await exercisePages(await isolated.newPage(), count)));
     if (!countArg) {
+      await motionCheckpoint(await isolated.newPage());
       await replicaCheckpointJournal(await isolated.newPage());
       await concurrentCheckpoints(isolated);
     }

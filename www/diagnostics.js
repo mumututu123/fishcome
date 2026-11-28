@@ -1,4 +1,4 @@
-import { CONFIG, clone } from './engine.js';
+import { CONFIG, clone, replicaSourceTable } from './engine.js';
 import { fishOrigin, inheritedGlyph, validBreedingRecord, canonicalBirthFish, canonicalBirthPath } from './breeding.js';
 
 const MAX_LOGS = 200;
@@ -38,8 +38,8 @@ export class DiagnosticLog {
 
 export function buildOriginSources(data, extra = {}, current = null, chars) {
   return {
-    ops: { ...extra?.ops, ...current?.ops, ...data?.ops },
-    breeding: { ...extra?.breeding, ...current?.breeding, ...data?.breeding },
+    ops: replicaSourceTable(current?.ops, data?.ops, extra?.ops),
+    breeding: replicaSourceTable(current?.breeding, data?.breeding, extra?.breeding),
     roots: { ...current?.roots, ...data?.roots },
     chars: chars ?? { ...extra?.chars, ...current?.chars, ...data?.chars }
   };

@@ -3,6 +3,7 @@ import test from 'node:test';
 import { CONFIG, World } from '../www/engine.js';
 import { worldTables } from '../www/simulation-changes.js';
 import { WorkerSimulation } from '../www/simulation-worker.js';
+import { expandSimulationPatch } from '../www/simulation-delta.js';
 
 const start = Date.UTC(2025, 5, 15, 12, 17);
 const root = '00000000-0000-4000-8000-000000000012';
@@ -38,7 +39,9 @@ test('后台重算使用归档、回滚和投喂后的鱼元记录', () => {
   const reply = step(start, { archives: [{ removed: { chars: ['archived'] }, meals: [] }],
     foods: [[replaced.id, replaced], [added.id, added]] });
   assert.deepEqual(reply.patch.tables.chars.remove, []);
-  assert.deepEqual(Object.fromEntries(reply.patch.tables.chars.set.map(([id, cell]) => [id, cell.x])), {
+  const committed = { chars: Object.fromEntries([restored, replaced, added].map(cell => [cell.id, cell])) };
+  const updated = expandSimulationPatch(committed, reply.patch, []).tables.chars.set;
+  assert.deepEqual(Object.fromEntries(updated.map(([id, cell]) => [id, cell.x])), {
     [replaced.id]: replaced.x, [restored.id]: restored.x, [added.id]: added.x
   });
 
@@ -79,6 +82,38 @@ test('后台按种类读取鱼元保留字符表顺序，变种类、删行和�
   assert.deepEqual(ids('scene'), []);
   assert.deepEqual(ids('food'), ['final']);
   assert.deepEqual(ids(), ['final']);
+});
+
+test('下沉的食物只交付标量改动，改写历史的鱼元完整交付', () => {
+  const initial = { ...food('food', 12), path: [{ reason: 'release', t: start, target: '' }] };
+  const { worker, send } = startWorker([initial]);
+  const result = send({ kind: 'step', base: start, names: [], foods: [] });
+  const [motion] = result.patch.tables.chars.set;
+  assert.equal(motion[0], initial.id);
+  assert.equal(motion.length, 3);
+  assert.equal(motion[1].moveAt, start + CONFIG.step);
+  assert(!Object.hasOwn(motion[1], 'path'));
+  const page = { chars: { [initial.id]: initial } };
+  const updated = expandSimulationPatch(page, result.patch, []).tables.chars.set[0][1];
+  assert.equal(updated.path, initial.path);
+  worker.world.data.chars.food.path[0].target = 'new-owner';
+  const [replacement] = worker.tracker.changes().tables.chars.set;
+  assert.equal(replacement.length, 2);
+  assert.equal(replacement[1].path[0].target, 'new-owner');
+  assert.equal(initial.path[0].target, '');
+});
+
+test('食物沉积后的分类读取沿用活跃鱼元集合', () => {
+  const { worker } = startWorker([food('loose', 10), { ...food('body', 20), kind: 'fish', entity: 'adult' }]);
+  const { world } = worker;
+  world.charValues('food');
+  world.charValues('scene');
+  let reads = 0;
+  Object.defineProperty(world.data.chars.body, 'kind', { configurable: true, get() { reads++; return 'fish'; } });
+  world.data.chars.loose.kind = 'scene';
+  assert.deepEqual(world.charValues('food'), []);
+  assert.deepEqual(world.charValues('scene').map(cell => cell.id), ['loose']);
+  assert.equal(reads, 0);
 });
 
 test('后台生态索引读取当前鱼体和餐史，换主人、修改旧餐、回滚后与重新索引相同', () => {

@@ -25,6 +25,30 @@ export const NEIGHBORS = [-1, 0, 1].flatMap(x => [-1, 0, 1].map(y => [x, y])).fi
 const AVOID_DIRECTIONS = [[0, -1], [0, 1], [-1, 0], [1, 0]];
 const MOVES = 1, TURNS = 2;
 export const clone = value => structuredClone(value);
+// The usual swimmer and relationship rows contain only scalars. Copy each
+// once. Nested ancestry and extension records still get a full detached copy.
+function detachReplicaRecord(row) {
+  if (!row || Object.getPrototypeOf(row) !== Object.prototype) return clone(row);
+  const copy = { ...row };
+  for (const field in copy) {
+    const value = copy[field], type = typeof value;
+    if ((value !== null && type === 'object') || type === 'function' || type === 'symbol') return clone(row);
+  }
+  return copy;
+}
+export function detachReplicaRows(rows) {
+  const result = { ...rows };
+  for (const id of Object.keys(result)) result[id] = detachReplicaRecord(result[id]);
+  return result;
+}
+export function replicaSourceTable(current, incoming, archived) {
+  // Creation records are seldom added during a swim. Validators only read
+  // this table, so a full dictionary is needed only for an actual overlay.
+  for (const changes of [incoming, archived]) for (const key in changes) {
+    if (Object.hasOwn(changes, key)) return { ...archived, ...current, ...incoming };
+  }
+  return current || {};
+}
 export const key = worldKey;
 const localKey = (x, y) => `${x},${y}`;
 // Replica validators look up these rows by ID, in newest-to-oldest order.
@@ -38,7 +62,7 @@ export function replicaSourceRows(...tables) {
   });
 }
 export const ordinal = (a, b) => a === b ? 0 : a > b ? 1 : -1;
-export function hash(text) { let n = 2166136261; for (const c of text) n = Math.imul(n ^ c.codePointAt(0), 16777619); return n >>> 0; }
+export function hash(text, n = 2166136261) { for (const c of text) n = Math.imul(n ^ c.codePointAt(0), 16777619); return n >>> 0; }
 export function validGlyph(ch) { return typeof ch === 'string' && Array.from(ch).length === 1 && !/\s/u.test(ch) && (/^[\x21-\x7e]$/.test(ch) || /\p{Script=Han}/u.test(ch) || /^[\u3001-\u303f\uff01-\uff65]$/u.test(ch)); }
 export function bounds(cells) {
   if (!cells.length) return { minX: 0, minY: 0, maxX: 0, maxY: 0, width: 0, height: 0 };
@@ -570,17 +594,22 @@ export class World {
     const layout = fishOccupancy.layout;
     const { fishes, breeding } = this.data, hasMagma = magma.size > 0;
     const avoidancePhase = Math.floor(now / 12000);
-    let travelDay;
-    for (const [id, cells, pair] of motionOrder(this, groups, layout)) {
-      let f = pair ? pair.fish : fishes[id];
+    let travelDay, starvationDue = false;
+    for (const [id, cells, pair, swimmer] of motionOrder(this, groups, layout, fishOccupancy.swimmers(this))) {
+      let f = pair ? pair.fish : swimmer?.fish ?? fishes[id];
+      if (!starvationDue) starvationDue = pair ? pair.members.some(member => now >= member.hungerAt) : !!f && now >= f.hungerAt;
       if (!f || !cells.length || (pair ? pair.members.some(member => captured.has(member.id)) : captured.has(id))) continue;
-      if (!pair && this.movingFish) f = this.movingFish(f);
+      const ordinal = swimmer?.ordinal;
+      if (ordinal === undefined && !pair && this.movingFish) f = this.movingFish(f);
       if (pair ? pair.members.some(member => waitingToEat.has(member.id)) : waitingToEat.has(id)) {
         if (pair) commitUnit(pair, now);
-        else { f.x = wrapX(f.x); f.posAt = now; }
+        else {
+          f.x = wrapX(f.x); f.posAt = now;
+          if (ordinal !== undefined) this.journalSwim(ordinal, f);
+        }
         continue;
       }
-      let hull = layout.hull(cells);
+      let hull = swimmer ? swimmer.hull : layout.hull(cells);
       if (!Number.isSafeInteger(f.x) || !Number.isSafeInteger(f.y) || Math.abs(f.facing) !== 1 || Math.abs(f.x) > WORLD_WIDTH * 2) hull = null;
       const found = bins.size && (pair ? pair.members.some(member => canEat(member.id)) : canEat(id)) ? new Map() : null;
       if (found) for (const eye of cells) if (EYES.has(eye.ch)) {
@@ -600,7 +629,7 @@ export class World {
       else { const phase = Math.floor((now - f.created) / 12000), r = hash(`${id}:${phase}`); dx = [-1, 0, 1][r % 3]; dy = [-1, 0, 1][Math.floor(r / 3) % 3]; }
       const beforeX = f.x, beforeY = f.y, beforeFacing = f.facing;
       if (pair) for (const member of pair.members) fishOccupancy.update(member, groups.get(member.id) || [], true);
-      const slot = hull && !pair && breeding[id]?.status !== 'active' ? fishOccupancy.slots.get(id) : undefined;
+      const slot = hull && !pair && breeding[id]?.status !== 'active' ? swimmer?.slot ?? fishOccupancy.slots.get(id) : undefined;
       const fits = (x, y, facing) => slot !== undefined
         ? fitsHullAt(hull, x, y, facing, fishOccupancy, slot)
         : this.canOccupy({ id, x, y, facing }, cells, scenery, fishOccupancy, foodPositions, hull);
@@ -665,12 +694,13 @@ export class World {
           if (swims && beforeFacing === f.facing && (movedX || movedY)) (swims[(movedY + 1) * 3 + movedX + 1] ||= []).push(id);
         }
       }
+      if (ordinal !== undefined) this.journalSwim(ordinal, f);
       if (hasMagma) noteMagmaContact(magma, magmaVictims, groups, f, cells, pair);
       if (movedX || movedY) {
         travelDay ??= shanghaiDay(now);
         const distance = Math.hypot(movedX, movedY);
         if (pair) for (const member of pair.members) this.recordMovement(member.id, distance, now, travelDay);
-        else this.recordMovement(id, distance, now, travelDay);
+        else this.recordMovement(id, distance, now, travelDay, ordinal);
       }
     }
     this.retainMovementGrid(groups, fishOccupancy);
@@ -693,7 +723,7 @@ export class World {
       }
     }
     let hungryBodies = bodyChanged ? undefined : groups;
-    for (const id of groups.keys()) {
+    if (starvationDue) for (const id of groups.keys()) {
       const f = this.data.fishes[id];
       if (f && now >= f.hungerAt) {
         hungryBodies ??= this.fishGroups();
@@ -745,7 +775,8 @@ export class World {
     if (other.terrain && !validTerrain(other.terrain, other.roots)) throw new Error('固定海底地形被修改或无效');
     for (const [root, at] of Object.entries(other.roots || {})) if (this.data.roots[root] !== undefined && this.data.roots[root] !== at) throw new Error('世界起源时间不能修改');
     if (!validEcology(other.ecology, Math.max(Date.now() + 60000, other.tick))) throw new Error('生态更替时钟无效');
-    const sources = { roots: { ...this.data.roots, ...other.roots }, fishes: replicaSourceRows(other.fishes, this.data.fishes), ops: { ...archived.ops, ...this.data.ops, ...other.ops }, breeding: { ...archived.breeding, ...this.data.breeding, ...other.breeding } };
+    const sources = { roots: { ...this.data.roots, ...other.roots }, fishes: replicaSourceRows(other.fishes, this.data.fishes),
+      ops: replicaSourceTable(this.data.ops, other.ops, archived.ops), breeding: replicaSourceTable(this.data.breeding, other.breeding, archived.breeding) };
     if (!validPopulation(other.population, sources, Math.max(Date.now() + 60000, other.tick)) || !validRocks(other.rocks, sources, Math.max(Date.now() + 60000, other.tick))) throw new Error('生态控制记录无效');
     const latest = Math.max(Date.now() + 60000, this.data.tick, other.tick);
     sources.chars = replicaSourceRows(other.chars, this.data.chars, archived.chars);
@@ -808,12 +839,16 @@ export class World {
     const birthOf = id => id.startsWith('born:') ? this.data.breeding[id.slice(5)] || archived.breeding?.[id.slice(5)] : undefined;
     for (const id of Object.keys(this.data.fishes)) if (id.startsWith('born:')) this.data.fishes[id] = canonicalBirthFish(this.data.fishes[id], birthOf(id));
     for (const type of ['fishes', 'scenes']) {
-      const table = this.data[type], winners = {};
-      for (const [id, incoming] of Object.entries(other[type])) {
+      const table = this.data[type], incomingRows = other[type], winners = {};
+      for (const id in incomingRows) {
+        if (!Object.hasOwn(incomingRows, id)) continue;
+        const incoming = incomingRows[id];
         const obj = type === 'fishes' && id.startsWith('born:') ? canonicalBirthFish(incoming, birthOf(id)) : incoming, old = table[id];
-        if (!old || (obj.posAt || 0) > (old.posAt || 0) || ((obj.posAt || 0) === (old.posAt || 0) && JSON.stringify(obj).localeCompare(JSON.stringify(old)) > 0)) winners[id] = obj;
+        if (!old || (obj.posAt || 0) > (old.posAt || 0) || ((obj.posAt || 0) === (old.posAt || 0) && JSON.stringify(obj).localeCompare(JSON.stringify(old)) > 0)) {
+          winners[id] = origin === 'replica' ? detachReplicaRecord(obj) : obj;
+        }
       }
-      Object.assign(table, clone(winners));
+      Object.assign(table, origin === 'replica' ? winners : clone(winners));
     }
     let dependencies;
     for (const field of ['ops', 'breeding']) for (const [id, record] of Object.entries(archived[field] || {})) {
