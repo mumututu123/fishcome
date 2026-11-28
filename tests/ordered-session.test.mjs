@@ -5,6 +5,7 @@ import { World } from '../www/engine.js';
 import { actorId, signer } from '../www/storage.js';
 import { prepareOrderedArchive } from '../www/ordered-archive.js';
 import { OrderedSession } from '../www/ordered-session.js';
+import { stepDigest } from '../www/step-digest.js';
 
 async function earn(world, serial) {
   const keys = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
@@ -31,7 +32,7 @@ function pair(now) {
       prepareArchive: (_, boundary) => prepareOrderedArchive(world, store, boundary, id => packs[id], async () => {}),
       archiveBoundary: (_, commit) => commit(), prepare: async () => ({}),
       install: (_, changes, valid, wrap) => { if (valid()) wrap(() => Object.assign(world.data, changes)); },
-      advance: async (_, tick) => { calls.push(tick); world.data.tick = tick; return { tick, changes: { tick } }; }
+      advance: async (_, tick) => { calls.push(tick); world.data.tick = tick; return { tick, changesDigest: await stepDigest({ tick }) }; }
     });
     sides.push({ world, peer, store, inputs, applied, session, calls, stops });
   }

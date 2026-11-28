@@ -29,7 +29,9 @@ test('同一权威前态和有序签名输入经双方确认后只能执行一�
   assert.deepEqual(right.inputs, ops);
   assert.equal(left.digest, right.digest);
   assert.equal(a.take(1000), undefined);
-  const result = { tick: 1500, changes: { fish: Float64Array.of(2, 3) }, outcomes: [{ ok: true }, { ok: false }] };
+  const changesDigest = await stepDigest({ fish: Float64Array.of(2, 3) });
+  const result = { tick: 1500, changesDigest, outcomes: [{ ok: true }, { ok: false }] };
+  await assert.rejects(a.complete(left, { ...result, changesDigest: undefined }), /摘要/);
   assert.equal(await a.complete(left, result), await b.complete(right, structuredClone(result)));
   await a.offer([]);
   await b.receive(messages.shift()); await a.receive(messages.shift()); await b.receive(messages.shift());

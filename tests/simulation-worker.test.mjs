@@ -65,7 +65,7 @@ function localWorker(beforeReceive = () => {}, simulation = new WorkerSimulation
       setImmediate(async () => {
         try {
           await beforeReceive(message);
-          if (!closed) this.onmessage({ data: { result: structuredClone(simulation.receive(message)) } });
+          if (!closed) this.onmessage({ data: { result: structuredClone(await simulation.receive(message)) } });
         }
         catch (error) { this.onmessage({ data: { error: error.message } }); }
       });
@@ -89,7 +89,8 @@ test('确认输入只装载基准，到点双方各提交一个相同的生态�
     const result = await Promise.all(ready.map((base, i) => advance(i, next, base)));
     assert.deepEqual(requested, [start, start]);
     assert.equal(result[0].tick, next);
-    assert.deepEqual(result[0].changes, result[1].changes);
+    assert.match(result[0].changesDigest, /^[0-9a-f]{64}$/);
+    assert.equal(result[0].changesDigest, result[1].changesDigest);
     assert.deepEqual(worlds[0].serialize(), worlds[1].serialize());
     assert.equal(await advance(0, next, ready[0]), null);
     const stale = await clients[0].prepareAgreed(worlds[0], () => true);

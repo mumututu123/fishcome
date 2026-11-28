@@ -1,20 +1,8 @@
 import { CONFIG } from './engine.js';
 import { verifyEnvelope } from './storage.js';
 
-const encoder = new TextEncoder();
-export async function stepDigest(value) {
-  const binary = [];
-  const json = JSON.stringify(value, (_, item) => {
-    if (item instanceof Map) return Array.from(item.entries());
-    if (item instanceof Set) return Array.from(item);
-    if (!ArrayBuffer.isView(item)) return item;
-    binary.push(new Uint8Array(item.buffer, item.byteOffset, item.byteLength));
-    return { binary: binary.length - 1, type: item.constructor.name, bytes: item.byteLength };
-  });
-  const bytes = binary.length ? await new Blob([json, ...binary]).arrayBuffer() : encoder.encode(json);
-  const hash = await crypto.subtle.digest('SHA-256', bytes);
-  return Array.from(new Uint8Array(hash), byte => byte.toString(16).padStart(2, '0')).join('');
-}
+import { stepDigest } from './step-digest.js';
+export { stepDigest };
 
 // Network.receive authenticates each direct control envelope. Both sides
 // validate its enclosed user signatures before voting for the ordered list.
@@ -66,7 +54,8 @@ export class OrderedSteps {
   }
   async complete(slot, result) {
     if (this.closed || !slot.taken || this.next !== slot || result.tick !== slot.tick) throw new Error('共同结算的步号不连续');
-    const proof = await stepDigest([slot.digest, result.changes, result.outcomes]);
+    if (!/^[0-9a-f]{64}$/.test(result.changesDigest)) throw new Error('共同结算缺少实际变化摘要');
+    const proof = await stepDigest([slot.digest, result.changesDigest, result.outcomes]);
     if (this.closed || this.next !== slot) return;
     this.proof = proof;
     this.tick = slot.tick;

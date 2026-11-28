@@ -5,6 +5,7 @@ import { shanghaiDay } from './fish-status.js';
 import { worldTables } from './simulation-changes.js';
 import { encodeFields, motionFields } from './simulation-delta.js';
 import { advanceBond, encodeBondIntervals } from './bond-interval.js';
+import { stepDigest } from './step-digest.js';
 
 const motionEdit = { properties: motionFields };
 
@@ -500,6 +501,13 @@ function trackWorld(source) {
 
 export class WorkerSimulation {
   receive(message) {
+    if (message.kind === 'step-proof') {
+      const patch = this.agreedPatch;
+      if (!patch || patch.values.tick !== message.tick) throw new Error('没有此步待确认的生态变化');
+      this.agreedPatch = undefined;
+      return stepDigest(patch);
+    }
+    this.agreedPatch = undefined;
     if (message.kind === 'open') {
       this.world = new World(message.values.tick, 'worker', { populate: false, ambient: message.ambient });
       this.world.data = message.values;
@@ -599,6 +607,7 @@ export class WorkerSimulation {
         }
         patch.swims = swims;
       }
+      if (message.agreed) this.agreedPatch = patch;
       return { patch, foodRevision: this.world.foodRevision - foodRevision, geometry };
     }
   }
@@ -606,13 +615,15 @@ export class WorkerSimulation {
 
 if (typeof WorkerGlobalScope !== 'undefined' && globalThis instanceof WorkerGlobalScope) {
   const simulation = new WorkerSimulation();
-  globalThis.onmessage = ({ data }) => {
+  globalThis.onmessage = async ({ data }) => {
     try {
-      const result = simulation.receive(data), patch = result?.patch;
+      const result = await simulation.receive(data), patch = result?.patch;
       const bonds = patch?.life?.bonds;
       const buffers = [patch?.tables.fishes?.motion?.buffer, patch?.tables.travel?.distances?.buffer, bonds?.counters?.buffer,
         bonds?.intervals?.kept.buffer, bonds?.intervals?.added.buffer].filter(Boolean);
-      postMessage({ result }, buffers);
+      // The renderer owns the posted copy. Keep the worker's bytes intact until
+      // it hashes the committed step, independently of edits on the page.
+      postMessage({ result }, data.agreed ? [] : buffers);
     }
     catch (error) { postMessage({ error: error.message }); }
   };

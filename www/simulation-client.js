@@ -194,9 +194,6 @@ export class SimulationClient {
     const result = await this.request(message);
     if (!result || !valid()) { this.close(); return null; }
     if (!this.foods.size) {
-      // A signed next-step agreement can name this exact result after the
-      // first paint, even if a foreground edit has since changed a live row.
-      if (message.agreed) result.agreedChanges = structuredClone(result.patch);
       applyResult(world, result, this.knownFish);
       return result;
     }
@@ -250,7 +247,8 @@ export class SimulationClient {
       const result = await this.compute(world, { kind: 'step', base: prepared.base, agreed: true }, valid);
       if (!result) return null;
       this.tick = world.data.tick;
-      return { tick: this.tick, changes: result.agreedChanges };
+      const tick = this.tick, changesDigest = await this.request({ kind: 'step-proof', tick });
+      return changesDigest && stillValid() ? { tick, changesDigest } : null;
     });
   }
   advance(world, now, ownsWorld = () => true, repair = {}) {
