@@ -123,7 +123,8 @@ function schoolGeometry(world, layout, roster) {
   const first = ordered[0]?.id, last = ordered.at(-1)?.id;
   const orderedPairs = subset && ordered.length > 0 || rank + 1 === ordered.length && ordered.every((p, i) =>
     /^[a-z0-9:-]+$/.test(p.id) && (!i || (ordered[i - 1].id + '|' + last).localeCompare(p.id + '|' + first) < 0));
-  return { groups: layout.groups, roster, points, centers, centerByBody, ordered, ranks, orderedPairs, maxRadius };
+  const ordinalIds = ordered.every((p, i) => !i || ordered[i - 1].id < p.id);
+  return { groups: layout.groups, roster, points, centers, centerByBody, ordered, ranks, orderedPairs, ordinalIds, maxRadius };
 }
 
 export function lifeContext(world, now, scenery, groups, sharedLayout) {
@@ -171,13 +172,15 @@ export function lifeContext(world, now, scenery, groups, sharedLayout) {
     }
     if (closest) scenes.set(p.id, closest);
   }
-  const { visitPairPartners, sorted, crowded } = fishNeighbors(geometry, (p, q) => clearLine(p, q, blockedRows));
+  let spatial;
+  const neighborhood = () => spatial ??= fishNeighbors(geometry, (p, q) => clearLine(p, q, blockedRows));
+  if (!sharedLayout) neighborhood();
   const neighbors = {
     get(id) {
       if (sortedNeighbors.has(id)) return sortedNeighbors.get(id);
       const p = points.get(id);
       if (!p) return;
-      const result = sorted(p, nearObstacle[p.slot]);
+      const result = neighborhood().sorted(p, nearObstacle[p.slot]);
       sortedNeighbors.set(id, result);
       return result;
     },
@@ -186,7 +189,7 @@ export function lifeContext(world, now, scenery, groups, sharedLayout) {
   function crowdedNeighbor(p) {
     if (!p) return;
     const radius = Math.min(12, 2 + maxRadius + Math.max(p.halfWidth, p.halfHeight));
-    return crowded(p, radius, nearObstacle[p.slot]);
+    return neighborhood().crowded(p, radius, nearObstacle[p.slot]);
   }
   const makeSchool = () => {
     const school = new Map();
@@ -196,7 +199,7 @@ export function lifeContext(world, now, scenery, groups, sharedLayout) {
     if (geometry.schoolSlot !== slot) { geometry.schoolSlot = slot; geometry.leaders = []; }
     for (const p of ordered) {
       if (!available[p.slot]) continue;
-      const companions = sorted(p, nearObstacle[p.slot], available);
+      const companions = neighborhood().sorted(p, nearObstacle[p.slot], available);
       if (companions.length < 2) continue;
       let motion = geometry.leaders[p.slot];
       if (!motion) {
@@ -246,10 +249,10 @@ export function lifeContext(world, now, scenery, groups, sharedLayout) {
   }
   function visitBonds(visit) {
     let remaining = LIFE.bondLimit;
-    const visible = (p, q) => visibleFrom(p, q) || visibleFrom(q, p);
     const accept = (p, q) => visit(p.id, q.id, bondKey(p, q));
+    const { visitPairPartners } = neighborhood();
     for (const p of ordered) {
-      remaining -= visitPairPartners(p, remaining, visible, accept);
+      remaining -= visitPairPartners(p, remaining, nearObstacle, accept);
       if (!remaining) break;
     }
   }

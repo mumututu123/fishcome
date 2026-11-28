@@ -94,6 +94,27 @@ export function exteriorContour(cells) {
   }
   return cells.filter(c => NEIGHBORS.some(([dx, dy]) => outside.has(localKey(c.x + dx, c.y + dy))));
 }
+function lossContour(cells, hull) {
+  if (!hull) return exteriorContour(cells);
+  // Coordinates fix the contour, but each swimmer's glyph IDs decide the loss.
+  if (!hull.lossRim) {
+    const points = cells.map(({ x, y }, index) => ({ x, y, index }));
+    hull.lossRim = exteriorContour(points).map(p => p.index);
+    hull.connectedLoss = new Uint8Array(cells.length);
+  }
+  return hull.lossRim.map(i => cells[i]);
+}
+function survivingFragment(cells, removed, event, hull) {
+  const index = cells.indexOf(removed);
+  if (hull?.connectedLoss?.[index]) return;
+  const remaining = cells.filter(c => c !== removed), parts = components(remaining);
+  if (parts.length === 1 && parts[0].length === remaining.length && remaining.length >= 2) {
+    if (hull?.connectedLoss) hull.connectedLoss[index] = 1;
+    return;
+  }
+  parts.sort((a, b) => b.length - a.length || hash(`${event}:${a.map(c => c.id).sort()[0]}`) - hash(`${event}:${b.map(c => c.id).sort()[0]}`));
+  return new Set(parts[0]?.length >= 2 ? parts[0].map(c => c.id) : []);
+}
 export function validateDrawing(cells, kind, balance = Infinity) {
   const size = kind === 'fish' ? 15 : 20;
   if (!Array.isArray(cells) || cells.length < 2) return '至少需要两个相连的鱼元';
@@ -818,12 +839,14 @@ export class World {
         if (food.ghost) { const s = legendSchedule(this.data.roots, food.ghost.seed, food.ghost.slot); recordStory(this, 'shipMeal', id, now, { legendary: s.id, legendSeed: s.seed, legendSlot: s.slot }); }
       }
     }
-    let hungryBodies = bodyChanged ? undefined : groups;
+    let hungryBodies = bodyChanged ? undefined : groups, hungryLayout;
     if (starvationDue) for (const id of groups.keys()) {
       const f = this.data.fishes[id];
       if (f && now >= f.hungerAt) {
         hungryBodies ??= this.fishGroups();
-        this.starve(id, f.hungerAt, null, { cells: hungryBodies.get(id), changeCell });
+        hungryLayout ??= hungryBodies === groups ? layout : this.bodyLayout(hungryBodies);
+        const cells = hungryBodies.get(id);
+        this.starve(id, f.hungerAt, null, { cells, hull: cells && hungryLayout.hull(cells), changeCell });
         bodyChanged = true;
       }
     }
@@ -844,25 +867,25 @@ export class World {
     for (const c of cells) { const a = cellPosition(f, c), z = cellPosition(next, c); for (let x = Math.min(a.x, z.x); x <= Math.max(a.x, z.x); x++) if (!this.waterAt(x, a.y) || scenery.has(key(x, a.y)) || foreignOwner(ownersAt(occupants, x, a.y), f.id, pair)) return false; }
     if (!this.canOccupy(next, cells, scenery, occupants)) return false; f.x = next.x; f.facing = next.facing; return true;
   }
-  starve(id, at, selectedId = null, { illness = false, cells = this.fishCells(id), changeCell = transition } = {}) {
+  starve(id, at, selectedId = null, { illness = false, cells = this.fishCells(id), hull, changeCell = transition } = {}) {
     const f = this.data.fishes[id]; if (!f || cells.length < 2) return;
     const candidates = illness ? cells.filter(c => components(cells.filter(other => other !== c)).length === 1) : [];
-    const rim = candidates.length ? candidates : exteriorContour(cells);
+    const rim = candidates.length ? candidates : lossContour(cells, hull);
     let removed = rim.find(c => c.id === selectedId);
     if (!removed) {
       let best = Infinity;
+      const prefix = hash(`${id}:${at}:`);
       for (const cell of rim) {
-        const score = hash(`${id}:${at}:${cell.id}`);
+        const score = hash(String(cell.id), prefix);
         if (score < best || score === best && cell.id.localeCompare(removed.id) < 0) { removed = cell; best = score; }
       }
     }
     const event = `${illness ? 'illness' : 'hunger'}:${id}:${at}`, loss = { id: event, t: at, reason: illness ? 'ecoDissolve' : 'starve', ...(illness ? { fish: id, cause: 'depression' } : {}) };
     if (illness) { const pair = this.breedingState(id); if (pair) cancelBreeding(this.data, pair, at, 'illness'); }
     changeCell(removed, { kind: 'burn', entity: '' }, loss);
-    const remaining = cells.filter(c => c !== removed), parts = components(remaining).sort((a, b) => b.length - a.length || hash(`${event}:${a.map(c => c.id).sort()[0]}`) - hash(`${event}:${b.map(c => c.id).sort()[0]}`));
-    const kept = parts[0]?.length >= 2 ? new Set(parts[0].map(c => c.id)) : new Set();
-    for (const c of remaining) if (!kept.has(c.id)) { const p = cellPosition(f, c); changeCell(c, illness ? { kind: 'burn', entity: '' } : { kind: 'food', entity: '', x: wrapX(p.x), y: p.y, born: at, fall: 0 }, illness ? loss : { id: event, t: at, reason: 'shed' }); }
-    if (!kept.size) { delete this.data.fishes[id]; recordStory(this, 'depart', id, at); } else if (!illness) f.hungerAt = at + CONFIG.hunger;
+    const kept = survivingFragment(cells, removed, event, hull);
+    if (kept) for (const c of cells) if (c !== removed && !kept.has(c.id)) { const p = cellPosition(f, c); changeCell(c, illness ? { kind: 'burn', entity: '' } : { kind: 'food', entity: '', x: wrapX(p.x), y: p.y, born: at, fall: 0 }, illness ? loss : { id: event, t: at, reason: 'shed' }); }
+    if (kept?.size === 0) { delete this.data.fishes[id]; recordStory(this, 'depart', id, at); } else if (!illness) f.hungerAt = at + CONFIG.hunger;
     this.foodRevision++; this.dirty = true;
   }
   merge(other, archived = {}, origin, trackChanges = false, checkedRules) {

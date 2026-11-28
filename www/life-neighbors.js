@@ -32,10 +32,16 @@ export function fishNeighbors(geometry, canSeeLine) {
     }
     return found;
   }
-  function visitPairPartners(p, remaining, visible, visit) {
+  function visitPairPartners(p, remaining, obstacles, visit) {
     let count = 0;
     for (const bin of collect(p, 12)) for (const q of bin) {
-      if (p.id < q.id && visible(p, q)) hits[count++] = q.slot;
+      if (geometry.ordinalIds ? p.slot >= q.slot : p.id >= q.id) continue;
+      if (Math.abs(p.y - q.y) > 12) continue;
+      const forward = horizontalDistance(p.x, q.x) <= 12;
+      if (forward && (!obstacles[p.slot] || canSeeLine(p, q)) ||
+          (halfGrid ? forward : horizontalDistance(q.x, p.x) <= 12) && (!obstacles[q.slot] || canSeeLine(q, p))) {
+        hits[count++] = q.slot;
+      }
     }
     const partners = hits.subarray(0, count).sort();
     count = Math.min(count, remaining);

@@ -8,6 +8,20 @@ const fish = (w, cells, x = 30, y = 20, actor = 'alice') => { const p = op('fish
 test('中文、扩展汉字与 ASCII 每格一个鱼元；眼睛只有六种', () => { for (const ch of ['鱼', '口', '。', '𠮷', '/', 'Q', '.']) assert.equal(validGlyph(ch), true, ch); for (const ch of ['你好', '', ' ', '🐟']) assert.equal(validGlyph(ch), false); assert.deepEqual([...EYES], ['0', 'O', 'o', '。', '.', '口']); assert.equal(EYES.has('8'), false); assert.equal(EYES.has('Q'), false); });
 test('创建需八方向整体连通，鱼最多十五字，中文按格计费', () => { assert.equal(components([cell(0, 0), cell(1, 1)]).length, 1); assert.equal(validateDrawing([cell(0, 0), cell(1, 1)], 'fish', 2), ''); assert.match(validateDrawing([cell(0, 0), cell(1, 0), cell(5, 0), cell(6, 0)], 'fish'), /整体/); assert.match(validateDrawing(Array.from({ length: 16 }, (_, i) => cell(i % 8, Math.floor(i / 8))), 'fish'), /15/); assert.match(validateDrawing([cell(0, 0)], 'scene'), /两个/); const w = new World(t); fish(w, [cell(0, 0, '鱼'), cell(1, 0, '口')]); assert.equal(w.wallet('alice'), 18); });
 test('鱼的外接宽高除以总鱼元数，斜线有双向优势', () => { assert.deepEqual(velocities([cell(0, 0), cell(1, 1)]), { x: 2, y: 2 }); assert.deepEqual(velocities([cell(0, 0), cell(1, 0)]), { x: 2, y: 1 }); });
+test('同形鱼饥饿时各自选字，断开等大的两段仍按这条鱼的记录裁决', () => {
+  const world = new World(t), body = Array.from({ length: 5 }, (_, i) => cell(i, 0));
+  const ids = Array.from({ length: 6 }, (_, i) => fish(world, body, 20 + 10 * i, 20, 'owner' + i));
+  const reference = new World(t);
+  reference.data = world.serialize();
+  const groups = world.fishGroups(), layout = world.bodyLayout(groups);
+  for (const [i, id] of ids.entries()) {
+    const cells = groups.get(id), selected = [cells[0].id, cells[2].id, null][i % 3];
+    world.starve(id, t + i, selected, { cells, hull: layout.hull(cells) });
+    reference.starve(id, t + i, selected);
+    assert.deepEqual(world.data.chars, reference.data.chars);
+    assert.deepEqual(world.data.fishes, reference.data.fishes);
+  }
+});
 test('每只眼睛浅水二十格、深水十格，包含边界和斜角，按眼睛所在深度划分且盲鱼不能追', () => {
   const f = { x: 40, y: 20, facing: 1 };
   assert.equal(canSee(f, [cell(0, 0, 'Q')], { x: 41, y: 21 }), false);
