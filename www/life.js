@@ -52,6 +52,41 @@ export function recordStory(world, kind, fish, at, extra = {}) {
   if (Object.keys(life.stories).length > LIFE.storyLimit) life.stories = trim(life.stories, LIFE.storyLimit);
   world.dirty = true;
 }
+export function storyBatch(world, life) {
+  let stories, storyOrder, storyCount, orderChanged = false;
+  const compareStories = (a, b) => stories[b].at - stories[a].at || a.localeCompare(b);
+  function record(_, kind, fish, at, extra = {}) {
+    if (!stories) {
+      life ??= state(world, at);
+      stories = { ...(world.readStories?.() ?? life.stories) };
+      storyCount = Object.keys(stories).length;
+    }
+    const story = makeStory(kind, fish, at, extra), id = story.id, old = stories[id];
+    if (old) {
+      stories[id] = choose(old, story);
+      if (old.at !== stories[id].at) orderChanged = true;
+    } else { stories[id] = story; storyCount++; }
+    if (storyCount <= LIFE.storyLimit) return;
+    if (!storyOrder) storyOrder = Object.keys(stories).sort(compareStories);
+    else if (orderChanged) { if (!old) storyOrder.push(id); storyOrder.sort(compareStories); }
+    else if (!old) {
+      let low = 0, high = storyOrder.length;
+      while (low < high) {
+        const mid = (low + high) >>> 1;
+        if (compareStories(id, storyOrder[mid]) < 0) high = mid; else low = mid + 1;
+      }
+      storyOrder.splice(low, 0, id);
+    }
+    while (storyOrder.length > LIFE.storyLimit) delete stories[storyOrder.pop()];
+    storyCount = storyOrder.length; orderChanged = false;
+  }
+  function commit() {
+    if (!stories) return;
+    life.stories = storyOrder ? Object.fromEntries(storyOrder.map(id => [id, stories[id]])) : stories;
+    world.dirty = true;
+  }
+  return { record, commit };
+}
 function clearLine(a, b, blockedRows) {
   const dx = deltaX(b.x, a.x), dy = b.y - a.y, steps = Math.ceil(Math.max(Math.abs(dx), Math.abs(dy)));
   for (let i = 1; i < steps; i++) {
@@ -294,29 +329,7 @@ export function updateLife(world, now, context) {
   const life = state(world, now), elapsed = now - life.at;
   if (elapsed < 1000 && elapsed >= 0) return;
   const dt = elapsed > 0 && elapsed <= 2500 ? Math.min(1, elapsed / 1000) : 0;
-  let stories, storyOrder, storyCount, orderChanged = false;
-  const compareStories = (a, b) => stories[b].at - stories[a].at || a.localeCompare(b);
-  function record(_, kind, fish, at, extra) {
-    if (!stories) { stories = { ...(world.readStories?.() ?? life.stories) }; storyCount = Object.keys(stories).length; }
-    const story = makeStory(kind, fish, at, extra), id = story.id, old = stories[id];
-    if (old) {
-      stories[id] = choose(old, story);
-      if (old.at !== stories[id].at) orderChanged = true;
-    } else { stories[id] = story; storyCount++; }
-    if (storyCount <= LIFE.storyLimit) return;
-    if (!storyOrder) storyOrder = Object.keys(stories).sort(compareStories);
-    else if (orderChanged) { if (!old) storyOrder.push(id); storyOrder.sort(compareStories); }
-    else if (!old) {
-      let low = 0, high = storyOrder.length;
-      while (low < high) {
-        const mid = (low + high) >>> 1;
-        if (compareStories(id, storyOrder[mid]) < 0) high = mid; else low = mid + 1;
-      }
-      storyOrder.splice(low, 0, id);
-    }
-    while (storyOrder.length > LIFE.storyLimit) delete stories[storyOrder.pop()];
-    storyCount = storyOrder.length; orderChanged = false;
-  }
+  const { record, commit } = storyBatch(world, life);
   const encounters = new Map();
   const previousAt = life.at;
   const spans = elapsed === 1000 && context.orderedPairs && world.activeBondSpans?.(previousAt);
@@ -401,10 +414,7 @@ export function updateLife(world, now, context) {
     if (row) return spans ? advanceBond(row, now) : row;
     return spans && previous[key] ? advanceBond(previous[key], previousAt) : previous[key];
   });
-  if (stories) {
-    life.stories = storyOrder ? Object.fromEntries(storyOrder.map(id => [id, stories[id]])) : stories;
-    world.dirty = true;
-  }
+  commit();
   life.at = now;
   if (context.orderedPairs && !inactive.length) {
     if (world.writeActiveBonds) world.writeActiveBonds(active, head, now, spans);

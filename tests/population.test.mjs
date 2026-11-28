@@ -5,7 +5,7 @@ import { wrapX } from '../www/geography.js';
 import { POPULATION, updatePopulation, illnessOf, volcanoPlan, predatorCells, validPopulation, validRocks, mergePopulation, mergeRocks } from '../www/population.js';
 import { restoreCheckpoint } from '../www/lifecycle.js';
 import { verifyLocalCheckpoint, verifyReplica } from '../www/replica.js';
-import { validateLife } from '../www/life.js';
+import { LIFE, recordStory, validateLife } from '../www/life.js';
 import { WorkerSimulation } from '../www/simulation-worker.js';
 import { SimulationClient } from '../www/simulation-client.js';
 import { WorldBroadcast } from '../www/world-broadcast.js';
@@ -24,6 +24,26 @@ function world(count = 0) {
   w.data.population.illnessSlot = Math.floor(now / HOUR); w.data.population.volcanoSlot = Math.floor(now / POPULATION.volcanoPeriod); return w;
 }
 const advance = (w, t) => { updatePopulation(w, t, transition); w.data.tick = t; };
+test('整点集中患病只交付一次故事表，保留逐条写入的内容与顺序', () => {
+  const w = world(), reference = world(), at = now + HOUR;
+  for (let i = 0; i < 2600; i++) {
+    const id = 'fish-' + i;
+    w.data.fishes[id] = { id, created: born };
+  }
+  for (let i = 0; i < LIFE.storyLimit; i++) recordStory(w, 'arrive', 'fish-' + i, now);
+  let stories = w.data.life.stories, writes = 0;
+  reference.data.life.stories = clone(stories);
+  Object.defineProperty(w.data.life, 'stories', {
+    get: () => stories,
+    set(value) { writes++; stories = value; }
+  });
+  advance(w, at);
+  const patients = Object.keys(w.data.population.illnesses);
+  assert.equal(patients.length, 520);
+  for (const id of patients) recordStory(reference, 'depressed', id, at, { visit: at });
+  assert.deepEqual(Object.entries(stories), Object.entries(reference.data.life.stories));
+  assert.equal(writes, 1);
+});
 function erupt(w, at = now) {
   for (let slot = Math.floor(at / POPULATION.volcanoPeriod); ; slot++) {
     if (!volcanoPlan(w.data, slot)) continue;
