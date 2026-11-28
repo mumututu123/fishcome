@@ -1,7 +1,11 @@
 import { EYES } from './engine.js';
 
 export function spriteCanvas() {
-  return typeof document === 'undefined' ? new OffscreenCanvas(1, 1) : document.createElement('canvas');
+  return typeof OffscreenCanvas === 'function' ? new OffscreenCanvas(1, 1) : document.createElement('canvas');
+}
+
+export function finishSprite(canvas) {
+  return canvas.transferToImageBitmap ? canvas.transferToImageBitmap() : canvas;
 }
 
 export function fishRuns(characters, previous) {
@@ -57,6 +61,7 @@ export class FishSprites {
       if (old.usedAt === renderer.frameTime) return;
       this.images.delete(oldKey);
       this.pixels -= old.image.width * old.image.height;
+      old.image.close?.();
       old.image = null;
     }
     const image = spriteCanvas();
@@ -65,7 +70,7 @@ export class FishSprites {
     for (const cell of parts) renderer.glyph(ctx, cell.ch, cell.color,
       (cell.x - first.x) * facing * size - left + pad, (cell.y - first.y) * size - top + pad,
       size, 1, EYES.has(cell.ch));
-    stamp = { key, size, facing, image, left: left - pad, top: top - pad, usedAt: renderer.frameTime };
+    stamp = { key, size, facing, image: finishSprite(image), left: left - pad, top: top - pad, usedAt: renderer.frameTime };
     this.images.set(key, stamp);
     this.pixels += width * height;
     return run.sprite = stamp;

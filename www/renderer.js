@@ -9,7 +9,7 @@ import { eventGlyphs } from './random-event-visuals.js';
 import { activeLegend, legendGeometry } from './legends.js';
 import { predatorCells, illnessOf, POPULATION } from './population.js';
 import { ViewportCells } from './viewport.js';
-import { FishSprites, fishRuns, spriteCanvas } from './fish-sprites.js';
+import { FishSprites, finishSprite, fishRuns, spriteCanvas } from './fish-sprites.js';
 import { SimulationRows } from './simulation-rows.js';
 const FONT = "'Microsoft YaHei',Consolas,monospace";
 
@@ -46,7 +46,32 @@ export class Renderer {
   screen(x, y) { const s = this.cell * this.scale; return { x: (nearX(x, this.camera.x) - this.camera.x) * s + this.width / 2, y: (y - this.camera.y) * s + this.height / 2 }; }
   seaweedScreen(cell) { const progress = Math.max(0, Math.min(1, (Date.now() - (cell.swayAt || 0)) / CONFIG.step)), x = Number.isFinite(cell.swayFromX) ? cell.swayFromX + deltaX(cell.x, cell.swayFromX) * progress : cell.x; return this.screen(x, cell.y); }
   zoom(value) { this.scale = Math.min(2, Math.max(.4, value)); }
-  glyph(ctx, ch, color, x, y, size, alpha = 1, glow = false) { this.glyphs ||= new Map(); const id = `${ch}:${color}:${size.toFixed(2)}:${glow}`; let sprite = this.glyphs.get(id); const pad = glow ? 6 : 1; if (!sprite) { sprite = spriteCanvas(); sprite.width = sprite.height = Math.ceil(size + pad * 2); const g = sprite.getContext('2d'); g.fillStyle = color; g.font = `${Math.max(3, size * .85)}px ${FONT}`; g.textAlign = 'center'; g.textBaseline = 'middle'; if (glow) { g.shadowBlur = 4; g.shadowColor = color; } g.fillText(ch, pad + size / 2, pad + size / 2, size); this.glyphs.set(id, sprite); if (this.glyphs.size > 4096) this.glyphs.delete(this.glyphs.keys().next().value); } ctx.globalAlpha = alpha; ctx.drawImage(sprite, x - pad, y - pad); ctx.globalAlpha = 1; }
+  glyph(ctx, ch, color, x, y, size, alpha = 1, glow = false) {
+    this.glyphs ||= new Map();
+    const id = `${ch}:${color}:${size.toFixed(2)}:${glow}`, pad = glow ? 6 : 1;
+    let sprite = this.glyphs.get(id);
+    if (!sprite) {
+      const canvas = spriteCanvas();
+      canvas.width = canvas.height = Math.ceil(size + pad * 2);
+      const g = canvas.getContext('2d');
+      g.fillStyle = color;
+      g.font = `${Math.max(3, size * .85)}px ${FONT}`;
+      g.textAlign = 'center';
+      g.textBaseline = 'middle';
+      if (glow) { g.shadowBlur = 4; g.shadowColor = color; }
+      g.fillText(ch, pad + size / 2, pad + size / 2, size);
+      sprite = finishSprite(canvas);
+      this.glyphs.set(id, sprite);
+      if (this.glyphs.size > 4096) {
+        const oldest = this.glyphs.keys().next().value;
+        this.glyphs.get(oldest).close?.();
+        this.glyphs.delete(oldest);
+      }
+    }
+    ctx.globalAlpha = alpha;
+    ctx.drawImage(sprite, x - pad, y - pad);
+    ctx.globalAlpha = 1;
+  }
   background(ctx, w, h, cam, size, world = this.world) {
     ctx.fillStyle = '#04121f'; ctx.fillRect(0, 0, w, h);
     const top = -cam.y * size + h / 2;
