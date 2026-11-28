@@ -125,6 +125,16 @@ const stoppedSessions = [];
 const workerLoads = [], activeWorkerLoad = new WeakMap();
 let revisionChange;
 const installedFields = new WeakMap(), originalInstall = ordered.installChecked;
+const checkpointDifferences = new WeakMap(), originalOrderedReceive = ordered.receive;
+ordered.receive = function (peer, body) {
+  const session = this.current;
+  if (session?.owner && session.cut && body?.action === 'history' && body.epoch === session.epoch) {
+    const fields = Object.keys(session.cut.tableProofs || {}).filter(key => body.tableProofs?.[key] !== session.cut.tableProofs[key]);
+    checkpointDifferences.set(session, { fields, exceptBondsEqual: body.exceptBonds === session.cut.exceptBonds,
+      receivedBonds: !!body.bonds, ordered: !!session.expanded, at: Date.now() });
+  }
+  return originalOrderedReceive.call(this,peer,body);
+};
 ordered.installChecked = function (session, changes) {
   installedFields.set(session, Object.keys(changes));
   return originalInstall.call(this, session, changes);
@@ -161,7 +171,7 @@ ordered.stop = function (reason, ...rest) {
   const s = this.current;
   if (s) stoppedSessions.push({ reason, at: Date.now(), base: s.base, tick: s.world.data.tick,
     ms: Math.round(performance.now() - s.began), waiting: !!s.waiting, checking: !!s.checking, cut: !!s.cut?.proof,
-    history: !!s.reconciling, step: s.steps?.next?.tick, sealed: !!s.steps?.next?.sealed,
+    history: !!s.reconciling, differences: checkpointDifferences.get(s), step: s.steps?.next?.tick, sealed: !!s.steps?.next?.sealed,
     local: !!s.localReady, remote: !!s.remoteReady, running: !!s.running, stack: new Error().stack.split(String.fromCharCode(10)).slice(2, 10) });
   return originalStop.call(this, reason, ...rest);
 };
