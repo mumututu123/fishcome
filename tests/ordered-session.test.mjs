@@ -231,6 +231,7 @@ function publishOrdinary(a, b, due, beforeMerge) {
   a.session.changed(a.world, { workerChanges: {}, values: { tick: due } });
   const incoming = a.world.serialize();
   beforeMerge?.();
+  b.session.replaceUnsealed(b.world, incoming.tick);
   const changes = b.world.merge(incoming, {}, 'replica', true);
   b.session.changed(b.world, null, 'replica', changes);
   b.session.appliedReplica(b.world, changes, incoming, {});
@@ -333,6 +334,34 @@ test('开启通知到达时已经错过旧步，双方提前预约同一自然�
   for (const side of [a,b]) assert.equal(side.session.run(now + 2500), true);
   await drain();
   assert.deepEqual(a.calls,[now + 2500]);
+  assert.deepEqual(a.calls,b.calls);
+});
+
+for (const missing of ['offer','accept']) test('首次输入尚未封单就错过 ' + missing + '，旧步照常发布并用原证明接管下一步', async () => {
+  const now = Date.now(), { sides: [a,b], drain } = pair(now);
+  const signed = await earn(a.world, 5);
+  a.session.io.inputs = () => a.world.data.ops[signed.body.id] ? [] : [signed];
+  a.session.io.resumeInputs = () => {
+    assert.ok(a.world.apply({ ...signed.body, proof: signed }).ok);
+    a.session.changed(a.world);
+  };
+  let lost;
+  await a.session.probe();
+  await drain(msg => { if (msg.action === missing) { lost = msg; return true; } });
+  const epoch = a.session.current.epoch;
+  for (const side of [a,b]) assert.equal(side.session.run(now + 500), false);
+  publishOrdinary(a,b,now + 500);
+  await b.session.afterReplica();
+  await drain();
+  await (missing === 'offer' ? b : a).session.receive((missing === 'offer' ? b : a).peer,lost);
+  for (const side of [a,b]) {
+    assert.equal(side.session.current.epoch, epoch);
+    assert.deepEqual(side.applied, []);
+    assert.deepEqual(side.world.data.ops[signed.body.id].proof, signed);
+    assert.equal(side.session.run(now + 1000), true);
+  }
+  await drain();
+  assert.deepEqual(a.calls,[now + 1000]);
   assert.deepEqual(a.calls,b.calls);
 });
 

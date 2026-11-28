@@ -200,6 +200,7 @@ const ordered = new OrderedSession({
   archiveBoundary: (target, commit) => atCheckpointBoundary(target.data, () => simulation.archiveAtStepBoundary(target, commit)),
   archiveConfirmed: () => { renderChat(); save({ reusePicture: true }).catch(error => diagnostics.record('warn', 'archive', error.message)); },
   firstCommit: () => worldBroadcast.reset(),
+  resumeInputs: () => resumeOrderedInputs().catch(error => diagnostics.record('warn', 'ordered-steps', error.message)),
   checkRetained: target => simulation.checkRetained(target, () => target === world && mayRetainWorker()),
   hasSavedCharacters: target => simulation.hasSavedCharacters(target),
   prepare: (target, valid, pages) => simulation.prepareAgreed(target, valid, pages),
@@ -368,6 +369,7 @@ async function mergeVerifiedWorld(data, peer, context, { local = false, worldMes
     const priorRevision = worldRevision(target), priorTick = target.data.tick;
     const routine = delta && !needsReplicaSave(incoming, target.data, store);
     const apply = () => {
+      if (worldMessage && peer?.node === worldMessage.from && worldMessage.from === leader()) ordered.replaceUnsealed(target, incoming.tick);
       const index = delta && renderer.currentIndex(target);
       let changes;
       try { changes = target.merge(incoming, archived, delta ? 'replica' : undefined, delta || (joined && 'join'), checkedRules); }

@@ -35,8 +35,9 @@ export class OrderedSteps {
       await this.verifyInputs(slot.inputs);
       slot.digest = await stepDigest([this.epoch, this.proof, slot.tick, slot.inputs, slot.archive ?? null]);
       if (this.next === slot && !this.closed) await this.reply('accept', slot);
-    } else if (body.action === 'accept' && this.leader && this.next?.digest && this.next.digest === body.digest && !this.next.sealed) {
+    } else if (body.action === 'accept' && this.leader && this.next?.digest && this.next.digest === body.digest && !this.next.sealing && !this.next.sealed) {
       const slot = this.next;
+      slot.sealing = true;
       await this.reply('seal', slot);
       if (this.next === slot && !this.closed) slot.sealed = true;
     } else if (body.action === 'seal' && !this.leader && this.next?.digest && this.next.digest === body.digest) {

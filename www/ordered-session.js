@@ -216,7 +216,7 @@ export class OrderedSession {
   begin(peer, epoch, base) {
     const world = this.io.world(), store = this.io.store();
     return this.current = { peer, epoch, base, world, store, revision: store.revision, archiveAt: world.data.archives?.at,
-      leader: this.io.leader(), owner: this.io.isLeader(), began: performance.now(), receipts: new Map() };
+      leader: this.io.leader(), owner: this.io.isLeader(), began: performance.now() };
   }
   async probe() {
     const prior = this.current;
@@ -299,6 +299,9 @@ export class OrderedSession {
   async afterReplica() {
     const s = this.current;
     if (s?.reserved && !s.owner && !s.snapshot && s.world.data.tick === s.base && this.valid(s)) this.capture(s);
+    if (s?.localJoined && !s.steps && !s.followAnchor && s.world.data.tick > s.base) {
+      return this.send(s, { action: 'pastJoined', base: s.base, proof: s.proof, follow: !s.cut?.changes.chars && !s.cut?.changes.ops });
+    }
     if (s?.followAnchor && !s.owner && !s.steps) {
       if (s.journal.broken) return this.send(s, { action: 'pastJoined', base: s.base, proof: s.proof, follow: false });
       return this.offerTip(s);
@@ -373,7 +376,7 @@ export class OrderedSession {
     const { tick, version } = s.journal, revision = s.store.revision;
     const current = () => this.valid(s) && !s.steps && s.world.data.tick === tick && s.journal.version === version &&
       s.store.revision === revision && this.io.peer() === s.peer;
-    if (s.offeredTip?.version === version || !current()) return;
+    if (tick < s.retryTipAt || s.offeredTip?.version === version || !current()) return;
     const proof = await s.journal.proof(s.world, s.store, s.proof);
     if (!proof || !current()) return;
     const handle = await this.io.prepare(s.world, current);
@@ -382,6 +385,7 @@ export class OrderedSession {
     await this.send(s, { action: 'tipReady', base: tick, anchor: s.proof, proof, parts: s.journal.tip.parts });
   }
   startTip(s, tick, proof) {
+    s.anchor ??= { base: s.base, proof: s.proof };
     s.revision = s.store.revision;
     s.archiveAt = s.world.data.archives?.at;
     s.base = tick;
@@ -418,15 +422,32 @@ export class OrderedSession {
     return s.onJoin ??= new Promise(resolve => { s.joined = resolve; });
   }
   start(s) {
+    s.anchor ??= { base: s.base, proof: s.proof };
     s.joined?.(true);
     if (!s.owner) this.preload(s, s.followAnchor ? undefined : s.cut?.characterPages);
     s.cut = undefined;
+    const receipts = s.receipts = new Map();
     s.steps = new OrderedSteps({ epoch: s.epoch, tick: s.base, proof: s.proof, leader: s.owner,
       send: body => this.send(s, body), validOp: async op => {
         if (!await this.io.validOp(s.world, op)) return false;
-        s.receipts.set(op.body.id, await s.store.get('ops', op.body.id));
+        receipts.set(op.body.id, await s.store.get('ops', op.body.id));
         return this.valid(s);
       } });
+  }
+  releaseOffer(s) {
+    s.retryTipAt = s.steps.next.tick;
+    s.steps.close();
+    s.steps = s.offeredTip = s.preload = undefined;
+    s.receipts.clear();
+    Object.assign(s, s.anchor);
+    s.localJoined = false;
+    s.followAnchor = s.changedAfterCut = true;
+    if (s.owner) this.io.resumeInputs?.();
+  }
+  replaceUnsealed(world, published) {
+    const s = this.current, slot = s?.steps?.next;
+    if (s?.world === world && !s.owner && s.followable && !s.executed && !s.archive &&
+        slot && !slot.sealed && published >= slot.tick) this.releaseOffer(s);
   }
   async proposeArchive(boundary) {
     const s = this.current;
@@ -592,6 +613,7 @@ export class OrderedSession {
       return;
     }
     if (b.action === 'joined' && s.owner && !s.steps && b.base === s.base && b.proof === s.proof) {
+      s.followable = b.follow === true;
       if (s.changedAfterCut || s.world.data.tick !== s.base || s.store.revision !== s.revision ||
           s.world.data.archives?.at !== s.archiveAt || this.io.peer() !== s.peer) {
         if (b.follow !== true || s.journal.broken) { s.nextCut = true; return; }
@@ -606,6 +628,7 @@ export class OrderedSession {
         return this.send(s, { action: 'pastJoined', base: s.base, proof: s.proof, follow: false });
       }
       s.followAnchor = true;
+      s.followable = true;
       return this.offerTip(s);
     }
     if (b.action === 'tipReady' && s.owner && s.followAnchor && !s.steps && b.base === s.world.data.tick && b.anchor === s.proof && /^[0-9a-f]{64}$/.test(b.proof)) {
@@ -617,6 +640,7 @@ export class OrderedSession {
         s.differences = { fields: ['chars/ops', 'world', 'archive'].filter((name, i) => s.journal.tip.parts[i] !== b.parts?.[i]), tick: b.base };
         this.stop('双方实际提交的增量结果不同'); return;
       }
+      s.followable = true;
       this.startTip(s, b.base, proof);
       return this.offer(s);
     }
@@ -626,6 +650,7 @@ export class OrderedSession {
       this.startTip(s, b.base, b.previous);
     }
     if (b.action === 'offer' && !s.owner && !s.steps && s.localJoined && b.base === s.base && b.previous === s.proof) {
+      s.followable = !s.cut?.changes.chars && !s.cut?.changes.ops;
       if (s.changedAfterCut || s.world.data.tick !== s.base || s.revision !== s.store.revision || s.archiveAt !== s.world.data.archives?.at || this.io.peer() !== s.peer) {
         await this.send(s, { action: 'pastJoined', base: s.base, proof: s.proof, follow: !s.cut?.changes.chars && !s.cut?.changes.ops });
         return;
@@ -669,8 +694,10 @@ export class OrderedSession {
       }
       return;
     }
-    await s.steps.receive(b);
-    const slot = s.steps.next;
+    const steps = s.steps;
+    await steps.receive(b);
+    if (s.steps !== steps) return;
+    const slot = steps.next;
     if (!this.valid(s) || !slot?.sealed || slot.preparing) return;
     slot.preparing = true;
     if (slot.archive) {
@@ -729,6 +756,11 @@ export class OrderedSession {
       return false;
     }
     if (!s.localReady || s.localReady !== s.remoteReady) {
+      const proposal = s.steps?.next;
+      if (!s.executed && !s.archive && s.followable && proposal && !proposal.sealing && !proposal.sealed) {
+        if (s.owner) this.releaseOffer(s);
+        return false;
+      }
       this.stop('本步输入尚未得到双方确认', true, true); return false;
     }
     const slot = s.steps.take(s.world.data.tick);
