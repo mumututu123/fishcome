@@ -175,7 +175,7 @@ try {
       if (!await verified.open(replay, () => true)) throw new Error('复核模拟未初始化');
       for (let i = 1; i <= warmup + steps; i++) {
         const now = start + i * CONFIG.step, swims = [], at = performance.now();
-        ecology.step(now, pathWorld === ecology ? swims : undefined);
+        ecology.step(now, pathWorld === ecology ? swims : []);
         if (i > warmup) ecologies.push(performance.now() - at);
         if (pathWorld !== ecology) pathWorld.step(now, swims);
         await verified.advance(replay, now);
