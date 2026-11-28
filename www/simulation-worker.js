@@ -584,7 +584,14 @@ export class WorkerSimulation {
       else if (message.geometry) geometry = this.world.reconcileGeometry(message.now);
       else this.world.reconcileChatFloor(message.now);
       const patch = this.tracker.changes();
-      if (swims.length) patch.swims = swims;
+      if (swims.length) {
+        // The page and worker already share this roster for position rows.
+        // Fish born since the worker opened still use their full ID.
+        for (const ids of swims) if (ids) {
+          for (let i = 0; i < ids.length; i++) ids[i] = this.tracker.swimOrdinal(ids[i]) ?? ids[i];
+        }
+        patch.swims = swims;
+      }
       return { patch, foodRevision: this.world.foodRevision - foodRevision, geometry };
     }
   }

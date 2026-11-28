@@ -3,6 +3,7 @@ import test from 'node:test';
 import { BodyMembership } from '../www/body-membership.js';
 import { CONFIG, World, indexEcologyCharacters } from '../www/engine.js';
 import { WorkerSimulation } from '../www/simulation-worker.js';
+import { expandSimulationPatch } from '../www/simulation-delta.js';
 import { POPULATION } from '../www/population.js';
 import { CONTACT_TIME, updateContacts } from '../www/breeding.js';
 import { makeFishWorld } from './capacity-fish.mjs';
@@ -54,7 +55,8 @@ test('进食、饥饿和疾病只撤销变形鱼的画面路径，其余鱼仍�
     const reply = sim.receive({ kind: 'step', base: now, names: [], foods: [] });
     if (cause === 'food') assert.equal(reference.data.chars.food.entity, changed);
     else assert.equal(reference.data.fishes[changed], undefined);
-    assert.deepEqual(reply.patch.swims, paths);
+    const committed = expandSimulationPatch(before, reply.patch, Object.keys(before.fishes));
+    assert.deepEqual(committed.swims, paths);
     assert(paths.flat().length > 0 && !paths.flat().includes(changed));
     paths.forEach((ids, d) => {
       for (const id of ids) {

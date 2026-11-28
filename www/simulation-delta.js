@@ -208,5 +208,7 @@ export function expandSimulationPatch(data, patch, knownFish, commitRows = false
       }
     }
   }
-  return patch.swims ? { values, tables, swims: patch.swims } : { values, tables };
+  if (!patch.swims) return { values, tables };
+  const swims = patch.swims.map(ids => ids.map(ref => rowId(ref, knownFish)));
+  return { values, tables, swims };
 }
