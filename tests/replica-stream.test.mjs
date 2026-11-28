@@ -687,6 +687,44 @@ test('签名收入、同格前台输入和已归档删除可随下一步交付�
   assert.deepEqual(first.world.chars.burn, burn);
 });
 
+test('游动发布按伙伴确认的鱼序编码，保留乱序数值列和同一步的完整记录', async () => {
+  const world = new World(100, 'sea', { populate: false, ambient: false }), { data } = world;
+  let notify;
+  const sender = new WorldBroadcast(fn => { notify = fn; });
+  const sink = { live: () => [1], broadcast: (_, body) => body };
+  const ids = ['a', 'b', 'c', 'd'];
+  for (const id of ids) data.fishes[id] = { id, x: 0, y: 3, facing: 1, cx: 0, cy: 0, posAt: data.tick };
+  const first = await sender.send(sink, data, 100);
+  let base = replicaRowBase(crypto.randomUUID(), first.world, true);
+
+  async function play(order, x) {
+    const tick = data.tick += CONFIG.step;
+    const set = [], motion = [];
+    for (const [i, index] of order.entries()) {
+      const id = ids[index], before = data.fishes[id];
+      const row = data.fishes[id] = { ...before, x: x + i, posAt: tick };
+      if (x === 10 && id === 'b') { row.name = '新名字'; set.push([id, row]); }
+      else if (x === 10 && id === 'c') set.push([id, { x: row.x, posAt: tick }, undefined]);
+      else { set.push(index); motion.push(row.x, row.y, row.facing, row.cx, row.cy); }
+    }
+    const tables = { fishes: { set: order.map(index => [ids[index], data.fishes[ids[index]]]), remove: [] } };
+    const values = { tick };
+    notify(world, { values, tables, workerChanges: { values, tables: { fishes: { set, motion: Float64Array.from(motion), remove: [] } } } });
+    const sent = await sender.send(sink, data, tick);
+    for (const bytes of [false, true]) {
+      const encoded = encodeReplicaRowDelta(sent, base, true, bytes);
+      assert.deepEqual(decodeReplicaRowDelta(encoded, base, true, bytes).world.fishes, data.fishes);
+    }
+    base = replicaRowBase(crypto.randomUUID(), sent.world, true, base);
+    return sent;
+  }
+
+  const previous = await play([3, 2, 0, 1], 10);
+  await play([1, 3, 2, 0], 20);
+  assert.deepEqual(Object.values(previous.world.fishes).map(({ x }) => x), [12, 13, 11, 10]);
+  assert.equal(previous.world.fishes.b.name, '新名字');
+});
+
 test('发布缺口锁住只覆盖较晚时刻的包，合包保留最早覆盖时刻', () => {
   const recovery = new ReplicaRecovery(), actor = 'host', from = 'direct';
   const packet = (fromTick, tick) => ({ delta: true, fromTick, world: { tick, travel: {} } });

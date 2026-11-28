@@ -77,62 +77,66 @@ export class FishPoseFrame {
     const indices = previous?.indices ?? new Map(roster.map(([id], i) => [id, i]));
     const idAt = i => frame ? frame.idAt(i) : edits.set[i][0];
     if (raw.motion.length === length * 5 && raw.set.every((row, i) => !Array.isArray(row) && idAt(i) === roster[i][0])) {
-      return new FishPoseFrame(previous, roster, indices, raw.motion, tick);
+      return new FishPoseFrame(previous, roster, indices, { motion: raw.motion }, tick);
     }
-    const motion = new Float64Array(length * 5), seen = new Uint8Array(length);
-    let updated, exceptions, offset = 0;
+    const offsets = new Int32Array(length);
+    let updated, loose, exceptions, offset = 0;
     for (let i = 0; i < length; i++) {
       const id = idAt(i), ref = indices.get(id), edit = raw.set[i];
-      if (ref === undefined || seen[ref]) return;
-      seen[ref] = 1;
-      const at = ref * 5;
+      if (ref === undefined || offsets[ref]) return;
       if (!Array.isArray(edit)) {
-        for (let k = 0; k < 5; k++) motion[at + k] = raw.motion[offset++];
+        offsets[ref] = offset + 1;
+        offset += 5;
       } else {
+        offsets[ref] = -1;
         const row = frame ? frame.recordAt(i) : edits.set[i][1];
-        for (let k = 0; k < 5; k++) motion[at + k] = row[poseFields[k]];
-        if (!poseEdit(edit, row, roster[ref][1], tick)) {
+        if (poseEdit(edit, row, roster[ref][1], tick)) {
+          (loose ??= [])[ref] = { x: row.x, y: row.y, facing: row.facing, cx: row.cx, cy: row.cy };
+        } else {
           const snapshot = structuredClone(row);
-          (exceptions ??= new Map()).set(ref, snapshot);
+          (loose ??= [])[ref] = snapshot;
+          (exceptions ??= [])[ref] = snapshot;
           (updated ??= roster.slice())[ref] = [id, snapshot];
         }
       }
     }
     if (offset !== raw.motion.length) return;
-    return new FishPoseFrame(previous, updated ?? roster, indices, motion, tick, exceptions);
+    return new FishPoseFrame(previous, updated ?? roster, indices, { motion: raw.motion, offsets, loose }, tick, exceptions);
   }
-  constructor(previous, roster, indices, motion, tick, exceptions) {
+  constructor(previous, roster, indices, columns, tick, exceptions) {
     this.roster = roster;
     this.indices = indices;
-    this.priorMotion = previous?.motion;
-    this.priorExceptions = previous?.exceptions;
+    this.prior = previous?.columns;
     this.exceptions = exceptions;
-    this.motion = motion;
+    this.columns = columns;
     this.tick = tick;
     this.token = {};
   }
   table() {
     if (this.materialized) return this.materialized;
-    const table = {};
-    for (let i = 0, j = 0; i < this.roster.length; i++, j += 5) {
+    const table = {}, { motion, offsets, loose } = this.columns;
+    for (let i = 0; i < this.roster.length; i++) {
       const [id, cold] = this.roster[i];
-      table[id] = this.exceptions?.get(i) ?? { ...cold, x: this.motion[j], y: this.motion[j + 1],
-        facing: this.motion[j + 2], cx: this.motion[j + 3], cy: this.motion[j + 4], posAt: this.tick };
+      const j = offsets ? offsets[i] - 1 : i * 5;
+      table[id] = this.exceptions?.[i] ?? (j < 0 ? { ...cold, ...loose[i], posAt: this.tick } : {
+        ...cold, x: motion[j], y: motion[j + 1], facing: motion[j + 2], cx: motion[j + 3], cy: motion[j + 4], posAt: this.tick
+      });
     }
     return this.materialized = table;
   }
   encode() {
     const rows = new Array(this.roster.length);
+    const { motion, offsets, loose } = this.columns, prior = this.prior;
     for (let i = 0; i < rows.length; i++) {
-      const exception = this.exceptions?.get(i);
+      const exception = this.exceptions?.[i];
       if (exception) { rows[i] = [this.roster[i][0], exception]; continue; }
-      const row = rows[i] = [i, -1], cold = this.roster[i][1];
-      const prior = this.priorExceptions?.get(i);
-      for (let k = 0, j = i * 5; k < 5; k++, j++) {
-        const before = prior ? prior[poseFields[k]] : this.priorMotion ? this.priorMotion[j] : cold[poseFields[k]];
-        if (this.motion[j] === before) continue;
+      const row = rows[i] = [i, -1], current = loose?.[i], before = prior ? prior.loose?.[i] : this.roster[i][1];
+      const nextAt = offsets ? offsets[i] - 1 : i * 5, beforeAt = prior?.offsets ? prior.offsets[i] - 1 : i * 5;
+      for (let k = 0; k < 5; k++) {
+        const value = current ? current[poseFields[k]] : motion[nextAt + k];
+        if (value === (before ? before[poseFields[k]] : prior.motion[beforeAt + k])) continue;
         row[1] -= 1 << k;
-        row.push(this.motion[j]);
+        row.push(value);
       }
     }
     return rows;
@@ -143,19 +147,22 @@ export class FishPoseFrame {
   packed() {
     if (this.packedRows) return this.packedRows;
     const bytes = new Uint8Array(this.roster.length * 41), view = new DataView(bytes.buffer);
-    const full = [];
+    const full = [], { motion, offsets, loose } = this.columns, prior = this.prior;
     let offset = 0;
     for (let i = 0; i < this.roster.length; i++) {
-      const maskAt = offset++, exception = this.exceptions?.get(i);
+      const maskAt = offset++, exception = this.exceptions?.[i];
       if (exception) { bytes[maskAt] = 32; full.push(exception); continue; }
-      const cold = this.roster[i][1], prior = this.priorExceptions?.get(i);
-      for (let k = 0, j = i * 5; k < 5; k++, j++) {
-        const before = prior ? prior[poseFields[k]] : this.priorMotion ? this.priorMotion[j] : cold[poseFields[k]];
-        if (this.motion[j] === before) continue;
-        bytes[maskAt] |= 1 << k;
-        view.setFloat64(offset, this.motion[j], true);
+      const current = loose?.[i], before = prior ? prior.loose?.[i] : this.roster[i][1];
+      const nextAt = offsets ? offsets[i] - 1 : i * 5, beforeAt = prior?.offsets ? prior.offsets[i] - 1 : i * 5;
+      let mask = 0;
+      for (let k = 0; k < 5; k++) {
+        const value = current ? current[poseFields[k]] : motion[nextAt + k];
+        if (value === (before ? before[poseFields[k]] : prior.motion[beforeAt + k])) continue;
+        mask |= 1 << k;
+        view.setFloat64(offset, value, true);
         offset += 8;
       }
+      bytes[maskAt] = mask;
     }
     return this.packedRows = { poses: bytes.subarray(0, offset).toBase64(), ...(full.length && { full }) };
   }
