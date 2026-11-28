@@ -127,6 +127,8 @@ test('画面依次播放已结算的横移、下潜，海域接缝上点击跟�
   assert.deepEqual(renderer.paintedFish.slice(0, 2), [55, 50]);
   assert.deepEqual(renderer.hit(56, 52), { kind: 'fish', id: 'f' });
   assert.equal(renderer.hit(65, 62), null);
+  renderer.worldChanged(world, null);
+  renderer.presentSwims(world, swims, start);
   renderer.draw(world, start + 375);
   assert.deepEqual(renderer.paintedFish.slice(0, 2), [60, 55]);
   assert.equal(renderer.fishPose(world, 'f', start + 501), fish);

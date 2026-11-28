@@ -187,7 +187,7 @@ for (const [object, method, name] of [
     const result = window.denseObserve(name, original, this, args), ms = performance.now() - start;
     const [incoming, archived, origin] = args;
     testData.worldMerges.push({ at, ms, before: previous, after: this.data.tick, incomingTick: incoming.tick,
-      routine: origin === 'replica', newArchives: Object.keys(this.data.archives?.chunks || {}).length - archiveCount,
+      replicaDelta: origin === 'replica', newArchives: Object.keys(this.data.archives?.chunks || {}).length - archiveCount,
       incomingChars: Object.keys(incoming.chars).length, incomingOps: Object.keys(incoming.ops).length,
       incomingScenes: Object.keys(incoming.scenes).length, incomingBreeding: Object.keys(incoming.breeding || {}).length,
       archiveChars: Object.keys(archived?.chars || {}).length, archiveOps: Object.keys(archived?.ops || {}).length });

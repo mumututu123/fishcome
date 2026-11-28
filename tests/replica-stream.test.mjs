@@ -355,13 +355,27 @@ test('只播放同一来源相邻确认步的泳姿，跨缝可游动，转向�
   next.body.world.chars = { cell: { kind: 'fish', entity: 'd' } };
   assert.deepEqual(apply(next, () => { local.fishes.c.x = 6; }).directions?.flat(), ['a']);
 
+  const started = animation.latest.startedAt;
+  const archive = message(600, {}, dir(5, [0]));
+  assert.deepEqual(apply(archive).directions.flat(), ['a']);
+  assert.equal(animation.latest.startedAt, started, '同一步补归档不应让鱼游回起点');
+  const delayed = apply(message(100, { a: fish('a', 999, 1, 100) }, dir(3, [0])));
+  assert.deepEqual(delayed.directions.flat(), ['a']);
+  assert.equal(delayed.tick, 600);
+  assert.equal(delayed.startedAt, started, '旧包不能中断已确认的当前一步');
+  assert.equal(apply(message(600, { a: fish('a', 4, 1, 600) })).directions, undefined);
+  assert.equal(apply(archive).directions, undefined, '后续归档不能恢复已经纠正的路径');
+
   const latest = animation.latest;
   assert.equal(apply(message(100, { a: fish('a', 999, 1, 100) }, dir(5, [0]))), undefined);
   assert.equal(animation.latest, latest);
-  assert.equal(local.fishes.a.x, 0);
+  assert.equal(local.fishes.a.x, 4);
   assert.equal(apply(message(1600, { a: fish('a', 2, 1, 1600) }, dir(5, [0]))).directions, undefined);
   assert.equal(local.fishes.a.x, 2);
   assert.deepEqual(apply(message(2100, { a: fish('a', 3, 1, 2100) }, dir(5, [0]))).directions?.flat(), ['a']);
+  const changed = message(2100, {});
+  changed.body.world.chars = { body: { kind: 'fish', entity: 'a' } };
+  assert.equal(apply(changed).directions, undefined, '同一步内鱼体发生变化应撤销该鱼的路径');
 
   assert.equal(apply(message(2600, { a: fish('a', 4, 1, 2600) })).directions, undefined);
   assert.equal(apply(message(3100, { a: fish('a', 5, 1, 3100) }, dir(5, [0]), 'new leader')).directions, undefined);

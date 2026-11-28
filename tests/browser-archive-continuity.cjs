@@ -162,5 +162,20 @@ test('空归档保持后台模拟，有记录时继续归档和整理', async t 
     const { world } = await get('checkpoint', { observeCheckpoint: false });
     return !!(world.ops[heldReplica.id] && world.archives.chunks[heldReplica.chunk] && await get('archive:' + heldReplica.chunk));
   }), '下一步接收成功后仍需从磁盘读回签名记录、归档目录和归档内容');
+  const scans = await page.evaluate(async () => {
+    const { world, earn, receive } = archiveFixture();
+    const income = await earn(5, Date.now());
+    await receive();
+    const original = world.charValues;
+    let full = 0;
+    world.charValues = function (...kinds) {
+      if (!kinds.length) full++;
+      return original.apply(this, kinds);
+    };
+    try { await receive({ [income.id]: income }); }
+    finally { delete world.charValues; }
+    return full;
+  });
+  assert.equal(scans, 0, '已验签收入不会改变鱼体，保存收入时应继续使用鱼元索引');
   assert.deepEqual(errors, []);
 });

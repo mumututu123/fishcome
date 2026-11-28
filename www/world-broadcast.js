@@ -184,15 +184,20 @@ function sameReplicaWorld(left, right) {
     roots.length === Object.keys(right.roots).length && roots.every(root => Object.hasOwn(right.roots, root) && left.roots[root] === right.roots[root]);
 }
 
-function decodeSwims(data, incoming, encoded) {
-  if (!Array.isArray(encoded) || encoded.length > 9 || encoded[4] != null) return;
-  const ids = Object.keys(incoming.fishes), seen = new Set(), dirs = [], captured = capturedFishIds(data, data.tick);
+function incomingBodyChanges(data, incoming) {
   const changedBodies = new Set();
   for (const [id, cell] of Object.entries(incoming.chars || {})) {
     const before = data.chars[id];
     if (before?.kind === 'fish') changedBodies.add(before.entity);
     if (cell.kind === 'fish') changedBodies.add(cell.entity);
   }
+  return changedBodies;
+}
+
+function decodeSwims(data, incoming, encoded) {
+  if (!Array.isArray(encoded) || encoded.length > 9 || encoded[4] != null) return;
+  const ids = Object.keys(incoming.fishes), seen = new Set(), dirs = [], captured = capturedFishIds(data, data.tick);
+  const changedBodies = incomingBodyChanges(data, incoming);
   for (let direction = 0; direction < encoded.length; direction++) {
     const indices = encoded[direction];
     if (indices == null) continue;
@@ -221,23 +226,30 @@ export class ReplicaSwims {
   merge(data, { from, actor, body }, apply) {
     const incoming = body.world, tick = data.tick, previous = this.latest;
     const sameWorld = sameReplicaWorld(data, incoming);
-    const contiguous = sameWorld && body.delta === true && previous?.data === data && previous.from === from && previous.actor === actor &&
-      previous.tick === tick && incoming.tick === tick + CONFIG.step;
-    const directions = contiguous ? decodeSwims(data, incoming, body.swims) : undefined;
+    const sameSource = sameWorld && body.delta === true && previous?.data === data && previous.from === from &&
+      previous.actor === actor && previous.tick === tick;
+    const keepStep = sameSource && incoming.tick <= tick, contiguous = sameSource && incoming.tick === tick + CONFIG.step;
+    const presentedTick = keepStep ? tick : incoming.tick;
+    const changedBodies = keepStep && previous.directions ? incomingBodyChanges(data, incoming) : null;
+    let directions = keepStep ? previous.directions : contiguous ? decodeSwims(data, incoming, body.swims) : undefined;
+    const poses = keepStep ? previous.poses : incoming.fishes;
     apply();
     const mergedWorld = sameReplicaWorld(data, incoming);
     if (!sameWorld || !mergedWorld) this.reset();
-    if (data.tick !== incoming.tick || !mergedWorld) return;
+    if (data.tick !== presentedTick || !mergedWorld || (incoming.tick < tick && !directions)) return;
     if (directions?.length) {
       const captured = capturedFishIds(data, data.tick);
-      for (let direction = 0; direction < directions.length; direction++) if (directions[direction]) {
-        directions[direction] = directions[direction].filter(id => {
-          const pose = data.fishes[id], sent = incoming.fishes[id];
-          return pose?.posAt === incoming.tick && pose.x === sent.x && pose.y === sent.y && pose.facing === sent.facing && !captured.has(id);
-        });
-      }
+      directions = directions.map(ids => ids?.filter(id => {
+        const pose = data.fishes[id], sent = poses[id];
+        return pose?.posAt === presentedTick && pose.x === sent.x && pose.y === sent.y && pose.facing === sent.facing &&
+          pose.actor === sent.actor && pose.created === sent.created && !captured.has(id) && !changedBodies?.has(id);
+      }));
     }
-    return this.latest = { data, from, actor, tick: incoming.tick, directions: directions?.some(ids => ids.length) ? directions : undefined };
+    if (!directions?.some(ids => ids?.length)) directions = undefined;
+    // An archive or late packet can merge into the current step. Retain only
+    // trajectories whose endpoints still match, on the original playback clock.
+    return this.latest = { data, from, actor, tick: presentedTick, directions, poses: directions && poses,
+      startedAt: keepStep ? previous.startedAt : performance.now() };
   }
 }
 

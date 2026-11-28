@@ -258,7 +258,7 @@ async function mergeVerifiedWorld(data, peer, context, { local = false, worldMes
     const apply = () => {
       const index = delta && renderer.currentIndex(target);
       let changes;
-      try { changes = target.merge(incoming, archived, routine ? 'replica' : undefined, delta); }
+      try { changes = target.merge(incoming, archived, delta ? 'replica' : undefined, delta); }
       finally { if (delta) noteCheckpointMerge(target.data, changes, incoming, archived); }
       if (index) renderer.applyMergedChars(target, index, changes?.chars);
     };
@@ -273,13 +273,14 @@ async function mergeVerifiedWorld(data, peer, context, { local = false, worldMes
 }
 function presentReplicaMovement(movement) {
   if (movement && movement === replicaSwims.latest && movement.data === world.data && movement.tick === world.data.tick && movement.from === leader()) {
-    renderer.presentSwims(world, movement.directions);
+    renderer.presentSwims(world, movement.directions, movement.startedAt);
   }
 }
 async function mergeReplica(data, peer, context = 'merge', worldMessage) {
   const previousTerrain = world.data.terrain?.seed;
   const { joinedWorld, movement, routine, ignored } = await mergeVerifiedWorld(data, peer, context, { worldMessage });
   if (ignored) return false;
+  presentReplicaMovement(movement);
   if (context === 'world-delta' && worldMessage) {
     const repair = replicaRecovery.request(worldMessage);
     if (repair) network.broadcast('replicaRequest', repair).catch(() => {});
@@ -290,10 +291,7 @@ async function mergeReplica(data, peer, context = 'merge', worldMessage) {
   }
   for (const member of active()) setParticipantName(world, member.actor, member.nick);
   if (identity) setParticipantName(world, identity.actor, identity.nick);
-  if (routine) {
-    presentReplicaMovement(movement);
-    return false;
-  }
+  if (routine) return false;
   // An expired local copy can be restored only after hearing its roots from a live peer.
   const checkpoint = priorCheckpoint; let recovered = false;
   if (checkpoint?.world?.roots && Object.keys(checkpoint.world.roots).some(r => world.roots.includes(r))) {
@@ -305,7 +303,6 @@ async function mergeReplica(data, peer, context = 'merge', worldMessage) {
     if (priorCheckpoint === checkpoint) priorCheckpoint = null;
     recovered = true;
   }
-  presentReplicaMovement(movement);
   for (const id of pending.keys()) if (world.data.ops[id] || archiveStore.ids.ops.has(id)) pending.delete(id);
   reconcileHistory(); syncIncomeSerial();
   const saved = save({ reusePicture: true });

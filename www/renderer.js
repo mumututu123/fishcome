@@ -61,13 +61,13 @@ export class Renderer {
     this.indexedTick = world.data.tick;
     world.dirty = false;
   }
-  presentSwims(world, directions) {
+  presentSwims(world, directions, startedAt = performance.now()) {
     if (world !== this.cachedWorld) return;
     this.swims = null;
     if (directions?.length) {
       this.swims = new Map();
       directions.forEach((ids, direction) => { if (ids) for (const id of ids) this.swims.set(id, direction); });
-      this.swimStart = performance.now();
+      this.swimStart = startedAt;
     }
     this.poseFrame = undefined;
   }
