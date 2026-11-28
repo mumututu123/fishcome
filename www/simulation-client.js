@@ -216,6 +216,7 @@ export class SimulationClient {
     }
     const previous = Object.fromEntries(Object.keys(values).map(key => [key, world.data[key]]));
     if (result.patch.life) previous.life = world.data.life;
+    if (result.patch.population) previous.population = world.data.population;
     await this.request({ kind: 'restore', rows, previous, foodRevision: result.foodRevision });
     if (!valid() || !this.worker) this.close();
     return null;

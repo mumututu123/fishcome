@@ -163,6 +163,11 @@ class CommittedRows {
 
 export function expandSimulationPatch(data, patch, knownFish, commitRows = false) {
   const tables = { ...patch.tables }, values = { ...patch.values };
+  if (patch.population) {
+    const { properties, illnesses } = patch.population;
+    values.population = applyFields(data.population, properties);
+    if (illnesses) values.population.illnesses = applyFields(data.population.illnesses, illnesses);
+  }
   for (const field of ['fishes', 'travel', 'chars']) {
     const change = tables[field];
     if (!change) continue;

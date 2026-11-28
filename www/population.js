@@ -39,8 +39,10 @@ export function killFish(world, id, now, cause, transition, groups = world.fishG
   recordStory(world, 'depart', id, now, { cause }); world.foodRevision++; world.dirty = true;
 }
 function settleIllness(world, now, changeCell) {
+  const schedule = world.illnessSchedule;
+  if (schedule && now < schedule.due) return;
   const state = world.data.population;
-  let groups;
+  let groups, due = Infinity;
   for (const [id, r] of Object.entries(state.illnesses)) {
     if (!world.data.fishes[id]) delete state.illnesses[id];
     else if (!r.curedAt) {
@@ -54,8 +56,10 @@ function settleIllness(world, now, changeCell) {
         r.nextLossAt = at + POPULATION.dissolveEvery;
       }
       if (!world.data.fishes[id]) delete state.illnesses[id];
+      else due = Math.min(due, r.nextLossAt);
     }
   }
+  if (schedule) schedule.due = due;
 }
 function checkIllness(world, now) {
   const state = world.data.population, slot = Math.floor(now / POPULATION.check);
@@ -64,16 +68,23 @@ function checkIllness(world, now) {
   // Never backfill infections for unattended/offline hours.
   const fishes = world.fishValues();
   if (fishes.length < POPULATION.threshold) return;
-  const active = fishes.filter(f => illnessOf(world.data, f.id)).length;
+  const illnesses = state.illnesses, patients = Object.values(illnesses);
+  let active = 0;
+  // Settlement has already removed every patient whose fish left the sea.
+  for (const patient of patients) if (!patient.curedAt) active++;
   const quota = Math.max(0, Math.ceil(fishes.length * POPULATION.sickRatio) - active);
   if (!quota) return;
-  const eligible = fishes.filter(f => now - f.created >= POPULATION.juvenile && !illnessOf(world.data, f.id)
-    && (!state.illnesses[f.id]?.curedAt || now - state.illnesses[f.id].curedAt >= POPULATION.immunity));
-  const ranked = eligible.map(fish => ({ fish, rank: hash(`crowding:${slot}:${fish.id}`) }));
-  ranked.sort((a, b) => a.rank - b.rank || a.fish.id.localeCompare(b.fish.id));
-  for (const { fish: f } of ranked.slice(0, quota)) {
-    state.illnesses[f.id] = { at: now, nextLossAt: now + POPULATION.dissolveEvery, curedAt: 0 };
-    recordStory(world, 'depressed', f.id, now, { visit: now });
+  const seed = hash(`crowding:${slot}:`), ranked = [];
+  for (const { id, created } of fishes) {
+    if (!(now - created >= POPULATION.juvenile)) continue;
+    const prior = patients.length && illnesses[id];
+    if (!prior || prior.curedAt && now - prior.curedAt >= POPULATION.immunity) ranked.push({ id, rank: hash(id, seed) });
+  }
+  ranked.sort((a, b) => a.rank - b.rank || a.id.localeCompare(b.id));
+  for (let i = 0; i < quota && i < ranked.length; i++) {
+    const { id } = ranked[i];
+    illnesses[id] = { at: now, nextLossAt: now + POPULATION.dissolveEvery, curedAt: 0 };
+    recordStory(world, 'depressed', id, now, { visit: now });
   }
 }
 function lineClear(world, a, b, scenery) {

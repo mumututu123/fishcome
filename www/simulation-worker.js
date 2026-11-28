@@ -23,6 +23,8 @@ function trackWorld(source) {
   // with its record avoids growing a world-sized hash table on a step.
   const observation = Symbol('simulation observation');
   const values = new Set(), rows = new Map(), lifeFields = new Set(), bondRows = new Map();
+  const populationFields = new Set(), patients = new Set();
+  const illnessSchedule = { due: -Infinity };
   const raw = object => object?.[observation]?.target ?? object;
   const bondTimes = new WeakMap();
   let characters, ecology, membership, meals, previousBonds, activeBonds, publishedBonds, orderedBonds = false;
@@ -117,6 +119,10 @@ function trackWorld(source) {
     if (field === 'chars' && property === undefined) return { field, id, property: key };
     if (location.editable && property === undefined) return { ...location, property: key };
     if (field === 'travel' && property === 'days' && location.day === undefined) return { ...location, day: key };
+    if (field === 'population') {
+      if (part === undefined) return { field, part: key };
+      if (part === 'illnesses' && id === undefined) return { ...location, id: key };
+    }
     if (field === 'life') {
       if (part === undefined) return { field, part: key };
       if (part === 'bonds' && bond === undefined) return { ...location, bond: key };
@@ -154,6 +160,8 @@ function trackWorld(source) {
   }
   function mark(target, parent, key, value, deleting = false) {
     const { field, id, property } = parent;
+    if (parent.root && (key === 'population' || key === 'fishes') ||
+        field === 'fishes' && parent.table && deleting && source.population?.illnesses[key]) illnessSchedule.due = -Infinity;
     if (parent.root && key === 'life') activeBonds = publishedBonds = undefined;
     if (parent.root && (key === 'fishes' || key === 'ops' || key === 'breeding') ||
         field === 'fishes' && (parent.table || !property && (key === 'id' || key === 'gender')) ||
@@ -203,6 +211,17 @@ function trackWorld(source) {
       }
       if (field === 'travel' && property === 'days') (edit.days ||= new Set()).add(parent.day ?? key);
       else edit.properties.add(property ?? key);
+    } else if (field === 'population') {
+      const part = parent.part ?? key;
+      if (part === 'illnesses') {
+        if (parent.part === 'illnesses' && id === undefined && !deleting && source.fishes[key] &&
+            value && value.deadline === undefined && Number.isFinite(value.nextLossAt)) {
+          if (!value.curedAt) illnessSchedule.due = Math.min(illnessSchedule.due, value.nextLossAt);
+        } else illnessSchedule.due = -Infinity;
+      }
+      // Replacing the table, or reinserting a removed patient, establishes a new order.
+      if (parent.part === 'illnesses' && (id !== undefined || !patients.has(key) || Object.hasOwn(target, key))) patients.add(id ?? key);
+      else populationFields.add(part);
     } else if (field === 'life') markLife(parent, target, key, value);
     else if (id === undefined) values.add(field);
     else tableChanges(field).set(id, null);
@@ -213,7 +232,7 @@ function trackWorld(source) {
       if (raw(target[key]) === raw(value) && Object.hasOwn(target, key)) return true;
       const parent = target[observation].location;
       mark(target, parent, key, value);
-      target[key] = value && typeof value === 'object' ? watch(value, child(parent, key)) : value;
+      target[key] = value && typeof value === 'object' && !isPatientTable(parent) ? watch(value, child(parent, key)) : value;
       return true;
     },
     deleteProperty(target, key) {
@@ -222,6 +241,9 @@ function trackWorld(source) {
       return delete target[key];
     }
   };
+  function isPatientTable(location) {
+    return location.field === 'population' && location.part === 'illnesses' && location.id === undefined;
+  }
   function watch(object, location) {
     if (!object || typeof object !== 'object' || inputFields.has(location.field)) return object;
     // Terminal proofs are immutable during natural simulation. Keep the table
@@ -231,7 +253,8 @@ function trackWorld(source) {
     if (existing) return existing.proxy;
     const bondTable = location.field === 'life' && location.part === 'bonds' && location.bond === undefined;
     const contactTable = location.field === 'contacts' && location.table;
-    const proxy = new Proxy(object, bondTable || contactTable ? {
+    const lazy = bondTable || contactTable || isPatientTable(location);
+    const proxy = new Proxy(object, lazy ? {
       ...writes,
       get(table, key, receiver) {
         if (key === observation) return table[key];
@@ -250,7 +273,7 @@ function trackWorld(source) {
       }
     } : writes);
     Object.defineProperty(object, observation, { value: { target: object, location, proxy } });
-    if (bondTable || contactTable) return proxy;
+    if (lazy) return proxy;
     for (const key of Object.keys(object)) {
       const value = object[key];
       if (value && typeof value === 'object') object[key] = watch(value, child(location, key));
@@ -398,6 +421,7 @@ function trackWorld(source) {
   }
   function reset() {
     swimming = undefined;
+    populationFields.clear(); patients.clear();
     previousStories = undefined;
     values.clear(); rows.clear(); lifeFields.clear(); bondRows.clear(); previousBonds = activeBonds = undefined; orderedBonds = false;
   }
@@ -405,6 +429,7 @@ function trackWorld(source) {
     data: watch(source, { root: true }),
     // Callers enumerate this read-only list. Its rows still carry tracked writes.
     charValues,
+    illnessSchedule,
     readBonds: () => materializeBonds(raw(source.life.bonds)),
     readStories: () => raw(source.life.stories),
     activeBondSpans: at => publishedBonds?.at === at && publishedBonds.table === raw(source.life.bonds) ? publishedBonds : null,
@@ -452,6 +477,13 @@ function trackWorld(source) {
     changes() {
       const patch = { values: {}, tables: {} };
       for (const field of values) patch.values[field] = plain(source[field]);
+      if (!values.has('population') && (populationFields.size || patients.size)) {
+        const population = raw(source.population);
+        patch.population = { properties: encodeFields(population, populationFields, plain) };
+        if (patients.size && !populationFields.has('illnesses')) {
+          patch.population.illnesses = encodeFields(raw(population.illnesses), patients, plain);
+        }
+      }
       for (const [field, edits] of rows) {
         if (values.has(field)) continue;
         const set = frameRows(field, edits), remove = [];
@@ -540,6 +572,7 @@ export class WorkerSimulation {
       this.world.poseRevision = this.tracker.poseRevision;
       this.world.originRevision = this.tracker.originRevision;
       this.world.stableFishRoster = this.tracker.fishValues;
+      this.world.illnessSchedule = this.tracker.illnessSchedule;
       this.world.mealEdits = this.tracker.mealEdits;
       this.world.readFish = this.tracker.readFish;
       this.world.readContacts = this.tracker.readContacts;
