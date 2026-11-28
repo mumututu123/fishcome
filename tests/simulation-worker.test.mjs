@@ -100,6 +100,34 @@ test('确认输入只装载基准，到点双方各提交一个相同的生态�
   } finally { for (const client of clients) client.close(); }
 });
 
+test('按实际鱼逐步确认结果，老线程保留已经离开的鱼的序号也能接入同一海洋', async () => {
+  const worlds = [new World(start, root), new World(start, root)];
+  worlds[1].data = structuredClone(worlds[0].data);
+  const id = Object.keys(worlds[0].data.fishes)[0], gone = '已离开的鱼';
+  const fishes = worlds[0].data.fishes;
+  worlds[0].data.fishes = { [gone]: { ...fishes[id], id: gone }, ...fishes };
+  const workers = worlds.map(() => new WorkerSimulation());
+  const clients = workers.map(worker => new SimulationClient(() => localWorker(undefined, worker)));
+  try {
+    await clients[0].open(worlds[0], () => true);
+    delete worlds[0].data.fishes[gone];
+    workers[0].receive({ kind: 'restore', rows: [['fishes', gone, undefined]] });
+    for (let i = 1; i <= 4; i++) {
+      if (i === 4) workers[1].world.data.fishes[id].name = '同一步出现不同鱼名';
+      const results = await Promise.all(clients.map(async (client, side) => {
+        const world = worlds[side], ready = await client.prepareAgreed(world, () => true);
+        return client.advanceAgreed(world, start + i * CONFIG.step, () => true, ready);
+      }));
+      assert.notEqual(clients[0].knownFish.indexOf(id), clients[1].knownFish.indexOf(id));
+      if (i === 4) assert.notEqual(results[0].changesDigest, results[1].changesDigest);
+      else {
+        assert.equal(results[0].changesDigest, results[1].changesDigest);
+        assert.deepEqual(worlds[0].serialize(), worlds[1].serialize());
+      }
+    }
+  } finally { for (const client of clients) client.close(); }
+});
+
 test('半秒结算把接触顺序完整交给页面，包括仍保留的旧配对', async () => {
   const world = new World(start, root, { populate: false, ambient: false });
   for (let i = 0; i < 4; i++) {

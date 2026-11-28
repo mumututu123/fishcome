@@ -5,7 +5,7 @@ import { shanghaiDay } from './fish-status.js';
 import { worldTables } from './simulation-changes.js';
 import { encodeFields, motionFields } from './simulation-delta.js';
 import { advanceBond, encodeBondIntervals } from './bond-interval.js';
-import { stepDigest } from './step-digest.js';
+import { jsonDigest } from './step-digest.js';
 
 const motionEdit = { properties: motionFields };
 
@@ -18,6 +18,7 @@ const inputFields = new Set(['ops', 'terrain', 'roots', 'participants', 'archive
 // (notably contacts), in which case additions and removals must both be sent.
 function trackWorld(source) {
   const knownFish = new Map(Object.keys(source.fishes).map((id, index) => [id, index]));
+  const fishIds = Array.from(knownFish.keys());
   const daysByOrdinal = new Array(knownFish.size);
   // These are the worker's private, mutable records. Keeping the observation
   // with its record avoids growing a world-sized hash table on a step.
@@ -291,6 +292,33 @@ function trackWorld(source) {
     for (const key of Object.keys(value)) result[key] = plain(value[key]);
     return result;
   }
+  function logicalChanges(patch) {
+    // Ordinals belong to one worker's roster. A worker retained across a
+    // connection and one opened from the same current checkpoint can assign
+    // different numbers to the same fish and encode equal bonds differently.
+    const idOf = ref => typeof ref === 'number' ? fishIds[ref] : Array.isArray(ref) ? ref[0] : ref;
+    const tables = { ...patch.tables };
+    for (const field of ['fishes', 'travel']) {
+      const changes = tables[field];
+      if (!changes) continue;
+      const rows = raw(source[field]);
+      tables[field] = { remove: changes.remove, set: changes.set.map(ref => {
+        const id = idOf(ref);
+        return [id, raw(rows[id])];
+      }) };
+    }
+    const logical = { ...patch, tables };
+    if (patch.life?.bonds) {
+      const table = raw(source.life.bonds), at = bondTimes.get(table);
+      const bonds = Object.keys(table).map(key => {
+        const row = raw(table[key]);
+        return [key, at == null ? row : advanceBond(row, at)];
+      });
+      logical.life = { ...patch.life, bonds };
+    }
+    if (patch.swims) logical.swims = patch.swims.map(ids => ids.map(idOf));
+    return logical;
+  }
   function encodeRow(id, row, edit) {
     if (!edit) return [id, plain(row)];
     row = raw(row);
@@ -474,6 +502,7 @@ function trackWorld(source) {
       }
     },
     reset,
+    logicalChanges,
     changes() {
       const patch = { values: {}, tables: {} };
       for (const field of values) patch.values[field] = plain(source[field]);
@@ -537,7 +566,7 @@ export class WorkerSimulation {
       const patch = this.agreedPatch;
       if (!patch || patch.values.tick !== message.tick) throw new Error('没有此步待确认的生态变化');
       this.agreedPatch = undefined;
-      return stepDigest(patch);
+      return jsonDigest(this.tracker.logicalChanges(patch));
     }
     this.agreedPatch = undefined;
     if (message.kind === 'open') {

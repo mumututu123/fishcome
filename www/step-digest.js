@@ -1,5 +1,14 @@
 const encoder = new TextEncoder();
 
+async function digestBytes(bytes) {
+  const hash = await crypto.subtle.digest('SHA-256', bytes);
+  return Array.from(new Uint8Array(hash), byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
+export function jsonDigest(value) {
+  return digestBytes(encoder.encode(JSON.stringify(value)));
+}
+
 export async function stepDigest(value) {
   const binary = [];
   const json = JSON.stringify(value, (_, item) => {
@@ -10,6 +19,5 @@ export async function stepDigest(value) {
     return { binary: binary.length - 1, type: item.constructor.name, bytes: item.byteLength };
   });
   const bytes = binary.length ? await new Blob([json, ...binary]).arrayBuffer() : encoder.encode(json);
-  const hash = await crypto.subtle.digest('SHA-256', bytes);
-  return Array.from(new Uint8Array(hash), byte => byte.toString(16).padStart(2, '0')).join('');
+  return digestBytes(bytes);
 }

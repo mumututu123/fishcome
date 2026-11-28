@@ -162,7 +162,7 @@ const ordered = new OrderedSession({
   archiveConfirmed: () => { renderChat(); save({ reusePicture: true }).catch(error => diagnostics.record('warn', 'archive', error.message)); },
   // Both workers start with the same row roster and compact patch reference.
   // An existing leader worker may still contain private pre-join indexes.
-  beginExecution: () => { worldBroadcast.reset(); simulation.close(); },
+  beginExecution: () => worldBroadcast.reset(),
   prepare: (target, valid) => simulation.prepareAgreed(target, valid),
   advance: (target, nextTick, valid, handle) => simulation.advanceAgreed(target, nextTick, valid, handle),
   stopped(session, reason) {
