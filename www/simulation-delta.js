@@ -60,7 +60,7 @@ export function applyStoryChanges(previous, changes, detach = false) {
 // records. Only readers of the older [id, record] interface allocate tuples.
 class CommittedRows {
   constructor(field, table, change, knownFish, tick) {
-    const { set, motion } = change;
+    const { set, motion, distances } = change;
     this.length = set.length;
     this.ids = new Array(set.length);
     this.records = new Array(set.length);
@@ -72,9 +72,11 @@ class CommittedRows {
       if (motion && !Array.isArray(row)) {
         record = poseRecord(previous, motion, offset, tick);
         offset += 5;
+      } else if (distances && typeof row === 'number') {
+        record = { ...previous, days: { ...previous.days, [change.day]: distances[offset++] } };
       } else record = expandedRecord(table, row);
       this.records[i] = record;
-      if (!Object.hasOwn(table, id)) this.added.push(id);
+      if (previous === undefined && !Object.hasOwn(table, id)) this.added.push(id);
       if (this.moved && (!previous || previous.x !== record.x || previous.y !== record.y || previous.facing !== record.facing)) this.moved.push(i);
     }
   }
@@ -92,19 +94,11 @@ export function expandSimulationPatch(data, patch, knownFish, commitRows = false
   for (const field of ['fishes', 'travel', 'chars']) {
     const change = tables[field];
     if (!change) continue;
-    const table = data[field], motion = change.motion;
-    if (commitRows && field !== 'chars') {
+    const table = data[field];
+    if (field !== 'chars' && (commitRows || change.motion || change.distances)) {
       const frame = new CommittedRows(field, table, change, knownFish, patch.values.tick);
-      tables[field] = { frame, remove: change.remove, get set() { return frame.entries(); } };
-    } else if (motion) {
-      let offset = 0;
-      const set = change.set.map(row => {
-        if (Array.isArray(row)) return expandRow(table, row);
-        const id = rowId(row, knownFish), record = poseRecord(table[id], motion, offset, patch.values.tick);
-        offset += 5;
-        return [id, record];
-      });
-      tables[field] = { set, remove: change.remove };
+      tables[field] = commitRows ? { frame, remove: change.remove, get set() { return frame.entries(); } }
+        : { set: frame.entries(), remove: change.remove };
     } else if (change.set.some(row => row.length > 2)) {
       tables[field] = { ...change, set: change.set.map(row => expandRow(table, row)) };
     }

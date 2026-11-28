@@ -371,7 +371,10 @@ function trackWorld(source) {
       let count = 0;
       for (let i = 0; i < list.length; i++) if (list[i] !== null) {
         list[count] = list[i];
-        if (poses && i !== count) swimming.motion.copyWithin(count * 5, i * 5, i * 5 + 5);
+        if (i !== count) {
+          if (poses) swimming.motion.copyWithin(count * 5, i * 5, i * 5 + 5);
+          else swimming.distances[count] = swimming.distances[i];
+        }
         count++;
       }
       list.length = count;
@@ -419,9 +422,14 @@ function trackWorld(source) {
       if (!record) { table[id] = { since: now, days: { [day]: distance } }; return; }
       const days = raw(record.days);
       days[day] = (days[day] || 0) + distance;
-      if (swimming && ordinal !== undefined) {
-        if (!swimming.travel.length) tableChanges('travel');
-        swimming.tripIndex[ordinal] = swimming.travel.push([id, day, days[day]]);
+      if (swimming && ordinal !== undefined && (swimming.day === undefined || swimming.day === day) && !swimming.tripIndex[ordinal]) {
+        if (!swimming.distances) {
+          tableChanges('travel');
+          swimming.day = day;
+          swimming.distances = new Float64Array(knownFish.size);
+        }
+        swimming.distances[swimming.travel.length] = days[day];
+        swimming.tripIndex[ordinal] = swimming.travel.push(ordinal);
         return;
       }
       const edits = tableChanges('travel');
@@ -439,6 +447,7 @@ function trackWorld(source) {
       for (const [field, edits] of rows) {
         if (values.has(field)) continue;
         const set = frameRows(field, edits), remove = [];
+        const distances = field === 'travel' && swimming?.distances?.subarray(0, set.length);
         const table = raw(source[field]) || {};
         let motion = field === 'fishes' ? swimming?.motion : undefined;
         let offset = motion ? set.length * 5 : 0;
@@ -460,7 +469,9 @@ function trackWorld(source) {
           } else set.push(encodeRow(id, row, edit));
         }
         if (motion && offset * 2 < motion.length) motion = motion.slice(0, offset);
-        patch.tables[field] = motion ? { set, remove, motion: motion.subarray(0, offset) } : { set, remove };
+        patch.tables[field] = { set, remove };
+        if (motion) patch.tables[field].motion = motion.subarray(0, offset);
+        if (distances?.length) Object.assign(patch.tables[field], { day: swimming.day, distances });
       }
       if (!values.has('life') && (lifeFields.size || previousStories || bondRows.size || orderedBonds)) {
         const life = raw(source.life);
@@ -579,7 +590,7 @@ if (typeof WorkerGlobalScope !== 'undefined' && globalThis instanceof WorkerGlob
     try {
       const result = simulation.receive(data), patch = result?.patch;
       const bonds = patch?.life?.bonds;
-      const buffers = [patch?.tables.fishes?.motion?.buffer, bonds?.counters?.buffer,
+      const buffers = [patch?.tables.fishes?.motion?.buffer, patch?.tables.travel?.distances?.buffer, bonds?.counters?.buffer,
         bonds?.intervals?.kept.buffer, bonds?.intervals?.added.buffer].filter(Boolean);
       postMessage({ result }, buffers);
     }

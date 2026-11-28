@@ -6,9 +6,12 @@ export function newEcology(now, legacy = false) { return { version: 1, activated
 export function ensureEcology(world, now, legacy = false) { return world.data.ecology ||= newEcology(now, legacy); }
 export function validEcology(state, now = Date.now() + 60000) { return state === undefined || !!state && state.version === 1 && typeof state.legacy === 'boolean' && Number.isFinite(state.activated) && state.activated >= 0 && state.activated <= now && Number.isInteger(state.hour) && state.hour >= 0 && state.hour <= Math.floor(now / 3600000); }
 export function mergeEcology(a, b) { if (!a) return b; if (!b) return a; return { version: 1, activated: Math.min(a.activated, b.activated), legacy: a.legacy || b.legacy, hour: Math.max(a.hour, b.hour) }; }
+// A query covers at most (2r+1)² cells. A rectangle sum therefore holds both
+// exact counts without a carry from its water count into its occupied count.
+const densityScale = 2 ** Math.ceil(Math.log2((2 * ECOLOGY.radius + 1) ** 2 + 1));
 export function densityField(world, scenery = world.sceneryMap(), occupiedByFish) {
   const width = 1000, floors = Array.from({ length: width }, (_, x) => world.floorAt(x)), height = Math.max(...floors), stride = width + 1;
-  const occupied = new Uint8Array(width * height), pressure = new Int32Array(stride * (height + 1)), wet = new Uint32Array(pressure.length);
+  const occupied = new Uint8Array(width * height), totals = new Uint32Array(stride * (height + 1));
   const mark = (x, y) => { if (Number.isInteger(y) && y >= 0 && y < height) occupied[y * width + wrapX(x)] = 1; };
   for (const { scene, cell } of scenery.values()) mark(scene.x + cell.x, scene.y + cell.y);
   for (const c of occupiedByFish ? world.charValues('food', 'seaweed', 'scene') : world.charValues()) {
@@ -18,30 +21,32 @@ export function densityField(world, scenery = world.sceneryMap(), occupiedByFish
   const monument = world.monument; for (const [dy, row] of monument.rows.entries()) for (const [dx, ch] of Array.from(row).entries()) if (ch !== ' ') mark(monument.x + dx, monument.y + dy);
   // Summed-area tables make every local density query constant-time, even on hourly turnover.
   for (let y = 0; y < height; y++) {
-    let rowWet = 0, rowUsed = 0;
+    let row = 0;
     for (let x = 0; x < width; x++) {
       const cell = y * width + x;
-      if (y < floors[x]) { rowWet++; if (occupied[cell] || occupiedByFish?.[cell]) rowUsed++; }
+      if (y < floors[x]) row += occupied[cell] || occupiedByFish?.[cell] ? densityScale + 1 : 1;
       const index = (y + 1) * stride + x + 1;
-      wet[index] = wet[index - stride] + rowWet;
-      // Nonnegative pressure means at least 40% of the water is occupied.
-      pressure[index] = pressure[index - stride] + rowUsed * 5 - rowWet * 2;
+      totals[index] = totals[index - stride] + row;
     }
   }
-  const rectangle = (table, left, right, top, bottom) => table[(bottom + 1) * stride + right + 1] - table[top * stride + right + 1] - table[(bottom + 1) * stride + left] + table[top * stride + left];
-  function windowArea(table, x, y) {
+  const rectangle = (left, right, top, bottom) => totals[(bottom + 1) * stride + right + 1] - totals[top * stride + right + 1] - totals[(bottom + 1) * stride + left] + totals[top * stride + left];
+  function windowArea(x, y) {
     const r = ECOLOGY.radius, left = x - r, right = x + r;
     const top = Math.max(0, y - r), bottom = Math.min(height - 1, y + r);
     if (top > bottom) return 0;
-    if (left < 0) return rectangle(table, width + left, width - 1, top, bottom) + rectangle(table, 0, right, top, bottom);
-    if (right >= width) return rectangle(table, left, width - 1, top, bottom) + rectangle(table, 0, right - width, top, bottom);
-    return rectangle(table, left, right, top, bottom);
+    if (left < 0) return rectangle(width + left, width - 1, top, bottom) + rectangle(0, right, top, bottom);
+    if (right >= width) return rectangle(left, width - 1, top, bottom) + rectangle(0, right - width, top, bottom);
+    return rectangle(left, right, top, bottom);
   }
   const density = (cx, cy) => {
     const x = wrapX(Math.round(cx)), y = Math.round(cy);
-    const water = windowArea(wet, x, y);
-    const used = (windowArea(pressure, x, y) + 2 * water) / 5;
+    const total = windowArea(x, y), water = total % densityScale;
+    const used = Math.floor(total / densityScale);
     return water ? used / water : 1;
+  };
+  const allowsBreeding = (x, y) => {
+    const total = windowArea(x, y);
+    return Math.floor(total / densityScale) * 5 < (total % densityScale) * 2;
   };
   // Each row prefix counts centers that permit breeding. One range check
   // covers all possible contact midpoints on that row of a fish's body.
@@ -54,7 +59,7 @@ export function densityField(world, scenery = world.sceneryMap(), occupiedByFish
       if (!row) {
         row = openRows[y] = new Uint16Array(stride);
         for (let x = 0; x < width; x++) {
-          row[x + 1] = row[x] + Number(windowArea(pressure, x, y) < 0);
+          row[x + 1] = row[x] + Number(allowsBreeding(x, y));
         }
       }
       if (right < width ? row[right + 1] !== row[left] :
@@ -62,7 +67,7 @@ export function densityField(world, scenery = world.sceneryMap(), occupiedByFish
     }
     return true;
   };
-  density.allowsBreedingAt = (x, y) => windowArea(pressure, x, y) < 0;
+  density.allowsBreedingAt = allowsBreeding;
   return density;
 }
 export const contactTime = density => density >= .4 ? Infinity : density >= .2 ? 20000 : 5000;

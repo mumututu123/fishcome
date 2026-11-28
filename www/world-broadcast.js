@@ -80,8 +80,10 @@ function captureStep(data, base, patch, breeding) {
       const id = frame ? frame.idAt(i) : edits.set[i][0], value = frame ? frame.records[i] : edits.set[i][1];
       const prior = last.get(id);
       const edit = worker.tables[field]?.set[i];
-      if (prior && field === 'travel' && edit?.length === 3 && typeof edit[1] === 'string') {
-        const day = edit[1], distance = edit[2];
+      const daily = field === 'travel' && (typeof edit === 'number' || edit?.length === 3 && typeof edit[1] === 'string');
+      if (prior && daily) {
+        const day = typeof edit === 'number' ? worker.tables.travel.day : edit[1];
+        const distance = typeof edit === 'number' ? worker.tables.travel.distances[i] : edit[2];
         const before = prior instanceof DailyDistance && day === prior.day ? prior.distance : travelRow(prior).days[day];
         if (before !== distance) rows.travel[id] = new DailyDistance(prior, day, distance);
         continue;

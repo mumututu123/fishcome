@@ -109,6 +109,25 @@ test('整条鱼留在同一分区时免逐格更新，鱼体增长与重新合�
   }
 });
 
+test('鱼身横跨两个分区时，只在某个鱼元真的越界后重新定位', () => {
+  const body = x => ({ kind: 'fish', entity: 'f', x, y: 0 });
+  const data = { fishes: { f: { x: 30, y: 5, facing: 1 } }, scenes: {}, chars: { a: body(-3), b: body(4) } };
+  const index = new ViewportCells(data);
+  let placements = 0;
+  const place = index.place.bind(index);
+  index.place = entry => { placements++; place(entry); };
+  for (const x of [31, 32, 33]) {
+    data.fishes.f = { x, y: 5, facing: 1 };
+    index.update({ fishes: { set: [['f', data.fishes.f]], remove: [] } });
+    assert.deepEqual(index.query(0, 0, 5, 5), Object.values(data.chars));
+  }
+  assert.equal(placements, 0);
+  data.fishes.f.x = 35;
+  index.update({ fishes: { set: [['f', data.fishes.f]], remove: [] } });
+  assert.deepEqual(index.query(0, 0, 5, 5), []);
+  assert.deepEqual(index.query(32, 32, 5, 5), Object.values(data.chars));
+});
+
 test('画面依次播放已结算的横移、下潜，海域接缝上点击跟随绘制位置', async () => {
   const { World } = await import('../www/engine.js');
   const { Renderer } = await import('../www/renderer.js');

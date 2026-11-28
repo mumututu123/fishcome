@@ -287,9 +287,11 @@ test('后台只发送变化的鱼记录与当日行程，订阅者收到完整�
       assert.equal(Object.hasOwn(fields, 'actor'), false);
       assert.equal(Object.hasOwn(fields, 'id'), false);
     }
-    const travel = sent.flatMap(change => change.tables.travel?.set || []);
-    assert(travel.length > 0);
-    for (const [, fields, , days] of travel) {
+    const trips = sent.map(change => change.tables.travel).filter(Boolean);
+    assert(trips.some(trip => trip.distances instanceof Float64Array && trip.distances.length > 0));
+    for (const trip of trips) for (const row of trip.set) {
+      if (typeof row === 'number') { assert.equal(trip.day, '2025-06-15'); continue; }
+      const [, fields, , days] = row;
       if (typeof fields === 'string') assert.equal(fields, '2025-06-15');
       else {
         assert.equal(Object.hasOwn(fields, 'since'), false);
@@ -593,5 +595,7 @@ test('游动同一步的进食、消亡和行程修订只交付一次，并保�
     for (const [id, record] of set) assert.deepEqual(record, sea.data[field][id]);
   }
   assert.equal(patch.tables.fishes.motion.length, 5);
+  assert.deepEqual(Array.from(patch.tables.travel.distances), [4]);
+  assert.equal(patch.tables.travel.set[0], ids.indexOf('swam'));
   assert.equal(expanded.tables.travel.set.find(([id]) => id === 'fed')[1].days[day], 6);
 });

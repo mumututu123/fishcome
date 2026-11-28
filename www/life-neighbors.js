@@ -50,18 +50,30 @@ export function fishNeighbors(geometry, canSeeLine) {
   const compare = (a, b) => distances[a] - distances[b] || ranks.get(ordered[a]) - ranks.get(ordered[b]);
   function sorted(p, obstacle, available) {
     const bins = collect(p, 12);
+    // School formation takes just four neighbors. The packed rank is unique,
+    // so a farther candidate cannot displace a confirmed visible companion.
+    const topFour = numericOrder && available;
     let visible = 0;
     for (const bin of bins) for (const q of bin) {
       const j = q.slot;
       if (q === p || available && !available[j]) continue;
       const distance = Math.max(horizontalDistance(p.x, q.x), Math.abs(q.y - p.y));
-      if (distance > 12 || obstacle && !canSeeLine(p, q)) continue;
-      if (numericOrder) hits[visible++] = distance * 2 * stride + j;
+      if (distance > 12) continue;
+      const rank = distance * 2 * stride + j;
+      if (topFour && visible === 4 && rank >= hits[3]) continue;
+      if (obstacle && !canSeeLine(p, q)) continue;
+      if (topFour) {
+        const last = Math.min(visible, 3);
+        let i = last;
+        while (i > 0 && hits[i - 1] > rank) { hits[i] = hits[i - 1]; i--; }
+        hits[i] = rank;
+        visible = last + 1;
+      } else if (numericOrder) hits[visible++] = rank;
       else { hits[visible++] = j; distances[j] = distance; }
     }
     const keys = hits.subarray(0, visible), out = new Array(available ? Math.min(4, visible) : visible);
     if (numericOrder) {
-      keys.sort();
+      if (!topFour) keys.sort();
       for (let i = 0; i < out.length; i++) out[i] = ordered[keys[i] & (stride - 1)];
     } else {
       keys.sort(compare);

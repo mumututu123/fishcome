@@ -5,23 +5,32 @@ const columns = Math.ceil(WORLD_WIDTH / side);
 const sector = (x, y) => Math.floor(wrapX(x) / side) + columns * Math.floor(y / side);
 const drawable = kind => kind === 'fish' || kind === 'scene' || kind === 'food' || kind === 'seaweed';
 
-// Every cell is still in its old sector if both whole poses fit in one sector.
-// Test the unwrapped interval first: the last sea column is only eight cells wide.
-function staysInSector(group, pose) {
-  if (!group.reach) {
-    let x = 0, y = 0;
-    for (const entry of group) {
-      x = Math.max(x, Math.abs(entry.x));
-      y = Math.max(y, Math.abs(entry.y));
-    }
-    group.reach = { x, y };
+// Intersect the anchor positions that keep each glyph in its current sector.
+// This also covers bodies spanning several sectors and turns about their anchor.
+function sectorRange(group) {
+  if (!Number.isInteger(group.x) || group.x < 0 || group.x >= WORLD_WIDTH ||
+      !Number.isInteger(group.y) || Math.abs(group.y) > WORLD_WIDTH || Math.abs(group.facing) !== 1) return;
+  let left = -Infinity, right = Infinity, flippedLeft = -Infinity, flippedRight = Infinity;
+  let top = -Infinity, bottom = Infinity;
+  for (const entry of group) {
+    if (!Number.isInteger(entry.x) || !Number.isInteger(entry.y) ||
+        Math.abs(entry.x) > WORLD_WIDTH || Math.abs(entry.y) > WORLD_WIDTH) return;
+    const x = group.x + group.facing * entry.x, y = group.y + entry.y;
+    const wrapped = wrapX(x), column = wrapped - wrapped % side, row = Math.floor(y / side) * side;
+    const start = x - wrapped + column, end = start + Math.min(side, WORLD_WIDTH - column);
+    left = Math.max(left, start - entry.x); right = Math.min(right, end - entry.x);
+    flippedLeft = Math.max(flippedLeft, start + entry.x); flippedRight = Math.min(flippedRight, end + entry.x);
+    top = Math.max(top, row - entry.y); bottom = Math.min(bottom, row + side - entry.y);
   }
-  const lowX = Math.min(group.x, pose.x) - group.reach.x, highX = Math.max(group.x, pose.x) + group.reach.x;
-  if (lowX < 0 || highX >= WORLD_WIDTH || highX - lowX >= side) return false;
-  const left = wrapX(lowX), right = wrapX(highX);
-  return left <= right && Math.floor(left / side) === Math.floor(right / side) &&
-    Math.floor((Math.min(group.y, pose.y) - group.reach.y) / side) ===
-    Math.floor((Math.max(group.y, pose.y) + group.reach.y) / side);
+  return { left, right, flippedLeft, flippedRight, top, bottom };
+}
+
+function staysInSector(group, pose) {
+  if (!Number.isInteger(pose?.x) || !Number.isInteger(pose.y) || Math.abs(pose.facing) !== 1) return false;
+  const range = group.range ??= sectorRange(group);
+  if (!range || pose.y < range.top || pose.y >= range.bottom) return false;
+  return pose.facing === 1 ? pose.x >= range.left && pose.x < range.right :
+    pose.x >= range.flippedLeft && pose.x < range.flippedRight;
 }
 
 // Several cells can share an owner. Moving the owner changes their sectors
@@ -94,7 +103,7 @@ export class ViewportCells {
     this.move(entry, undefined);
     if (entry.owner) {
       entry.owner.delete(entry);
-      entry.owner.reach = null;
+      entry.owner.range = null;
       if (!entry.owner.size) this.owners[entry.kind].delete(entry.entity);
     }
     this.cells.delete(id);
@@ -114,7 +123,7 @@ export class ViewportCells {
       }
       entry.owner = owners.get(cell.entity);
       entry.owner.add(entry);
-      entry.owner.reach = null;
+      entry.owner.range = null;
     }
     this.cells.set(id, entry);
     this.place(entry);
@@ -125,7 +134,10 @@ export class ViewportCells {
     if (!group || group.x === pose?.x && group.y === pose?.y && group.facing === pose?.facing) return;
     const inside = Math.abs(group.facing) === 1 && Math.abs(pose?.facing) === 1 && staysInSector(group, pose);
     group.x = pose?.x; group.y = pose?.y; group.facing = pose?.facing;
-    if (!inside) for (const entry of group) this.place(entry);
+    if (!inside) {
+      group.range = null;
+      for (const entry of group) this.place(entry);
+    }
   }
 
   refresh(id, cell) {
@@ -136,7 +148,7 @@ export class ViewportCells {
     if (entry.x !== cell.x || entry.y !== cell.y) {
       entry.x = cell.x;
       entry.y = cell.y;
-      if (entry.owner) entry.owner.reach = null;
+      if (entry.owner) entry.owner.range = null;
       this.place(entry);
     }
     return entry;
