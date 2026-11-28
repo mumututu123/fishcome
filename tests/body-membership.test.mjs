@@ -76,7 +76,7 @@ test('连续两步进食保留鱼群顺序，之后的转向、避让和结伴�
     fish.hungerAt = now + CONFIG.hunger;
   }
   const worker = open(reference), roster = worker.world.stableFishRoster();
-  const diners = Object.keys(reference.data.fishes).slice(0, 2);
+  const knownFish = Object.keys(reference.data.fishes), diners = knownFish.slice(0, 2);
   for (let step = 0; step < 14; step++) {
     const base = reference.data.tick, foods = [], paths = [];
     if (step === 4 || step === 5) {
@@ -86,11 +86,12 @@ test('连续两步进食保留鱼群顺序，之后的转向、避让和结伴�
       reference.data.chars[cell.id] = cell;
       foods.push([cell.id, structuredClone(cell)]);
     }
+    const before = reference.serialize();
     reference.step(base + CONFIG.step, paths);
     const reply = worker.receive({ kind: 'step', base, names: [], foods });
     if (foods.length) assert.equal(reference.data.chars[foods[0][0]].entity, diners[step - 4]);
     assert.equal(worker.world.stableFishRoster(), roster);
-    assert.deepEqual(reply.patch.swims || [], paths);
+    assert.deepEqual(expandSimulationPatch(before, reply.patch, knownFish).swims || [], paths);
     assert.deepEqual(JSON.parse(JSON.stringify(worker.world.data)), reference.serialize());
   }
 });
