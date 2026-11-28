@@ -156,6 +156,30 @@ test('尚未在本机计算过的伙伴提前装鱼元，沿途普通同步继�
   } finally { client.close(); }
 });
 
+test('靠前两条鱼元被移除导致各页整体移位，逐页验证真实目标顺序只重送实际改写的一页', async () => {
+  const world = new World(start, root, {populate:false,ambient:false}), store = new ArchiveStore();
+  world.attachArchives(store);
+  const ids = Array.from({length:800},(_,i)=>'x' + i);
+  for (const id of ids) world.data.chars[id] = { id,kind:'burn',entity:'',created:start,path:[] };
+  const worker = new WorkerSimulation(), sent = [];
+  let checking = false;
+  const client = new SimulationClient(()=>localWorker(message => {
+    if (checking && message.kind === 'rows') for (const [field,id] of message.rows) if (field === 'chars') sent.push(id);
+  },worker));
+  try {
+    await client.checkRetained(world);
+    worldEdited(world);
+    delete world.data.chars[ids[0]]; delete world.data.chars[ids[5]];
+    world.data.chars[ids[131]].former = { phase:1 };
+    checking = true;
+    const cut = await orderedCheckpoint(world,store);
+    const handle = await client.prepareAgreed(world,()=>true,cut.characterPages);
+    assert.ok(handle);
+    assert.deepEqual(sent,Object.keys(world.data.chars).slice(128,256));
+    assert.equal(JSON.stringify(worker.world.data.chars),JSON.stringify(world.data.chars));
+  } finally { client.close(); }
+});
+
 test('确认输入只装载基准，到点双方各提交一个相同的生态步，过期约定无法再用', async () => {
   const makeWorld = () => new World(start, root, { populate: false, ambient: false });
   const worlds = [makeWorld(), makeWorld()];

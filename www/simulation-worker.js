@@ -565,6 +565,28 @@ function trackWorld(source) {
 }
 
 export class WorkerSimulation {
+  async installCharacters(table, order, hashes) {
+    const pages = this.characterPages;
+    this.characterPages = undefined;
+    const missing = [], checks = [];
+    let byId;
+    for (const [index, page] of order.entries()) {
+      if (typeof page === 'number') {
+        for (const [id, record] of pages[page]) table[id] = record;
+        continue;
+      }
+      // Removing an early row shifts all following page boundaries. Preserve
+      // the checkpoint's order and check its actual page bytes again using
+      // old rows by ID before asking the UI for replacement records.
+      byId ??= new Map(pages.flat());
+      const candidate = page.map(id => [id, byId.get(id)]);
+      for (const [id, record] of candidate) table[id] = record;
+      if (candidate.some(([,record]) => record === undefined)) missing.push(index);
+      else checks.push(jsonDigest(candidate).then(hash => { if (hash !== hashes[index]) missing.push(index); }));
+    }
+    await Promise.all(checks);
+    return missing.sort((a,b) => a - b);
+  }
   receive(message) {
     if (message.kind === 'step-proof') {
       const patch = this.agreedPatch;
@@ -586,13 +608,6 @@ export class WorkerSimulation {
       this.world = new World(message.values.tick, 'worker', { populate: false, ambient: message.ambient });
       this.world.data = message.values;
       for (const field of message.tables) this.world.data[field] = {};
-      if (message.characters) {
-        for (const page of message.characters) {
-          if (typeof page === 'number') for (const [id, record] of this.characterPages[page]) this.world.data.chars[id] = record;
-          else for (const id of page) this.world.data.chars[id] = null;
-        }
-      }
-      this.characterPages = undefined;
       const fishes = this.world.data.fishes;
       // Live fish usually carry their original actor and gender. Only legacy
       // discrepancies need separate entries in the simulation's origin lookup.
@@ -600,6 +615,8 @@ export class WorkerSimulation {
         get: (overrides, id) => Object.hasOwn(overrides, id) ? overrides[id] || undefined : fishes[id]
       });
       this.archive = { summary: { catalog, lastMeals: new Map(), grassMeals: new Set() } };
+      if (message.characters) return this.installCharacters(this.world.data.chars, message.characters, message.hashes);
+      this.characterPages = undefined;
     } else if (message.kind === 'rows') {
       for (const [field, id, value, origin] of message.rows) {
         if (field === '@lastMeals') this.archive.summary.lastMeals.set(id, value);

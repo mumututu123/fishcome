@@ -188,18 +188,15 @@ export class SimulationClient {
     });
   }
   async open(world, valid, characterPages) {
-    let characters, missingCharacters;
+    let characters;
     const retainedWorker = characterPages?.table === world.data.chars && characterPages.revision === characterRevision(world) &&
       this.hasSavedCharacters(world) && this.worker;
     if (retainedWorker) {
       const ids = Object.keys(world.data.chars);
-      missingCharacters = [];
       characters = characterPages.hashes.map((hash, i) => {
         const old = this.savedCharacters.get(hash);
         if (old !== undefined) return old;
-        const changed = ids.slice(i * 128, (i + 1) * 128);
-        missingCharacters.push(...changed);
-        return changed;
+        return ids.slice(i * 128, (i + 1) * 128);
       });
       this.worker = null;
     }
@@ -217,7 +214,7 @@ export class SimulationClient {
       for (const [id, nick] of patch.tables.participants?.set || []) this.names.set(id, nick);
       for (const [id, food] of patch.tables.chars?.set || []) this.foods.set(id, food);
     });
-    return this.loadWorld(world, valid, worker, characters, missingCharacters);
+    return this.loadWorld(world, valid, worker, characters, characters && characterPages.hashes);
   }
   bindWorker(world, worker) {
     this.worker = worker;
@@ -238,13 +235,14 @@ export class SimulationClient {
     };
     worker.onerror = worker.onmessageerror = failed;
   }
-  async loadWorld(world, valid, worker, characters, missingCharacters) {
+  async loadWorld(world, valid, worker, characters, hashes) {
     const values = {}, tables = [];
     for (const field of Object.keys(world.data)) {
       if (worldTables.has(field)) tables.push(field); else values[field] = world.data[field];
     }
-    await this.request({ kind: 'open', values, tables, ambient: world.ambient, characters });
+    const missing = await this.request({ kind: 'open', values, tables, ambient: world.ambient, characters, hashes });
     if (!valid() || this.worker !== worker) return false;
+    const missingCharacters = characters && missing.flatMap(page => characters[page]);
     // Gather the next page while the worker installs the previous one. A single
     // outstanding acknowledgement preserves cancellation and message ordering.
     let rows = [], prior, slice = performance.now();

@@ -180,6 +180,7 @@ SimulationClient.prototype.request = function (message) {
     }
     return originalRequest.call(this,message).then(result => {
       const ms = Math.round(performance.now() - start);
+      if (message.kind === 'open' && message.characters && Array.isArray(result)) load.checkedById = message.characters.length - load.reused - result.length;
       if (message.kind === 'rows') load.rowMs += ms; else load[message.kind + 'Ms'] = ms;
       return result;
     });
