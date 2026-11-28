@@ -198,13 +198,13 @@ test('画面依次播放已结算的横移、下潜，海域接缝上点击跟�
   renderer.worldChanged(world, { values: { tick: world.data.tick }, tables: {}, swims });
   const start = renderer.swimStart;
   renderer.draw(world, start + 125);
-  assert.deepEqual(renderer.paintedFish.slice(0, 2), [55, 50]);
+  assert.deepEqual(Array.from(renderer.paintedCoordinates.slice(0, 2)), [55, 50]);
   assert.deepEqual(renderer.hit(56, 52), { kind: 'fish', id: 'f' });
   assert.equal(renderer.hit(65, 62), null);
   renderer.worldChanged(world, null);
   renderer.presentSwims(world, swims, start);
   renderer.draw(world, start + 375);
-  assert.deepEqual(renderer.paintedFish.slice(0, 2), [60, 55]);
+  assert.deepEqual(Array.from(renderer.paintedCoordinates.slice(0, 2)), [60, 55]);
   assert.equal(renderer.fishPose(world, 'f', start + 501), fish);
   assert.deepEqual([fish.x, fish.y], [0, 11]);
   renderer.worldChanged(world, null);

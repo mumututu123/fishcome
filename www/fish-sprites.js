@@ -16,15 +16,19 @@ export class FishSprites {
   pixels = 0;
 
   get(renderer, run, size, facing) {
+    const cached = run.sprite;
+    if (cached?.image && cached.size === size && cached.facing === facing && cached.usedAt === renderer.frameTime) return cached;
     const parts = run.cells, first = parts[0];
     const shape = run.shape ??= JSON.stringify(parts.map(c => [c.x - first.x, c.y - first.y, c.ch, c.color]));
-    const key = size + '/' + facing + '/' + shape;
+    const key = cached?.size === size && cached.facing === facing ? cached.key : size + '/' + facing + '/' + shape;
     let stamp = this.images.get(key);
     if (stamp) {
-      stamp.usedAt = renderer.frameTime;
-      this.images.delete(key);
-      this.images.set(key, stamp);
-      return stamp;
+      if (stamp.usedAt !== renderer.frameTime) {
+        stamp.usedAt = renderer.frameTime;
+        this.images.delete(key);
+        this.images.set(key, stamp);
+      }
+      return run.sprite = stamp;
     }
     let left = 0, right = 0, top = 0, bottom = 0;
     for (const cell of parts) {
@@ -42,6 +46,7 @@ export class FishSprites {
       if (old.usedAt === renderer.frameTime) return;
       this.images.delete(oldKey);
       this.pixels -= old.image.width * old.image.height;
+      old.image = null;
     }
     const image = document.createElement('canvas');
     image.width = width; image.height = height;
@@ -49,9 +54,9 @@ export class FishSprites {
     for (const cell of parts) renderer.glyph(ctx, cell.ch, cell.color,
       (cell.x - first.x) * facing * size - left + pad, (cell.y - first.y) * size - top + pad,
       size, 1, EYES.has(cell.ch));
-    stamp = { image, left: left - pad, top: top - pad, usedAt: renderer.frameTime };
+    stamp = { key, size, facing, image, left: left - pad, top: top - pad, usedAt: renderer.frameTime };
     this.images.set(key, stamp);
     this.pixels += width * height;
-    return stamp;
+    return run.sprite = stamp;
   }
 }

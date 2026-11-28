@@ -19,11 +19,13 @@ function recordDraw(renderer, frames, page, trace) {
     }
     const poses = [];
     const cells = renderer.paintedFish || [];
-    const step = Math.max(1, Math.floor(cells.length / 3 / 96)) * 3;
-    if (trace) for (let i = 0; i < cells.length; i += step) {
-      const x = cells[i], y = cells[i + 1], size = renderer.paintedSize;
+    const coordinates = renderer.paintedCoordinates, visible = coordinates ? cells.length : cells.length / 3;
+    const step = Math.max(1, Math.floor(visible / 96));
+    if (trace) for (let i = 0; i < visible; i += step) {
+      const x = coordinates ? coordinates[i * 2] : cells[i * 3];
+      const y = coordinates ? coordinates[i * 2 + 1] : cells[i * 3 + 1], size = renderer.paintedSize;
       if (x + size / 2 < 0 || y + size / 2 < 0 || x + size / 2 >= renderer.width || y + size / 2 >= renderer.height) continue;
-      const glyph = cells[i + 2].id;
+      const glyph = (coordinates ? cells[i] : cells[i * 3 + 2]).id;
       let ordinal = glyphIds.get(glyph);
       if (ordinal === undefined) { ordinal = glyphIds.size; glyphIds.set(glyph, ordinal); }
       // Keep exact coordinates and stable identity in a packed numeric array.
@@ -32,7 +34,7 @@ function recordDraw(renderer, frames, page, trace) {
     }
     frames.push({ sequence, at: performance.timeOrigin + start, draw: drawMs,
       ...(trace && { beforeMark: performance.timeOrigin + beforeMark, afterMark: performance.timeOrigin + afterMark }),
-      tick: args[0].data.tick, visible: cells.length / 3, poses });
+      tick: args[0].data.tick, visible, poses });
   };
 }
 
@@ -103,6 +105,7 @@ function readPresentations(events, page, start, end) {
   }
   const rows = [...displayed.values()].sort((a, b) => a.at - b.at);
   const moving = [];
+  const longestMotionGaps = [];
   let previousIndices = new Map(), previousPoses = [];
   for (const frame of rows) {
     let changed = false;
@@ -114,7 +117,19 @@ function readPresentations(events, page, start, end) {
         (poses[i + 2] - previousPoses[prior + 2]) ** 2 >= .01) changed = true;
       current.set(poses[i], i);
     }
-    if (changed) moving.push(frame);
+    if (changed) {
+      const prior = moving.at(-1);
+      if (prior && frame.at > start && prior.at < end) {
+        const ms = frame.at - prior.at;
+        if (longestMotionGaps.length < 5 || ms > longestMotionGaps.at(-1).ms) {
+          longestMotionGaps.push({ ms, afterMs: frame.at - start, fromTick: prior.tick, toTick: frame.tick,
+            fromFrame: prior.sequence, toFrame: frame.sequence });
+          longestMotionGaps.sort((a, b) => b.ms - a.ms);
+          if (longestMotionGaps.length > 5) longestMotionGaps.pop();
+        }
+      }
+      moving.push(frame);
+    }
     previousIndices = current;
     previousPoses = poses;
   }
@@ -135,7 +150,7 @@ function readPresentations(events, page, start, end) {
   }));
   // Both independent browser processes run on the same machine. Check the
   // mapping from trace ticks to the page clock before comparing their events.
-  return { drawn, rows, moving, longestGaps,
+  return { drawn, rows, moving, longestGaps, longestMotionGaps,
     clockOffsets: Number.isFinite(minClockOffset) && minClockOffset <= maxClockOffset ? [minClockOffset, maxClockOffset] : undefined };
 }
 
@@ -194,6 +209,7 @@ function frameSummary(page, presentations, start, end, authority = page.steps, r
     framesPresented: presentations.rows.filter(inWindow).length,
     framesWithMotion: presentations.moving.filter(inWindow).length,
     longestPresentationGaps: presentations.longestGaps,
+    longestMotionGaps: presentations.longestMotionGaps,
     drawToPresent: distribution(presentations.rows.filter(inWindow).map(frame => frame.drawToPresent)),
     authorityToVisibleMotion: { ...distribution(visibleAfterCommit), commitsWithoutObservedMotion: commits.length - visibleAfterCommit.length },
     requestToConfirmedFrame: { ...distribution(requestToConfirmed), requestsWithoutObservedFrame: requests.length - requestToConfirmed.length }

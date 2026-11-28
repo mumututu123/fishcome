@@ -14,7 +14,15 @@ const FONT = "'Microsoft YaHei',Consolas,monospace";
 export { MONUMENT } from './engine.js';
 export class Renderer {
   scene3d = null;
-  constructor(canvas) { this.canvas = canvas; this.ctx = canvas.getContext('2d'); this.camera = { x: 380, y: 23 }; this.scale = 1; this.cell = 18; this.pointer = { x: 0, y: 0 }; this.preview = null; this.selected = null; this.world = null; this.resize(); window.addEventListener('resize', () => this.resize()); }
+  constructor(canvas) {
+    this.canvas = canvas;
+    // Both sea views cover every pixel each frame. Let the browser present
+    // this surface directly when the graphics driver supports it.
+    this.ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
+    this.camera = { x: 380, y: 23 }; this.scale = 1; this.cell = 18;
+    this.pointer = { x: 0, y: 0 }; this.preview = null; this.selected = null; this.world = null;
+    this.resize(); window.addEventListener('resize', () => this.resize());
+  }
   resize() { this.width = innerWidth; this.height = innerHeight; this.dpr = Math.min(2, devicePixelRatio || 1); this.canvas.width = this.width * this.dpr; this.canvas.height = this.height * this.dpr; this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0); }
   point(x, y) { const s = this.cell * this.scale; return { x: wrapX(Math.floor(this.camera.x + (x - this.width / 2) / s)), y: Math.floor(this.camera.y + (y - this.height / 2) / s) }; }
   screen(x, y) { const s = this.cell * this.scale; return { x: (nearX(x, this.camera.x) - this.camera.x) * s + this.width / 2, y: (y - this.camera.y) * s + this.height / 2 }; }
@@ -70,24 +78,27 @@ export class Renderer {
       directions.forEach((ids, direction) => { if (ids) for (const id of ids) this.swims.set(id, direction); });
       this.swimStart = startedAt;
     }
-    this.poseFrame = undefined;
+    this.frameFish?.clear();
   }
   fishPose(world, id, now = this.frameTime) {
     const fish = world.data.fishes[id];
-    if (!fish || world !== this.cachedWorld || !this.swims?.has(id)) return fish;
+    if (!fish || world !== this.cachedWorld) return fish;
+    const direction = this.swims?.get(id);
+    if (direction === undefined) return fish;
     const progress = Math.max(0, (now - this.swimStart) / CONFIG.step);
     if (progress >= 1) return fish;
-    if (this.poseFrame !== now) {
-      this.poseFrame = now;
-      (this.frameFish ||= new Map()).clear();
+    const poses = this.frameFish ||= new Map();
+    let pose = poses.get(id);
+    if (pose?.time === now) return pose;
+    if (!pose) {
+      pose = { x: 0, y: 0, facing: fish.facing, cx: fish.cx, cy: fish.cy, time: now };
+      poses.set(id, pose);
     }
-    if (this.frameFish.has(id)) return this.frameFish.get(id);
-    const direction = this.swims.get(id), dx = direction % 3 - 1, dy = Math.floor(direction / 3) - 1;
+    const dx = direction % 3 - 1, dy = Math.floor(direction / 3) - 1;
     const along = progress * (Math.abs(dx) + Math.abs(dy));
-    const x = fish.x - dx * (1 - Math.min(1, along));
-    const y = fish.y - dy * (1 - Math.max(0, along - Math.abs(dx)));
-    const pose = { x, y, facing: fish.facing, cx: fish.cx, cy: fish.cy };
-    this.frameFish.set(id, pose);
+    pose.x = fish.x - dx * (1 - Math.min(1, along));
+    pose.y = fish.y - dy * (1 - Math.max(0, along - Math.abs(dx)));
+    pose.facing = fish.facing; pose.cx = fish.cx; pose.cy = fish.cy; pose.time = now;
     return pose;
   }
   cellIndex(world) {
@@ -121,8 +132,8 @@ export class Renderer {
     index.advance();
     this.paintedCells ||= new Map();
     this.paintedCells.clear();
-    (this.paintedFish ||= []).length = 0;
-    (this.paintedFishOwners ||= []).length = 0;
+    const paintedFish = this.paintedFish ||= [], owners = this.paintedFishOwners ||= [];
+    let painted = 0;
     this.paintedLeft = this.camera.x - this.width / (2 * size);
     this.paintedTop = this.camera.y - this.height / (2 * size);
     this.paintedSize = size;
@@ -132,6 +143,10 @@ export class Renderer {
       this.echoes = echoCells(world.data, characters);
       this.fishRuns = fishRuns(characters);
     }
+    if (!this.paintedCoordinates || this.paintedCoordinates.length < characters.length * 2) {
+      this.paintedCoordinates = new Float64Array(Math.max(characters.length * 2, (this.paintedCoordinates?.length || 0) * 2));
+    }
+    const coordinates = this.paintedCoordinates;
     const legend = activeLegend(world.data, Date.now());
     if (legend) this.drawLegend(world, legend, Date.now(), size, visible, false);
     const occasion = activeEvent(world.data, Date.now());
@@ -139,33 +154,40 @@ export class Renderer {
     for (const c of characters) if (c.kind === 'scene') { const s = world.data.scenes[c.entity]; if (!s) continue; const p = { x: s.x + c.x, y: s.y + c.y }; if (!visible(p)) continue; this.paintedCells.set(worldKey(p.x, p.y), { id: c.id, entity: c.entity }); const pixel = this.screen(p.x, p.y), selected = this.selected === c.entity && (!c.chat || this.selectedCell === c.id), echo = this.echoes.has(c.id); paint.glyph(ctx, c.ch, echo ? '#d7efe1' : c.color, pixel.x, pixel.y, size, selected ? 1 : echo ? .8 + .2 * Math.sin(Date.now() / 450) : .85, echo, c.kind); if (selected) { ctx.strokeStyle = '#b7f7de55'; ctx.strokeRect(pixel.x, pixel.y, size, size); } }
     this.scene3d?.drawFishLinks?.(this, world, characters, size, visible);
     const batchFish = !this.scene3d && this.dpr === 1 && Number.isInteger(size) && right - left < CONFIG.width / 2;
+    const camera = this.camera, horizontalRange = (right - left) / 2;
     const drawFish = (run, observed) => {
       const pose = this.fishPose(world, run.id);
       if (!pose) return;
       let canBatch = batchFish && !observed && run.cells.length > 1, stamp;
-      for (const cell of run.cells) {
-        const p = cellPosition(pose, cell);
-        if (!visible(p)) continue;
-        const pixel = this.screen(p.x, p.y);
-        this.paintedFish.push(pixel.x, pixel.y, cell);
-        this.paintedFishOwners.push(run.id);
+      for (let index = 0; index < run.cells.length; index++) {
+        const cell = run.cells[index], y = pose.y + cell.y;
+        if (y < top || y > bottom) continue;
+        const dx = deltaX(pose.x + pose.facing * cell.x, camera.x);
+        if (Math.abs(dx) > horizontalRange) continue;
+        const pixelX = (camera.x + dx - camera.x) * size + this.width / 2;
+        const pixelY = (y - camera.y) * size + this.height / 2;
+        coordinates[painted * 2] = pixelX;
+        coordinates[painted * 2 + 1] = pixelY;
+        paintedFish[painted] = cell;
+        owners[painted++] = run.id;
         if (canBatch) {
           canBatch = false;
           stamp = (this.fishSprites ??= new FishSprites()).get(this, run, size, pose.facing);
           if (stamp) {
             const first = run.cells[0];
-            ctx.drawImage(stamp.image, pixel.x + (first.x - cell.x) * pose.facing * size + stamp.left,
-              pixel.y + (first.y - cell.y) * size + stamp.top);
+            ctx.drawImage(stamp.image, pixelX + (first.x - cell.x) * pose.facing * size + stamp.left,
+              pixelY + (first.y - cell.y) * size + stamp.top);
           }
         }
         if (stamp) continue;
-        if (observed) { ctx.fillStyle = '#9aeee015'; ctx.fillRect(pixel.x, pixel.y, size, size); }
-        paint.glyph(ctx, cell.ch, cell.color, pixel.x, pixel.y, size, 1, EYES.has(cell.ch), cell.kind, cell, pose.facing);
-        if (observed) { ctx.strokeStyle = '#9aeee077'; ctx.lineWidth = 1; ctx.strokeRect(pixel.x, pixel.y, size, size); }
+        if (observed) { ctx.fillStyle = '#9aeee015'; ctx.fillRect(pixelX, pixelY, size, size); }
+        paint.glyph(ctx, cell.ch, cell.color, pixelX, pixelY, size, 1, EYES.has(cell.ch), cell.kind, cell, pose.facing);
+        if (observed) { ctx.strokeStyle = '#9aeee077'; ctx.lineWidth = 1; ctx.strokeRect(pixelX, pixelY, size, size); }
       }
     };
     for (const run of this.fishRuns) if (run.id !== this.observedFish) drawFish(run, false);
     if (this.observedFish) for (const run of this.fishRuns) if (run.id === this.observedFish) drawFish(run, true);
+    paintedFish.length = owners.length = painted;
     for (const c of characters) if ((c.kind === 'food' || c.kind === 'seaweed') && visible(c)) { const pixel = c.kind === 'seaweed' ? this.seaweedScreen(c) : this.screen(c.x, c.y); paint.glyph(ctx, c.ch, c.color, pixel.x, pixel.y, size, c.kind === 'seaweed' ? weedAlpha(c, world.data.ecology, Date.now()) : 1, false, c.kind); if (c.kind === 'food' && world.data.tick - c.born >= CONFIG.foodLife) { ctx.strokeStyle = '#84a2b355'; ctx.strokeRect(pixel.x + size * .2, pixel.y + size * .2, size * .6, size * .6); } }
     const bubbleNow = Date.now();
     const sick = new Set();
@@ -247,11 +269,11 @@ export class Renderer {
     const monument = this.world.monument;
     if (p.x >= monument.x && p.x < monument.x + 8 && p.y >= monument.y && p.y < monument.y + 5) return { kind: 'monument' };
     // Select the last painted frame, including while the next index is building.
-    for (let i = (this.paintedFish?.length || 0) - 3; i >= 0; i -= 3) {
-      const left = this.paintedFish[i], top = this.paintedFish[i + 1];
+    for (let i = (this.paintedFish?.length || 0) - 1; i >= 0; i--) {
+      const left = this.paintedCoordinates[i * 2], top = this.paintedCoordinates[i * 2 + 1];
       if (x < left || y < top || x >= left + this.paintedSize || y >= top + this.paintedSize) continue;
-      const drawn = this.paintedFish[i + 2], live = this.world.data.chars[drawn.id];
-      if (live?.kind === 'fish' && live.entity === this.paintedFishOwners[i / 3] && this.world.data.fishes[live.entity]) return { kind: 'fish', id: live.entity };
+      const drawn = this.paintedFish[i], live = this.world.data.chars[drawn.id];
+      if (live?.kind === 'fish' && live.entity === this.paintedFishOwners[i] && this.world.data.fishes[live.entity]) return { kind: 'fish', id: live.entity };
     }
     const painted = this.paintedCells?.get(worldKey(p.x, p.y));
     const live = painted && this.world.data.chars[painted.id];
