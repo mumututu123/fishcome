@@ -196,6 +196,33 @@ test('漏掉首次归档公告时继续确认鱼步，随后补发同一归档',
     assert.equal(side.calls.length,2);
   }
 });
+
+test('开启消息颠倒仍独立验证，较大名册和伙伴次序仅在双方不同的表上补送', async () => {
+  const now = Date.now(), { sides: [a,b], drain } = pair(now);
+  const traffic = [];
+  const ids = Array.from({ length: 140 }, (_,i) => 'id' + i);
+  const bonds = Object.fromEntries(ids.map(id => ['a|' + id, { a:'a', b:id, seconds:1, at:now, lastNear:now, run:1 }]));
+  for (const side of [a,b]) {
+    side.world.data.participants = Object.fromEntries(ids.map(id => [id,id]));
+    side.world.data.life.bonds = Object.fromEntries(side === a ? Object.entries(bonds) : Object.entries(bonds).reverse());
+    const send = side.session.io.send;
+    side.session.io.send = (peer,message) => { traffic.push(message); return send(peer,message); };
+  }
+  let opening;
+  await a.session.probe();
+  await drain(message => { if (message.action === 'opening') { opening = message; return true; } });
+  assert.ok(b.session.current.proof);
+  assert.equal(b.session.current.checking,undefined);
+  await b.session.receive(b.peer,opening);
+  await drain();
+  assert.ok(a.session.current.steps); assert.ok(b.session.current.steps);
+  assert.deepEqual(Object.keys(a.world.data.life.bonds),Object.keys(b.world.data.life.bonds));
+  assert.equal(opening.order.participants,undefined);
+  assert.equal(opening.order['life.bonds'],undefined);
+  assert.equal(traffic.find(m=>m.action==='open').order,undefined);
+  assert.deepEqual(Object.keys(traffic.find(m=>m.action==='tableOrder').order),['life.bonds']);
+  assert.ok(traffic.every(m=>!m.bonds));
+});
 test('对方尚未完成首次加入时询问不占用时钟，迟到的回执不能锁定旧世界', async () => {
   const now = Date.now(), { sides: [a,b], drain } = pair(now);
   await a.session.probe();

@@ -9,9 +9,19 @@ const tableAt = (data, name) => name.startsWith('life.') ? data.life?.[name.slic
 
 const largeTables = new Set(['chars', 'fishes', 'ops', 'travel']);
 export function checkpointOrder(data, requested) {
-  const names = requested || orderedTables.filter(name => !largeTables.has(name));
-  return Object.fromEntries(names.filter(name => orderedTables.includes(name) && tableAt(data, name))
-    .map(name => [name, Object.keys(tableAt(data, name))]));
+  const order = {};
+  for (const name of requested || orderedTables) {
+    if (!orderedTables.includes(name) || !requested && largeTables.has(name)) continue;
+    const rows = tableAt(data, name);
+    if (!rows) continue;
+    const keys = [];
+    for (const id in rows) {
+      keys.push(id);
+      if (!requested && keys.length > 128) break;
+    }
+    if (requested || keys.length <= 128) order[name] = keys;
+  }
+  return order;
 }
 
 // State that determines traversal order is part of the commitment. Hash small
@@ -37,6 +47,13 @@ async function checkpointProof(world, store, data, valid) {
     return Promise.all(pages);
   }
   const fields = [], tableProofs = {};
+  let bondOrder;
+  async function proveTable(name, value) {
+    const pages = await table(value);
+    if (valid() && orderedTables.includes(name) && (largeTables.has(name) || pages.length > 1)) tableProofs[name] = await stepDigest(pages);
+    if (name === 'life.bonds' && pages?.length > 1) bondOrder = await jsonDigest(Object.keys(value));
+    return pages;
+  }
   let characterPages;
   let bondEntry;
   for (const name of Object.keys(data)) {
@@ -45,14 +62,13 @@ async function checkpointProof(world, store, data, valid) {
     if (name === 'life' && field) {
       const parts = [];
       for (const [key, value] of Object.entries(field)) parts.push([key, value && typeof value === 'object' && !Array.isArray(value)
-        ? ['pages', await table(value)] : ['value', value]]);
+        ? ['pages', await proveTable('life.' + key, value)] : ['value', value]]);
       bondEntry = parts.find(part => part[0] === 'bonds');
       fields.push([name, 'life', parts]);
     } else if (field && typeof field === 'object' && !Array.isArray(field)) {
-      const pages = await table(field);
+      const pages = await proveTable(name, field);
       fields.push([name, 'pages', pages]);
       if (name === 'chars') characterPages = { table: field, hashes: pages, revision };
-      if (largeTables.has(name) && valid()) tableProofs[name] = await stepDigest(pages);
     }
     else fields.push([name, 'value', field]);
   }
@@ -69,7 +85,7 @@ async function checkpointProof(world, store, data, valid) {
     bondEntry[1] = ['pages', await table(bonds)];
     return valid() ? whole() : undefined;
   }
-  return { proof, exceptBonds, withBonds, tableProofs, characterPages };
+  return { proof, exceptBonds, withBonds, tableProofs, characterPages, bondOrder };
 }
 
 // Merging can preserve every record but reorder a dictionary. The leader's
@@ -168,11 +184,11 @@ export class OrderedSession {
     const { proof } = s.cut;
     if (!this.valid(s) || world.data.tick !== s.base) return;
     s.proof = proof;
-    await this.send(s, { action: 'open', base: s.base, proof, order });
+    await this.send(s, { action: 'open', base: s.base, proof, exceptBonds: s.cut.exceptBonds, bondOrder: s.cut.bondOrder });
   }
   async afterReplica() {
     const s = this.current;
-    if (!s?.waiting || s.checking || s.world.data.tick < s.base) return;
+    if (!s?.waiting || !s.order || s.checking || s.world.data.tick < s.base) return;
     if (!this.valid(s) || s.world.data.tick !== s.base) { this.stop('已错过共同检查点'); return; }
     s.checking = true;
     // Loading the independently verified local replica executes no ecological
@@ -193,7 +209,10 @@ export class OrderedSession {
     if (!this.valid(s)) return;
     if (proof !== s.proof) {
       s.reconciling = true;
-      await this.send(s, { action: 'history', base: s.base, exceptBonds: s.cut.exceptBonds, tableProofs: s.cut.tableProofs, bonds: s.world.data.life.bonds });
+      const needsBonds = s.cut.exceptBonds === s.exceptBonds &&
+        (s.expanded || !s.cut.bondOrder || !s.bondOrder || s.bondOrder === s.cut.bondOrder);
+      await this.send(s, { action: 'history', base: s.base, exceptBonds: s.cut.exceptBonds, tableProofs: s.cut.tableProofs,
+        ...(needsBonds && { bonds: s.world.data.life.bonds }) });
       return;
     }
     if (Object.keys(changes).length) {
@@ -287,21 +306,23 @@ export class OrderedSession {
     if (b.action === 'open' || b.action === 'opening') {
       if (this.io.isLeader() || typeof b.epoch !== 'string' || b.epoch.length !== 36 || !Number.isSafeInteger(b.base) ||
           b.base < this.io.world().data.tick || b.base > this.io.world().data.tick + CONFIG.step * 2 ||
-          b.action === 'open' && !/^[0-9a-f]{64}$/.test(b.proof) || !b.order || typeof b.order !== 'object') return;
+          (b.action === 'open' ? !/^[0-9a-f]{64}$/.test(b.proof) || !/^[0-9a-f]{64}$/.test(b.exceptBonds)
+            : !b.order || typeof b.order !== 'object' || Array.isArray(b.order))) return;
       if (s && (s.peer !== peer || s.epoch !== b.epoch || s.base !== b.base || !s.waiting)) return;
       if (!s) {
         s = this.begin(peer, b.epoch, b.base);
-        Object.assign(s, { waiting: true, order: b.order });
+        s.waiting = true;
       }
-      if (b.action === 'open') s.proof = b.proof;
+      if (b.action === 'open') { s.proof = b.proof; s.exceptBonds = b.exceptBonds; s.bondOrder = b.bondOrder; }
+      else s.order = b.order;
       return s.cut ? this.finishCheckpoint(s) : this.afterReplica();
     }
     if (!s || s.peer !== peer || b.epoch !== s.epoch) return;
     if (b.action === 'stop') { this.stop('伙伴已切回世界同步', false); return; }
     if (!this.valid(s)) { this.stop('共同结算的连接或归档已更换'); return; }
     if (b.action === 'history' && s.owner && !s.steps && !s.reconciling && b.base === s.base) {
-      if (!s.cut?.exceptBonds || b.exceptBonds !== s.cut.exceptBonds) {
-        const different = [...largeTables].filter(name => /^[0-9a-f]{64}$/.test(b.tableProofs?.[name]) && b.tableProofs[name] !== s.cut?.tableProofs?.[name]);
+      if (!s.cut?.exceptBonds || b.exceptBonds !== s.cut.exceptBonds || !b.bonds) {
+        const different = Object.keys(s.cut?.tableProofs || {}).filter(name => /^[0-9a-f]{64}$/.test(b.tableProofs?.[name]) && b.tableProofs[name] !== s.cut.tableProofs[name]);
         if (!s.expanded && different.length) {
           s.expanded = true;
           await this.send(s, { action: 'tableOrder', base: s.base, order: checkpointOrder(s.world.data, different) });
@@ -319,9 +340,9 @@ export class OrderedSession {
       return;
     }
     if (b.action === 'tableOrder' && !s.owner && s.reconciling && !s.expanded && !s.steps && b.base === s.base) {
-      if (!b.order || !Object.keys(b.order).every(name => largeTables.has(name))) return;
+      if (!b.order || !Object.keys(b.order).every(name => orderedTables.includes(name))) return;
       s.expanded = true;
-      Object.assign(s.order, b.order);
+      s.order = { ...s.order, ...b.order };
       s.cut = undefined;
       s.joining = s.checking = s.reconciling = false;
       await this.afterReplica();
