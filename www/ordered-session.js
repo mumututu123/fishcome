@@ -76,7 +76,7 @@ async function checkpointProof(world, store, data, valid) {
   const commonArchives = await stepDigest([world.ambient, Object.keys(store.manifests).sort(), store.summary, store.overrides]);
   const whole = () => stepDigest([fields, commonArchives]);
   const proof = await whole();
-  if (!bondEntry) return { proof };
+  if (!bondEntry) return { proof, exceptBonds: proof, tableProofs, characterPages };
   const before = bondEntry[1];
   bondEntry[1] = null;
   const exceptBonds = await whole();

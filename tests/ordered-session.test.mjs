@@ -94,6 +94,13 @@ test('即使步号相同，不同的归档基准也无法开启会话', async ()
   assert.equal(a.session.current, null); assert.equal(b.session.current, null);
   assert.deepEqual(b.calls, []);
 });
+test('双方持有同一尚无伙伴表的旧基准时仍验证整个世界', async () => {
+  const now = Date.now(), { sides: [a,b], drain } = pair(now);
+  for (const side of [a,b]) delete side.world.data.life.bonds;
+  await a.session.probe(); await drain();
+  assert.ok(a.session.current.steps); assert.ok(b.session.current.steps);
+  assert.equal(a.session.current.steps.proof,b.session.current.steps.proof);
+});
 test('一批两份签名依业务编号各取自己的归档凭据', async () => {
   const { sides: [a,b], drain } = pair(Date.now());
   const first = await earn(a.world, 3), second = await earn(a.world, 5);
