@@ -152,3 +152,20 @@ test('同一步归并离线期间不同的伙伴成员与累计相处，随后�
   await drain();
   assert.equal(a.session.current.steps.proof,b.session.current.steps.proof);
 });
+test('入场保留场景编辑和鱼名册的原遍历次序，只为不同的大表请求次序', async () => {
+  const now = Date.now(), { sides: [a,b], drain } = pair(now), traffic = [];
+  const tables = { scenes: { s2: {id:'s2'}, s1: {id:'s1'} }, fishes: { f2: {id:'f2'}, f1: {id:'f1'} } };
+  for (const [field, table] of Object.entries(tables)) {
+    a.world.data[field] = structuredClone(table);
+    b.world.data[field] = Object.fromEntries(Object.entries(structuredClone(table)).reverse());
+  }
+  const before = a.session.io.send;
+  a.session.io.send = async (peer, body) => { traffic.push(body); await before(peer,body); };
+  await a.session.probe(); await drain();
+  assert.ok(a.session.current?.steps); assert.ok(b.session.current?.steps);
+  assert.deepEqual(Object.keys(b.world.data.scenes),['s2','s1']); assert.deepEqual(Object.keys(b.world.data.fishes),['f2','f1']);
+  const opening = traffic.find(r=>r.action==='opening');
+  for (const name of ['chars','fishes','ops','travel']) assert.equal(opening.order[name],undefined);
+  assert.deepEqual(Object.keys(traffic.find(r=>r.action==='tableOrder').order), ['fishes']);
+  assert.deepEqual(a.stops,[]); assert.deepEqual(b.stops,[]);
+});
