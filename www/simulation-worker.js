@@ -722,17 +722,20 @@ export class WorkerSimulation {
   }
 }
 
+export function simulationBuffers(patch) {
+  const bonds = patch?.life?.bonds;
+  return [patch?.tables.fishes?.motion?.buffer, patch?.tables.travel?.distances?.buffer, bonds?.counters?.buffer,
+    bonds?.intervals?.kept.buffer, bonds?.intervals?.added.buffer].filter(Boolean);
+}
+
 if (typeof WorkerGlobalScope !== 'undefined' && globalThis instanceof WorkerGlobalScope) {
   const simulation = new WorkerSimulation();
   globalThis.onmessage = async ({ data }) => {
     try {
       const result = await simulation.receive(data), patch = result?.patch;
-      const bonds = patch?.life?.bonds;
-      const buffers = [patch?.tables.fishes?.motion?.buffer, patch?.tables.travel?.distances?.buffer, bonds?.counters?.buffer,
-        bonds?.intervals?.kept.buffer, bonds?.intervals?.added.buffer].filter(Boolean);
-      // The renderer owns the posted copy. Keep the worker's bytes intact until
-      // it hashes the committed step, independently of edits on the page.
-      postMessage({ result }, data.agreed ? [] : buffers);
+      // The page owns display columns. The signed proof reads the independent
+      // authoritative records and changed IDs still held by this worker.
+      postMessage({ result }, simulationBuffers(patch));
     }
     catch (error) { postMessage({ error: error.message }); }
   };

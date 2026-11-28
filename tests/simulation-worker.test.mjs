@@ -3,7 +3,7 @@ import test from 'node:test';
 import { CONFIG, World, chooseClaim } from '../www/engine.js';
 import { ARCHIVE_FIELDS, ArchiveStore, encodeArchive, prepareCompaction } from '../www/archive.js';
 import { SimulationClient, startSimulationClock, subscribeSimulationChanges } from '../www/simulation-client.js';
-import { WorkerSimulation } from '../www/simulation-worker.js';
+import { WorkerSimulation, simulationBuffers } from '../www/simulation-worker.js';
 import { expandSimulationPatch } from '../www/simulation-delta.js';
 import { applyBondIntervals } from '../www/bond-interval.js';
 import { LIFE, lifeContext, updateLife } from '../www/life.js';
@@ -66,7 +66,10 @@ function localWorker(beforeReceive = () => {}, simulation = new WorkerSimulation
       setImmediate(async () => {
         try {
           await beforeReceive(message);
-          if (!closed) this.onmessage({ data: { result: structuredClone(await simulation.receive(message)) } });
+          if (!closed) {
+            const result = await simulation.receive(message);
+            this.onmessage({ data: { result: structuredClone(result, { transfer: simulationBuffers(result?.patch) }) } });
+          }
         }
         catch (error) { this.onmessage({ data: { error: error.message } }); }
       });
@@ -444,7 +447,7 @@ test('后台只发送变化的鱼记录与当日行程，订阅者收到完整�
   class ObservedWorker extends WorkerSimulation {
     receive(message) {
       const reply = super.receive(message);
-      if (reply) sent.push(reply.patch);
+      if (reply?.patch) sent.push(structuredClone(reply.patch));
       return reply;
     }
   }
