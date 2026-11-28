@@ -106,6 +106,7 @@ export class SimulationClient {
     this.knownFish = null;
     this.historyParts = null;
     this.savedCharacters = undefined;
+    this.characterOwner = null;
     this.failure = null;
     const pending = this.pending;
     this.pending = null;
@@ -151,19 +152,45 @@ export class SimulationClient {
   finishBoundary() {
     for (const apply of this.boundaries?.splice(0) || []) apply();
   }
-  async checkRetained(world) {
+  hasSavedCharacters(world) { return this.characterOwner === world && !!this.savedCharacters; }
+  async checkRetained(world, valid = () => true) {
     if (this.task) await this.task;
-    if (!this.worker || this.owner !== world || this.task || this.savedCharacters) return;
-    const worker = this.worker;
+    if (this.task || !valid() || this.hasSavedCharacters(world)) return;
     await this.startTask(world, async () => {
-      const hashes = await this.request({ kind: 'characterWitness' });
-      if (this.worker === worker && hashes) this.savedCharacters = new Map(hashes.map((hash, i) => [hash, i]));
+      const cold = !this.worker || this.owner !== world;
+      let worker = this.worker;
+      if (cold) {
+        // A joining tab may never have advanced on its own. Only stage the
+        // characters here. Its ordinary stream can keep committing world
+        // frames, and the later checkpoint will authenticate every reused page.
+        this.close();
+        worker = this.makeWorker();
+        this.bindWorker(world, worker);
+        await this.request({ kind: 'open', values: { tick: world.data.tick }, tables: ['chars'], ambient: world.ambient });
+        const table = world.data.chars;
+        let rows = [];
+        for (const id in table) {
+          rows.push(['chars', id, table[id]]);
+          if (rows.length < 512) continue;
+          if (this.worker !== worker || !valid()) return;
+          await this.request({ kind: 'rows', rows });
+          rows = [];
+        }
+        if (this.worker !== worker || !valid()) return;
+        if (rows.length) await this.request({ kind: 'rows', rows });
+      }
+      if (this.worker !== worker || !valid()) return;
+      const hashes = await this.request({ kind: 'characterWitness', cold });
+      if (this.worker === worker && hashes) {
+        this.characterOwner = world;
+        this.savedCharacters = new Map(hashes.map((hash, i) => [hash, i]));
+      }
     });
   }
   async open(world, valid, characterPages) {
     let characters, missingCharacters;
     const retainedWorker = characterPages?.table === world.data.chars && characterPages.revision === characterRevision(world) &&
-      this.savedCharacters && this.owner === world && this.worker;
+      this.hasSavedCharacters(world) && this.worker;
     if (retainedWorker) {
       const ids = Object.keys(world.data.chars);
       missingCharacters = [];
@@ -177,7 +204,8 @@ export class SimulationClient {
       this.worker = null;
     }
     this.close();
-    const worker = this.worker = retainedWorker || this.makeWorker();
+    const worker = retainedWorker || this.makeWorker();
+    this.bindWorker(world, worker);
     this.knownFish = Object.keys(world.data.fishes);
     SimulationRows.for(world.data.fishes, this.knownFish);
     SimulationRows.for(world.data.travel, this.knownFish);
@@ -189,6 +217,10 @@ export class SimulationClient {
       for (const [id, nick] of patch.tables.participants?.set || []) this.names.set(id, nick);
       for (const [id, food] of patch.tables.chars?.set || []) this.foods.set(id, food);
     });
+    return this.loadWorld(world, valid, worker, characters, missingCharacters);
+  }
+  bindWorker(world, worker) {
+    this.worker = worker;
     worker.onmessage = ({ data }) => {
       if (this.worker !== worker || !this.pending) return;
       const { resolve, reject } = this.pending;
@@ -205,6 +237,8 @@ export class SimulationClient {
       pending?.reject(error);
     };
     worker.onerror = worker.onmessageerror = failed;
+  }
+  async loadWorld(world, valid, worker, characters, missingCharacters) {
     const values = {}, tables = [];
     for (const field of Object.keys(world.data)) {
       if (worldTables.has(field)) tables.push(field); else values[field] = world.data[field];

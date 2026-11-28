@@ -123,6 +123,16 @@ const instrument = `
 const testData = { frames: [], steps: [], stepRequests: [], applied: [], sends: [], receives: [], merges: [], worldMerges: [], repairs: [], saves: [], liveBytes: [] };
 const stoppedSessions = [];
 const workerLoads = [], activeWorkerLoad = new WeakMap();
+const originalWitness = SimulationClient.prototype.checkRetained;
+SimulationClient.prototype.checkRetained = async function (world, valid) {
+  if (this.hasSavedCharacters(world) || activeWorkerLoad.has(this)) return originalWitness.call(this, world, valid);
+  const row = { stage: 'witness', at: Date.now(), tick: world.data.tick, oldWorker: !!this.worker,
+    characters: 0, otherRows: 0, rowBatches: 0, rowMs: 0 };
+  activeWorkerLoad.set(this,row); workerLoads.push(row);
+  const start = performance.now();
+  try { await originalWitness.call(this,world,valid); row.cached = this.savedCharacters?.size || 0; }
+  finally { row.ms = Math.round(performance.now() - start); activeWorkerLoad.delete(this); }
+};
 const originalOpen = SimulationClient.prototype.open;
 SimulationClient.prototype.open = async function (world, valid, cut) {
   const row = { at: Date.now(), tick: world.data.tick, oldWorker: !!this.worker, cached: this.savedCharacters?.size || 0,
@@ -161,7 +171,7 @@ SimulationClient.prototype.advanceAgreed = function (...args) {
 const originalRequest = SimulationClient.prototype.request;
 SimulationClient.prototype.request = function (message) {
   const load = activeWorkerLoad.get(this);
-  if (load && ['open','rows','ready'].includes(message.kind)) {
+  if (load && ['open','rows','ready','characterWitness'].includes(message.kind)) {
     const start = performance.now();
     if (message.kind === 'open') load.reused = message.characters?.filter(page => typeof page === 'number').length || 0;
     if (message.kind === 'rows') {

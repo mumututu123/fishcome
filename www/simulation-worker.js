@@ -577,7 +577,8 @@ export class WorkerSimulation {
       const ids = Object.keys(this.world.data.chars);
       this.characterPages = [];
       for (let start = 0; start < ids.length; start += 128) {
-        this.characterPages.push(ids.slice(start, start + 128).map(id => [id, this.tracker.copyCharacter(id)]));
+        this.characterPages.push(ids.slice(start, start + 128).map(id => [id,
+          message.cold ? this.world.data.chars[id] : this.tracker.copyCharacter(id)]));
       }
       return Promise.all(this.characterPages.map(jsonDigest));
     }

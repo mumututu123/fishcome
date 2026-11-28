@@ -184,8 +184,8 @@ const ordered = new OrderedSession({
   archiveBoundary: (target, commit) => atCheckpointBoundary(target.data, () => simulation.archiveAtStepBoundary(target, commit)),
   archiveConfirmed: () => { renderChat(); save({ reusePicture: true }).catch(error => diagnostics.record('warn', 'archive', error.message)); },
   firstCommit: () => worldBroadcast.reset(),
-  checkRetained: target => simulation.checkRetained(target),
-  hasSavedCharacters: target => simulation.owner === target && !!simulation.savedCharacters,
+  checkRetained: target => simulation.checkRetained(target, () => target === world && mayRetainWorker()),
+  hasSavedCharacters: target => simulation.hasSavedCharacters(target),
   prepare: (target, valid, pages) => simulation.prepareAgreed(target, valid, pages),
   advance: (target, nextTick, valid, handle) => simulation.advanceAgreed(target, nextTick, valid, handle),
   stopped(session, reason) {

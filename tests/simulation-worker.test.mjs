@@ -118,6 +118,44 @@ test('旧伙伴线程只复用逐页一致的鱼元，补齐换序、增删和�
   } finally { client.close(); }
 });
 
+test('尚未在本机计算过的伙伴提前装鱼元，沿途普通同步继续提交，到共同点只补差异', async () => {
+  const world = new World(start, root, { populate: false, ambient: false });
+  const store = new ArchiveStore();
+  world.attachArchives(store);
+  const ids = Array.from({length:640},(_,i)=>'id' + i);
+  for (const id of ids) world.data.chars[id] = { id, kind:'burn', entity:'', created:start, path:[] };
+  let inSeed = true, changed = false, steps = 0;
+  const loads = [], workers = [];
+  const client = new SimulationClient(() => {
+    const worker = new WorkerSimulation();
+    workers.push(worker);
+    return localWorker(message => {
+      if (message.kind === 'open') loads.push(message);
+      if (message.kind === 'step') steps++;
+      if (inSeed && message.kind === 'rows' && !changed) {
+        changed = true;
+        worldEdited(world);
+        world.data.tick += CONFIG.step;
+        world.data.chars[ids[0]] = { ...world.data.chars[ids[0]], olderField: 1 };
+      }
+    },worker);
+  });
+  try {
+    await client.checkRetained(world);
+    inSeed = false;
+    assert.equal(changed,true);
+    assert.equal(client.owner,null);
+    assert.equal(client.hasSavedCharacters(world),true);
+    const cut = await orderedCheckpoint(world,store);
+    assert.ok(await client.prepareAgreed(world,()=>true,cut.characterPages));
+    assert.equal(workers.length,1);
+    assert.equal(steps,0);
+    assert.deepEqual(loads.at(-1).characters[0],ids.slice(0,128));
+    assert.deepEqual(loads.at(-1).characters.slice(1),[1,2,3,4]);
+    assert.equal(JSON.stringify(workers[0].world.data.chars),JSON.stringify(world.data.chars));
+  } finally { client.close(); }
+});
+
 test('确认输入只装载基准，到点双方各提交一个相同的生态步，过期约定无法再用', async () => {
   const makeWorld = () => new World(start, root, { populate: false, ambient: false });
   const worlds = [makeWorld(), makeWorld()];
