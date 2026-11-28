@@ -14,11 +14,14 @@ const temp = mkdtempSync(join(tmpdir(), 'fishcome-swimming-'));
 try {
   const output = join(temp, 'swimming.wasm');
   execFileSync(zig, ['cc', '-target', 'wasm32-freestanding', '-O3', '-ffp-contract=off', '-nostdlib',
-    '-Wl,--no-entry', '-Wl,--strip-all', '-Wl,--export=swim', '-Wl,--export=swim_one', '-Wl,--export=__heap_base',
-    '-o', output, 'native/swimming.c'], { cwd: root, stdio: 'inherit' });
+    '-Wl,--no-entry', '-Wl,--strip-all', '-Wl,--export=swim', '-Wl,--export=swim_one', '-Wl,--export=density_prefix',
+    '-Wl,--export=adjacent_pairs', '-Wl,--export=canonical_midpoint', '-Wl,--export=__heap_base',
+    '-o', output, 'native/swimming.c', 'native/contacts.c'], { cwd: root, stdio: 'inherit' });
   const encoded = readFileSync(output).toString('base64');
-  const sourceHash = createHash('sha256').update(readFileSync(join(root, 'native/swimming.c'), 'utf8').replaceAll('\r\n', '\n')).digest('hex');
-  const source = '// Generated from native/swimming.c by scripts/build-swimming.mjs. SHA-256 ' + sourceHash + '\n' +
+  const hash = createHash('sha256');
+  for (const file of ['native/swimming.c', 'native/contacts.c']) hash.update(readFileSync(join(root, file), 'utf8').replaceAll('\r\n', '\n'));
+  const sourceHash = hash.digest('hex');
+  const source = '// Generated from native/swimming.c and native/contacts.c by scripts/build-swimming.mjs. SHA-256 ' + sourceHash + '\n' +
     "export const swimProgram = new WebAssembly.Module(Uint8Array.from(atob('" + encoded + "'), char => char.charCodeAt(0)));\n";
   const file = join(root, 'www/swim-program.js');
   if (process.argv.includes('--check')) {

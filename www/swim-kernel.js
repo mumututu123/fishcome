@@ -37,17 +37,19 @@ export function packedGrid(grid, count) {
   return packed;
 }
 
+// Numeric grid operations use compiled hulls. Only single legacy moves call back into world geometry.
+export function gridProgram() {
+  const missingHull = () => { throw new Error('Missing packed fish hull'); };
+  return new WebAssembly.Instance(swimProgram, { geometry: { fits: missingHull, turns: missingHull } }).exports;
+}
+
 class PackedGrid {
   constructor(grid) {
-    // The batch only contains integer singleton bodies with compiled hulls.
-    this.program = new WebAssembly.Instance(swimProgram, { geometry: {
-      fits() { throw new Error('Missing packed fish hull'); },
-      turns() { throw new Error('Missing packed fish hull'); }
-    } }).exports;
+    this.program = gridProgram();
     this.grid = grid;
     this.ownersOffset = Number(this.program.__heap_base.value);
     this.maskOffset = this.ownersOffset + grid.cells.byteLength;
-    this.poseOffset = Math.ceil((this.maskOffset + grid.obstacles.byteLength) / 8) * 8;
+    this.poseOffset = Math.ceil((this.maskOffset + WORLD_WIDTH * MAX_FLOOR) / 8) * 8;
     this.capacity = 0;
     this.ownersLength = grid.cells.length;
   }
@@ -72,7 +74,7 @@ class PackedGrid {
       this.shapes = new Map();
       this.reserve(this.shapeEnd);
     }
-    if (this.mask !== this.grid.obstacles) {
+    if (this.grid.obstacles && this.mask !== this.grid.obstacles) {
       this.mask = this.grid.obstacles;
       this.bytes.set(this.mask, this.maskOffset);
     }

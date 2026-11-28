@@ -1,3 +1,4 @@
+import { densityPrefix } from './contact-field.js';
 import { hash } from './world-hash.js';
 import { wrapX } from './geography.js';
 
@@ -8,10 +9,12 @@ export function validEcology(state, now = Date.now() + 60000) { return state ===
 export function mergeEcology(a, b) { if (!a) return b; if (!b) return a; return { version: 1, activated: Math.min(a.activated, b.activated), legacy: a.legacy || b.legacy, hour: Math.max(a.hour, b.hour) }; }
 // A query covers at most (2r+1)² cells. A rectangle sum therefore holds both
 // exact counts without a carry from its water count into its occupied count.
-const densityScale = 2 ** Math.ceil(Math.log2((2 * ECOLOGY.radius + 1) ** 2 + 1));
-export function densityField(world, scenery = world.sceneryMap(), occupiedByFish) {
+export const densityScale = 2 ** Math.ceil(Math.log2((2 * ECOLOGY.radius + 1) ** 2 + 1));
+export const breedingThreshold = Object.freeze({ numerator: 2, denominator: 5 });
+const crowded = breedingThreshold.numerator / breedingThreshold.denominator;
+export function densityField(world, scenery = world.sceneryMap(), occupiedByFish, field) {
   const width = 1000, floors = Array.from({ length: width }, (_, x) => world.floorAt(x)), height = Math.max(...floors), stride = width + 1;
-  const occupied = new Uint8Array(width * height), totals = new Uint32Array(stride * (height + 1));
+  const occupied = field ? field.occupied.fill(0) : new Uint8Array(width * height);
   const mark = (x, y) => { if (Number.isInteger(y) && y >= 0 && y < height) occupied[y * width + wrapX(x)] = 1; };
   for (const { scene, cell } of scenery.values()) mark(scene.x + cell.x, scene.y + cell.y);
   for (const c of occupiedByFish ? world.charValues('food', 'seaweed', 'scene') : world.charValues()) {
@@ -20,15 +23,7 @@ export function densityField(world, scenery = world.sceneryMap(), occupiedByFish
   }
   const monument = world.monument; for (const [dy, row] of monument.rows.entries()) for (const [dx, ch] of Array.from(row).entries()) if (ch !== ' ') mark(monument.x + dx, monument.y + dy);
   // Summed-area tables make every local density query constant-time, even on hourly turnover.
-  for (let y = 0; y < height; y++) {
-    let row = 0;
-    for (let x = 0; x < width; x++) {
-      const cell = y * width + x;
-      if (y < floors[x]) row += occupied[cell] || occupiedByFish?.[cell] ? densityScale + 1 : 1;
-      const index = (y + 1) * stride + x + 1;
-      totals[index] = totals[index - stride] + row;
-    }
-  }
+  const totals = field ? field.prefix(floors, height, densityScale) : densityPrefix(occupied, occupiedByFish, floors, height, densityScale);
   const rectangle = (left, right, top, bottom) => totals[(bottom + 1) * stride + right + 1] - totals[top * stride + right + 1] - totals[(bottom + 1) * stride + left] + totals[top * stride + left];
   function windowArea(x, y) {
     const r = ECOLOGY.radius, left = x - r, right = x + r;
@@ -46,7 +41,7 @@ export function densityField(world, scenery = world.sceneryMap(), occupiedByFish
   };
   const allowsBreeding = (x, y) => {
     const total = windowArea(x, y);
-    return Math.floor(total / densityScale) * 5 < (total % densityScale) * 2;
+    return Math.floor(total / densityScale) * breedingThreshold.denominator < (total % densityScale) * breedingThreshold.numerator;
   };
   // Each row prefix counts centers that permit breeding. One range check
   // covers all possible contact midpoints on that row of a fish's body.
@@ -70,8 +65,8 @@ export function densityField(world, scenery = world.sceneryMap(), occupiedByFish
   density.allowsBreedingAt = allowsBreeding;
   return density;
 }
-export const contactTime = density => density >= .4 ? Infinity : density >= .2 ? 20000 : 5000;
-export const growthChance = density => density >= .4 ? 0 : density >= .2 ? .005 : .01;
+export const contactTime = density => density >= crowded ? Infinity : density >= .2 ? 20000 : 5000;
+export const growthChance = density => density >= crowded ? 0 : density >= .2 ? .005 : .01;
 export function weedExpires(cell, state) {
   const ordinary = cell.created + ECOLOGY.weedMinLife + hash(`weed-life:${cell.id}`) % (ECOLOGY.weedLifeRange + 1);
   const activated = cell.ecoGraceAt ?? (state?.legacy && cell.created < state.activated ? state.activated : undefined);

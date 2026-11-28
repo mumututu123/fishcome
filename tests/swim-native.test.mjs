@@ -8,8 +8,9 @@ import { packedGrid, singlePose, swimOne } from '../www/swim-kernel.js';
 
 test('配送的游动程序由当前源码生成', async () => {
   const load = name => readFile(new URL(name, import.meta.url), 'utf8');
-  const source = (await load('../native/swimming.c')).replaceAll('\r\n', '\n');
-  const hash = createHash('sha256').update(source).digest('hex');
+  const inputs = createHash('sha256');
+  for (const path of ['../native/swimming.c', '../native/contacts.c']) inputs.update((await load(path)).replaceAll('\r\n', '\n'));
+  const hash = inputs.digest('hex');
   assert((await load('../www/swim-program.js')).split('\n')[0].trimEnd().endsWith(' SHA-256 ' + hash),
     '修改游动规则后请运行 node scripts/build-swimming.mjs 重建浏览器产物');
 });

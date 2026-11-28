@@ -231,3 +231,12 @@ test('旧鱼体重复编号仍按原来的首个鱼元寻找接触点', () => {
   updateContacts(w, now, w.fishGroups(), w.sceneryMap());
   assert.deepEqual(w.data.contacts[male + '|' + female], { male, female, since: now, lastAt: now });
 });
+test('密度快照在下一次按整海占格统计后仍保持原值', () => {
+  const w = sea();
+  fill(w, 998, 20, 100);
+  const before = densityField(w), expected = before(998, 20);
+  const empty = densityField(sea());
+  assert.equal(empty(998, 20), 0);
+  assert.equal(before(998, 20), expected);
+  assert.equal(expected, 100 / 961);
+});

@@ -1,9 +1,9 @@
 import { WORLD_WIDTH, deltaX, nearX, worldKey } from './geography.js';
-import { contactTime, densityField } from './ecology.js';
+import { ContactField } from './contact-field.js';
+import { ECOLOGY, breedingThreshold, contactTime, densityField, densityScale } from './ecology.js';
 
 const glyphOrders = new WeakMap();
 const namedBodies = new WeakMap();
-const relativeContacts = new WeakMap();
 
 export function hasNamedGlyphs(cells) {
   let named = namedBodies.get(cells);
@@ -50,44 +50,18 @@ function glyphOrder(cells, mother, hull) {
   return orders[side];
 }
 
-function contactOffsets(father, mother, x, y, facing, motherFacing) {
-  const edges = [];
-  for (let i = 0; i < father.length; i += 2) {
-    const px = facing * father[i], py = father[i + 1];
-    for (let j = 0; j < mother.length; j += 2) {
-      const dy = y + mother[j + 1] - py;
-      if (Math.abs(dy) > 1) continue;
-      const dx = deltaX(x + motherFacing * mother[j], px);
-      if (Math.abs(dx) > 1 || !dx && !dy) continue;
-      edges.push(px, py, dx, dy);
-      if (!dx || !dy) return edges;
-    }
-  }
-  return edges;
-}
-
-function waitingTime(density, grid, father, mother, scenery) {
+function waitingTime(field, density, grid, father, mother, scenery) {
   const layout = grid.layout, groups = layout.groups;
   const fatherCells = groups.get(father.id), motherCells = groups.get(mother.id);
   const maleHull = layout.hull(fatherCells), femaleHull = layout.hull(motherCells);
   const male = glyphOrder(fatherCells, false, maleHull), female = glyphOrder(motherCells, true, femaleHull);
-  if (male === maleHull.xy && female === femaleHull.xy && Math.abs(father.x) <= 2 * WORLD_WIDTH && Math.abs(mother.x) <= 2 * WORLD_WIDTH &&
+  if (Number.isSafeInteger(father.x) && Number.isSafeInteger(mother.x) &&
+      Math.abs(father.x) <= 2 * WORLD_WIDTH && Math.abs(mother.x) <= 2 * WORLD_WIDTH &&
       Math.abs(father.facing) === 1 && Math.abs(mother.facing) === 1) {
-    let byMother = relativeContacts.get(maleHull);
-    if (!byMother) relativeContacts.set(maleHull, byMother = new WeakMap());
-    let plans = byMother.get(femaleHull);
-    if (!plans) byMother.set(femaleHull, plans = new Map());
-    const x = deltaX(mother.x, father.x), y = mother.y - father.y;
-    const key = (y * WORLD_WIDTH + x) * 4 + Number(father.facing === 1) * 2 + Number(mother.facing === 1);
-    let edges = plans.get(key);
-    if (!edges) plans.set(key, edges = contactOffsets(male, female, x, y, father.facing, mother.facing));
-    for (let i = 0; i < edges.length; i += 4) {
-      const px = father.x + edges[i], py = father.y + edges[i + 1], dx = edges[i + 2], dy = edges[i + 3];
-      if (dx && dy && (scenery.has(worldKey(px, py + dy)) || scenery.has(worldKey(px + dx, py)))) continue;
-      return contactTime(density(px + dx / 2, py + dy / 2));
-    }
-    return Infinity;
+    const cell = field.midpoint(father, mother, male, female);
+    return cell < 0 ? Infinity : contactTime(density(cell % WORLD_WIDTH, Math.floor(cell / WORLD_WIDTH)));
   }
+  // Older positions outside the integer sea retain their floating-point midpoint arithmetic.
   for (let i = 0; i < male.length; i += 2) {
     const x = father.x + father.facing * male[i], y = father.y + male[i + 1];
     for (let j = 0; j < female.length; j += 2) {
@@ -123,32 +97,13 @@ export function collectGridPairs(world, grid, scenery, roster, taken, captured, 
   const sex = taken.size || captured.size ? roster.sex.slice() : roster.sex, count = sex.length;
   for (const id of taken) sex[grid.slots.get(id)] = 0;
   for (const id of captured) sex[grid.slots.get(id)] = 0;
-  const candidates = new Set();
-  function add(a, b) {
-    if ((sex[a] | sex[b]) === 3) candidates.add(sex[a] === 1 ? a * count + b : b * count + a);
-  }
-  let density;
-  const cells = grid.cells;
-  for (let row = 0, y = 0; row < cells.length; row += WORLD_WIDTH, y++) {
-    let left = cells[row + WORLD_WIDTH - 1], diagonal = y ? cells[row - 1] : 0;
-    for (let x = 0; x < WORLD_WIDTH; x++) {
-      const here = cells[row + x], up = y ? cells[row + x - WORLD_WIDTH] : 0;
-      if ((sex[here] | sex[left] | sex[up] | sex[diagonal]) === 3) {
-        if (world.ambient) density ??= densityField(world, scenery, cells);
-        if (!density || density.allowsBreedingAt(x, y)) {
-          add(left, here);
-          add(up, here);
-          if ((sex[diagonal] | sex[here]) === 3 && !scenery.has(worldKey(x - 1, y)) && !scenery.has(worldKey(x, y - 1))) add(diagonal, here);
-          if ((sex[left] | sex[up]) === 3 && !scenery.has(worldKey(x - 1, y - 1)) && !scenery.has(worldKey(x, y))) add(left, up);
-        }
-      }
-      left = here;
-      diagonal = up;
-    }
-  }
+  const field = new ContactField(grid, sex, scenery);
+  if (!field.hasNeighbors()) return true;
+  const density = world.ambient ? densityField(world, scenery, grid.cells, field) : undefined;
+  const candidates = field.candidates(ECOLOGY.radius, densityScale, breedingThreshold.numerator, breedingThreshold.denominator);
   for (const pair of candidates) {
     const male = grid.owners[Math.floor(pair / count)], female = grid.owners[pair % count];
-    const wait = density && waitingTime(density, grid, world.readFish(male), world.readFish(female), scenery);
+    const wait = density && waitingTime(field, density, grid, world.readFish(male), world.readFish(female), scenery);
     if (wait !== Infinity) pairs.set(male + '|' + female, { male, female, wait });
   }
   return true;
