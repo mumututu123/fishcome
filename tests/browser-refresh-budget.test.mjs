@@ -1,6 +1,15 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { frameSummary, bothDisplays } from './browser-refresh-budget.cjs';
+import { frameSummary, bothDisplays, scheduledSteps } from './browser-refresh-budget.cjs';
+
+test('按海洋的半秒时钟计数，采样首尾从未请求的步也算缺失', () => {
+  const shown = { host: { presented: 12 }, peer: { presented: 15 } };
+  const requests = [{ tick: 143, display: shown }, { tick: 1143, display: { host: shown.host } },
+    { tick: 1643 }, { tick: 1643, display: shown }, { tick: 2643, display: shown }];
+  assert.deepEqual(scheduledSteps(requests, 143, 500, 200, 2643), {
+    expected: 4, unrequested: [643, 2143], unpresented: [643, 1143, 2143]
+  });
+});
 
 test('刷新间隔包含跨过采样开始或结束时刻的长帧', () => {
   const frames = [84, 117, 134, 191].map(at => ({ at, draw: 2 }));

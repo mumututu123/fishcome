@@ -190,4 +190,18 @@ function bothDisplays(requests) {
   return { ...distribution(completed), requested: requests.length, missing: requests.length - completed.length, slowest };
 }
 
-module.exports = { recordDraw, frameSummary, startTrace, readPresentations, bothDisplays };
+function scheduledSteps(requests, phase, step, start, end) {
+  const first = phase + Math.ceil((start - phase) / step) * step;
+  const observed = new Set(requests.filter(row => row.display?.host && row.display.peer).map(row => row.tick));
+  const attempted = new Set(requests.map(row => row.tick));
+  const unrequested = [], unpresented = [];
+  let expected = 0;
+  for (let tick = first; tick < end; tick += step) {
+    expected++;
+    if (!attempted.has(tick)) unrequested.push(tick);
+    if (!observed.has(tick)) unpresented.push(tick);
+  }
+  return { expected, unrequested, unpresented };
+}
+
+module.exports = { recordDraw, frameSummary, startTrace, readPresentations, bothDisplays, scheduledSteps };

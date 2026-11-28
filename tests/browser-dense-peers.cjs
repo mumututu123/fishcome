@@ -8,7 +8,7 @@ const path = require('node:path');
 const { setTimeout: pause } = require('node:timers/promises');
 const { parseArgs } = require('node:util');
 const { unpackZip, launcherName, withReleaseFixtures } = require('./release-fixtures.cjs');
-const { recordDraw, frameSummary, startTrace, readPresentations, bothDisplays } = require('./browser-refresh-budget.cjs');
+const { recordDraw, frameSummary, startTrace, readPresentations, bothDisplays, scheduledSteps } = require('./browser-refresh-budget.cjs');
 
 const { positionals, values } = parseArgs({ allowPositionals: true, options: {
   profile: { type: 'string' }, source: { type: 'string' }, seconds: { type: 'string', default: '10' },
@@ -238,7 +238,7 @@ if (${Boolean(values['rebuild-viewport'])}) renderer.applyMerge = () => {};
 window.denseSurvey = () => ({ ...testData, node: network?.node, leader: network && leader(), peers: network?.live().length,
   simulationFailure: simulation.failure?.error?.message,
   page: window.densePage, timeOrigin: performance.timeOrigin,
-  tick: world.data.tick, fish: Object.keys(world.data.fishes).length, rejected: network?.stats.rejected,
+  tick: world.data.tick, step: CONFIG.step, fish: Object.keys(world.data.fishes).length, rejected: network?.stats.rejected,
   phases: window.densePhases, longTasks: window.denseLongTasks, replicaFailures: window.denseReplicaFailures,
   liveTransfers: window.denseLiveTransfers,
   logs: diagnostics.list().filter(log => log.level === 'warn' || log.level === 'error').slice(-10) });
@@ -544,7 +544,10 @@ async function seedSynthetic(a, b) {
 }
 
 async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace, browserVersion }) {
-  const firstLeads = await a.evaluate(() => { const { node, leader } = denseSurvey(); return node === leader; });
+  const { firstLeads, tick: clockPhase, step } = await a.evaluate(() => {
+    const { node, leader, tick, step } = denseSurvey();
+    return { firstLeads: node === leader, tick, step };
+  });
   let profiler, profileStartedAt;
   if (values.profile) {
     const followerPage = firstLeads ? b : a;
@@ -563,7 +566,7 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
   finally { clearTimeout(dropTimer); }
   const ended = Date.now(), sampled = event => event.at >= recent && event.at <= ended;
   await Promise.all([a, b].map(page => page.waitForFunction(end => denseSurvey().frames.at(-1)?.at >= end, ended, { polling: 50, timeout: 10000 })));
-  if (stopTrace) await pause(200);
+  if (stopTrace) await pause(step);
   const trace = stopTrace && await stopTrace(values.trace);
   const { rounds = [], error: archiveError } = await archiveResult;
   let profileSummary;
@@ -596,7 +599,8 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
   const actualSteps = [...new Map(follower.applied.filter(sampled).map(event => [event.tick, event])).values()];
   const appliedAfterSend = actualSteps.map(event => elapsedAfterSend(event, event.at)).filter(matchedLatency);
   const leaderProgress = progress(leaderSteps, recent, ended), followerProgress = progress(actualSteps, recent, ended);
-  const requests = coordinator.stepRequests.filter(row => row.startAt >= recent && row.startAt < ended);
+  const requests = coordinator.stepRequests.filter(row => row.startAt >= recent && row.startAt < ended ||
+    row.tick >= recent && row.tick < ended);
   if (trace) {
     const prefix = 'tide.request.' + coordinator.page + '.';
     const stamps = new Map(trace.traceEvents.filter(event => event.name.startsWith(prefix))
@@ -637,6 +641,7 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
       failed: page.receives.filter(event => event.failed), replicaFailures: page.replicaFailures, logs: page.logs };
   });
   const confirmed = trace && bothDisplays(requests);
+  const schedule = trace && scheduledSteps(requests, clockPhase, step, recent, ended);
   const dropped = coordinator.sends.filter(event => event.dropped && sampled(event));
   const droppedTicks = new Set(dropped.map(event => event.tick));
   const resumedTick = dropped.at(-1)?.tick + 500;
@@ -660,7 +665,7 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
       requested: page.repairs.filter(sampled).map(row => ({ afterMs: row.at - recent, correlated: row.correlated })),
       incoming: page.receives.filter(row => row.kind === 'merge' && sampled(row)).map(row => ({ afterMs: row.startAt - recent, ms: row.ms })) })),
     archiveRounds: rounds.map(({ at, tick, deliveredAt }) => ({ afterMs: at - recent, tick, deliveredAfterMs: deliveredAt - recent })), archiveError,
-    leaderProgress, followerProgress, stepComplete, stepStages, bothDisplays: confirmed, slowestStep: committed.reduce((slowest, row) =>
+    leaderProgress, followerProgress, stepComplete, stepStages, bothDisplays: confirmed, schedule, slowestStep: committed.reduce((slowest, row) =>
       !slowest || row.ms > slowest.ms ? row : slowest, null), stepSamples: requests, replicaRows,
     requestGaps: stats(requests.slice(1).map((row, index) => row.startAt - requests[index].startAt)),
     stepGaps: stats(leaderSteps.slice(1).map((step, index) => step.at - leaderSteps[index].at)),
@@ -704,7 +709,7 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
   if (archiveRounds && !values.drop && !values['forget-live-base'] && !values['plain-live']) {
     assert(!pages.some(page => page.repairs.some(sampled)), '完整存档直连归档时误报缺少记录，触发了补拉');
   }
-  if (values['refresh-budget']) assert(confirmed.missing === 0 && confirmed.over20 === 0 &&
+  if (values['refresh-budget']) assert(schedule.unpresented.length === 0 && confirmed.missing === 0 && confirmed.over20 === 0 &&
     stepComplete.n >= 9 && stepComplete.n === stepComplete.requested && stepComplete.over20 === 0 &&
     requests.slice(1).every((row, i) => row.tick - requests[i].tick === 500) && summaries.every(page => page.draw.over20 === 0 &&
     [page.presented, page.visibleMotion].every(row => row.over20 === 0 && row.n >= 20 && row.startCovered && row.endCovered) &&
