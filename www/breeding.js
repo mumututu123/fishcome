@@ -287,7 +287,7 @@ function pairBody(record, members, layout, cache) {
 export function motionOrder(world, groups, layout = world.bodyLayout(groups), singles = layout.ordered) {
   const active = activeRecords(world.data);
   if (!active.length) return singles;
-  const result = [], paired = new Set();
+  const result = [];
   const cache = world.stableFishRoster && (layout.pairBodies ??= new WeakMap());
   for (const record of active.sort((a, b) => a.id.localeCompare(b.id))) {
     const members = [world.data.fishes[record.male], world.data.fishes[record.female]];
@@ -295,17 +295,40 @@ export function motionOrder(world, groups, layout = world.bodyLayout(groups), si
     const { cells, offsets, x, y } = pairBody(record, members, layout, cache);
     const fish = { id: record.id, x, y, facing: 1, created: record.started, ...record.motion };
     result.push([record.id, cells, { id: record.id, fish, cells, members, offsets, record }]);
-    for (const member of members) paired.add(member.id);
   }
-  const units = [];
+  if (!result.length) return singles;
+  // Only the membership and fish order determine the slots. Rebuild each
+  // pair's live pose above even when its slot in the collision order is fixed.
+  const previous = layout.pairOrder;
+  if (cache && previous?.singles === singles && previous.slots.length === result.length &&
+      result.every(([id, , { members }], i) => {
+        const slot = previous.slots[i];
+        return slot.id === id && slot.male === members[0].id && slot.female === members[1].id;
+      })) {
+    const units = previous.entries.slice();
+    for (let i = 0; i < result.length; i++) units[previous.slots[i].index] = result[i];
+    return units;
+  }
+  const paired = new Set(), slots = [], units = [];
+  for (const [, , { members }] of result) for (const member of members) paired.add(member.id);
   let index = 0;
+  function insertPair() {
+    const pair = result[index++], [male, female] = pair[2].members;
+    slots.push({ id: pair[0], male: male.id, female: female.id, index: units.length });
+    units.push(pair);
+  }
   for (const entry of singles) {
     const [id] = entry;
     if (paired.has(id)) continue;
-    while (index < result.length && result[index][0].localeCompare(id) <= 0) units.push(result[index++]);
+    while (index < result.length && result[index][0].localeCompare(id) <= 0) insertPair();
     units.push(entry);
   }
-  while (index < result.length) units.push(result[index++]);
+  while (index < result.length) insertPair();
+  if (cache) {
+    const entries = units.slice();
+    for (const slot of slots) entries[slot.index] = null;
+    layout.pairOrder = { singles, slots, entries };
+  }
   return units;
 }
 export function motionUnits(world, groups) {

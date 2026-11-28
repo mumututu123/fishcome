@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { World, key } from '../www/engine.js';
-import { motionOrder } from '../www/breeding.js';
+import { motionOrder, writeBreedingRecord } from '../www/breeding.js';
 import { BodyLayout, compileHull, fitsHullAt, sweepsHullAt } from '../www/motion-hull.js';
 import { MovementGrid } from '../www/movement-grid.js';
 import { wrapX } from '../www/geography.js';
@@ -95,6 +95,37 @@ test('亲鱼跨海界平移、转身、被分开或恢复旧小数位置，联�
     Object.assign(female, { x: fx, y: fy, facing: ff });
     assert.deepEqual(motionOrder(world, groups, layout), motionOrder(fresh, groups, new BodyLayout(groups)));
   }
+});
+
+test('相同配对每步取新位置，亲鱼替换、配对结束和鱼序更换即时生效', () => {
+  const world = new World(100, 'test', { populate: false });
+  const groups = new Map();
+  for (const [i, id] of ['a', 'b', 'c', 'd', 'e', 'f'].entries()) {
+    world.data.fishes[id] = { id, x: i * 3, y: 10, facing: 1 };
+    groups.set(id, [{ id: id + '-eye', ch: 'O', x: 0, y: 0 }]);
+  }
+  const layout = new BodyLayout(groups);
+  world.stableFishRoster = () => Object.values(world.data.fishes);
+  const pair = { id: 'cc', male: 'a', female: 'e', status: 'active', started: 100 };
+  writeBreedingRecord(world.data.breeding, 'cc', pair);
+  const assertOrder = (singles = layout.ordered) => {
+    const actual = motionOrder(world, groups, layout, singles);
+    assert.deepEqual(actual, motionOrder({ data: world.data }, groups, new BodyLayout(groups), singles));
+    return actual;
+  };
+  const initial = assertOrder();
+  const lastPose = initial.find(([id]) => id === 'cc')[2].fish;
+  world.data.fishes.a.x++;
+  world.data.fishes.e.x++;
+  assert.notEqual(assertOrder().find(([id]) => id === 'cc')[2].fish.x, lastPose.x);
+  pair.female = 'b';
+  assert.deepEqual(assertOrder().map(row => row[0]), ['c', 'cc', 'd', 'e', 'f']);
+  writeBreedingRecord(world.data.breeding, 'cc', { ...pair, status: 'cancelled' });
+  assert.deepEqual(assertOrder().map(row => row[0]), ['a', 'b', 'c', 'd', 'e', 'f']);
+  writeBreedingRecord(world.data.breeding, 'cc', { ...pair, male: 'c' });
+  assertOrder(layout.ordered.filter(([id]) => id !== 'e'));
+  delete world.data.fishes.c;
+  assertOrder();
 });
 
 test('逐行转身和占位与逐鱼元判定一致，包括越界、重叠、食物和鱼体内部空隙', () => {
