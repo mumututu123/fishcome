@@ -163,6 +163,19 @@ test('人工字符、主动改字后的沉积与聊天记忆不会风化，风�
 });
 test('生态时钟合流取稳定起点和最新小时，非法时间拒绝', () => { const a = newEcology(now, true), b = newEcology(now + HOUR); assert.deepEqual(mergeEcology(a, b), mergeEcology(b, a)); assert(validEcology(a)); assert(!validEcology({ ...a, activated: Infinity })); });
 
+test('恢复时所有沉积物都在保护期内，更新整点无需扫描全海密度', () => {
+  const w = sea(), start = Math.floor(now / HOUR) * HOUR;
+  const grain = sediment(w, 'young', start);
+  const read = w.charValues.bind(w);
+  w.charValues = (...kinds) => {
+    assert(kinds.length, '未到风化时间不应枚举全海字符');
+    return read(...kinds);
+  };
+  updateEcology(w, start + ECOLOGY.sedimentGrace - HOUR, transition);
+  assert.equal(grain.kind, 'scene');
+  assert.equal(w.data.ecology.hour, Math.floor((start + ECOLOGY.sedimentGrace - HOUR) / HOUR));
+});
+
 test('鱼体横跨接缝、海面或密度分界时，整片繁殖区域与逐点密度相同', () => {
   const w = sea();
   fill(w, 0, 9, 420);

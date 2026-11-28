@@ -98,15 +98,19 @@ export function updateEcology(world, now, transition) {
     world.foodRevision++; world.dirty = true;
   }
   const hour = Math.floor(now / 3600000); if (hour <= state.hour) return;
-  const density = densityField(world), edited = new Set(Object.values(world.data.ops).filter(op => op.kind === 'sceneEdit').map(op => op.cell));
+  let density;
+  const edited = new Set(Object.values(world.data.ops).filter(op => op.kind === 'sceneEdit').map(op => op.cell));
   const scenes = world.charValues('scene');
   for (const c of scenes) {
     if (c.chat || edited.has(c.id)) continue;
     const settled = settleAt(c); if (!Number.isFinite(settled)) continue;
     const scene = world.data.scenes[c.entity]; if (!scene) continue;
-    const x = wrapX(scene.x + c.x), y = scene.y + c.y, probability = density(x, y) >= .4 ? 500 : 200;
     // One stable trial per elapsed hour, with immutable settlement age.
     const first = Math.max(state.hour + 1, Math.ceil((settled + ECOLOGY.sedimentGrace) / 3600000));
+    if (first > hour) continue;
+    // The first eligible deposit captures the same pre-weathering sea for all trials.
+    density ??= densityField(world);
+    const x = wrapX(scene.x + c.x), y = scene.y + c.y, probability = density(x, y) >= .4 ? 500 : 200;
     for (let h = first; h <= hour; h++) if (hash(`weathering:${c.id}:${h}`) % 10000 < probability) { transition(c, { kind: 'burn', entity: '' }, { id: `weathering:${c.id}:${h}`, t: h * 3600000, reason: 'weathering' }); world.dirty = true; break; }
   }
   const remaining = new Set(scenes.filter(c => c.kind === 'scene').map(c => c.entity)); for (const id of Object.keys(world.data.scenes)) if (!remaining.has(id)) delete world.data.scenes[id];
