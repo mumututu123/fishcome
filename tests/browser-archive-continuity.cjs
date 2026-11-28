@@ -38,11 +38,16 @@ test('空归档保持后台模拟，有记录时继续归档和整理', async t 
         },
         holdArchiveSave() {
           const original = save;
-          let entered, release;
+          let entered, release, finished;
           const saving = new Promise(resolve => { entered = resolve; });
           const hold = new Promise(resolve => { release = resolve; });
-          save = async () => { save = original; entered(); await hold; return original(); };
-          return { saving, release };
+          save = (...args) => { save = original; entered(); return finished = hold.then(() => original(...args)); };
+          return { saving, release, get finished() { return finished; } };
+        },
+        receive(ops = {}, archives = world.data.archives) {
+          const base = world.data.tick, delta = { protocol: 1, roots: world.data.roots, tick: base + CONFIG.step,
+            fishes: {}, scenes: {}, chars: {}, ops, archives };
+          return mergeReplica(delta, null, 'world-delta', { from: leader(), body: { delta: true, fromTick: base, world: delta } });
         },
         async earn(serial, t) {
           const id = identity.actor + ':hour:' + serial;
@@ -128,5 +133,34 @@ test('空归档保持后台模拟，有记录时继续归档和整理', async t 
   });
   assert.deepEqual(archived, { live: false, saved: false, chunks: 2, stored: true, initial: false, delivered: true });
   assert.equal(workers, workersBefore, '写入非空归档期间继续使用同一模拟线程');
+  await page.evaluate(async () => {
+    const { world, earn, holdArchiveSave, receive } = archiveFixture();
+    const { ARCHIVE_FIELDS, encodeArchive } = await import('./archive.js');
+    const { putMany } = await import('./storage.js');
+    const op = await earn(3, Date.now()), archived = await earn(4, Date.now() - 8 * 86400000);
+    const records = Object.fromEntries(ARCHIVE_FIELDS.map(field => [field, {}]));
+    records.ops[archived.id] = archived;
+    const { manifest, encoded } = await encodeArchive(records, world.data.roots);
+    await putMany([['archive:' + manifest.id, encoded]]);
+    const gate = holdArchiveSave(), archives = structuredClone(world.data.archives);
+    archives.chunks[manifest.id] = manifest;
+    const applied = receive({ [op.id]: op }, archives);
+    await gate.saving;
+    window.heldReplica = { gate, id: op.id, chunk: manifest.id, next: false };
+    applied.then(() => receive()).then(() => { heldReplica.next = true; });
+  });
+  try {
+    await page.waitForFunction(() => heldReplica.next, null, { timeout: 4000 });
+  } finally {
+    await page.evaluate(async () => {
+      heldReplica.gate.release();
+      await heldReplica.gate.finished;
+    });
+  }
+  assert(await page.evaluate(async () => {
+    const { get } = await import('./storage.js');
+    const { world } = await get('checkpoint', { observeCheckpoint: false });
+    return !!(world.ops[heldReplica.id] && world.archives.chunks[heldReplica.chunk] && await get('archive:' + heldReplica.chunk));
+  }), '下一步接收成功后仍需从磁盘读回签名记录、归档目录和归档内容');
   assert.deepEqual(errors, []);
 });

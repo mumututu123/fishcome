@@ -8,6 +8,14 @@ import { signer, actorId, verifyEnvelope } from '../www/storage.js';
 import { Network } from '../www/network.js';
 import { loadReplicaArchives, verifyReplica } from '../www/replica.js';
 const now = Date.now(), old = now - 10 * 86400000, glyph = (x, y, ch = 'Q') => ({ x, y, ch, color: '#88aacc' });
+test('少量归档编号按键核对，海里没有重复记录时无需枚举整海', async () => {
+  const world = new World(old, undefined, { populate: false }), store = new ArchiveStore();
+  store.ids.chars.set('old-glyph', 'old-pack');
+  world.data.chars = new Proxy(world.data.chars, {
+    ownKeys() { assert.fail('归档只有一个待核对编号，不应枚举在线鱼元'); }
+  });
+  assert.equal(await compactKnown(world, store), false);
+});
 test('分批检查归档大小保留 UTF-8 字节阈值和原有归档选择', async () => {
   const { w } = await fixture();
   w.data.participants['引号"'] = '鱼🌊';

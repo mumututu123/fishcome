@@ -136,15 +136,21 @@ mergeReplica = async (...args) => {
   finally { testData.merges.push({ type: args[2], tick: args[0].tick, ms: performance.now() - start, failed }); }
 };
 const originalBroadcast = Network.prototype.broadcast;
+let lastWorldSent = -Infinity, suppressedTick;
 Network.prototype.broadcast = async function (kind, body, ...args) {
   if (kind === 'replicaRequest') testData.repairs.push({ at: Date.now(), correlated: !!body.request });
   if (kind !== 'world') return originalBroadcast.call(this, kind, body, ...args);
   const at = Date.now();
-  if (window.denseDropNext && body.delta) {
+  if (window.denseDropNext && body.delta && body.world.tick > lastWorldSent) {
     window.denseDropNext = false;
+    suppressedTick = body.world.tick;
+  }
+  // An archive may publish the same logical step a second time.
+  if (body.delta && body.world.tick === suppressedTick) {
     testData.sends.push({ tick: body.world.tick, delta: true, at, done: at, dropped: true });
     return;
   }
+  lastWorldSent = Math.max(lastWorldSent, body.world.tick);
   try { return await originalBroadcast.call(this, kind, body, ...args); }
   finally { testData.sends.push({ tick: body.world.tick, delta: body.delta, at, done: Date.now() }); }
 };
@@ -560,7 +566,7 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
       failed: page.receives.filter(event => event.failed), replicaFailures: page.replicaFailures, logs: page.logs };
   });
   const dropped = coordinator.sends.filter(event => event.dropped && sampled(event));
-  const recovered = dropped.length === 1 && actualSteps.some(event => event.tick < dropped[0].tick) &&
+  const recovered = new Set(dropped.map(event => event.tick)).size === 1 && actualSteps.some(event => event.tick < dropped[0].tick) &&
     !actualSteps.some(event => event.tick === dropped[0].tick) && actualSteps.some(event => event.tick > dropped[0].tick);
   const fullUpdates = follower.receives.filter(event => event.kind === 'world' && sampled(event) && !event.delta && !event.failed).length;
   const transfers = coordinator.liveTransfers.filter(sampled);

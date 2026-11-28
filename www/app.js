@@ -150,11 +150,6 @@ async function requestArchive(id, peer) {
     throw new Error('缺少历史归档，等待持有记忆的伙伴重新接入');
   })(); archiveRequests.set(id, task); try { return await task; } finally { archiveRequests.delete(id); }
 }
-function archiveMetadataChanged(target) {
-  const changes = { chars: new Set() };
-  worldEdited(target, 'archive', changes);
-  noteCheckpointMerge(target.data, changes);
-}
 async function ensureArchives(data, peer, bundle, target = archiveStore, current = {}, beforeIngest) {
   const load = async id => bundle ? bundle[id] : await get('archive:' + id) || (peer && await requestArchive(id, peer));
   const persist = peer && (chunks => putMany(chunks.map(chunk => ['archive:' + chunk.manifest.id, chunk.encoded])));
@@ -165,7 +160,7 @@ async function ensureArchives(data, peer, bundle, target = archiveStore, current
     finally {
       if (live) {
         archiveImports--;
-        if (target === archiveStore && revision !== target.revision) archiveMetadataChanged(world);
+        if (target === archiveStore && revision !== target.revision) worldEdited(world, 'archive');
       }
     }
   };
@@ -289,16 +284,16 @@ async function mergeReplica(data, peer, context = 'merge', worldMessage) {
     const repair = replicaRecovery.request(worldMessage);
     if (repair) network.broadcast('replicaRequest', repair).catch(() => {});
   }
+  if (!routine) {
+    await compactKnown(world, archiveStore);
+    if (world.data.terrain?.seed !== previousTerrain) geometryRepair = true;
+  }
+  for (const member of active()) setParticipantName(world, member.actor, member.nick);
+  if (identity) setParticipantName(world, identity.actor, identity.nick);
   if (routine) {
-    for (const member of active()) setParticipantName(world, member.actor, member.nick);
-    setParticipantName(world, identity.actor, identity.nick);
     presentReplicaMovement(movement);
     return false;
   }
-  await compactKnown(world, archiveStore);
-  if (world.data.terrain?.seed !== previousTerrain) geometryRepair = true;
-  archiveMetadataChanged(world);
-  for (const member of active()) world.data.participants[member.actor] = member.nick; if (identity) world.data.participants[identity.actor] = identity.nick;
   // An expired local copy can be restored only after hearing its roots from a live peer.
   const checkpoint = priorCheckpoint; let recovered = false;
   if (checkpoint?.world?.roots && Object.keys(checkpoint.world.roots).some(r => world.roots.includes(r))) {
@@ -312,7 +307,13 @@ async function mergeReplica(data, peer, context = 'merge', worldMessage) {
   }
   presentReplicaMovement(movement);
   for (const id of pending.keys()) if (world.data.ops[id] || archiveStore.ids.ops.has(id)) pending.delete(id);
-  reconcileHistory(); syncIncomeSerial(); await save({ reusePicture: true }); renderChat();
+  reconcileHistory(); syncIncomeSerial();
+  const saved = save({ reusePicture: true });
+  // A live receipt confirms the verified in-memory base for the next delta.
+  // Its archive chunks are already durable. The local checkpoint owns its cut.
+  if (worldMessage && context === 'world-delta' && !joinedWorld && !recovered) saved.catch(reportSaveError);
+  else await saved;
+  renderChat();
   if (joinedWorld) toast('两片海合流了');
   if (recovered) await network.broadcast('merge', { world: await captureReplica() }, { capturedWorld: true });
   return true;
@@ -815,7 +816,11 @@ async function receiveHistory(card, peer) {
   for (const message of joining) { const result = world.addChat(message); if (!result.ok) throw new Error(result.error); }
   renderChat();
 }
-subscribeSimulationChanges((current, patch, origin, merge) => noteCheckpointChanges(current.data, patch, merge));
+subscribeSimulationChanges((current, patch, origin, merge) => {
+  // Importing a verified archive updates the cold index. The checkpoint head
+  // always captures its manifest. Compaction publishes the exact live deletions.
+  if (origin !== 'archive') noteCheckpointChanges(current.data, patch, merge);
+});
 subscribeBeforeSimulationPatch((current, patch) => beforeCheckpointPatch(current.data, patch));
 async function saveInternal({ capture = false, mirrorLegacy = false, reconciledRevision, reusePicture = false } = {}) {
   if (replacingCheckpoint) throw new Error('正在更换存档');
@@ -841,6 +846,7 @@ async function saveInternal({ capture = false, mirrorLegacy = false, reconciledR
   try { return await task; } finally { if (activeSavePromise === task) activeSavePromise = null; }
 }
 async function save(options) { if (!started || updateFrozen || replacingCheckpoint) return; return saveInternal(options); }
+function reportSaveError(error) { toast('本地保存失败：' + error.message); }
 async function saveHandoff({ mirrorLegacy = false, startup = false } = {}) {
   if (!started && !startup) throw new Error('世界尚未启动，暂时无法交接进度');
   let revision;
@@ -980,7 +986,7 @@ async function tick() {
         toast(status);
       });
   } else simulation.close();
-  if (!activeSavePromise && now - lastSave > 5000) { lastSave = now; save().catch(e => toast('本地保存失败：' + e.message)); }
+  if (!activeSavePromise && now - lastSave > 5000) { lastSave = now; save().catch(reportSaveError); }
   if (amLeader() && now - lastPictureTime > 30000) { lastPictureTime = now; takePicture().catch(() => {}); }
   update();
   archiveWorld(now).catch(() => {});

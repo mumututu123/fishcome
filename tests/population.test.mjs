@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { World, clone, cellPosition, key, chooseClaim } from '../www/engine.js';
+import { wrapX } from '../www/geography.js';
 import { POPULATION, updatePopulation, illnessOf, volcanoPlan, predatorCells, validPopulation, validRocks, mergePopulation, mergeRocks } from '../www/population.js';
 import { restoreCheckpoint } from '../www/lifecycle.js';
 import { verifyReplica } from '../www/replica.js';
@@ -14,7 +15,8 @@ const HOUR = 3600000, now = Math.floor((Date.now() - 48 * HOUR) / HOUR) * HOUR, 
 const glyph = (x, y, ch = '鱼') => ({ x, y, ch, color: '#88aacc' });
 const transition = (cell, next, record) => { Object.assign(cell, next); cell.path.push({ ...record, target: next.entity || '', x: next.x, y: next.y }); };
 function fish(w, x, y, cells = [glyph(0, 0, 'o'), glyph(1, 0)], created = born) {
-  const id = crypto.randomUUID(); assert(w.apply({ id, actor: crypto.randomUUID(), nick: '生态测试', kind: 'fish', t: created, cells, cost: cells.length, gender: 'male', x, y }).ok); return id;
+  const id = crypto.randomUUID(), result = w.apply({ id, actor: crypto.randomUUID(), nick: '生态测试', kind: 'fish', t: created, cells, cost: cells.length, gender: 'male', x, y });
+  assert(result.ok, result.error); return id;
 }
 function world(count = 0) {
   const w = new World(born, crypto.randomUUID(), { populate: false }); w.data.tick = w.data.population.at = now;
@@ -23,12 +25,12 @@ function world(count = 0) {
 }
 const advance = (w, t) => { updatePopulation(w, t, transition); w.data.tick = t; };
 function erupt(w, at = now) {
-  let slot = Math.floor(at / POPULATION.volcanoPeriod), plan;
-  while (!(plan = volcanoPlan(w.data, slot))) slot++;
-  const started = slot * POPULATION.volcanoPeriod;
-  w.data.population.eruption = { ...plan, at: started, emitted: 0, nextAt: started + POPULATION.warning, particles: {} };
-  w.data.population.at = w.data.tick = started; w.data.population.volcanoSlot = slot;
-  return w.data.population.eruption;
+  for (let slot = Math.floor(at / POPULATION.volcanoPeriod); ; slot++) {
+    if (!volcanoPlan(w.data, slot)) continue;
+    w.data.population.volcanoSlot = slot - 1;
+    advance(w, slot * POPULATION.volcanoPeriod);
+    if (w.data.population.eruption?.slot === slot) return w.data.population.eruption;
+  }
 }
 function particle(w, e, index, x, y, at = e.at + POPULATION.warning) {
   const id = `${e.id}:${index}`; e.emitted = Math.max(e.emitted, index + 1);
@@ -124,14 +126,18 @@ test('火山预警、发射上升、回落与32字上限；间隔至少6小时�
   assert.equal(w.data.population.eruption.id, e.id);
 });
 test('红色浆真实碰鱼致死；正好10分钟冷却不再伤鱼，岩石堆叠且挡住鱼与食物', () => {
-  const w = world(), e = erupt(w), bornAt = e.at + POPULATION.warning, y = w.floorAt(e.x) - 1;
-  const target = fish(w, e.x, y - 3), c = particle(w, e, 0, e.x, y - 3, bornAt);
+  const start = Date.UTC(2026, 0, 1), created = start - 3 * HOUR;
+  const w = new World(created, '00000000-0000-4000-8000-0000000009e5', { populate: false });
+  const e = erupt(w, start), bornAt = e.at + POPULATION.warning, y = w.floorAt(e.x) - 1;
+  assert.equal(e.x, 999, '同时覆盖火山紧邻环海接缝时的投放');
+  const target = fish(w, e.x, y - 3, undefined, created), c = particle(w, e, 0, e.x, y - 3, bornAt);
   advance(w, bornAt + 500); assert(!w.data.fishes[target]);
   c.y = y; advance(w, bornAt + POPULATION.cooling - 1); assert.equal(Object.keys(w.data.rocks).length, 0);
   advance(w, bornAt + POPULATION.cooling); const rock = w.data.rocks[c.id]; assert(rock); assert.equal(rock.y, y); assert(w.sceneryMap().has(key(e.x, y)));
   const second = particle(w, e, 1, e.x, y - 1, bornAt + 2000); advance(w, bornAt + 2000 + POPULATION.cooling); assert.equal(w.data.rocks[second.id].y, y - 1);
   const f = { id: 'preview', x: e.x, y: y - 1, facing: 1 }; assert.equal(w.canOccupy(f, [glyph(0, 0)]), false);
-  const coldFish = fish(w, e.x + 5, y - 4), cold = particle(w, e, 2, e.x + 5, y - 4, bornAt + 4000);
+  const x = wrapX(e.x + 5), coldY = Math.min(w.floorAt(x), w.floorAt(x + 1)) - 5;
+  const coldFish = fish(w, x, coldY, undefined, created), cold = particle(w, e, 2, x, coldY, bornAt + 4000);
   advance(w, cold.born + POPULATION.cooling); assert(w.data.fishes[coldFish]);
   assert(validRocks(w.data.rocks, w.data));
 });

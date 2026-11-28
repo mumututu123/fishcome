@@ -327,8 +327,12 @@ export async function prepareCompaction(world, store) {
   for (const field of compactableFields) {
     const index = store.ids[field];
     if (!index.size) continue;
-    for (const id of Object.keys(data[field] || {})) {
-      if (!index.has(id) || field === 'chars' && data.chars[id]?.kind !== 'burn') continue;
+    const live = data[field] || {};
+    // A young archive has few keys. Bound that walk so an old sea with a
+    // large cold history still does at most one pass over its live table.
+    const ids = index.size <= 1024 ? index.keys() : Object.keys(live);
+    for (const id of ids) {
+      if (!Object.hasOwn(live, id) || !index.has(id) || field === 'chars' && live[id]?.kind !== 'burn') continue;
       keep ??= archiveDependencies(data);
       if (keep[field].has(id)) continue;
       const archived = await store.get(field, id);
