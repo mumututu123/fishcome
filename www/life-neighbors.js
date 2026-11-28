@@ -1,4 +1,4 @@
-import { WORLD_WIDTH, deltaX } from './geography.js';
+import { WORLD_WIDTH, MAX_FLOOR, deltaX } from './geography.js';
 
 export function fishNeighbors(geometry, canSeeLine) {
   const { points, ordered, ranks } = geometry;
@@ -99,5 +99,73 @@ export function fishNeighbors(geometry, canSeeLine) {
     }
     return best;
   }
-  return { visitPairPartners, sorted, crowded };
+  let crowdIndex;
+  function crowdedHalfGrid(p, radius, obstacle) {
+    const binRows = Math.ceil(MAX_FLOOR / size) + 1;
+    if (crowdIndex === undefined) {
+      crowdIndex = geometry.crowdIndex ??= {
+        heads: new Uint32Array(binRows * columns), next: new Uint32Array(n), bounds: new Float64Array(4 * n),
+        edges: new Float64Array(binRows * columns * 4)
+      };
+      const { heads, next, bounds, edges } = crowdIndex;
+      heads.fill(0);
+      for (let j = 0; j < n; j++) {
+        const q = ordered[j], b = j * 4;
+        if (!(q.x >= 0 && q.x < WORLD_WIDTH && q.y >= 0 && q.y <= MAX_FLOOR) ||
+            !Number.isInteger(2 * q.halfWidth) || !Number.isInteger(2 * q.halfHeight) ||
+            q.halfWidth >= WORLD_WIDTH || q.halfHeight >= WORLD_WIDTH) {
+          crowdIndex = false;
+          break;
+        }
+        const bin = Math.floor(q.y / size) * columns + Math.floor(q.x / size);
+        const e = 4 * bin;
+        const left = q.x - q.halfWidth, right = q.x + q.halfWidth;
+        const top = q.y - q.halfHeight, bottom = q.y + q.halfHeight;
+        edges[e] = heads[bin] ? Math.min(edges[e], left) : left;
+        edges[e + 1] = heads[bin] ? Math.max(edges[e + 1], right) : right;
+        edges[e + 2] = heads[bin] ? Math.min(edges[e + 2], top) : top;
+        edges[e + 3] = heads[bin] ? Math.max(edges[e + 3], bottom) : bottom;
+        next[j] = heads[bin];
+        heads[bin] = j + 1;
+        bounds[b] = q.x;
+        bounds[b + 1] = q.y;
+        bounds[b + 2] = q.halfWidth;
+        bounds[b + 3] = q.halfHeight;
+      }
+    }
+    if (!crowdIndex) return crowded(p, radius, obstacle);
+    const { heads, next, bounds, edges } = crowdIndex;
+    const px = p.x, py = p.y, pw = p.halfWidth, ph = p.halfHeight, i = p.slot;
+    const extent = radius + Number.EPSILON * WORLD_WIDTH * 4;
+    const lo = Math.max(0, Math.floor((py - extent) / size));
+    const hi = Math.min(binRows - 1, Math.floor((py + extent) / size));
+    const first = Math.floor((px - extent) / size), last = Math.floor((px + extent) / size);
+    let best = Infinity, bestGap = 2;
+    for (let by = lo; by <= hi; by++) {
+      const row = by * columns;
+      for (let bx = first; bx <= last; bx++) {
+        const col = bx < 0 ? bx + columns : bx >= columns ? bx - columns : bx;
+        const nearX = bx < 0 ? px + WORLD_WIDTH : bx >= columns ? px - WORLD_WIDTH : px;
+        let link = heads[row + col];
+        if (!link) continue;
+        const e = 4 * (row + col), xLimit = pw + bestGap, yLimit = ph + bestGap;
+        if (edges[e] > nearX + xLimit || edges[e + 1] < nearX - xLimit ||
+            edges[e + 2] > py + yLimit || edges[e + 3] < py - yLimit) continue;
+        for (; link; link = next[link - 1]) {
+          const j = link - 1;
+          if (i === j) continue;
+          const b = j * 4;
+          const dx = Math.abs(bounds[b] - nearX), dy = Math.abs(bounds[b + 1] - py);
+          if (dx > 12 || dy > 12) continue;
+          const gap = Math.max(dx - pw - bounds[b + 2], dy - ph - bounds[b + 3]);
+          if (gap > bestGap || gap === bestGap && j >= best || obstacle && !canSeeLine(p, ordered[j])) continue;
+          best = j;
+          bestGap = gap;
+        }
+      }
+    }
+    return ordered[best];
+  }
+
+  return { visitPairPartners, sorted, crowded: numericOrder ? crowdedHalfGrid : crowded };
 }

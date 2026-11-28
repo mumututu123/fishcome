@@ -101,6 +101,18 @@ test('距离与标识排序都相等时保留跨海界的分桶和桶内顺序',
   assert.deepEqual(ctx.neighbors.get('center').map(p => p.id), [alsoLeft, left, right]);
   assert.equal(ctx.crowdedNeighbor(ctx.points.get('center')).id, alsoLeft);
 });
+test('避让时隔着环形边界的鱼与同侧鱼相距相同，按标识选择，再考虑遮挡', () => {
+  const w = world(), groups = new Map();
+  for (const [id, x, width] of [['center', 1, 2], ['first', 996, 4], ['second', 4, 2]]) {
+    w.data.fishes[id] = { id, x, y: 20, facing: 1 };
+    groups.set(id, Array.from({ length: width }, (_, x) => cell(x, 0)));
+  }
+  const open = lifeContext(w, t, w.sceneryMap(), groups);
+  assert.equal(open.crowdedNeighbor(open.points.get('center')).id, 'first');
+  scene(w, 0, 20);
+  const blocked = lifeContext(w, t, w.sceneryMap(), groups);
+  assert.equal(blocked.crowdedNeighbor(blocked.points.get('center')).id, 'second');
+});
 test('旧存档的分数坐标保留距离边界上的单向视线', () => {
   const w = world(), a = fish(w, 7, 20), b = crypto.randomUUID();
   assert(w.apply({ id: b, actor: 'bob', t, kind: 'fish', x: 20, y: 9, cells: [cell(0, 0), cell(0, 1)], cost: 2 }).ok);
