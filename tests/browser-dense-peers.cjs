@@ -416,7 +416,18 @@ async function openPage(browser, origin, options, assets) {
     const file = path.resolve(assets, '.' + (pathname === '/' ? '/index.html' : pathname));
     if (!file.startsWith(assets + path.sep)) return route.fulfill({ status: 404 });
     try {
-      if (pathname === '/app.js') return route.fulfill({ contentType: 'text/javascript', body: readFileSync(file, 'utf8') + instrument });
+      if (pathname === '/app.js') {
+        // These injections exercise dropped or incompatible world frames.
+        // One pre-agreement peer keeps the production path that carries them.
+        const legacyPeer = ['both', options].includes(values['plain-live']) ||
+          options === 'B' && (values.drop || values['forget-live-base']);
+        const legacyPresence = legacyPeer ? `
+const modernMember = member;
+member = () => { const claim = modernMember(); delete claim.orderedSteps; return claim; };
+if (typeof ordered !== 'undefined') ordered.io.peer = () => undefined;
+` : '';
+        return route.fulfill({ contentType: 'text/javascript', body: readFileSync(file, 'utf8') + legacyPresence + instrument });
+      }
       if (pathname === '/ordered-steps.js') return route.fulfill({ contentType: 'text/javascript', body: readFileSync(file, 'utf8') + `
 const completeStep = OrderedSteps.prototype.complete;
 OrderedSteps.prototype.complete = async function (slot, result) {
