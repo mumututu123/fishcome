@@ -124,6 +124,31 @@ function chooseDirection(world, id, fish, cells, pair, center, now, ambient, foo
   const phase = Math.floor((now - fish.created) / LIFE.wanderPeriod), r = hash(`${id}:${phase}`);
   return { dx: r % 3 - 1, dy: Math.floor(r / 3) % 3 - 1 };
 }
+// Pair membership changes collision order. Intersect the new order with the
+// native rows that really ran last time. Each surviving range can run in place.
+function unchangedRuns(old, packed, ordered, order, groups, inputs, waiting, captured) {
+  if (!old || old.shapes !== packed.shapes || !inputs) return;
+  if (old.order === order && old.groups === groups && !inputs.size && !waiting.size && !captured.size) return old.byOrder;
+  const matched = [];
+  let cursor = 0, current, source;
+  for (let i = 0; i < ordered.length; i++) {
+    const entry = ordered[i], swimmer = entry[3];
+    if (!swimmer) continue;
+    const rank = swimmer.rank;
+    while (cursor < old.list.length && old.list[cursor].lastRank <= rank) cursor++;
+    const before = old.list[cursor], id = entry[0];
+    if (!before || rank < before.rank || packed.swimmers[rank] !== swimmer || packed.hulls[rank] !== swimmer.hull ||
+        inputs.has(id) || waiting.has(id) || captured.has(id)) continue;
+    if (current?.end === i && current.lastRank === rank && source === before) {
+      current.end++;
+      current.lastRank++;
+    } else {
+      current = matched[i] = { rank, lastRank: rank + 1, end: i + 1, allWander: before.allWander };
+      source = before;
+    }
+  }
+  return matched;
+}
 export function advanceSwimming(world, now, dt, grid, groups, ambient, captured, waitingToEat, foodsNear, canEat, scenery,
   foodPositions, turningObstacles, edible, magma, magmaVictims, swims, paths) {
   const layout = grid.layout, { fishes, breeding } = world.data;
@@ -134,32 +159,35 @@ export function advanceSwimming(world, now, dt, grid, groups, ambient, captured,
   const ordered = motionOrder(world, groups, layout, singles);
   const prior = world.currentSwimColumns?.(), batch = world.beginSwimBatch?.();
   const packed = Number.isFinite(dt) && ambient && batch && ordered.length && !magma.size && !grid.overlapped
-    ? packedGrid(grid, ordered.length) : null;
+    ? packedGrid(grid, singles.length) : null;
+  if (packed) batch.nativeIndex = new Int32Array(batch.poseIndex.length);
   const previous = packed && prior?.grid === packed ? prior.index : undefined;
   const phase = String(Math.floor(now / 12000));
   const avoidance = [0, 1, 2, 3].map(seed => hash(phase, seed) & 3);
   const schedule = grid.intentPlan, order = ordered === singles ? singles : layout.pairOrder?.entries;
-  const reusable = packed && order && !waitingToEat.size && !captured.size && schedule;
-  const oldRuns = reusable && previous && packed.runs;
-  let runs = oldRuns && oldRuns.order === order && oldRuns.groups === layout.groups && oldRuns.shapes === packed.shapes &&
-    oldRuns.revision === batch.inputRevision ? oldRuns.rows : null;
-  const record = reusable && !runs ? [] : null;
+  const oldRuns = packed && previous && packed.runs;
+  const runs = oldRuns && unchangedRuns(oldRuns, packed, ordered, order, layout.groups, batch.inputs, waitingToEat, captured);
   const sameDirections = runs && oldRuns.schedule === schedule && oldRuns.next === schedule.next && oldRuns.phase === phase;
-  if (packed && !runs) packed.runs = undefined;
-  let start = 0, count = 0, allWander = true, travelDay;
+  const list = packed && [], byOrder = packed && [];
+  let start = 0, count = 0, rank = 0, allWander = true, travelDay;
 
-  function publishPose(fish, ordinal) {
+  function publishPose(fish, ordinal, rank) {
     const { x, y, facing, cx, cy } = fish;
     if (ordinal !== undefined) {
       if (Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(facing) && Number.isFinite(cx) && Number.isFinite(cy)) {
         const offset = batch.poses.length * 5;
         batch.poseIndex[ordinal] = batch.poses.push(ordinal);
-        const data = packed ? packed.doubles : batch.motion, p = (packed ? packed.poseOffset / 8 : 0) + offset;
-        data[p] = x;
-        data[p + 1] = y;
-        data[p + 2] = facing;
-        data[p + 3] = cx;
-        data[p + 4] = cy;
+        batch.motion[offset] = x;
+        batch.motion[offset + 1] = y;
+        batch.motion[offset + 2] = facing;
+        batch.motion[offset + 3] = cx;
+        batch.motion[offset + 4] = cy;
+        if (packed) {
+          batch.nativeIndex[ordinal] = rank + 1;
+          const at = packed.poseOffset / 8 + rank * 5;
+          packed.doubles.set(batch.motion.subarray(offset, offset + 5), at);
+          packed.swimmers[rank] = undefined;
+        }
       } else world.movingFish(fish);
     }
   }
@@ -194,35 +222,41 @@ export function advanceSwimming(world, now, dt, grid, groups, ambient, captured,
   function flush() {
     if (!count) return;
     const first = batch.poses.length;
-    if (record) record[start] = { first, end: start + count, allWander };
+    const finished = { rank, lastRank: rank + count, end: start + count, allWander };
+    list.push(finished);
+    byOrder[start] = finished;
     allWander = true;
-    packed.advance(count, dt, first);
-    const poses = packed.doubles, trails = packed.words, base = packed.poseOffset / 8 + first * 5;
+    packed.advance(count, dt, rank);
+    const poses = packed.doubles, trails = packed.words, base = packed.poseOffset / 8 + rank * 5;
+    batch.motion.set(poses.subarray(base, base + count * 5), first * 5);
     for (let i = 0; i < count; i++) {
       const entry = ordered[start + i], swimmer = entry[3], f = swimmer.fish;
       const p = base + i * 5, oldFacing = f.facing;
       f.x = poses[p]; f.y = poses[p + 1]; f.facing = poses[p + 2]; f.cx = poses[p + 3]; f.cy = poses[p + 4]; f.posAt = now;
+      batch.nativeIndex[swimmer.ordinal] = rank + i + 1;
       batch.poseIndex[swimmer.ordinal] = batch.poses.push(swimmer.ordinal);
-      recordTrail(entry[0], null, swimmer.ordinal, trails[packed.trailsOffset / 4 + first + i], f.facing, oldFacing);
+      recordTrail(entry[0], null, swimmer.ordinal, trails[packed.trailsOffset / 4 + rank + i], f.facing, oldFacing);
     }
     count = 0;
   }
   for (let index = 0; index < ordered.length; index++) {
     const entry = ordered[index], id = entry[0], cells = entry[1], pair = entry[2], swimmer = entry[3];
     const run = runs?.[index];
-    if (run && !grid.overlapped && !count && run.first === batch.poses.length) {
+    if (run && !grid.overlapped) {
+      flush();
+      allWander = run.allWander;
       if (!sameDirections || !run.allWander || foodsNear) {
         let all = true;
-        for (let k = index; k < run.end; k++) if (!aimSingle(ordered[k], run.first + k - index, false)) all = false;
-        run.allWander = all;
+        for (let k = index; k < run.end; k++) {
+          if (sameDirections && run.allWander && nearFood && !nearFood[ordered[k][3].slot]) continue;
+          if (!aimSingle(ordered[k], run.rank + k - index, false)) all = false;
+        }
+        allWander = all;
       }
-      start = index; count = run.end - index; flush();
+      start = index; rank = run.rank; count = run.end - index; flush();
       index = run.end - 1;
       continue;
     }
-    // A legacy row can become packable on this step. Its new position in the
-    // output may displace a previously reusable run and its directions.
-    if (run) runs = null;
     let f = pair ? pair.fish : swimmer?.fish ?? fishes[id];
     if (!f || !cells.length || (captured.size && (pair ? pair.members.some(member => captured.has(member.id)) : captured.has(id)))) {
       flush();
@@ -239,8 +273,10 @@ export function advanceSwimming(world, now, dt, grid, groups, ambient, captured,
       Number.isFinite(f.cx || 0) && Number.isFinite(f.cy || 0) &&
       oldY + hull.bounds.minY >= 0 && oldY + hull.bounds.maxY < MAX_FLOOR;
     if (bulk) {
-      if (!count) start = index;
-      if (!aimSingle(entry, batch.poses.length + count++, true)) allWander = false;
+      if (count && swimmer.rank !== rank + count) flush();
+      if (!count) { start = index; rank = swimmer.rank; }
+      count++;
+      if (!aimSingle(entry, swimmer.rank, true)) allWander = false;
       continue;
     }
     const sight = foodsNear && (!nearFood || swimmer?.slot === undefined || nearFood[swimmer.slot]) ? foodsNear : null;
@@ -278,16 +314,12 @@ export function advanceSwimming(world, now, dt, grid, groups, ambient, captured,
       if (!waiting && (oldX !== f.x || oldY !== f.y || oldFacing !== f.facing)) grid.moveFish(f, cells, oldX, oldY, oldFacing, hull, slot);
     }
     if (!waiting && magma.size) noteMagmaContact(magma, magmaVictims, groups, f, cells, pair, f.x, f.y, f.facing);
-    publishPose(f, ordinal);
+    publishPose(f, ordinal, swimmer?.rank);
     recordTrail(id, pair, ordinal, trail, f.facing, oldFacing);
   }
   flush();
   if (packed) {
-    if (record || runs) packed.runs = { order, groups: layout.groups, shapes: packed.shapes, revision: batch.inputRevision,
-      schedule, next: schedule.next, phase, rows: record || runs };
-    else packed.runs = undefined;
-    const base = packed.poseOffset / 8;
-    batch.motion.set(packed.doubles.subarray(base, base + batch.poses.length * 5));
+    packed.runs = order && schedule ? { order, groups: layout.groups, shapes: packed.shapes, schedule, next: schedule.next, phase, list, byOrder } : undefined;
   }
   if (batch) world.completeSwimBatch(batch, travelDay, packed);
 }

@@ -200,8 +200,9 @@ function trackWorld() {
   }
   function mark(target, parent, key, value, deleting = false) {
     const { field, id, property } = parent;
-    if (field === 'fishes' && !parent.table && !property && (key === 'cx' || key === 'cy' || key === 'lastFed') ||
-        parent.root && key === 'breeding' || field === 'breeding' && (parent.table || key === 'status')) swimInputRevision++;
+    if (parent.root && key === 'breeding') swimChanges = undefined;
+    else if (field === 'fishes' && !parent.table && !property && (key === 'cx' || key === 'cy' || key === 'lastFed')) swimChanges?.add(id);
+    else if (field === 'breeding' && (parent.table || key === 'status')) swimChanges?.add(parent.table ? key : id);
     if (parent.root && key === 'fishes') firstHunger = -Infinity;
     else if (field === 'fishes') {
       if (parent.table) includeHunger(value?.hungerAt);
@@ -469,7 +470,7 @@ function trackWorld() {
   }
   // Ordinary fish publish their motion directly in the wire format. Later
   // feeding, death or repairs can still supersede that row in the same step.
-  let swimming, swimColumns, swimInputRevision = 0;
+  let swimming, swimColumns, swimChanges = new Set();
   function currentSwimColumns() {
     return swimColumns?.revision === poseRevision ? swimColumns : undefined;
   }
@@ -478,9 +479,10 @@ function trackWorld() {
     if (record) return daysByOrdinal[ordinal] = raw(record.days);
   }
   function beginSwimBatch() {
-    const count = knownFish.size;
+    const count = knownFish.size, inputs = swimChanges;
+    swimChanges = new Set();
     swimColumns = undefined;
-    return { inputRevision: swimInputRevision, motion: new Float64Array(count * 5), poses: [], travel: [], distances: new Float64Array(count),
+    return { inputs, motion: new Float64Array(count * 5), poses: [], travel: [], distances: new Float64Array(count),
       poseIndex: new Int32Array(count), tripIndex: new Int32Array(count), daysByOrdinal, readDays };
   }
   function completeSwimBatch(frame, day, packed) {
@@ -488,7 +490,7 @@ function trackWorld() {
       poseRevision++;
       // Edit compaction and delivery may overwrite or detach the wire buffer.
       // The grid still owns the complete ordered result until the next movement.
-      if (packed) swimColumns = { revision: poseRevision, grid: packed, index: frame.poseIndex };
+      if (packed) swimColumns = { revision: poseRevision, grid: packed, index: frame.nativeIndex };
       tableChanges('fishes');
     }
     if (frame.travel.length) {

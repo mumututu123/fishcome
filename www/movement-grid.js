@@ -43,11 +43,14 @@ export class MovementGrid {
       this.roster = roster;
       this.swimmerGroups = this.layout.groups;
       const entries = this.swimmerBodies ??= new WeakMap();
-      this.swimmersById = this.layout.ordered.map(([id, cells]) => {
+      this.swimmersById = this.layout.ordered.map(([id, cells], rank) => {
         const fish = world.readFish(id), cached = entries.get(cells);
-        if (cached && cached[0] === id && cached[3].fish === fish) return cached;
+        if (cached && cached[0] === id && cached[3].fish === fish) {
+          cached[3].rank = rank;
+          return cached;
+        }
         const hull = this.layout.hull(cells);
-        const entry = [id, cells, null, { fish, ordinal: world.swimOrdinal?.(id), hull, slot: this.slots.get(id),
+        const entry = [id, cells, null, { fish, rank, ordinal: world.swimOrdinal?.(id), hull, slot: this.slots.get(id),
           speedX: hull && speed * hull.bounds.width / cells.length, speedY: hull && speed * hull.bounds.height / cells.length,
           intended: undefined, avoidanceSeed: undefined }];
         entries.set(cells, entry);
