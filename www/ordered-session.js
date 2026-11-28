@@ -1,5 +1,6 @@
 import { CONFIG } from './engine.js';
 import { OrderedSteps, stepDigest } from './ordered-steps.js';
+import { jsonDigest } from './step-digest.js';
 import { worldTables } from './simulation-changes.js';
 
 const orderedTables = [...worldTables, 'life.events', 'life.bonds', 'life.stories',
@@ -28,7 +29,9 @@ async function checkpointProof(world, store, data, valid) {
         yieldAt = performance.now() + 2;
       }
       const page = keys.slice(at, at + 128).map(id => [id, rows[id]]);
-      pages.push(stepDigest(page));
+      // Checkpoint rows use the same JSON representation as the stored world.
+      // Only the archive index below contains sets and maps.
+      pages.push(jsonDigest(page));
     }
     return Promise.all(pages);
   }
@@ -121,9 +124,17 @@ export class OrderedSession {
   changed(world, patch) {
     const s = this.current;
     if (!s || world !== s.world || s.applying) return;
-    if (s.running && patch?.workerChanges && patch.values?.tick === s.steps.next?.tick) return;
+    if (s.running && patch?.workerChanges && patch.values?.tick === s.steps.next?.tick) {
+      this.committed(s);
+      return;
+    }
     if (s.waiting && !s.checking) return;
     this.stop('世界在共同基准之外有新变更');
+  }
+  committed(s) {
+    if (s.executed) return;
+    s.executed = true;
+    this.io.firstCommit?.(s.world);
   }
   begin(peer, epoch, base) {
     const world = this.io.world(), store = this.io.store();
@@ -201,7 +212,6 @@ export class OrderedSession {
   }
   start(s) {
     s.joined?.(true);
-    this.io.beginExecution?.(s.world);
     s.cut = undefined;
     s.steps = new OrderedSteps({ epoch: s.epoch, tick: s.base, proof: s.proof, leader: s.owner,
       send: body => this.send(s, body), validOp: async op => {
@@ -416,12 +426,13 @@ export class OrderedSession {
     }
     const slot = s.steps.take(s.world.data.tick);
     if (!slot) { this.stop('共同基准已变更'); return false; }
-    s.running = s.executed = true;
+    s.running = true;
     const handle = s.handle;
     s.handle = s.localReady = s.remoteReady = null;
     this.io.advance(s.world, slot.tick, () => this.valid(s), handle).then(async result => {
       if (!this.valid(s)) return;
       if (!result || result.tick !== slot.tick) { this.stop('共同结算未提交'); return; }
+      this.committed(s);
       s.base = result.tick;
       const proof = await s.steps.complete(slot, { ...result, outcomes: slot.outcomes });
       if (!this.valid(s) || !proof) return;
