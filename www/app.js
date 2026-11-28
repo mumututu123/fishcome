@@ -109,7 +109,7 @@ const historyQueues = new Map();
 function authorNick(actor, fallback) { return actor === identity?.actor ? identity.nick : active().find(member => member.actor === actor)?.nick || world.data.participants[actor] || displayNick(fallback) || '匿名'; }
 function rememberAuthor(actor, nick) { if (setParticipantName(world, actor, nick)) { renderedChatCount = -1; renderChat(); } }
 function toast(text) { $('toast').textContent = text; $('toast').hidden = false; clearTimeout(toast.timer); toast.timer = setTimeout(() => $('toast').hidden = true, 5000); }
-const orderedProtocol = 2;
+const orderedProtocol = 3;
 function sameOrderedProtocol(other) { return other?.orderedSteps === orderedProtocol && other.build === meta.version; }
 function member() { return { replicaPages: 1, orderedSteps: orderedProtocol, build: meta.version, id: network.node, actor: identity.actor, nick: displayNick(identity.nick), url: meta.url, at: Date.now(), visible: !document.hidden, peers: network.live().length }; }
 function active() { return [...members.values()].filter(m => Date.now() - m.at < 120000); }

@@ -95,6 +95,10 @@ ReplicaTransfers.prototype.sendLivePacket = async function (peer, lane, body) {
 };
 const receivePage = ReplicaTransfers.prototype.receive;
 ReplicaTransfers.prototype.receive = async function (message, peer) {
+  if (message.kind === 'replicaFrame') {
+    const sample = window.denseWireReceived?.get(message.id);
+    if (sample) sample.verified = performance.timeOrigin + performance.now();
+  }
   if (window.denseForgetArmed && (message.kind === 'replicaFrame' && message.body.rowBase ||
       message.body.kind === 'live' && message.body.index === 0 && message.body.text.split('\\n', 1)[0].includes('"rowBase":'))) {
     this.rowsReceived.delete(peer);
@@ -121,6 +125,21 @@ replicaPages = function* (body, frame) {
 `;
 const instrument = `
 const testData = { frames: [], steps: [], stepRequests: [], applied: [], sends: [], receives: [], merges: [], worldMerges: [], repairs: [], saves: [], liveBytes: [] };
+const wireReceived = window.denseWireReceived = new Map(), wireSent = new Map(), wireIds = new TextDecoder();
+const wireTime = () => performance.timeOrigin + performance.now();
+const readWire = Network.prototype.receive;
+Network.prototype.receive = function (peer, buffer) {
+  if (buffer instanceof ArrayBuffer && buffer.byteLength > 44) {
+    const header = new DataView(buffer), index = header.getUint32(40), total = header.getUint32(36);
+    if (!index || index === total - 1) {
+      const id = wireIds.decode(new Uint8Array(buffer, 0, 36));
+      if (!index && (header.getUint8(44) === 2 || header.getUint8(44) === 3)) wireReceived.set(id, { first: wireTime() });
+      const sample = wireReceived.get(id);
+      if (sample && index === total - 1) sample.last = wireTime();
+    }
+  }
+  return readWire.call(this, peer, buffer);
+};
 const stoppedSessions = [];
 const workerLoads = [], activeWorkerLoad = new WeakMap();
 let revisionChange;
@@ -254,7 +273,8 @@ onMessage = async (message, peer) => {
   try { return await originalOnMessage(message, peer); }
   catch (error) { failed = true; throw error; }
   finally {
-    if (['hello', 'merge', 'world', 'archiveChunk'].includes(message.kind)) testData.receives.push({ kind: message.kind,
+    if (['hello', 'merge', 'world', 'archiveChunk'].includes(message.kind)) testData.receives.push({ kind: message.kind, id: message.id,
+      wire: wireReceived.get(message.id),
       tick: message.body.world?.tick, delta: message.body.delta, before, after: world.data.tick,
       bundled: message.body.archivePacks ? Object.keys(message.body.archivePacks) : undefined,
       ...(${!values['step-boundaries-only']} && message.kind === 'world' && message.body.delta && { rows: Object.fromEntries(['fishes', 'chars', 'breeding', 'contacts', 'travel', 'ops', 'scenes'].map(field => [field, Object.keys(message.body.world[field] || {}).length])) }),
@@ -300,9 +320,25 @@ Network.prototype.encode = async function (message) {
 };
 const originalEncodeLiveFrame = Network.prototype.encodeLiveFrame;
 Network.prototype.encodeLiveFrame = async function (...args) {
+  const encoding = wireTime();
   const wire = await originalEncodeLiveFrame.apply(this, args);
-  if (wire) testData.liveBytes.push({ at: Date.now(), directFrame: true, bytes: wire.length + Math.ceil(wire.length / 16000) * 44 });
+  if (wire) {
+    const sample = { id: args[0], tick: args[1].world.tick, encoding, encoded: wireTime(), at: Date.now(), directFrame: true,
+      bytes: wire.length + Math.ceil(wire.length / 16000) * 44 };
+    testData.liveBytes.push(sample);
+    wireSent.set(args[0], sample);
+  }
   return wire;
+};
+const sendWire = Network.prototype.send;
+Network.prototype.send = async function (peer, id, bytes, ...args) {
+  const sample = wireSent.get(id);
+  if (!sample) return sendWire.call(this, peer, id, bytes, ...args);
+  sample.sendCalled = wireTime();
+  sample.queued = peer.queued;
+  sample.buffered = peer.dc?.bufferedAmount;
+  try { return await sendWire.call(this, peer, id, bytes, ...args); }
+  finally { sample.sent = wireTime(); }
 };
 const originalSave = save;
 save = async (...args) => {
@@ -858,11 +894,16 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
   const receivedByTick = new Map(follower.receives.filter(row => row.kind === 'world' && !row.failed && row.before < row.tick && row.after >= row.tick)
     .map(row => [row.tick, row]));
   const appliedByTick = new Map(follower.applied.map(row => [row.tick, row.at]));
+  const sentFrames = new Map(coordinator.liveBytes.filter(row => row.directFrame).map(row => [row.id, row]));
   for (const request of committed) {
     const message = receivedByTick.get(request.tick);
     const elapsed = at => Number.isFinite(at) ? Math.round((at - request.startAt) * 1000) / 1000 : undefined;
     request.delivery = { published: elapsed(sentAt.get(request.tick)), received: elapsed(message?.startAt),
       applied: elapsed(appliedByTick.get(request.tick)), finished: elapsed(message?.at) };
+    const wire = sentFrames.get(message?.id);
+    if (wire) request.delivery.transport = { encoding: elapsed(wire.encoding), encoded: elapsed(wire.encoded),
+      sendCalled: elapsed(wire.sendCalled), sent: elapsed(wire.sent), queued: wire.queued, buffered: wire.buffered,
+      firstChunk: elapsed(message.wire?.first), lastChunk: elapsed(message.wire?.last), verified: elapsed(message.wire?.verified) };
   }
   const authority = committed.map(row => row.authority).filter(Number.isFinite);
   const stepStages = {
