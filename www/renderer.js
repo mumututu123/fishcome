@@ -54,9 +54,9 @@ export class Renderer {
     const index = this.viewport;
     if (this.cachedWorld === world && index?.data === world.data && !index.remaining && !this.indexInvalid && !world.dirty && this.indexedTick === world.data.tick) return index;
   }
-  applyMergedChars(world, index, changedChars) {
-    if (!index || !changedChars || this.viewport !== index || world.data !== index.data) return;
-    index.reconcileMerge(changedChars);
+  applyMerge(world, index, changes) {
+    if (!index || !changes?.chars || this.viewport !== index || world.data !== index.data) return;
+    index.reconcileMerge(changes);
     this.indexInvalid = false;
     this.indexedTick = world.data.tick;
     world.dirty = false;

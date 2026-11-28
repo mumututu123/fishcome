@@ -95,7 +95,7 @@ function injure(world, fish, at, s, transition) {
   else story(world, 'atomicSurvivor', fish, at, s);
   world.foodRevision++; world.dirty = true;
 }
-export function enforceLegends(world, now, transition) {
+export function enforceLegends(world, now, transition, onPose) {
   const state = world.data.legends; if (!state) return;
   for (const [id, proof] of Object.entries(state.burns)) if (world.data.chars[id]) burn(world, world.data.chars[id], proof, transition);
   for (const [id, death] of Object.entries(state.deaths)) if (world.data.fishes[id]) {
@@ -106,25 +106,25 @@ export function enforceLegends(world, now, transition) {
       if (death.reason === 'cthulhu') burn(world, c, { ...death, fish: id, x: wrapX(p.x), y: p.y }, transition);
       else transition(c, { kind: 'food', entity: '', x: wrapX(p.x), y: p.y, born: death.at, fall: 0 }, { id: `legend-remnant:${s.id}:${c.id}`, t: death.at, reason: 'shed' });
     }
-    delete world.data.fishes[id]; recordStory(world, 'depart', id, death.at); world.dirty = true;
+    delete world.data.fishes[id]; onPose?.(id); recordStory(world, 'depart', id, death.at); world.dirty = true;
   }
 }
-function settleCaptures(world, now, transition, posed) {
+function settleCaptures(world, now, transition, onPose) {
   for (const e of Object.values(world.data.legends.events)) {
     const s = legendSchedule(world.data.roots, e.seed, e.slot); if (s?.kind !== 'cthulhu') continue;
     for (const [arm, c] of Object.entries(e.arms)) {
       if (now >= s.ends) {
         for (const id of c.cells) if (world.data.chars[id]?.kind === 'fish' && world.data.chars[id].entity === c.fish) burn(world, world.data.chars[id], { seed: s.seed, slot: s.slot, at: s.ends, reason: 'cthulhu', arm: +arm, fish: c.fish, x: c.x, y: c.y }, transition);
         world.data.legends.deaths[c.fish] ||= { seed: s.seed, slot: s.slot, at: s.ends, reason: 'cthulhu' };
-        if (world.data.fishes[c.fish]) { delete world.data.fishes[c.fish]; story(world, 'cthulhuDepart', c.fish, s.ends, s); recordStory(world, 'depart', c.fish, s.ends); world.dirty = true; }
+        if (world.data.fishes[c.fish]) { delete world.data.fishes[c.fish]; onPose?.(c.fish); story(world, 'cthulhuDepart', c.fish, s.ends, s); recordStory(world, 'depart', c.fish, s.ends); world.dirty = true; }
       } else if (world.data.fishes[c.fish]) {
         cancelPair(world, c.fish, now); const f = world.data.fishes[c.fish]; Object.assign(f, c.pose, { cx: 0, cy: 0, posAt: now });
-        posed?.add(c.fish);
+        onPose?.(c.fish);
       }
     }
   }
 }
-export function settleLegendary(world, now, transition, posed) { settleCaptures(world, now, transition, posed); enforceLegends(world, now, transition); }
+export function settleLegendary(world, now, transition, onPose) { settleCaptures(world, now, transition, onPose); enforceLegends(world, now, transition, onPose); }
 export function ghostRoll(seed, slot, minute) { return (hash(`maggot:${seed}:${slot}:${minute}`) >>> 8) % 100 === 0; }
 export function ghostIndex(seed, slot, minute, prior = []) { const order = modelCells('ship').sort((a, b) => hash(`plank:${seed}:${slot}:${a.index}`) - hash(`plank:${seed}:${slot}:${b.index}`) || a.index - b.index); return order[minute - 1]?.index ?? null; }
 export function ghostSource(roots, source) {

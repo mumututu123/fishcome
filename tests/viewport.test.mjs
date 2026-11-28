@@ -305,7 +305,7 @@ test('追随端提交合流后，鱼体换主人、食物沉积和跨接缝镜�
       plant: { id: 'plant', kind: 'seaweed', entity: '', x: 220, y: 45, ch: '草', path: [], moveAt: tick } } };
   runtime.worldChanged(world, null);
   const changed = world.merge(incoming, {}, 'replica', true);
-  runtime.applyMergedChars(world, index, changed.chars);
+  runtime.applyMerge(world, index, changed);
   const reference = new ViewportCells(world.data);
   const rows = items => items.map(item => [item.id, item.kind, item.entity, item.x, item.y]);
   for (const [left, right, top, bottom] of [[-1, 2, 0, 31], [996, 1002, 0, 31], [91, 125, 32, 57], [210, 240, 32, 57]]) {
@@ -313,6 +313,26 @@ test('追随端提交合流后，鱼体换主人、食物沉积和跨接缝镜�
   }
   assert.deepEqual(rows(index.fishCells('g')).map(row => row[0]).sort(), ['b', 'd', 'e']);
   runtime.camera.x = 999;
+  runtime.draw(world);
+  assert.deepEqual(runtime.hit(71, 51), { kind: 'fish', id: 'g' });
+
+  const movedOwners = [];
+  const moveOwner = index.moveOwner.bind(index);
+  index.moveOwner = (group, pose) => { movedOwners.push(pose?.id); moveOwner(group, pose); };
+  const nextTick = tick + 500;
+  const next = { ...incoming, tick: nextTick, chars: {}, scenes: {},
+    fishes: Object.fromEntries(Object.entries(world.data.fishes).map(([id, fish]) => [id, { ...fish, posAt: nextTick, cx: 0.25 }])) };
+  // The clocks and fractional swim counters changed, but none of these bodies
+  // left its anchor. Hit-testing and drawing still use the latest fish rows.
+  const steady = world.merge(next, {}, 'replica', true);
+  runtime.applyMerge(world, index, steady);
+  assert.deepEqual(movedOwners, []);
+  const cross = { ...next, tick: nextTick + 500, fishes: { g: { ...next.fishes.g, x: 35, posAt: nextTick + 500 } } };
+  runtime.applyMerge(world, index, world.merge(cross, {}, 'replica', true));
+  assert.deepEqual(movedOwners, ['g']);
+  const rebuilt = new ViewportCells(world.data);
+  for (const x of [0, 33, 997]) assert.deepEqual(rows(index.query(x, x + 5, 0, 31)), rows(rebuilt.query(x, x + 5, 0, 31)));
+  runtime.camera.x = 35;
   runtime.draw(world);
   assert.deepEqual(runtime.hit(71, 51), { kind: 'fish', id: 'g' });
 });
@@ -325,6 +345,6 @@ test('旧存档合流新增整数键时，画面沿用实际字符顺序', async
   const index = new ViewportCells(world.data);
   const incoming = { protocol: 1, tick: now + 500, roots: world.data.roots, ops: {}, fishes: {}, scenes: {}, chars: { 1: food('1') } };
   const changes = world.merge(incoming, {}, 'replica', true);
-  if (changes.chars) index.reconcileMerge(changes.chars); else index.reconcile();
+  if (changes.chars) index.reconcileMerge(changes); else index.reconcile();
   assert.deepEqual(index.query(20, 20, 5, 5).map(cell => cell.id), ['1', '2']);
 });

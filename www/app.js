@@ -262,7 +262,7 @@ async function mergeVerifiedWorld(data, peer, context, { local = false, worldMes
       try { changes = target.merge(incoming, archived, delta ? 'replica' : undefined, delta, checkedRules); }
       finally { if (delta) noteCheckpointMerge(target.data, changes, incoming, archived); }
       if (delta) pictures.merged(target, changes);
-      if (index) renderer.applyMergedChars(target, index, changes?.chars);
+      if (index) renderer.applyMerge(target, index, changes);
     };
     let movement;
     if (worldMessage && worldMessage.from !== network.node) movement = replicaSwims.merge(target.data, worldMessage, apply);

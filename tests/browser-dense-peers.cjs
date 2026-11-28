@@ -208,7 +208,7 @@ window.denseCommitted = (target, patch, at) => {
 };
 for (const [object, method, name] of [
   [World.prototype, 'merge', 'World.merge'], [pictures, 'prepare', 'pictures.prepare'], [renderer, 'cellIndex', 'renderer.cellIndex'],
-  [renderer, 'applyMergedChars', 'renderer.applyMergedChars'], [renderer, 'worldChanged', 'renderer.worldChanged'],
+  [renderer, 'applyMerge', 'renderer.applyMerge'], [renderer, 'worldChanged', 'renderer.worldChanged'],
   [worldBroadcast, 'send', 'WorldBroadcast.send'], [Network.prototype, 'broadcast', 'Network.broadcast']
 ]) {
   const original = object[method];
@@ -233,7 +233,7 @@ for (const [object, method, name] of [
     return result;
   };
 }
-if (${Boolean(values['rebuild-viewport'])}) renderer.applyMergedChars = () => {};
+if (${Boolean(values['rebuild-viewport'])}) renderer.applyMerge = () => {};
 (${recordDraw.toString()})(renderer, testData.frames, window.densePage, ${Boolean(values.trace)});
 window.denseSurvey = () => ({ ...testData, node: network?.node, leader: network && leader(), peers: network?.live().length,
   simulationFailure: simulation.failure?.error?.message,

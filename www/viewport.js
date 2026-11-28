@@ -157,15 +157,11 @@ export class ViewportCells {
     return entry;
   }
 
-  syncOwners() {
-    for (const [id, group] of this.owners.fish) this.moveOwner(group, this.data.fishes[id]);
-    for (const [id, group] of this.owners.scene) this.moveOwner(group, this.data.scenes[id]);
-  }
-
-  reconcileMerge(changedChars) {
-    this.queryKey = undefined;
-    for (const id of changedChars) this.refresh(id, this.data.chars[id]);
-    this.syncOwners();
+  reconcileMerge({ chars, fishes, scenes }) {
+    if (chars.size) this.queryKey = undefined;
+    for (const id of chars) this.refresh(id, this.data.chars[id]);
+    for (const id of fishes) this.moveOwner(this.owners.fish.get(id), this.data.fishes[id]);
+    for (const id of scenes) this.moveOwner(this.owners.scene.get(id), this.data.scenes[id]);
   }
 
   reconcile() {
@@ -180,7 +176,8 @@ export class ViewportCells {
     }
     if (order !== this.cells.size) for (const id of this.cells.keys()) if (!Object.hasOwn(chars, id)) this.remove(id);
     this.order = order;
-    this.syncOwners();
+    for (const [id, group] of this.owners.fish) this.moveOwner(group, this.data.fishes[id]);
+    for (const [id, group] of this.owners.scene) this.moveOwner(group, this.data.scenes[id]);
   }
 
   update(tables) {

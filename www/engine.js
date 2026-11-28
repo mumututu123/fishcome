@@ -865,10 +865,10 @@ export class World {
     if (!kept.size) { delete this.data.fishes[id]; recordStory(this, 'depart', id, at); } else if (!illness) f.hungerAt = at + CONFIG.hunger;
     this.foodRevision++; this.dirty = true;
   }
-  merge(other, archived = {}, origin, trackChars = false, checkedRules) {
+  merge(other, archived = {}, origin, trackChanges = false, checkedRules) {
     let cellIndex = origin === 'replica' ? replicaCellIndexes.get(this) : undefined;
-    const changes = trackChars ? { chars: undefined } : undefined;
-    let changedChars = trackChars ? new Set() : undefined;
+    const changes = trackChanges ? { chars: undefined, fishes: new Set(), scenes: new Set() } : undefined;
+    let changedChars = trackChanges ? new Set() : undefined;
     if (!other || other.protocol !== 1 || !other.chars || !other.fishes || !other.scenes || !other.ops) throw new Error('世界协议不兼容');
     if (other.terrain && !validTerrain(other.terrain, other.roots)) throw new Error('固定海底地形被修改或无效');
     for (const [root, at] of Object.entries(other.roots || {})) if (this.data.roots[root] !== undefined && this.data.roots[root] !== at) throw new Error('世界起源时间不能修改');
@@ -950,6 +950,7 @@ export class World {
         const incoming = incomingRows[id];
         const obj = type === 'fishes' && id.startsWith('born:') ? canonicalBirthFish(incoming, birthOf(id)) : incoming, old = table[id];
         if (!old || (obj.posAt || 0) > (old.posAt || 0) || ((obj.posAt || 0) === (old.posAt || 0) && JSON.stringify(obj).localeCompare(JSON.stringify(old)) > 0)) {
+          if (changes && (!old || old.x !== obj.x || old.y !== obj.y || old.facing !== obj.facing)) changes[type].add(id);
           if (winners) winners[id] = obj;
           else table[id] = detachReplicaRecord(obj);
           // The previous merge normalized each surviving body and its meals.
@@ -980,7 +981,10 @@ export class World {
       cellIndex = undefined;
       changedChars?.add(cell.id);
       transition(cell, fields, event);
-    }, pendingFish);
+    }, id => {
+      pendingFish?.add(id);
+      changes?.fishes.add(id);
+    });
     const normalize = cellIndex && pendingFish ? pendingFish : Object.keys(this.data.fishes);
     cellIndex ??= indexReplicaCells(this, changedChars);
     const { bodies, latestFeed, occupiedScenes } = cellIndex;
@@ -988,13 +992,17 @@ export class World {
     for (const id of normalize) {
       const f = this.data.fishes[id];
       if (!f) continue;
-      const lone = bodies.get(id); if (lone === undefined) { delete this.data.fishes[id]; continue; }
+      const lone = bodies.get(id);
+      if (lone === undefined) { delete this.data.fishes[id]; changes?.fishes.add(id); continue; }
       const meal = latestFeed.get(id), fed = Math.max(f.created, meal || 0);
       f.lastFed = fed; f.hungerAt = Math.max(f.hungerAt, fed + CONFIG.hunger);
       const mealAt = lastMealAt(f, meal); if (mealAt !== undefined) f.lastMealAt = mealAt;
-      if (lone) { const p = cellPosition(f, lone); changedChars?.add(lone.id); transition(lone, { kind: 'food', entity: '', x: wrapX(p.x), y: p.y, born: Math.max(this.data.tick, other.tick), fall: 0 }, { id: `normalize:${id}`, t: Math.max(this.data.tick, other.tick), reason: 'shed' }); delete this.data.fishes[id]; bodies.delete(id); }
+      if (lone) { const p = cellPosition(f, lone); changedChars?.add(lone.id); transition(lone, { kind: 'food', entity: '', x: wrapX(p.x), y: p.y, born: Math.max(this.data.tick, other.tick), fall: 0 }, { id: `normalize:${id}`, t: Math.max(this.data.tick, other.tick), reason: 'shed' }); delete this.data.fishes[id]; bodies.delete(id); changes?.fishes.add(id); }
     }
-    for (const id of Object.keys(this.data.scenes)) if (!occupiedScenes.has(id)) delete this.data.scenes[id];
+    for (const id of Object.keys(this.data.scenes)) if (!occupiedScenes.has(id)) {
+      delete this.data.scenes[id];
+      changes?.scenes.add(id);
+    }
     const localChatSources = new Set();
     for (const [id, message] of Object.entries(this.data.chatSources)) if (message.body.roots.some(root => this.data.roots[root] !== undefined)) {
       delete this.data.chatSources[id];
@@ -1008,7 +1016,10 @@ export class World {
         else if (c.kind === 'scene' && c.entity === CHAT_FLOOR) occupiedChatFloor = true;
       }
     }
-    if (!occupiedChatFloor) delete this.data.scenes[CHAT_FLOOR];
+    if (!occupiedChatFloor && Object.hasOwn(this.data.scenes, CHAT_FLOOR)) {
+      delete this.data.scenes[CHAT_FLOOR];
+      changes?.scenes.add(CHAT_FLOOR);
+    }
     this.data.pendingChatGlyphs = Math.max(0, Object.values(this.data.chatSources).reduce((sum, message) => sum + chatGlyphs(message.body.text).length, 0) - chatGlyphCount);
     this.data.tick = Math.max(this.data.tick, other.tick);
     this.data.ecology = mergeEcology(this.data.ecology, other.ecology);
@@ -1020,8 +1031,9 @@ export class World {
     this.data.bubbles = mergeBubbles(this.data.bubbles, other.bubbles, this.data.tick, this.data.chars); this.data.bubbleMinute = Math.max(this.data.bubbleMinute ?? Math.floor(this.data.tick / MINUTE), other.bubbleMinute ?? Math.floor(other.tick / MINUTE));
     const retainCells = origin === 'replica' && !localChatSources.size && beforePopulation === this.foodRevision;
     if (retainCells) (cellIndex.posed ??= new Set()).clear();
-    normalizeBreeding(this, this.data.tick, retainCells ? cellIndex.posed : undefined);
+    normalizeBreeding(this, this.data.tick, retainCells ? cellIndex.posed : changes?.fishes);
     if (retainCells) {
+      if (changes) for (const id of cellIndex.posed) changes.fishes.add(id);
       cellIndex.table = this.data.chars;
       cellIndex.tick = this.data.tick;
       cellIndex.mealRevision = this.archives?.mealRevision;
