@@ -1,6 +1,26 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { frameSummary, bothDisplays, scheduledSteps } from './browser-refresh-budget.cjs';
+import { readPresentations, frameSummary, bothDisplays, scheduledSteps } from './browser-refresh-budget.cjs';
+
+test('从实际呈现的同一鱼元坐标核实游动，切换可见鱼元不会伪造运动', () => {
+  const frames = [
+    ['甲', 1, 3], ['乙', 1, 3], ['乙', 1, 3, '丙', 8, 9], ['丙', 8, 9, '乙', 1.125, 3]
+  ].map((poses, sequence) => ({ sequence, at: sequence * 10, poses }));
+  const events = frames.flatMap(({ sequence: id }) => {
+    const at = id * 10000;
+    return [
+      { name: 'AnimationFrame', ph: 'b', ts: at, args: { id } },
+      ...['start', 'end'].map((phase, i) => ({
+        name: `tide.refresh.A.${id}.${phase}`, ts: at + i + 1, args: { data: { callTime: at + i + 1 } }
+      })),
+      { name: 'AnimationFrame', ph: 'e', ts: at + 3, args: { id } },
+      { name: 'AnimationFrame::Presentation', ts: at + 4, args: { id } }
+    ].map(event => ({ ...event, pid: 1, tid: 2 }));
+  });
+  const { rows, moving } = readPresentations(events, { frames, page: 'A' }, 0, 40);
+  assert.equal(rows.length, 4);
+  assert.deepEqual(moving.map(frame => frame.sequence), [3]);
+});
 
 test('按海洋的半秒时钟计数，采样首尾从未请求的步也算缺失', () => {
   const shown = { host: { presented: 12 }, peer: { presented: 15 } };
@@ -32,7 +52,7 @@ test('窗口结束前一直没有新运动时保留停顿下限', () => {
 });
 
 test('请求到同一步确认画面的累计时间独立检查，并单独记录未显示步骤', () => {
-  const frames = [{ at: 35, traceTs: 35000, tick: 500, draw: 2, drawToPresent: 15, poses: [['a', 3, 0]] }];
+  const frames = [{ at: 35, traceTs: 35000, tick: 500, draw: 2, drawToPresent: 15, poses: ['a', 3, 0] }];
   const commits = [{ at: 20, tick: 500 }];
   const requests = [{ traceAt: 3000, tick: 500, committed: true }, { traceAt: 600000, tick: 1000, committed: true }];
   const measured = frameSummary({ frames, steps: commits }, { drawn: [], rows: frames, moving: frames }, 0, 700, commits, requests);
@@ -48,7 +68,7 @@ test('同一步取较迟呈现的一端，任一端缺帧都算缺失', () => {
     const rows = delays.map((ms, i) => {
       const { tick, traceAt } = requests[i];
       return { tick, at: tick + ms, traceTs: traceAt + ms * 1000, drawStartTs: traceAt + 6000,
-        drawEndTs: traceAt + 8000, poses: [['鱼', i, 0]] };
+        drawEndTs: traceAt + 8000, poses: ['鱼', i, 0] };
     });
     frameSummary({ node, leader: 'host', frames: [], steps: [] }, { drawn: [], rows, moving: [] }, 0, 2000, [], requests);
   }

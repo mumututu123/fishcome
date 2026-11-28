@@ -465,7 +465,7 @@ async function main([urlA, urlB], assets) {
   }, { count, real: Boolean(backup) }, { polling: 100, timeout: count < 200 ? 20000 : 95000 })));
   const joined = Date.now();
   await Promise.all([a, b].map(page => page.waitForFunction(() => denseJoinSettled(), null, { polling: 125, timeout: 45000 })));
-  const stopTrace = values.trace && await startTrace(browser);
+  const stopTrace = values.trace && await startTrace(browser, values['step-boundaries-only']);
   if (stopTrace) await pause(300);
   const recent = Date.now();
   await survey({ a, b, fixture, cold, joining, joined, recent, stopTrace, browserVersion: browser.version() });

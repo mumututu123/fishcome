@@ -21,17 +21,19 @@ function recordDraw(renderer, frames, page, trace) {
     if (trace) for (let i = 0; i < cells.length; i += step) {
       const x = cells[i], y = cells[i + 1], size = renderer.paintedSize;
       if (x + size / 2 < 0 || y + size / 2 < 0 || x + size / 2 >= renderer.width || y + size / 2 >= renderer.height) continue;
-      poses.push([cells[i + 2].id, x, y]);
+      poses.push(cells[i + 2].id, x, y);
     }
     frames.push({ sequence, at: performance.timeOrigin + start, draw: drawMs,
       tick: args[0].data.tick, visible: cells.length / 3, poses });
   };
 }
 
-async function startTrace(browser) {
+async function startTrace(browser, boundariesOnly) {
   const client = await browser.newBrowserCDPSession();
   const complete = once(client, 'Tracing.tracingComplete');
-  await client.send('Tracing.start', { categories: 'devtools.timeline,blink.user_timing,toplevel', transferMode: 'ReturnAsStream' });
+  const categories = ['devtools.timeline', 'blink.user_timing'];
+  if (!boundariesOnly) categories.push('toplevel');
+  await client.send('Tracing.start', { categories: categories.join(','), transferMode: 'ReturnAsStream' });
   return async filename => {
     await client.send('Tracing.end');
     const [{ stream, dataLossOccurred }] = await complete;
@@ -87,17 +89,20 @@ function readPresentations(events, page, start, end) {
   }
   const rows = [...displayed.values()].sort((a, b) => a.at - b.at);
   const moving = [];
-  let previous = new Map();
+  let previousIndices = new Map(), previousPoses = [];
   for (const frame of rows) {
     let changed = false;
     const current = new Map();
-    for (const [id, x, y] of frame.poses) {
-      const p = previous.get(id);
-      if (p && (x - p[0]) ** 2 + (y - p[1]) ** 2 >= .01) changed = true;
-      current.set(id, [x, y]);
+    const poses = frame.poses;
+    for (let i = 0; i < poses.length; i += 3) {
+      const prior = previousIndices.get(poses[i]);
+      if (prior !== undefined && (poses[i + 1] - previousPoses[prior + 1]) ** 2 +
+        (poses[i + 2] - previousPoses[prior + 2]) ** 2 >= .01) changed = true;
+      current.set(poses[i], i);
     }
     if (changed) moving.push(frame);
-    previous = current;
+    previousIndices = current;
+    previousPoses = poses;
   }
   const thread = startMarks.values().next().value;
   const work = events.filter(event => event.pid === thread?.pid && event.tid === thread?.tid && event.dur >= 1000 &&
