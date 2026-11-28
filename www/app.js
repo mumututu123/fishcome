@@ -372,13 +372,13 @@ async function mergeVerifiedWorld(data, peer, context, { local = false, worldMes
       let changes;
       try { changes = target.merge(incoming, archived, delta ? 'replica' : undefined, delta || (joined && 'join'), checkedRules); }
       finally { if (delta) noteCheckpointMerge(target.data, changes, incoming, archived); }
+      if (worldMessage && peer?.node === worldMessage.from && worldMessage.from === leader()) {
+        ordered.appliedReplica(target, changes, incoming, archived);
+      }
       if (delta) pictures.merged(target, changes);
       if (index) renderer.applyMerge(target, index, changes);
       joined?.(target, priorTick, priorRevision, changes);
       if (worldMessage && delta) followVerifiedReplica(target, priorTick, priorRevision, changes);
-      if (worldMessage && peer?.node === worldMessage.from && worldMessage.from === leader()) {
-        ordered.appliedReplica(target, changes, incoming, archived);
-      }
     };
     let movement;
     if (worldMessage && worldMessage.from !== network.node) movement = replicaSwims.merge(target.data, worldMessage, apply);

@@ -266,6 +266,19 @@ export class OrderedSession {
   appliedReplica(world, changes, incoming, archived) {
     const s = this.current;
     if (!s || s.world !== world || s.owner || !s.journal || s.steps) return;
+    // mergeLife ranks bounded histories to choose what survives. The
+    // authenticated publisher can keep those same winners in insertion order.
+    for (const [name, source] of Object.entries(incoming.life || {})) {
+      if (!world.data.life || !Object.hasOwn(world.data.life, name)) continue;
+      const local = world.data.life?.[name];
+      if (!source || typeof source !== 'object' || Array.isArray(source) ||
+          !local || typeof local !== 'object' || Array.isArray(local) || source === local) continue;
+      const keys = Object.keys(source), actual = Object.keys(local);
+      if (keys.length !== actual.length || keys.every((id, i) => actual[i] === id)) continue;
+      if (keys.every(id => Object.hasOwn(local, id) && JSON.stringify(source[id]) === JSON.stringify(local[id]))) {
+        world.data.life[name] = Object.fromEntries(keys.map(id => [id, local[id]]));
+      }
+    }
     s.journal.merged(changes, incoming, archived);
     s.journal.capture(world);
   }

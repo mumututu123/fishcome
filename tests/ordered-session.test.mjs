@@ -235,6 +235,27 @@ function publishOrdinary(a, b, due, beforeMerge) {
   b.session.changed(b.world, null, 'replica', changes);
   b.session.appliedReplica(b.world, changes, incoming, {});
 }
+test('权威完整鱼生记录沿用原次序，零行、局部键和本地胜出的内容保留原合流结果', async () => {
+  const now = Date.now(), { sides: [a,b], drain } = pair(now);
+  await a.session.probe();
+  await drain(message => message.action === 'open');
+  const source = {}, life = b.world.data.life;
+  for (const [name, table] of Object.entries(life)) {
+    if (typeof table !== 'object') continue;
+    const rows = { second: { old: 2 }, first: { old: 1 } };
+    life[name] = { first: rows.first, second: rows.second };
+    source[name] = structuredClone(rows);
+  }
+  source.stories.first.old = 10;
+  delete source.haunts.second;
+  source.places = {};
+  b.session.appliedReplica(b.world, {}, { life: source }, {});
+  for (const name of Object.keys(source)) {
+    const locallyRetained = ['haunts','stories','places'].includes(name);
+    assert.deepEqual(Object.keys(life[name]), locallyRetained ? ['first','second'] : ['second','first']);
+    assert.deepEqual(life[name].first, { old: 1 });
+  }
+});
 for (const diverged of [false, true]) test('每一份全态签认都跨过三个真实权威步，最新实际状态' + (diverged ? '不同时不能切换' : '相同时在同一会话接管下一步'), async () => {
   const now = Date.now(), { sides: [a,b], drain } = pair(now);
   let withheld;
