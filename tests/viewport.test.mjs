@@ -183,6 +183,24 @@ test('鱼身横跨两个分区时，只在某个鱼元真的越界后重新定�
   assert.deepEqual(index.query(32, 32, 5, 5), Object.values(data.chars));
 });
 
+test('画面筛选保留跨海界的完整鱼体和旧存档的小数鱼元', () => {
+  const body = (id, entity, x) => ({ id, entity, kind: 'fish', x, y: 0 });
+  const data = { fishes: { f: { x: 999, y: 5, facing: 1 }, old: { x: 31.5, y: 8, facing: 1 } }, scenes: {},
+    chars: { a: body('a', 'f', -2), b: body('b', 'old', .5), c: body('c', 'f', 4), d: body('d', 'old', 1000 + 64.5) } };
+  const index = new ViewportCells(data);
+  const query = (left, right = left) => index.query(left, right, 0, 10).map(cell => cell.id);
+  assert.deepEqual(query(999), ['a', 'c']);
+  assert.deepEqual(query(1), ['a', 'c']);
+  assert.deepEqual(query(996, 1005), ['a', 'c']);
+  assert.deepEqual(query(32), ['b', 'd']);
+  assert.deepEqual(query(96), ['b', 'd']);
+  assert.deepEqual(query(64), []);
+  data.fishes.f = { x: 1, y: 5, facing: -1 };
+  index.update({ fishes: { set: [['f', data.fishes.f]], remove: [] } });
+  assert.deepEqual(query(999), ['a', 'c']);
+  assert.deepEqual(query(1), ['a', 'c']);
+});
+
 test('画面依次播放已结算的横移、下潜，海域接缝上点击跟随绘制位置', async () => {
   const { World } = await import('../www/engine.js');
   const { Renderer } = await import('../www/renderer.js');

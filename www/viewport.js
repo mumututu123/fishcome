@@ -32,6 +32,33 @@ function staysInSector(group, x, y, facing) {
   return facing === 1 ? x >= range.left && x < range.right : x >= range.flippedLeft && x < range.flippedRight;
 }
 
+function bodyBounds(group) {
+  let left = Infinity, right = -Infinity, top = Infinity, bottom = -Infinity;
+  for (const { x, y } of group) {
+    if (!Number.isInteger(x) || !Number.isInteger(y) || Math.abs(x) > WORLD_WIDTH || Math.abs(y) > WORLD_WIDTH) return false;
+    left = Math.min(left, x); right = Math.max(right, x);
+    top = Math.min(top, y); bottom = Math.max(bottom, y);
+  }
+  return { left, right, top, bottom };
+}
+
+// Integer bodies can be rejected by their bounds. Older coordinates still use
+// the glyph test, which rounds wrapped positions the same way as drawing.
+function reachesFishSector(group, x1, x2, y1, y2, wraps, all) {
+  if (group.x === undefined) return false;
+  const bounds = group.bounds ??= bodyBounds(group);
+  if (!bounds || !Number.isInteger(group.x) || group.x < 0 || group.x >= WORLD_WIDTH ||
+      !Number.isInteger(group.y) || Math.abs(group.y) > WORLD_WIDTH || Math.abs(group.facing) !== 1) return true;
+  if (group.y + bounds.top >= y2 || group.y + bounds.bottom < y1) return false;
+  if (all) return true;
+  const left = group.x + (group.facing === 1 ? bounds.left : -bounds.right);
+  const right = group.x + (group.facing === 1 ? bounds.right : -bounds.left);
+  if (wraps) return left < x2 || right >= x1;
+  return (left < x2 && right >= x1) ||
+    (left + WORLD_WIDTH < x2 && right + WORLD_WIDTH >= x1) ||
+    (left - WORLD_WIDTH < x2 && right - WORLD_WIDTH >= x1);
+}
+
 // Several cells can share an owner. Moving the owner changes their sectors
 // without changing the insertion order used by painting and hit testing.
 export class ViewportCells {
@@ -69,13 +96,17 @@ export class ViewportCells {
   }
 
   place(entry) {
+    if (entry.kind === 'fish') {
+      entry.owner.bounds = undefined;
+      this.queryKey = undefined;
+      return;
+    }
     const { cell } = entry;
     let x = cell.x, y = cell.y;
     if (entry.owner) {
-      const fish = cell.kind === 'fish';
-      const owner = (fish ? this.data.fishes : this.data.scenes)[cell.entity];
+      const owner = this.data.scenes[cell.entity];
       if (!owner) return this.move(entry, undefined);
-      x = owner.x + (fish ? owner.facing : 1) * x;
+      x = owner.x + x;
       y += owner.y;
     }
     this.move(entry, sector(x, y));
@@ -103,6 +134,10 @@ export class ViewportCells {
     if (entry.owner) {
       entry.owner.delete(entry);
       entry.owner.range = null;
+      if (entry.kind === 'fish') {
+        entry.owner.bounds = undefined;
+        this.queryKey = undefined;
+      }
       if (!entry.owner.size) this.owners[entry.kind].delete(entry.entity);
     }
     this.cells.delete(id);
@@ -117,6 +152,7 @@ export class ViewportCells {
     if (owners) {
       if (!owners.has(cell.entity)) {
         const group = new Set(), pose = (cell.kind === 'fish' ? this.data.fishes : this.data.scenes)[cell.entity];
+        group.fish = cell.kind === 'fish';
         if (pose) { group.x = pose.x; group.y = pose.y; group.facing = pose.facing; }
         owners.set(cell.entity, group);
       }
@@ -135,6 +171,11 @@ export class ViewportCells {
 
   moveOwnerTo(group, x, y, facing) {
     if (!group || group.x === x && group.y === y && group.facing === facing) return;
+    if (group.fish) {
+      group.x = x; group.y = y; group.facing = facing;
+      this.fishQueryDirty = true;
+      return;
+    }
     const inside = Math.abs(group.facing) === 1 && staysInSector(group, x, y, facing);
     group.x = x; group.y = y; group.facing = facing;
     if (!inside) {
@@ -206,25 +247,33 @@ export class ViewportCells {
     const all = right - left >= WORLD_WIDTH;
     const wraps = Math.floor(left / WORLD_WIDTH) !== Math.floor(right / WORLD_WIDTH);
     const key = [first, last, upper, lower, all, wraps].join(',');
-    if (key === this.queryKey) return this.result;
+    if (key === this.queryKey && !this.fishQueryDirty) return this.result;
+    const previous = key === this.queryKey && this.result;
     const entries = new Set();
     this.queriedSectors = new Set();
     const visit = (a, b) => {
       for (let row = upper; row <= lower; row++) for (let col = a; col <= b; col++) {
         const id = row * columns + col;
         this.queriedSectors.add(id);
-        for (const entry of this.sectors.get(id) || []) {
-          // Fish shapes, eye placement and echo effects use the entire visible body.
-          if (entry.kind === 'fish') { if (!entries.has(entry)) for (const part of entry.owner) entries.add(part); }
-          else entries.add(entry);
-        }
+        for (const entry of this.sectors.get(id) || []) entries.add(entry);
       }
     };
     if (all) visit(0, columns - 1);
     else if (wraps) { visit(first, columns - 1); visit(0, last); }
     else visit(first, last);
+    const x1 = first * side, x2 = Math.min(WORLD_WIDTH, (last + 1) * side), y1 = upper * side, y2 = (lower + 1) * side;
+    for (const group of this.owners.fish.values()) {
+      if (!reachesFishSector(group, x1, x2, y1, y2, wraps, all)) continue;
+      for (const { x, y } of group) if (this.queriedSectors.has(sector(group.x + group.facing * x, group.y + y))) {
+        // Fish shapes, eye placement and echo effects use the entire visible body.
+        for (const part of group) entries.add(part);
+        break;
+      }
+    }
+    this.fishQueryDirty = false;
     this.queryKey = key;
-    this.result = Array.from(entries).sort((a, b) => a.order - b.order).map(entry => entry.cell);
+    const result = Array.from(entries).sort((a, b) => a.order - b.order).map(entry => entry.cell);
+    if (!previous || previous.length !== result.length || result.some((cell, i) => cell !== previous[i])) this.result = result;
     return this.result;
   }
 }
