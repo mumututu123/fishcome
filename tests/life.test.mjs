@@ -199,7 +199,14 @@ test('浮游食物被吃后正常增长，脱落重新计时并可沉积与付�
   f.x = (f.x + 300) % 1000; f.y = 20; w.step(c.born + CONFIG.foodLife); assert.equal(c.kind, 'scene'); assert(validPlankton(c, w.data.roots));
   const scaled = crypto.randomUUID(); assert(w.apply({ id: scaled, actor: 'maker', kind: 'sceneScale', scene: c.entity, factor: 2, cost: 3, t: w.data.tick }).ok === false); // Cannot enlarge through the fixed seabed.
   assert.equal(w.wallet('maker'), 20);
-  assert(w.apply({ id: crypto.randomUUID(), actor: 'maker', kind: 'sceneMove', scene: c.entity, x: 70, y: 20, cost: 0, t: w.data.tick }).ok);
+  // The random sea can put the swimmer at the old fixed destination. Choose
+  // open water for the move and its subsequent 2×2 expansion.
+  const blocked = new Set([...w.fishMap().keys(), ...w.sceneryMap().keys()]);
+  for (const row of Object.values(w.data.chars)) if (row.kind === 'seaweed') blocked.add(`${row.x},${row.y}`);
+  const x = Array.from({ length: CONFIG.width - 1 }, (_, i) => i).find(i =>
+    [i, i + 1].every(col => [20, 21].every(y => w.waterAt(col, y) && !blocked.has(`${col},${y}`))));
+  assert.notEqual(x, undefined);
+  assert(w.apply({ id: crypto.randomUUID(), actor: 'maker', kind: 'sceneMove', scene: c.entity, x, y: 20, cost: 0, t: w.data.tick }).ok);
   const grow = crypto.randomUUID(); assert(w.apply({ id: grow, actor: 'maker', kind: 'sceneScale', scene: c.entity, factor: 2, cost: 3, t: w.data.tick }).ok);
   assert.equal(w.wallet('maker'), 17); assert(validPlankton(c, w.data.roots));
   assert(Object.values(w.data.chars).filter(c => c.id.startsWith(grow)).every(c => !c.plankton && c.payer === 'maker'));

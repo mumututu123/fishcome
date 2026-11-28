@@ -42,7 +42,7 @@ assert(Number.isSafeInteger(seconds) && seconds >= 6 && seconds <= 90);
 assert(expectedFull === undefined || Number.isSafeInteger(expectedFull) && expectedFull >= 0);
 assert(!backup || !positionals.length, '使用真实存档时，鱼数从存档读取');
 assert(!values['refresh-budget'] || values.trace, '严格验收需要记录浏览器呈现');
-assert(Number.isSafeInteger(archiveRounds) && archiveRounds >= 0 && archiveRounds <= 3 && (!archiveRounds || backup), '归档轮次应为 0–3，写新归档需要真实存档');
+assert(Number.isSafeInteger(archiveRounds) && archiveRounds >= 0 && archiveRounds <= seconds / 2 && (!archiveRounds || backup), '归档轮次须为非负整数，每轮至少预留两秒，写新归档需要真实存档');
 assert(!values['plain-live'] || ['A', 'B', 'both'].includes(values['plain-live']), '--plain-live 应为 A、B 或 both');
 assert(!values['forget-live-base'] || !values['plain-live'], '遗失基准测试需要两端支持紧凑发送');
 const launchers = [process.env.TIDE_DENSE_LAUNCHER_A, process.env.TIDE_DENSE_LAUNCHER_B];
@@ -690,7 +690,8 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
   assert.deepEqual(errors, []);
   assert.equal(stepStages.requestToAuthority.missing, 0, '完成的生态请求缺少权威状态写入时间');
   assert(!archiveError && rounds.every(round => sampled(round) && round.deliveredAt <= ended), archiveError || '至少一轮归档未在采样期间传递');
-  if (values['refresh-budget']) assert(stepComplete.n >= 9 && stepComplete.over20 === 0 && summaries.every(page => page.draw.over20 === 0 &&
+  if (values['refresh-budget']) assert(stepComplete.n >= 9 && stepComplete.n === stepComplete.requested && stepComplete.over20 === 0 &&
+    requests.slice(1).every((row, i) => row.tick - requests[i].tick === 500) && summaries.every(page => page.draw.over20 === 0 &&
     [page.presented, page.visibleMotion].every(row => row.over20 === 0 && row.n >= 20 && row.startCovered && row.endCovered) &&
     page.requestToConfirmedFrame.over20 === 0 && page.requestToConfirmedFrame.requestsWithoutObservedFrame === 0),
     '单步提交、实际呈现间隔或请求至同一步首张确认画面超过 20 毫秒');
@@ -708,8 +709,13 @@ async function switchLeader(pages, oldLeader, newLeader) {
 
 async function runArchiveRounds(count, leader, follower, known) {
   const written = new Set(known), rounds = [];
+  const start = Date.now();
   for (let i = 0; i < count; i++) {
-    await pause(1000);
+    // Exercise a burst of adjacent archives, then repeat during the following
+    // part of the run so later saves and heartbeats overlap archive traffic too.
+    const group = Math.floor(i / 3), groups = Math.ceil(count / 3);
+    const due = start + seconds * 1000 * group / groups + 1000 * (i % 3 + 1);
+    await pause(Math.max(0, due - Date.now()));
     const round = await leader.evaluate(([serial, dropStep]) => denseArchiveRound(serial, dropStep),
       [100000 + i, values.drop && i === Math.min(1, count - 1)]);
     assert(!written.has(round.id), '本轮归档重复使用了旧包');

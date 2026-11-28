@@ -8,7 +8,7 @@ import { parseArgs } from 'node:util';
 
 const { values } = parseArgs({ options: {
   checkpoint: { type: 'string' }, source: { type: 'string' }, reference: { type: 'string' }, fish: { type: 'string' },
-  'resume-at': { type: 'string' },
+  'resume-at': { type: 'string' }, 'reference-paths': { type: 'boolean' },
   budget: { type: 'string' }, samples: { type: 'boolean' }, pace: { type: 'boolean' }, 'delivery-control': { type: 'boolean' },
   steps: { type: 'string', default: '24' }, warmup: { type: 'string', default: '6' }, help: { type: 'boolean' }
 } });
@@ -16,6 +16,7 @@ if (values.help) {
   console.log('用法：node tests/benchmark-step.mjs [--steps=24] [--warmup=6] [--fish=5000 | --checkpoint=备份.json] [--source=被测工作区] [--reference=原版工作区] [--budget=20] [--samples] [--pace]');
   console.log('--resume-at=含时区的时间 从备份恢复到指定时刻，保留离线期间到期的自然事件；默认按备份本身的时刻复播。');
   console.log('--delivery-control 增跑空消息和预计算整步的独立交付对照。20 毫秒验收仍按正常生态步计时。');
+  console.log('--reference-paths 同时比对参考版本的逐鱼游动路径，适用于游动展示规则相同的版本。');
   process.exit(0);
 }
 const steps = Number(values.steps), warmup = Number(values.warmup), fish = Number(values.fish ?? 5000);
@@ -65,7 +66,7 @@ try {
   page.on('worker', () => workers++);
   page.on('pageerror', error => errors.push(error.message));
   await page.goto(`http://127.0.0.1:${server.address().port}/`);
-  const report = await page.evaluate(async ({ checkpoint, fish, steps, warmup, budget, separateReference, samples, pace, deliveryControl }) => {
+  const report = await page.evaluate(async ({ checkpoint, fish, steps, warmup, budget, separateReference, referencePaths, samples, pace, deliveryControl }) => {
     const { World, CONFIG } = await import('/engine.js');
     const { SimulationClient, subscribeSimulationChanges } = await import('/simulation-client.js');
     const { ArchiveStore } = await import('/archive.js');
@@ -194,7 +195,7 @@ try {
     // Older rules can clear every visual path when just one body changes.
     // Compare persisted state with the requested reference and display paths
     // with the current public simulation, independent of the worker and UI.
-    const pathWorld = separateReference ? copyWorld() : ecology;
+    const pathWorld = separateReference && !referencePaths ? copyWorld() : ecology;
     let patches = 0, workerSwims;
     const unsubscribe = subscribeSimulationChanges((world, patch) => {
       if (world === replay && patch && Number.isFinite(patch.values.tick)) { patches++; workerSwims = patch.swims; }
@@ -221,7 +222,7 @@ try {
         budgetMs: budget, ecologyMs: stats(ecologies), workerSubmitMs: stats(roundTrips),
         phaseMs: Object.fromEntries(Object.entries(phases).map(([phase, times]) => [phase, stats(times)])), deliveryControlMs };
     } finally { unsubscribe(); verified.close(); }
-  }, { checkpoint, fish, steps, warmup, budget, separateReference: !!values.reference, samples: values.samples, pace: !!values.pace, deliveryControl: values['delivery-control'] });
+  }, { checkpoint, fish, steps, warmup, budget, separateReference: !!values.reference, referencePaths: values['reference-paths'], samples: values.samples, pace: !!values.pace, deliveryControl: values['delivery-control'] });
   assert.deepEqual(errors, []);
   assert.equal(workers, values['delivery-control'] ? 3 : 2, '计时、交付对照和状态复核应使用各自的后台线程');
   console.log(JSON.stringify({ browser: browser.version(), sample: checkpoint ? 'checkpoint' : 'generated', ...report }, null, 2));
