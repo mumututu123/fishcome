@@ -64,7 +64,15 @@ test('空归档保持后台模拟，有记录时继续归档和整理', async t 
     return route.fulfill({ contentType: 'text/javascript', body: readFileSync(asset, 'utf8') + fixture });
   });
   await page.goto(origin + '/fixture');
-  await page.evaluate(async () => { await (await import('./storage.js')).newIdentity('归档测试'); });
+  await page.evaluate(async () => {
+    const { newIdentity, putMany } = await import('./storage.js');
+    const { World } = await import('./engine.js');
+    await newIdentity('归档测试');
+    // A random newborn school can legitimately stay in place for the entire hold.
+    // Use a reproducible, moving school so the position assertion detects an actual stall.
+    const at = Date.now(), world = new World(at, 'b67fe460-b490-4ede-9878-000000000001');
+    await putMany([['checkpoint', { at, lastOnlineAt: at, world: world.data }]]);
+  });
   await page.goto(origin);
   await page.waitForFunction(() => window.tide);
   const initialTick = await page.evaluate(() => archiveFixture().world.data.tick);
