@@ -119,16 +119,28 @@ replicaPages = function* (body, frame) {
 const instrument = `
 const testData = { frames: [], steps: [], stepRequests: [], applied: [], sends: [], receives: [], merges: [], worldMerges: [], repairs: [], saves: [], liveBytes: [] };
 const stepRequests = new WeakMap();
+let activeStepMark, markNumber = 0;
+function markStep() {
+  const marker = markNumber++, start = performance.now();
+  if (${Boolean(values.trace)}) {
+    const name = 'tide.request.' + window.densePage + '.' + marker;
+    performance.mark(name);
+    performance.clearMarks(name);
+  }
+  return { start, marker };
+}
+const originalAgreed = SimulationClient.prototype.advanceAgreed;
+SimulationClient.prototype.advanceAgreed = function (...args) {
+  activeStepMark = markStep();
+  try { return originalAgreed.apply(this, args); }
+  finally { activeStepMark = undefined; }
+};
 const originalRequest = SimulationClient.prototype.request;
 SimulationClient.prototype.request = function (message) {
   if (message.kind !== 'step') return originalRequest.call(this, message);
   const sequence = testData.stepRequests.length;
-  if (${Boolean(values.trace)}) {
-    const name = 'tide.request.' + window.densePage + '.' + sequence;
-    performance.mark(name);
-    performance.clearMarks(name);
-  }
-  const start = performance.now(), row = { sequence, startAt: performance.timeOrigin + start, tick: message.base + CONFIG.step,
+  const { start, marker } = activeStepMark || markStep();
+  const row = { sequence, marker, startAt: performance.timeOrigin + start, tick: message.base + CONFIG.step,
     ...(message.agreed && { agreed: true }) };
   stepRequests.set(message, { row, start });
   testData.stepRequests.push(row);
@@ -151,8 +163,12 @@ SimulationClient.prototype.request = function (message) {
 };
 const originalCompute = SimulationClient.prototype.compute;
 SimulationClient.prototype.compute = async function (target, message, ownsWorld) {
-  let result;
-  try { return result = await originalCompute.call(this, target, message, ownsWorld); }
+  let result, pending;
+  const outer = activeStepMark;
+  if (!outer && message.kind === 'step') activeStepMark = markStep();
+  try { pending = originalCompute.call(this, target, message, ownsWorld); }
+  finally { activeStepMark = outer; }
+  try { return result = await pending; }
   finally {
     const request = stepRequests.get(message), end = performance.now();
     if (request) Object.assign(request.row, { ms: end - request.start, committed: Boolean(result && target === world) });
@@ -264,7 +280,23 @@ window.denseSurvey = () => ({ ...testData, node: network?.node, leader: network 
   phases: window.densePhases, longTasks: window.denseLongTasks, replicaFailures: window.denseReplicaFailures,
   liveTransfers: window.denseLiveTransfers,
   orderedHistory: diagnostics.list().filter(log => log.source === 'ordered-steps').slice(-24),
+  proofs: window.denseProofs || [], surface: renderer.ctx.getContextAttributes?.(),
   logs: diagnostics.list().filter(log => log.level === 'warn' || log.level === 'error').slice(-10) });
+window.denseCheckpointAt = tick => new Promise((resolve, reject) => {
+  const release = subscribeSimulationChanges((target, patch) => {
+    if (target !== world || !(patch?.values?.tick >= tick)) return;
+    release();
+    clearTimeout(timeout);
+    if (target.data.tick !== tick) { reject(new Error('同一步的世界核对发生跳步')); return; }
+    // Capture the applied UI replica after the timed observation has ended.
+    // Signed input, archive manifests, ordered history and poses all count.
+    const bytes = new TextEncoder().encode(JSON.stringify(target.data));
+    crypto.subtle.digest('SHA-256', bytes).then(hash => resolve({
+      tick, bytes: bytes.length, sha256: Array.from(new Uint8Array(hash), n => n.toString(16).padStart(2, '0')).join('')
+    }), reject);
+  });
+  const timeout = setTimeout(() => { release(); reject(new Error('等待同一步的世界核对超时')); }, 10000);
+});
 window.denseJoinSettled = () => {
   if (!network?.replicaPeers().length) return false;
   const full = testData.receives.filter(row => ['hello', 'merge'].includes(row.kind) || row.kind === 'world' && !row.delta).at(-1);
@@ -375,6 +407,13 @@ async function openPage(browser, origin, options, assets) {
     if (!file.startsWith(assets + path.sep)) return route.fulfill({ status: 404 });
     try {
       if (pathname === '/app.js') return route.fulfill({ contentType: 'text/javascript', body: readFileSync(file, 'utf8') + instrument });
+      if (pathname === '/ordered-steps.js') return route.fulfill({ contentType: 'text/javascript', body: readFileSync(file, 'utf8') + `
+const completeStep = OrderedSteps.prototype.complete;
+OrderedSteps.prototype.complete = async function (slot, result) {
+  const proof = await completeStep.call(this, slot, result);
+  if (proof) (window.denseProofs ||= []).push({ tick: slot.tick, epoch: this.epoch, proof });
+  return proof;
+};` });
       if (pathname === '/replica-stream.js') return route.fulfill({ contentType: 'text/javascript',
         body: readFileSync(file, 'utf8') + observeReplicaPages + (values['step-boundaries-only'] ? '' : observeFirstReplicaPage) });
       if (pathname === '/simulation-changes.js') return route.fulfill({ contentType: 'text/javascript', body: readFileSync(file, 'utf8') + observeCommit });
@@ -620,6 +659,11 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
     profileSummary = profileTimes(profile);
   }
   const pages = await Promise.all([a, b].map(page => page.evaluate(() => denseSurvey())));
+  let commonCheckpoint;
+  if (values['refresh-budget'] && pages.every(page => page.proofs.length)) {
+    const tick = Math.max(...await Promise.all([a,b].map(page => page.evaluate(() => denseSurvey().tick)))) + 3 * step;
+    commonCheckpoint = await Promise.all([a,b].map(page => page.evaluate(tick => denseCheckpointAt(tick), tick)));
+  }
   const archiveIds = [...fixture.archiveIds, ...rounds.map(round => round.id)];
   assert.equal(new Set(archiveIds).size, archiveIds.length, '每轮应生成不同于历史记录的新归档');
   const saved = await Promise.all((backup ? [a, b] : [b]).map(page => page.evaluate(async ({ joinedFish, archiveIds }) => {
@@ -694,7 +738,7 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
     const phases = {};
     for (const row of page.phases.filter(sampled)) (phases[row.phase] ||= []).push(row);
     const presentations = traces && readPresentations(traces[i].traceEvents, page, recent, ended);
-    return { leader: page.node === page.leader, fish: page.fish, simulationFailure: page.simulationFailure,
+    return { leader: page.node === page.leader, fish: page.fish, simulationFailure: page.simulationFailure, surface: page.surface,
       traceClockOffsets: presentations?.clockOffsets,
       ...frameSummary(page, presentations, recent, ended, coordinator.steps, requests),
       visible: stats(frames.map(event => event.visible)), noFish, rejected: page.rejected, saves: stats(page.saves.filter(sampled).map(event => event.ms)),
@@ -705,6 +749,9 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
   const offsets = traces && summaries.flatMap(page => page.traceClockOffsets ?? []);
   const traceClockSkewMs = offsets?.length === 4 ? Math.max(...offsets) - Math.min(...offsets) : undefined;
   const confirmed = traces && bothDisplays(requests);
+  const agreed = requests.filter(row => row.agreed && row.committed && row.peerSteps?.some(peer => peer.agreed && peer.committed));
+  const matchedProofs = agreed.filter(({ tick }) => coordinator.proofs.some(left => left.tick === tick &&
+    follower.proofs.some(right => right.tick === tick && right.epoch === left.epoch && right.proof === left.proof))).length;
   const schedule = traces && scheduledSteps(requests, clockPhase, step, recent, ended);
   const dropped = coordinator.sends.filter(event => event.dropped && sampled(event));
   const droppedTicks = new Set(dropped.map(event => event.tick));
@@ -726,7 +773,7 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
     .map(field => [field, stats(received.flatMap(row => row.rows ? [row.rows[field]] : []))]));
   const report = JSON.stringify({ count, realBackup: Boolean(backup), browserVersion, cold, joinedMs: joined - joining, settledMs: recent - joining, steadyMs: ended - recent,
     saved, liveWire, browserProcesses: browsers.length, graphics, traceClockSkewMs, worldStart,
-    agreedSteps: requests.filter(r => r.agreed && r.committed && r.peerSteps?.some(p => p.agreed && p.committed)).length,
+    agreedSteps: agreed.length, matchedProofs, commonCheckpoint,
     bundledArchives: new Set(follower.receives.filter(sampled).flatMap(row => row.bundled || [])).size,
     separateArchiveMessages: follower.receives.filter(row => sampled(row) && row.kind === 'archiveChunk').length,
     ...(switched ? { switched } : {}),
@@ -781,7 +828,9 @@ async function survey({ a, b, fixture, cold, joining, joined, recent, stopTrace,
   if (archiveRounds && !values.drop && !values['forget-live-base'] && !values['plain-live']) {
     assert(!pages.some(page => page.repairs.some(sampled)), '完整存档直连归档时误报缺少记录，触发了补拉');
   }
+  if (commonCheckpoint) assert.deepEqual(commonCheckpoint[0], commonCheckpoint[1], '实际提交到两端的同一步完整世界不同');
   if (values['refresh-budget']) assert(schedule.unpresented.length === 0 && confirmed.missing === 0 && confirmed.over20 === 0 &&
+    commonCheckpoint && agreed.length === requests.length && matchedProofs === agreed.length &&
     stepComplete.n >= 9 && stepComplete.n === stepComplete.requested && stepComplete.over20 === 0 &&
     requests.slice(1).every((row, i) => row.tick - requests[i].tick === 500) && summaries.every(page => page.draw.over20 === 0 &&
     [page.presented, page.visibleMotion].every(row => row.over20 === 0 && row.n >= 20 && row.startCovered && row.endCovered) &&

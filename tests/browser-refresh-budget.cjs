@@ -236,9 +236,9 @@ function matchStepStarts(requests, peers, hostMarks, peerMarks) {
     byTick.get(row.tick).push(row);
   }
   for (const request of requests) {
-    const host = hostMarks.get(request.sequence);
+    const host = hostMarks.get(request.marker ?? request.sequence);
     const others = byTick.get(request.tick) || [];
-    const stamps = others.map(row => peerMarks.get(row.sequence));
+    const stamps = others.map(row => peerMarks.get(row.marker ?? row.sequence));
     // A sealed tick belongs to both engines. Its clock starts at the first
     // request, including earlier peer attempts. Missing evidence fails closed.
     request.traceAt = Number.isFinite(host) && stamps.every(Number.isFinite) &&
