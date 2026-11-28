@@ -649,7 +649,7 @@ export class World {
     const foodsNear = foodSight(edible);
     fishOccupancy.prepareMovement(this.data, scenery, foodPositions, seaweed);
     const layout = fishOccupancy.layout;
-    const starvationDue = advanceSwimming(this, now, dt, fishOccupancy, groups, ambient, captured, waitingToEat, foodsNear, canEat,
+    advanceSwimming(this, now, dt, fishOccupancy, groups, ambient, captured, waitingToEat, foodsNear, canEat,
       scenery, foodPositions, turningObstacles, edible, magma, magmaVictims, swims, paths);
     this.retainMovementGrid(groups, fishOccupancy);
     let bodyChanged = magmaVictims.size > 0;
@@ -671,7 +671,7 @@ export class World {
       }
     }
     let hungryBodies = bodyChanged ? undefined : groups, hungryLayout;
-    if (starvationDue) for (const id of groups.keys()) {
+    if (!this.hungerDue || this.hungerDue(now)) for (const id of groups.keys()) {
       const f = this.data.fishes[id];
       if (f && now >= f.hungerAt) {
         hungryBodies ??= this.fishGroups();

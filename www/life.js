@@ -447,6 +447,10 @@ function observeLife(world, now, context, life, elapsed, record) {
   life.haunts = trim(Object.fromEntries(Object.entries(life.haunts || {}).filter(([id]) => world.data.fishes[id])), LIFE.bondLimit);
 }
 const wandering = new WeakMap();
+const directions = Array.from({ length: 9 }, (_, i) => Object.freeze({ dx: i % 3 - 1, dy: Math.floor(i / 3) - 1 }));
+export function wanderDirection(prefix, phaseText) {
+  return directions[hash(phaseText, prefix) % directions.length];
+}
 export function swimPattern(fish, now) {
   const phase = Math.floor((now - fish.created) / LIFE.wanderPeriod);
   let pattern = wandering.get(fish);
@@ -455,10 +459,10 @@ export function swimPattern(fish, now) {
     wandering.set(fish, pattern);
   }
   if (pattern.phase !== phase) {
-    const r = hash(String(phase), pattern.prefix);
+    const direction = wanderDirection(pattern.prefix, String(phase));
     pattern.phase = phase;
-    pattern.dx = r % 3 - 1;
-    pattern.dy = Math.floor(r / 3) % 3 - 1;
+    pattern.dx = direction.dx;
+    pattern.dy = direction.dy;
   }
   return pattern;
 }

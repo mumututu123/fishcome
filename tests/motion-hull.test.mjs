@@ -206,3 +206,47 @@ test('平移或翻转空心鱼体后，全海占格与逐格重新摆放一致',
     }
   }
 });
+test('后台绝食日程跟随旧档、投喂、鱼行回填与绝食后延期，缺失行程按原顺序补齐', () => {
+  const now = Date.UTC(2025, 5, 15, 12, 17);
+  const reference = makeFishWorld(World, 4, 1000, { now, mixedGenders: true });
+  reference.ambient = false;
+  const [legacy, eater, due, missing] = Object.keys(reference.data.fishes);
+  for (const fish of Object.values(reference.data.fishes)) {
+    fish.hungerAt = now + 60000;
+    fish.lastFed = now - 86400000;
+  }
+  delete reference.data.fishes[legacy].hungerAt;
+  delete reference.data.travel[missing];
+  reference.data.fishes[eater].hungerAt = now + 500;
+  reference.data.chars.bait = { id: 'bait', kind: 'food', entity: '', payer: 'local', x: 8, y: 3,
+    ch: '*', color: '#ffffff', created: now, born: now, fall: 0, moveAt: now, path: [] };
+  const worker = new WorkerSimulation();
+  worker.receive({ kind: 'open', values: reference.serialize(), tables: [], ambient: false });
+  worker.receive({ kind: 'ready' });
+  function advance() {
+    const base = reference.data.tick;
+    reference.step(base + 500);
+    worker.receive({ kind: 'step', base, names: [], foods: [] });
+    for (const key of ['fishes', 'chars', 'travel']) {
+      assert.equal(JSON.stringify(worker.world.data[key]), JSON.stringify(reference.data[key]), key);
+    }
+  }
+  advance();
+  assert.equal(worker.world.data.chars.bait.entity, eater);
+  assert.equal(worker.world.data.fishes[eater].hungerAt, now + 500 + 86400000);
+  assert.equal(worker.world.data.travel[missing].since, now + 500);
+  assert.equal(worker.world.hungerDue(now + 1000), false);
+
+  const replacement = { ...reference.data.fishes[due], hungerAt: now + 1000 };
+  reference.data.fishes[due] = replacement;
+  worker.receive({ kind: 'restore', rows: [['fishes', due, structuredClone(replacement)]] });
+  assert.equal(worker.world.hungerDue(now + 1000), true);
+  advance();
+  assert(Object.values(worker.world.data.chars).some(c => c.path.some(event => event.reason === 'starve')));
+  assert.equal(worker.world.hungerDue(now + 1500), false);
+
+  delete reference.data.travel[legacy];
+  worker.receive({ kind: 'restore', rows: [['travel', legacy, undefined]] });
+  advance();
+  assert.equal(worker.world.data.travel[legacy].since, now + 1500);
+});

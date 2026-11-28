@@ -1,5 +1,5 @@
 import { CONFIG, EYES, key, hash, bounds, sightRadius, cellPosition } from './engine.js';
-import { LIFE, idleMotion, swimPattern } from './life.js';
+import { LIFE, idleMotion, wanderDirection } from './life.js';
 import { POPULATION, illnessOf } from './population.js';
 import { motionOrder, commitUnit } from './breeding.js';
 import { WORLD_WIDTH, MAX_FLOOR, wrapX, deltaX } from './geography.js';
@@ -35,7 +35,7 @@ function canFlip(hull, x, y, facing, grid, slot, legacy) {
 function planFreeSwimming(grid, singles, now) {
   let plan = grid.intentPlan;
   if (!plan || plan.singles !== singles || now < plan.last || now >= plan.fedDeadline) {
-    const byResidue = new Map();
+    const byCreation = new Map();
     plan = grid.intentPlan = { singles, last: now, fedDeadline: Infinity, next: -Infinity, buckets: [] };
     for (const entry of singles) {
       const swimmer = entry[3], fish = swimmer?.fish;
@@ -46,11 +46,11 @@ function planFreeSwimming(grid, singles, now) {
         plan.fedDeadline = Math.min(plan.fedDeadline, fish.lastFed + CONFIG.hunger);
         continue;
       }
-      const residue = ((fish.created % LIFE.wanderPeriod) + LIFE.wanderPeriod) % LIFE.wanderPeriod;
-      let bucket = byResidue.get(residue);
+      let bucket = byCreation.get(fish.created);
       if (!bucket) {
-        bucket = { swimmers: [], due: -Infinity, residue };
-        byResidue.set(residue, bucket);
+        const residue = ((fish.created % LIFE.wanderPeriod) + LIFE.wanderPeriod) % LIFE.wanderPeriod;
+        bucket = { swimmers: [], due: -Infinity, created: fish.created, residue };
+        byCreation.set(fish.created, bucket);
         plan.buckets.push(bucket);
       }
       bucket.swimmers.push(swimmer);
@@ -60,7 +60,14 @@ function planFreeSwimming(grid, singles, now) {
     plan.next = Infinity;
     for (const bucket of plan.buckets) {
       if (now >= bucket.due) {
-        for (const swimmer of bucket.swimmers) swimmer.intended = swimPattern(swimmer.fish, now);
+        const phase = Math.floor((now - bucket.created) / LIFE.wanderPeriod), text = String(phase);
+        for (const swimmer of bucket.swimmers) {
+          if (swimmer.wanderId !== swimmer.fish.id) {
+            swimmer.wanderId = swimmer.fish.id;
+            swimmer.wanderSeed = hash(swimmer.wanderId + ':');
+          }
+          swimmer.intended = wanderDirection(swimmer.wanderSeed, text);
+        }
         bucket.due = (Math.floor((now - bucket.residue) / LIFE.wanderPeriod) + 1) * LIFE.wanderPeriod + bucket.residue;
       }
       plan.next = Math.min(plan.next, bucket.due);
@@ -125,13 +132,13 @@ export function advanceSwimming(world, now, dt, grid, groups, ambient, captured,
   const nearFood = freeIntents && foodsNear && grid.ownersNear(edible, Math.max(CONFIG.sightShallow, CONFIG.sightDeep));
   if (freeIntents) planFreeSwimming(grid, singles, now);
   const ordered = motionOrder(world, groups, layout, singles), batch = world.beginSwimBatch?.();
-  const packed = ambient && batch && ordered.length && !magma.size && !grid.overlapped
+  const packed = Number.isFinite(dt) && ambient && batch && ordered.length && !magma.size && !grid.overlapped
     ? packedGrid(grid, ordered.length) : null;
   const phase = String(Math.floor(now / 12000));
   const avoidance = [0, 1, 2, 3].map(seed => hash(phase, seed) & 3);
-  let start = 0, count = 0, travelDay, starvationDue = false;
+  let start = 0, count = 0, travelDay;
 
-  function publish(id, fish, pair, ordinal, trail, oldFacing) {
+  function publishPose(fish, ordinal) {
     const { x, y, facing, cx, cy } = fish;
     if (ordinal !== undefined) {
       if (Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(facing) && Number.isFinite(cx) && Number.isFinite(cy)) {
@@ -144,6 +151,8 @@ export function advanceSwimming(world, now, dt, grid, groups, ambient, captured,
         batch.motion[offset + 4] = cy;
       } else world.movingFish(fish);
     }
+  }
+  function recordTrail(id, pair, ordinal, trail, facing, oldFacing) {
     if (trail === 4) return;
     if (swims && !pair && oldFacing === facing) (paths[trail] ||= []).push(id);
     travelDay ??= shanghaiDay(now);
@@ -163,19 +172,20 @@ export function advanceSwimming(world, now, dt, grid, groups, ambient, captured,
   function flush() {
     if (!count) return;
     packed.advance(count, dt);
-    const poses = packed.doubles, trails = packed.words;
+    const poses = packed.doubles, trails = packed.words, base = packed.poseOffset / 8;
+    batch.motion.set(poses.subarray(base, base + count * 5), batch.poses.length * 5);
     for (let i = 0; i < count; i++) {
       const entry = ordered[start + i], swimmer = entry[3], f = swimmer.fish;
-      const p = packed.poseOffset / 8 + i * 5, oldFacing = f.facing;
+      const p = base + i * 5, oldFacing = f.facing;
       f.x = poses[p]; f.y = poses[p + 1]; f.facing = poses[p + 2]; f.cx = poses[p + 3]; f.cy = poses[p + 4]; f.posAt = now;
-      publish(entry[0], f, null, swimmer.ordinal, trails[packed.trailsOffset / 4 + i], oldFacing);
+      batch.poseIndex[swimmer.ordinal] = batch.poses.push(swimmer.ordinal);
+      recordTrail(entry[0], null, swimmer.ordinal, trails[packed.trailsOffset / 4 + i], f.facing, oldFacing);
     }
     count = 0;
   }
   for (let index = 0; index < ordered.length; index++) {
-    const [id, cells, pair, swimmer] = ordered[index];
+    const entry = ordered[index], id = entry[0], cells = entry[1], pair = entry[2], swimmer = entry[3];
     let f = pair ? pair.fish : swimmer?.fish ?? fishes[id];
-    if (!starvationDue) starvationDue = pair ? pair.members.some(member => now >= member.hungerAt) : !!f && now >= f.hungerAt;
     if (!f || !cells.length || (captured.size && (pair ? pair.members.some(member => captured.has(member.id)) : captured.has(id)))) {
       flush();
       continue;
@@ -188,6 +198,7 @@ export function advanceSwimming(world, now, dt, grid, groups, ambient, captured,
     const hull = canonical && !waiting ? (swimmer ? swimmer.hull : layout.hull(cells)) : null;
     const slot = hull && !pair && breeding[id]?.status !== 'active' ? swimmer?.slot ?? grid.slots.get(id) : undefined;
     const bulk = packed && !grid.overlapped && !waiting && ordinal !== undefined && slot !== undefined && !hull.duplicate &&
+      Number.isFinite(f.cx || 0) && Number.isFinite(f.cy || 0) &&
       oldY + hull.bounds.minY >= 0 && oldY + hull.bounds.maxY < MAX_FLOOR;
     const sight = foodsNear && (!nearFood || swimmer?.slot === undefined || nearFood[swimmer.slot]) ? foodsNear : null;
     const planned = freeIntents && now - f.lastFed >= CONFIG.hunger && swimmer?.intended;
@@ -229,9 +240,9 @@ export function advanceSwimming(world, now, dt, grid, groups, ambient, captured,
       if (!waiting && (oldX !== f.x || oldY !== f.y || oldFacing !== f.facing)) grid.moveFish(f, cells, oldX, oldY, oldFacing, hull, slot);
     }
     if (!waiting && magma.size) noteMagmaContact(magma, magmaVictims, groups, f, cells, pair, f.x, f.y, f.facing);
-    publish(id, f, pair, ordinal, trail, oldFacing);
+    publishPose(f, ordinal);
+    recordTrail(id, pair, ordinal, trail, f.facing, oldFacing);
   }
   flush();
   if (batch) world.completeSwimBatch(batch, travelDay);
-  return starvationDue;
 }

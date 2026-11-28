@@ -24,7 +24,21 @@ const inputFields = new Set(['ops', 'terrain', 'roots', 'participants', 'archive
 // them in a message. Collections can be replaced by the simulation as a whole
 // (notably contacts), in which case additions and removals must both be sent.
 function trackWorld() {
-  let source, knownFish, fishIds, daysByOrdinal;
+  let source, knownFish, fishIds, daysByOrdinal, firstHunger = Infinity, travelComplete;
+  function includeHunger(at) {
+    // The original comparison ignores missing and nonnumeric deadlines.
+    const deadline = Number(at);
+    if (deadline < firstHunger) firstHunger = deadline;
+  }
+  function hungerDue(now) {
+    if (now < firstHunger) return false;
+    // Postponing a meal deadline or removing a fish can leave an earlier bound.
+    // Refresh it only once that bound is reached.
+    firstHunger = Infinity;
+    const fishes = raw(source.fishes);
+    for (const id in fishes) includeHunger(raw(fishes[id])?.hungerAt);
+    return now >= firstHunger;
+  }
   // These are the worker's private, mutable records. Keeping the observation
   // with its record avoids growing a world-sized hash table on a step.
   const observation = Symbol('simulation observation');
@@ -183,6 +197,11 @@ function trackWorld() {
   }
   function mark(target, parent, key, value, deleting = false) {
     const { field, id, property } = parent;
+    if (parent.root && key === 'fishes') firstHunger = -Infinity;
+    else if (field === 'fishes') {
+      if (parent.table) includeHunger(value?.hungerAt);
+      else if (!property && key === 'hungerAt') includeHunger(value);
+    }
     if (parent.root && (key === 'population' || key === 'fishes') ||
         field === 'fishes' && parent.table && deleting && source.population?.illnesses[key]) illnessSchedule.due = -Infinity;
     if (parent.root && key === 'life') activeBonds = publishedBonds = undefined;
@@ -495,8 +514,18 @@ function trackWorld() {
     attach(data) {
       source = data;
       fishIds = Object.keys(source.fishes);
-      knownFish = new Map(fishIds.map((id,index) => [id,index]));
+      knownFish = new Map();
       daysByOrdinal = new Array(fishIds.length);
+      travelComplete = true;
+      firstHunger = Infinity;
+      for (let i = 0; i < fishIds.length; i++) {
+        const id = fishIds[i], fish = source.fishes[id];
+        knownFish.set(id, i);
+        includeHunger(fish.hungerAt);
+        const travel = source.travel?.[id];
+        if (travel) daysByOrdinal[i] = raw(travel.days);
+        if (!travel || fish.id !== id) travelComplete = false;
+      }
       return watch(source, { root: true });
     },
     // These detached records can acquire observers before a tick is selected.
@@ -525,6 +554,8 @@ function trackWorld() {
     poseRevision: () => poseRevision,
     readFish: id => raw(source.fishes[id]),
     readContacts: () => raw(source.contacts),
+    initialTravelComplete: () => travelComplete,
+    hungerDue,
     fishValues: () => fishRoster ??= Object.values(raw(source.fishes)),
     mealEdits,
     originRevision: () => originRevision,
@@ -708,6 +739,8 @@ export class WorkerSimulation {
       this.world.poseRevision = this.tracker.poseRevision;
       this.world.originRevision = this.tracker.originRevision;
       this.world.stableFishRoster = this.tracker.fishValues;
+      this.world.hungerDue = this.tracker.hungerDue;
+      if (this.tracker.initialTravelComplete()) this.world.trackedRoster = this.world.stableFishRoster();
       this.world.illnessSchedule = this.tracker.illnessSchedule;
       this.world.witherSchedule = this.tracker.witherSchedule;
       this.world.mealEdits = this.tracker.mealEdits;
