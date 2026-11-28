@@ -3,6 +3,8 @@ import test from 'node:test';
 import { World, key } from '../www/engine.js';
 import { motionOrder } from '../www/breeding.js';
 import { BodyLayout, compileHull, fitsHullAt, sweepsHullAt } from '../www/motion-hull.js';
+import { MovementGrid } from '../www/movement-grid.js';
+import { wrapX } from '../www/geography.js';
 import { WorkerSimulation } from '../www/simulation-worker.js';
 import { makeFishWorld } from './capacity-fish.mjs';
 
@@ -112,4 +114,36 @@ test('逐行转身和占位与逐鱼元判定一致，包括越界、重叠、�
   }
   assert.equal(compileHull([{ x: .25, y: 1 }]), null);
   assert.equal(compileHull([{ x: -501, y: 0 }, { x: 499, y: 0 }]), null);
+});
+
+test('平移或翻转空心鱼体后，全海占格与逐格重新摆放一致', () => {
+  let seed = 0x188bb70b;
+  const random = limit => {
+    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+    return (seed >>> 16) % limit;
+  };
+  for (const x of [0, 999, 100 + random(800)]) for (const facing of [-1, 1]) {
+    const body = [];
+    for (let y = -1; y <= 1; y++) for (let x = -1; x <= 1; x++) {
+      if (x || y) body.push({ x, y });
+    }
+    body.push({ x: 2, y: random(3) - 1 });
+    const start = { id: 'swimmer', x, y: 10 + random(60), facing };
+    const layout = new BodyLayout(new Map([[start.id, body]])), hull = layout.hull(body);
+    const updated = new MovementGrid(layout), rebuilt = new MovementGrid(layout);
+    const neighbor = { id: 'neighbor', x: wrapX(x + 8), y: start.y, facing: 1 };
+    const singleCell = [{ x: 0, y: 0 }];
+    for (const turns of [false, true]) for (const dx of [-1, 0, 1]) for (const dy of [-1, 0, 1]) {
+      const turnOffset = turns ? facing * (hull.bounds.minX + hull.bounds.maxX) : 0;
+      const next = { ...start, x: wrapX(x + turnOffset + dx), y: start.y + dy, facing: turns ? -facing : facing };
+      for (const grid of [updated, rebuilt]) {
+        grid.cells.fill(0);
+        grid.update(neighbor, singleCell);
+      }
+      updated.update(start, body);
+      updated.moveFish(next, body, start.x, start.y, facing, hull, updated.slots.get(start.id));
+      rebuilt.update(next, body);
+      assert.deepEqual(updated.cells, rebuilt.cells, JSON.stringify({ start, next }));
+    }
+  }
 });

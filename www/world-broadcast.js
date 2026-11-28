@@ -62,8 +62,9 @@ function captureDelta(delta) {
 
 // The simulation already identified the exact fields it replaced. Reuse the
 // previous detached records as the static part of a contiguous publication.
-function captureStep(data, base, patch, breeding) {
-  const worker = patch.workerChanges, rows = fullRows({});
+function captureStep(data, base, patch, breeding, pending) {
+  const worker = patch.workerChanges, rows = pending.size ? changedRows(data, base, pending) : fullRows({});
+  if (pending.has('chars')) rows.chars = structuredClone(rows.chars);
   const source = { previousFishes: base.fishes, trips: rows.travel };
   const poses = patch.tables.fishes && FishPoseFrame.capture(worker.tables.fishes, patch.tables.fishes, base.poseFrame, base.fishes, data.tick);
   if (poses) source.poses = poses;
@@ -73,11 +74,12 @@ function captureStep(data, base, patch, breeding) {
     if (poses && field === 'fishes') continue;
     const edits = patch.tables[field];
     if (!edits) continue;
-    const last = base.rows[field];
+    const last = base.rows[field], otherEdits = pending.get(field);
     for (const id of edits.remove) last.delete(id);
     const frame = edits.frame, length = frame ? frame.length : edits.set.length;
     for (let i = 0; i < length; i++) {
       const id = frame ? frame.idAt(i) : edits.set[i][0], value = frame ? frame.records[i] : edits.set[i][1];
+      if (otherEdits?.has(id)) continue;
       const prior = last.get(id);
       const edit = worker.tables[field]?.set[i];
       const daily = field === 'travel' && (typeof edit === 'number' || edit?.length === 3 && typeof edit[1] === 'string');
@@ -347,6 +349,11 @@ export class WorldBroadcast {
     subscribe?.((world, patch) => {
       if (world.data !== this.source || !this.pending) return;
       if (!patch) { this.pending = null; this.step = null; return; }
+      if (!this.step && !patch.workerChanges && Object.keys(patch.values || {}).length === 0 &&
+          Object.keys(patch.tables || {}).every(field => field !== 'fishes' && field !== 'travel' && rowFields.includes(field))) {
+        this.track(patch);
+        return;
+      }
       if (this.step) { this.track(this.step); this.step = null; }
       const onlyPatch = this.firstChange;
       this.firstChange = false;
@@ -423,7 +430,7 @@ export class WorldBroadcast {
       const fromTick = previous?.tick;
       if (previous) {
         if (!contiguous) reconcileFishRows(previous);
-        world = contiguous ? captureStep(data, previous, step, breeding) : captureDelta(packet(data, changedRows(data, previous, pending), breeding));
+        world = contiguous ? captureStep(data, previous, step, breeding, pending) : captureDelta(packet(data, changedRows(data, previous, pending), breeding));
         const poses = committedStepFields.get(world)?.poses;
         if (directions?.length && world.tick === previous.tick + CONFIG.step) swims = encodeSwims(poses ? poses.indices.keys() : Object.keys(world.fishes), directions);
         previous.tick = world.tick;

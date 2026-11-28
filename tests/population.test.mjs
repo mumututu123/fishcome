@@ -101,6 +101,27 @@ test('食肉鱼真实嘴部接触才捕食，30分钟个体冷却和10分钟全�
   advance(w, now + 3000); assert(w.data.fishes[blocked]); assert.equal(p.x, 500);
   assert(predatorCells(p).every(c => !w.fishMap().has(key(c.x, c.y))));
 });
+test('捕食保留同一鱼体的鱼元顺序，以及环绕和旧坐标的视距', () => {
+  const base = world(201);
+  for (const f of base.fishValues()) f.y -= 8;
+  function hunt(mouthX, fishX, fishY, cells, legacyX) {
+    const w = new World(now, 'test', { populate: false });
+    w.data = clone(base.data);
+    const id = fish(w, fishX, fishY, cells);
+    if (legacyX !== undefined) w.data.fishes[id].x = legacyX;
+    const predator = { id: '0', x: mouthX, y: 40, facing: 1, created: born, lastBite: 0, cx: .6, cy: .9 };
+    w.data.population.predators[0] = predator;
+    advance(w, now + 500);
+    return { predator, caught: !w.data.fishes[id] };
+  }
+  assert(hunt(999, 0, 40).caught);
+  const rightFirst = hunt(300, 300, 38, [glyph(2, 2, 'o'), glyph(0, 0), glyph(1, 1)]).predator;
+  const topFirst = hunt(300, 300, 38, [glyph(0, 0, 'o'), glyph(2, 2), glyph(1, 1)]).predator;
+  assert.deepEqual([rightFirst.x, rightFirst.y], [301, 40]);
+  assert.deepEqual([topFirst.x, topFirst.y], [300, 39]);
+  assert.equal(hunt(999, 0, 40, undefined, .5).predator.x, 0);
+  assert.equal(hunt(11, 0, 40, [glyph(0, 0, 'o'), glyph(0, 1)], 2 ** 60).predator.facing, -1);
+});
 test('火山预警和冷却后保留的喷发记录无需读取鱼体或造景', () => {
   const w = world(1), e = erupt(w);
   w.ambient = false;

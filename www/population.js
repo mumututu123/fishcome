@@ -105,8 +105,9 @@ function updatePredators(world, now, dt, transition) {
     const targets = [];
     if (ready) {
       prey ??= fishes.filter(f => now - f.created >= POPULATION.juvenile && (groups.get(f.id)?.length || Infinity) <= POPULATION.preySize);
+      const nearby = !occupants.unsafeHorizontal && occupants.ownersNear([mouth], POPULATION.sight);
       for (const f of prey) {
-        if (!world.data.fishes[f.id]) continue;
+        if ((nearby && !nearby[occupants.slots.get(f.id)]) || !world.data.fishes[f.id]) continue;
         for (const cell of groups.get(f.id) || []) {
           const at = cellPosition(f, cell);
           if (Math.max(Math.abs(deltaX(at.x, mouth.x)), Math.abs(at.y - mouth.y)) <= POPULATION.sight && lineClear(world, mouth, at, scenery)) targets.push({ fish: f, ...at });

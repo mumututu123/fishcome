@@ -2,6 +2,7 @@ import { WORLD_WIDTH, MAX_FLOOR, terrainOf, wrapX, worldKey } from './geography.
 import { obstacleMask } from './motion-hull.js';
 
 const occupancyRows = MAX_FLOOR + 1;
+const maxExactDelta = Number.MAX_SAFE_INTEGER - 2 * WORLD_WIDTH;
 
 export function foreignOwner(owners, id, pair) {
   if (owners) for (const owner of owners) {
@@ -68,6 +69,7 @@ export class MovementGrid {
     return slot;
   }
   setCell(x, y, id, slot, remove) {
+    if (x < -maxExactDelta || x > maxExactDelta) this.unsafeHorizontal = true;
     const k = this.index(x, y);
     if (typeof k !== 'number') {
       if (!Number.isInteger(x) || !Number.isInteger(y)) this.integerCells = false;
@@ -128,16 +130,16 @@ export class MovementGrid {
     }
     return !this.overlapped;
   }
-  visibleFoodOwners(foods, radius) {
-    // The eyes are a subset of occupied body cells. Select every owner with
-    // any cell in range before the ordered pass starts moving its first fish.
+  ownersNear(positions, radius) {
+    // These sectors include every owner with at least one cell in range.
+    // Callers check the exact distance and any further visibility rules.
     if (this.overlapped || this.fractional.size) return;
     const size = 10, columns = WORLD_WIDTH / size, rows = Math.ceil(occupancyRows / size);
     const sectors = new Uint8Array(rows * columns), nearby = new Uint8Array(this.owners.length);
-    for (const food of foods) {
-      if (!Number.isSafeInteger(food.x) || !Number.isSafeInteger(food.y) || Math.abs(food.x) > 2 * WORLD_WIDTH) return;
-      const x = wrapX(food.x), top = Math.max(0, Math.floor((food.y - radius) / size));
-      const bottom = Math.min(rows - 1, Math.floor((food.y + radius) / size));
+    for (const position of positions) {
+      if (!Number.isSafeInteger(position.x) || !Number.isSafeInteger(position.y) || Math.abs(position.x) > 2 * WORLD_WIDTH) return;
+      const x = wrapX(position.x), top = Math.max(0, Math.floor((position.y - radius) / size));
+      const bottom = Math.min(rows - 1, Math.floor((position.y + radius) / size));
       for (let y = top; y <= bottom; y++) {
         for (let bx = Math.floor((x - radius) / size); bx <= Math.floor((x + radius) / size); bx++) {
           const column = (bx + columns) % columns, sector = y * columns + column;
@@ -189,12 +191,35 @@ export class MovementGrid {
   moveFish(fish, body, x, y, facing, hull, slot) {
     if (slot !== undefined && !this.overlapped && y + hull.bounds.minY >= 0 && y + hull.bounds.maxY < occupancyRows &&
         fish.y + hull.bounds.minY >= 0 && fish.y + hull.bounds.maxY < occupancyRows) {
-      const { xy } = hull, cells = this.cells;
+      const { xy, bounds, offsetsRight, offsetsLeft, moveEdges } = hull, cells = this.cells;
+      const { x: nextX, y: nextY, facing: nextFacing } = fish;
+      const left = facing === 1 ? bounds.minX : -bounds.maxX, right = facing === 1 ? bounds.maxX : -bounds.minX;
+      const dx = nextX - x, dy = nextY - y;
+      if (nextFacing === facing && Math.abs(dx) <= 1 && Math.abs(dy) <= 1 &&
+          Math.min(x, nextX) + left >= 0 && Math.max(x, nextX) + right < WORLD_WIDTH) {
+        const direction = (dy + 1) * 3 + dx * facing + 1;
+        let edges = moveEdges[direction];
+        if (!edges) {
+          const leaving = [], entering = [], offset = dx * facing + dy * 2 * WORLD_WIDTH;
+          const positions = [];
+          for (let i = 0; i < xy.length; i += 2) positions.push(xy[i] + xy[i + 1] * 2 * WORLD_WIDTH);
+          const occupied = new Set(positions);
+          for (let i = 0; i < offsetsRight.length; i++) {
+            if (!occupied.has(positions[i] - offset)) leaving.push(i);
+            if (!occupied.has(positions[i] + offset)) entering.push(i);
+          }
+          edges = moveEdges[direction] = { leaving, entering };
+        }
+        const offsets = facing === 1 ? offsetsRight : offsetsLeft;
+        const origin = y * WORLD_WIDTH + x, target = nextY * WORLD_WIDTH + nextX;
+        for (let i = 0; i < edges.leaving.length; i++) cells[origin + offsets[edges.leaving[i]]] = 0;
+        for (let i = 0; i < edges.entering.length; i++) cells[target + offsets[edges.entering[i]]] = slot;
+        return;
+      }
       for (let i = 0; i < xy.length; i += 2) {
         const column = x + facing * xy[i];
         cells[(y + xy[i + 1]) * WORLD_WIDTH + (column >= 0 && column < WORLD_WIDTH ? column : wrapX(column))] = 0;
       }
-      const { x: nextX, y: nextY, facing: nextFacing } = fish;
       for (let i = 0; i < xy.length; i += 2) {
         const column = nextX + nextFacing * xy[i];
         cells[(nextY + xy[i + 1]) * WORLD_WIDTH + (column >= 0 && column < WORLD_WIDTH ? column : wrapX(column))] = slot;

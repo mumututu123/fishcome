@@ -634,6 +634,59 @@ test('连续工作线程更新保留旧快照，将完整位置与稀疏字符�
   assert.deepEqual((await sender.send(sink, data, 400)).world.terrain, terrain);
 });
 
+test('签名收入、同格前台输入和已归档删除可随下一步交付，并保留最终记录', async () => {
+  const world = new World(100, 'sea', { populate: false, ambient: false }), { data } = world;
+  let notify;
+  const sender = new WorldBroadcast(fn => { notify = fn; });
+  const sink = { live: () => [1], broadcast: (_, body) => body };
+  const fish = { id: 'f', x: 1, y: 9, facing: 1, cx: 1, cy: 9, posAt: data.tick };
+  const letter = data.chars.letter = { id: 'letter', ch: '鱼', data: { from: '旧' } };
+  const burn = data.chars.burn = { id: 'burn', ch: '迹', kind: 'burn' };
+  data.fishes.f = fish;
+  data.ops.retired = { id: 'retired', kind: 'earn' };
+  const first = await sender.send(sink, data, 100), base = replicaRowBase(crypto.randomUUID(), first.world, true);
+
+  const earn = data.ops.earn = { id: 'earn', kind: 'earn', proof: { signature: 'signed' } };
+  data.participants.p = '归档员';
+  const edited = data.chars.letter = { ...letter, data: { from: '输入' } };
+  notify(world, { values: {}, tables: {
+    ops: { set: [['earn', earn]], remove: [] },
+    participants: { set: [['p', '归档员']], remove: [] },
+    chars: { set: [['letter', edited]], remove: [] }
+  } });
+
+  delete data.ops.retired;
+  delete data.chars.burn;
+  notify(world, { values: {}, tables: {
+    ops: { set: [], remove: ['retired'] }, chars: { set: [], remove: ['burn'] }
+  } });
+  const tick = data.tick += CONFIG.step;
+  const pose = data.fishes.f = { ...fish, x: 2, cx: 2, posAt: tick };
+  const finalLetter = data.chars.letter = { ...edited, ch: '海' };
+  notify(world, { values: { tick }, tables: {
+    fishes: { set: [['f', pose]], remove: [] },
+    chars: { set: [['letter', finalLetter]], remove: [] }
+  }, workerChanges: { values: { tick }, tables: {
+    fishes: { set: [0], remove: [], motion: Float64Array.of(2, 9, 1, 2, 9) },
+    chars: { set: [['letter', { ch: '海' }, undefined]] }
+  } } });
+
+  const next = await sender.send(sink, data, tick), encoded = encodeReplicaRowDelta(next, base, true, true);
+  assert.equal(typeof encoded.world.fishes.poses, 'string');
+  const received = decodeReplicaRowDelta(encoded, base, true, true);
+  assert.deepEqual(received, next);
+  assert.deepEqual(received.world.fishes, data.fishes);
+  assert.deepEqual(received.world.chars, { letter: finalLetter });
+  assert.deepEqual(received.world.ops, { earn });
+  assert.deepEqual(received.world.participants, { p: '归档员' });
+  finalLetter.data.from = '后续编辑';
+  earn.proof.signature = '后续编辑';
+  assert.equal(next.world.chars.letter.data.from, '输入');
+  assert.equal(next.world.ops.earn.proof.signature, 'signed');
+  assert.equal(first.world.chars.letter.ch, '鱼');
+  assert.deepEqual(first.world.chars.burn, burn);
+});
+
 test('发布缺口锁住只覆盖较晚时刻的包，合包保留最早覆盖时刻', () => {
   const recovery = new ReplicaRecovery(), actor = 'host', from = 'direct';
   const packet = (fromTick, tick) => ({ delta: true, fromTick, world: { tick, travel: {} } });

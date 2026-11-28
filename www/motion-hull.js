@@ -73,7 +73,13 @@ export function compileHull(cells) {
     const first = Math.min(left, minX + maxX - right);
     sweep.push(first, minX + maxX - first, y);
   }
-  return { xy, sweep, duplicate, namedCells, bounds: { minX, maxX, minY, maxY, width: maxX - minX + 1, height: maxY - minY + 1 } };
+  const offsetsRight = [], offsetsLeft = [];
+  for (let i = 0; i < xy.length; i += 2) {
+    offsetsRight.push(xy[i + 1] * WORLD_WIDTH + xy[i]);
+    offsetsLeft.push(xy[i + 1] * WORLD_WIDTH - xy[i]);
+  }
+  return { xy, sweep, duplicate, namedCells, offsetsRight, offsetsLeft, moveEdges: [],
+    bounds: { minX, maxX, minY, maxY, width: maxX - minX + 1, height: maxY - minY + 1 } };
 }
 export function fitsHull(hull, fish, grid, pair) {
   if (hull.duplicate) return false;
@@ -93,9 +99,18 @@ export function sweepsHull(hull, fish, grid, pair) {
   return true;
 }
 
-export function fitsHullAt({ xy, duplicate, bounds }, x, y, facing, grid, slot) {
+export function fitsHullAt({ xy, duplicate, bounds, offsetsRight, offsetsLeft }, x, y, facing, grid, slot) {
   if (duplicate || y + bounds.minY < 0 || y + bounds.maxY >= MAX_FLOOR) return false;
   const { cells, obstacles } = grid;
+  const left = facing === 1 ? bounds.minX : -bounds.maxX, right = facing === 1 ? bounds.maxX : -bounds.minX;
+  if (x + left >= 0 && x + right < WORLD_WIDTH) {
+    const offsets = facing === 1 ? offsetsRight : offsetsLeft, origin = y * WORLD_WIDTH + x;
+    for (let i = 0; i < offsets.length; i++) {
+      const index = origin + offsets[i], owner = cells[index];
+      if ((owner && owner !== slot) || (obstacles[index] & 1)) return false;
+    }
+    return true;
+  }
   for (let i = 0; i < xy.length; i += 2) {
     let column = x + facing * xy[i];
     const row = y + xy[i + 1];
@@ -109,6 +124,20 @@ export function fitsHullAt({ xy, duplicate, bounds }, x, y, facing, grid, slot) 
 export function sweepsHullAt({ sweep, duplicate, bounds }, x, y, facing, grid, slot) {
   if (duplicate || y + bounds.minY < 0 || y + bounds.maxY >= MAX_FLOOR) return false;
   const { cells, obstacles } = grid;
+  const left = facing === 1 ? bounds.minX : -bounds.maxX, right = facing === 1 ? bounds.maxX : -bounds.minX;
+  if (x + left >= 0 && x + right < WORLD_WIDTH) {
+    const origin = y * WORLD_WIDTH + x;
+    for (let i = 0; i < sweep.length; i += 3) {
+      const base = origin + sweep[i + 2] * WORLD_WIDTH;
+      const start = base + (facing === 1 ? sweep[i] : -sweep[i + 1]);
+      const end = base + (facing === 1 ? sweep[i + 1] : -sweep[i]);
+      for (let index = start; index <= end; index++) {
+        const owner = cells[index];
+        if ((owner && owner !== slot) || (obstacles[index] & 2)) return false;
+      }
+    }
+    return true;
+  }
   for (let i = 0; i < sweep.length; i += 3) {
     const row = y + sweep[i + 2];
     for (let j = sweep[i]; j <= sweep[i + 1]; j++) {

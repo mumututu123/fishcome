@@ -670,7 +670,7 @@ export class World {
     let travelDay, starvationDue = false;
     const singles = fishOccupancy.swimmers(this, CONFIG.speed);
     const freeIntents = ambient && this.stableFishRoster;
-    const nearFood = freeIntents && bins.size && fishOccupancy.visibleFoodOwners(edible, Math.max(CONFIG.sightShallow, CONFIG.sightDeep));
+    const nearFood = freeIntents && bins.size && fishOccupancy.ownersNear(edible, Math.max(CONFIG.sightShallow, CONFIG.sightDeep));
     if (freeIntents) planFreeSwimming(fishOccupancy, singles, now);
     for (const [id, cells, pair, swimmer] of motionOrder(this, groups, layout, singles)) {
       let f = pair ? pair.fish : swimmer?.fish ?? fishes[id];
