@@ -141,53 +141,10 @@ export function sweepsHull(hull, fish, grid, pair) {
   return true;
 }
 
-export function fitsHullAt({ xy, duplicate, bounds, offsetsRight, offsetsLeft }, x, y, facing, grid, slot) {
-  if (duplicate || y + bounds.minY < 0 || y + bounds.maxY >= MAX_FLOOR) return false;
-  const { cells, obstacles } = grid;
-  const left = facing === 1 ? bounds.minX : -bounds.maxX, right = facing === 1 ? bounds.maxX : -bounds.minX;
-  if (x + left >= 0 && x + right < WORLD_WIDTH) {
-    const offsets = facing === 1 ? offsetsRight : offsetsLeft, origin = y * WORLD_WIDTH + x;
-    for (let i = 0; i < offsets.length; i++) {
-      const index = origin + offsets[i], owner = cells[index];
-      if ((owner && owner !== slot) || (obstacles[index] & 1)) return false;
-    }
-    return true;
-  }
-  for (let i = 0; i < xy.length; i += 2) {
-    let column = x + facing * xy[i];
-    const row = y + xy[i + 1];
-    if (column < 0 || column >= WORLD_WIDTH) column = ((column % WORLD_WIDTH) + WORLD_WIDTH) % WORLD_WIDTH;
-    const index = row * WORLD_WIDTH + column, owner = cells[index];
-    if ((owner && owner !== slot) || (obstacles[index] & 1)) return false;
-  }
-  return true;
+// Scalar queries use the same cell ownership rules as an unpaired fish.
+export function fitsHullAt(hull, x, y, facing, grid, slot) {
+  return fitsHull(hull, { x, y, facing, id: grid.owners[slot] }, grid);
 }
-
-export function sweepsHullAt({ sweep, duplicate, bounds }, x, y, facing, grid, slot) {
-  if (duplicate || y + bounds.minY < 0 || y + bounds.maxY >= MAX_FLOOR) return false;
-  const { cells, obstacles } = grid;
-  const left = facing === 1 ? bounds.minX : -bounds.maxX, right = facing === 1 ? bounds.maxX : -bounds.minX;
-  if (x + left >= 0 && x + right < WORLD_WIDTH) {
-    const origin = y * WORLD_WIDTH + x;
-    for (let i = 0; i < sweep.length; i += 3) {
-      const base = origin + sweep[i + 2] * WORLD_WIDTH;
-      const start = base + (facing === 1 ? sweep[i] : -sweep[i + 1]);
-      const end = base + (facing === 1 ? sweep[i + 1] : -sweep[i]);
-      for (let index = start; index <= end; index++) {
-        const owner = cells[index];
-        if ((owner && owner !== slot) || (obstacles[index] & 2)) return false;
-      }
-    }
-    return true;
-  }
-  for (let i = 0; i < sweep.length; i += 3) {
-    const row = y + sweep[i + 2];
-    for (let j = sweep[i]; j <= sweep[i + 1]; j++) {
-      let column = x + facing * j;
-      if (column < 0 || column >= WORLD_WIDTH) column = ((column % WORLD_WIDTH) + WORLD_WIDTH) % WORLD_WIDTH;
-      const index = row * WORLD_WIDTH + column, owner = cells[index];
-      if ((owner && owner !== slot) || (obstacles[index] & 2)) return false;
-    }
-  }
-  return true;
+export function sweepsHullAt(hull, x, y, facing, grid, slot) {
+  return sweepsHull(hull, { x, y, facing, id: grid.owners[slot] }, grid);
 }

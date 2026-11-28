@@ -1,6 +1,6 @@
 import { hash } from './world-hash.js';
-export { hash };
-import { BodyLayout, fitsHull, fitsHullAt, sweepsHull, sweepsHullAt } from './motion-hull.js';
+import { advanceSwimming, foodSight } from './swimming.js';
+import { BodyLayout, fitsHull, sweepsHull } from './motion-hull.js';
 import { MovementGrid, foreignOwner } from './movement-grid.js';
 import { CHAT_FLOOR, validChatMessage, buildChatFloor, chatGlyphs } from './chat.js';
 import { applyInputRows, subscribeSimulationChanges, worldEdited, worldRevision } from './simulation-changes.js';
@@ -11,22 +11,20 @@ import { initialLife, initialSources, validInitialOp } from './genesis.js';
 import { fishNameError } from './fish-profile.js';
 import { newEcology, updateEcology, validEcology, mergeEcology } from './ecology.js';
 import { emptyArchiveState, mergeArchiveState, operationValue, archiveDependencies } from './archive.js';
-import { LIFE, newLife, lifeContext, updateLife, idleMotion, swimPattern, spawnPlankton, recordStory, withStoryBatch, mergeLife, validateLife, freshPlankton } from './life.js';
+import { LIFE, newLife, lifeContext, updateLife, spawnPlankton, recordStory, withStoryBatch, mergeLife, validateLife, freshPlankton } from './life.js';
 import { REFERRAL_REWARD, referralError, chooseReferral } from './referral.js';
 import { WORLD_WIDTH, MAX_FLOOR, wrapX, worldKey, deltaX, nearX, makeTerrain, terrainOf, validTerrain, chooseTerrain, floorAt, waterAt } from './geography.js';
-import { canonicalBirthFish, canonicalBirthPath, fishOrigin, activeBreeding, finishBreeding, updateContacts, motionOrder, motionUnits, commitUnit, mergeBreeding, normalizeBreeding, normalizeBirthCells, writeBreedingRecord } from './breeding.js';
+import { canonicalBirthFish, canonicalBirthPath, fishOrigin, activeBreeding, finishBreeding, updateContacts, motionUnits, commitUnit, mergeBreeding, normalizeBreeding, normalizeBirthCells, writeBreedingRecord } from './breeding.js';
 import { newLegends, processLegends, capturedFishIds, retargetCapture, mergeLegends, settleLegendary, validLegends, legendSchedule } from './legends.js';
-import { POPULATION, newPopulation, updatePopulation, mergePopulation, populationScenery, validPopulation, validRocks, mergeRocks, illnessOf, cureFish, killFish } from './population.js';
+import { POPULATION, newPopulation, updatePopulation, mergePopulation, populationScenery, validPopulation, validRocks, mergeRocks, cureFish, killFish } from './population.js';
 import { cancelBreeding } from './breeding.js';
+export { hash };
 export const CONFIG = Object.freeze({ width: WORLD_WIDTH, depth: MAX_FLOOR + 1, shallow: 60, sightShallow: 20, sightDeep: 10, step: 500, speed: 2, foodLife: 300000, hunger: 86400000, initial: 20, offlineLife: 240 * 60 * 60 * 1000 });
 export const MONUMENT = { x: 610, y: CONFIG.depth - 5, rows: ['  ____  ', ' /记忆\\ ', ' | 口 | ', ' |____| ', '________'] };
 // The fixed monument provides one memory entrance, separate from scenery entities.
 export const sceneryCount = data => Object.keys(data.scenes).filter(id => data.ops[id]?.kind === 'scene').length + 1;
 export const EYES = new Set(['0', 'O', 'o', '。', '.', '口']);
 export const NEIGHBORS = [-1, 0, 1].flatMap(x => [-1, 0, 1].map(y => [x, y])).filter(([x, y]) => x || y);
-const AVOID_DIRECTIONS = [[0, -1], [0, 1], [-1, 0], [1, 0]];
-const MOVES = 1, TURNS = 2;
-const DIAGONAL_SWIM = Math.hypot(1, 1);
 export function validateLifeAndLegends(data, sources, latest) {
   if (!validateLife(data.life, sources, latest)) throw new Error('鱼生记录无效');
   if (!validLegends(data.legends, sources, latest)) throw new Error('稀有异象记录无效');
@@ -127,119 +125,6 @@ export function validateDrawing(cells, kind, balance = Infinity) {
   return '';
 }
 export function cellPosition(fish, cell) { return { x: fish.x + fish.facing * cell.x, y: fish.y + cell.y }; }
-function noteMagmaContact(magma, victims, groups, f, cells, pair, x, y, facing) {
-  if (!pair) {
-    for (const cell of cells) if (magma.has(key(x + facing * cell.x, y + cell.y))) victims.add(f.id);
-    return;
-  }
-  for (const [index, member] of pair.members.entries()) {
-    const offset = pair.offsets[index];
-    const memberX = wrapX(x + facing * offset.x), memberY = y + offset.y, memberFacing = facing * offset.facing;
-    for (const cell of groups.get(member.id) || []) if (magma.has(key(memberX + memberFacing * cell.x, memberY + cell.y))) victims.add(member.id);
-  }
-}
-function positionFits(hull, x, y, facing, grid, slot, legacy) {
-  if (!legacy) return fitsHullAt(hull, x, y, facing, grid, slot);
-  const { world, id, cells, scenery, foodPositions } = legacy;
-  return world.canOccupy({ id, x, y, facing }, cells, scenery, grid, foodPositions, hull);
-}
-function canFlip(hull, x, y, facing, grid, slot, legacy) {
-  if (!legacy) return sweepsHullAt(hull, x, y, facing, grid, slot);
-  const { world, id, cells, turningObstacles, center } = legacy;
-  return world.turn({ id, x, y, facing }, cells, turningObstacles, grid, center, hull);
-}
-function probeDirection(hull, grid, slot, legacy, x, y, facing, turnX, dx, dy) {
-  const turns = dx && dx !== facing && canFlip(hull, x, y, facing, grid, slot, legacy);
-  const moves = positionFits(hull, (turns ? turnX : x) + dx, y + dy, turns ? -facing : facing, grid, slot, legacy);
-  return (turns ? TURNS : 0) | (moves ? MOVES : 0);
-}
-// Hungry swimmers sharing a creation-time offset turn over their intentions
-// together. Eating or changing a fish replaces the roster supplied by the grid.
-function planFreeSwimming(grid, singles, now) {
-  let plan = grid.intentPlan;
-  if (!plan || plan.singles !== singles || now < plan.last || now >= plan.fedDeadline) {
-    const byResidue = new Map();
-    plan = grid.intentPlan = { singles, last: now, fedDeadline: Infinity, next: -Infinity, buckets: [] };
-    for (const entry of singles) {
-      const swimmer = entry[3], fish = swimmer?.fish;
-      if (!fish) continue;
-      swimmer.intended = undefined;
-      if (!Number.isSafeInteger(fish.created) || !Number.isSafeInteger(now - fish.created) || !Number.isFinite(fish.lastFed)) continue;
-      if (now - fish.lastFed < CONFIG.hunger) {
-        plan.fedDeadline = Math.min(plan.fedDeadline, fish.lastFed + CONFIG.hunger);
-        continue;
-      }
-      const residue = ((fish.created % LIFE.wanderPeriod) + LIFE.wanderPeriod) % LIFE.wanderPeriod;
-      let bucket = byResidue.get(residue);
-      if (!bucket) {
-        bucket = { swimmers: [], due: -Infinity, residue };
-        byResidue.set(residue, bucket);
-        plan.buckets.push(bucket);
-      }
-      bucket.swimmers.push(swimmer);
-    }
-  }
-  if (now >= plan.next) {
-    plan.next = Infinity;
-    for (const bucket of plan.buckets) {
-      if (now >= bucket.due) {
-        for (const swimmer of bucket.swimmers) swimmer.intended = swimPattern(swimmer.fish, now);
-        bucket.due = (Math.floor((now - bucket.residue) / LIFE.wanderPeriod) + 1) * LIFE.wanderPeriod + bucket.residue;
-      }
-      plan.next = Math.min(plan.next, bucket.due);
-    }
-  }
-  plan.last = now;
-}
-function foodSight(edible) {
-  if (!edible.length) return null;
-  const bins = new Map(), views = new Map(), width = CONFIG.width / 10;
-  for (const food of edible) {
-    const bin = key(Math.floor(wrapX(food.x) / 10), Math.floor(food.y / 10));
-    if (!bins.has(bin)) bins.set(bin, []);
-    bins.get(bin).push(food);
-  }
-  // Eyes in the same ten-cell square visit the same bins in the same order.
-  // The exact distance from each eye is still checked before choosing a meal.
-  return (x, y, radius) => {
-    const bx = Math.floor(x / 10), by = Math.floor(y / 10), bin = key(bx, by);
-    let view = views.get(bin);
-    if (view) return view;
-    view = [];
-    const reach = radius / 10;
-    for (let i = bx - reach; i <= bx + reach; i++) for (let j = by - reach; j <= by + reach; j++) {
-      const foods = bins.get(key((i % width + width) % width, j));
-      if (foods) for (const food of foods) view.push(food);
-    }
-    views.set(bin, view);
-    return view;
-  };
-}
-function chooseDirection(world, id, fish, cells, pair, center, now, ambient, foodsNear, canEat, planned) {
-  const midX = fish.x + fish.facing * (center.minX + center.maxX) / 2, midY = fish.y + (center.minY + center.maxY) / 2;
-  if (foodsNear && (pair ? pair.members.some(member => canEat(member.id)) : canEat(id))) {
-    let best, distance, needsRemedy;
-    for (const eye of cells) if (EYES.has(eye.ch)) {
-      const p = cellPosition(fish, eye), radius = sightRadius(p.y);
-      for (const food of foodsNear(p.x, p.y, radius)) {
-        if (food === best || Math.max(Math.abs(deltaX(food.x, p.x)), Math.abs(food.y - p.y)) > radius) continue;
-        const nextDistance = Math.abs(deltaX(food.x, midX)) + Math.abs(food.y - midY);
-        if (best) {
-          needsRemedy ??= pair ? pair.members.some(member => illnessOf(world.data, member.id)) : !!illnessOf(world.data, id);
-          const rank = (needsRemedy ? Number(best.ch === POPULATION.remedy) - Number(food.ch === POPULATION.remedy) : 0) ||
-            nextDistance - distance || food.id.localeCompare(best.id);
-          if (rank >= 0) continue;
-        }
-        best = food; distance = nextDistance;
-      }
-    }
-    if (best) return { dx: Math.sign(deltaX(best.x, midX)), dy: Math.sign(best.y - midY) };
-  }
-  if (planned) return planned;
-  if (ambient) return idleMotion(world, fish, now, ambient, { x: midX, y: midY });
-  const phase = Math.floor((now - fish.created) / LIFE.wanderPeriod), r = hash(`${id}:${phase}`);
-  return { dx: r % 3 - 1, dy: Math.floor(r / 3) % 3 - 1 };
-}
 function ownersAt(occupants, x, y) {
   return occupants instanceof MovementGrid ? occupants.get(x, y) : occupants.get(key(x, y));
 }
@@ -746,126 +631,8 @@ export class World {
     const foodsNear = foodSight(edible);
     fishOccupancy.prepareMovement(this.data, scenery, foodPositions, seaweed);
     const layout = fishOccupancy.layout;
-    const { fishes, breeding } = this.data, hasMagma = magma.size > 0;
-    const avoidancePhase = Math.floor(now / 12000);
-    let travelDay, starvationDue = false;
-    const singles = fishOccupancy.swimmers(this, CONFIG.speed);
-    const freeIntents = ambient && this.stableFishRoster;
-    const nearFood = freeIntents && foodsNear && fishOccupancy.ownersNear(edible, Math.max(CONFIG.sightShallow, CONFIG.sightDeep));
-    if (freeIntents) planFreeSwimming(fishOccupancy, singles, now);
-    const ordered = motionOrder(this, groups, layout, singles), batch = this.beginSwimBatch?.();
-    const hasCaptives = captured.size > 0, hasWaiting = waitingToEat.size > 0;
-    const avoidanceText = String(avoidancePhase);
-    const avoidance = AVOID_DIRECTIONS.map((_, seed) => hash(avoidanceText, seed) % AVOID_DIRECTIONS.length);
-    for (let index = 0; index < ordered.length; index++) {
-      const entry = ordered[index], id = entry[0], cells = entry[1], pair = entry[2], swimmer = entry[3];
-      let f = pair ? pair.fish : swimmer?.fish ?? fishes[id];
-      if (!starvationDue) starvationDue = pair ? pair.members.some(member => now >= member.hungerAt) : !!f && now >= f.hungerAt;
-      if (!f || !cells.length || (hasCaptives && (pair ? pair.members.some(member => captured.has(member.id)) : captured.has(id)))) continue;
-      const ordinal = swimmer?.ordinal;
-      if (ordinal === undefined && !pair && this.movingFish) f = this.movingFish(f);
-      const waiting = hasWaiting && (pair ? pair.members.some(member => waitingToEat.has(member.id)) : waitingToEat.has(id));
-      const beforeX = f.x, beforeY = f.y, beforeFacing = f.facing;
-      let x = beforeX, y = beforeY, facing = beforeFacing, cx = f.cx, cy = f.cy;
-      let movedX = 0, movedY = 0, hull, slot;
-      if (!waiting) {
-        hull = swimmer ? swimmer.hull : layout.hull(cells);
-        if (!Number.isSafeInteger(x) || !Number.isSafeInteger(y) || Math.abs(facing) !== 1 || Math.abs(x) > WORLD_WIDTH * 2) hull = null;
-        const center = hull?.bounds || bounds(cells);
-        slot = hull && !pair && breeding[id]?.status !== 'active' ? swimmer?.slot ?? fishOccupancy.slots.get(id) : undefined;
-        const legacy = slot === undefined ? { world: this, id, cells, scenery, foodPositions, turningObstacles, center } : null;
-        const sight = foodsNear && (!nearFood || swimmer?.slot === undefined || nearFood[swimmer.slot]) ? foodsNear : null;
-        const planned = freeIntents && now - f.lastFed >= CONFIG.hunger && swimmer?.intended;
-        const intended = !sight && planned || chooseDirection(this, id, f, cells, pair, center, now, ambient, sight, canEat, planned);
-        let dx = intended.dx, dy = intended.dy;
-        if (pair) for (const member of pair.members) fishOccupancy.update(member, groups.get(member.id) || [], true);
-        const turnX = beforeX + beforeFacing * (center.minX + center.maxX);
-        let horizontal = -1, vertical = -1;
-        if (ambient && !pair && (dx || dy)) {
-          if (dx) horizontal = probeDirection(hull, fishOccupancy, slot, legacy, beforeX, beforeY, beforeFacing, turnX, dx, 0);
-          if (horizontal === -1 || !(horizontal & MOVES)) {
-            if (dy) vertical = probeDirection(hull, fishOccupancy, slot, legacy, beforeX, beforeY, beforeFacing, turnX, 0, dy);
-            if (vertical === -1 || !(vertical & MOVES)) {
-              // With four directions only the low two bits of the hash can affect the offset.
-              const offset = swimmer ? avoidance[swimmer.avoidanceSeed ??= hash('avoid:' + id + ':') & 3]
-                : hash('avoid:' + id + ':' + avoidanceText) % AVOID_DIRECTIONS.length;
-              for (let i = 0; i < AVOID_DIRECTIONS.length; i++) {
-                const direction = AVOID_DIRECTIONS[(offset + i) % AVOID_DIRECTIONS.length];
-                const alongX = direction[0], alongY = direction[1];
-                if (alongX && alongX === dx && horizontal !== -1 || alongY && alongY === dy && vertical !== -1) continue;
-                const candidate = probeDirection(hull, fishOccupancy, slot, legacy, beforeX, beforeY, beforeFacing, turnX, alongX, alongY);
-                if (!(candidate & MOVES)) continue;
-                dx = alongX; dy = alongY;
-                horizontal = dx ? candidate : -1;
-                vertical = dy ? candidate : -1;
-                break;
-              }
-            }
-          }
-        }
-        if (dx && dx !== beforeFacing) {
-          if (horizontal === -1 ? canFlip(hull, beforeX, beforeY, beforeFacing, fishOccupancy, slot, legacy) : horizontal & TURNS) {
-            x = turnX; facing = -beforeFacing;
-          }
-          if (hasMagma) noteMagmaContact(magma, magmaVictims, groups, f, cells, pair, x, y, facing);
-        }
-        cx = dx ? Math.min(2, (cx || 0) + (hull && swimmer ? swimmer.speedX : CONFIG.speed * center.width / cells.length) * dt) : 0;
-        cy = dy ? Math.min(2, (cy || 0) + (hull && swimmer ? swimmer.speedY : CONFIG.speed * center.height / cells.length) * dt) : 0;
-        if (cx >= 1 && dx) {
-          if (horizontal === -1 ? positionFits(hull, x + dx, y, facing, fishOccupancy, slot, legacy) : horizontal & MOVES) {
-            x += dx; movedX = dx;
-          }
-          cx--;
-        }
-        if (movedX && hasMagma) noteMagmaContact(magma, magmaVictims, groups, f, cells, pair, x, y, facing);
-        if (cy >= 1 && dy) {
-          const moves = vertical !== -1 && x === beforeX && facing === beforeFacing ? vertical & MOVES
-            : positionFits(hull, x, y + dy, facing, fishOccupancy, slot, legacy);
-          if (moves) { y += dy; movedY = dy; }
-          cy--;
-        }
-        f.y = y; f.facing = facing; f.cx = cx; f.cy = cy;
-      }
-      if (pair) {
-        f.x = x;
-        commitUnit(pair, now);
-        if (!waiting) for (const member of pair.members) fishOccupancy.update(member, groups.get(member.id) || []);
-      } else {
-        x = wrapX(x); f.x = x; f.posAt = now;
-        if (!waiting && (beforeX !== x || beforeY !== y || beforeFacing !== facing)) {
-          fishOccupancy.moveFish(f, cells, beforeX, beforeY, beforeFacing, hull, slot);
-          if (swims && beforeFacing === facing && (movedX || movedY)) (paths[(movedY + 1) * 3 + movedX + 1] ||= []).push(id);
-        }
-      }
-      if (ordinal !== undefined) {
-        if (Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(facing) && Number.isFinite(cx) && Number.isFinite(cy)) {
-          const offset = batch.poses.length * 5;
-          batch.poseIndex[ordinal] = batch.poses.push(ordinal);
-          batch.motion[offset] = x;
-          batch.motion[offset + 1] = y;
-          batch.motion[offset + 2] = facing;
-          batch.motion[offset + 3] = cx;
-          batch.motion[offset + 4] = cy;
-        } else this.movingFish(f);
-      }
-      if (waiting) continue;
-      if (hasMagma) noteMagmaContact(magma, magmaVictims, groups, f, cells, pair, x, y, facing);
-      if (movedX || movedY) {
-        travelDay ??= shanghaiDay(now);
-        const distance = movedX && movedY ? DIAGONAL_SWIM : 1;
-        if (pair) for (const member of pair.members) this.recordMovement(member.id, distance, now, travelDay);
-        else {
-          const days = ordinal === undefined ? undefined : batch.daysByOrdinal[ordinal] ?? batch.readDays(id, ordinal);
-          if (days) {
-            const distanceToday = (days[travelDay] || 0) + distance;
-            days[travelDay] = distanceToday;
-            batch.distances[batch.travel.length] = distanceToday;
-            batch.tripIndex[ordinal] = batch.travel.push(ordinal);
-          } else this.recordMovement(id, distance, now, travelDay);
-        }
-      }
-    }
-    if (batch) this.completeSwimBatch(batch, travelDay);
+    const starvationDue = advanceSwimming(this, now, dt, fishOccupancy, groups, ambient, captured, waitingToEat, foodsNear, canEat,
+      scenery, foodPositions, turningObstacles, edible, magma, magmaVictims, swims, paths);
     this.retainMovementGrid(groups, fishOccupancy);
     let bodyChanged = magmaVictims.size > 0;
     for (const id of magmaVictims) killFish(this, id, now, 'magma', changeCell, groups);
