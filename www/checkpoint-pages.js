@@ -200,6 +200,28 @@ function sameRecord(a, b) {
   return keys.length === other.length && keys.every((key, n) => key === other[n] && sameRecord(a[key], b[key]));
 }
 
+function patchSavedPage(ids, previous, changes) {
+  if (previous?.length === ids.length && ids.every((id, index) => id === previous[index][0])) {
+    let changed = false;
+    for (const pair of previous) {
+      const id = pair[0];
+      if (!changes.has(id)) continue;
+      const value = changes.get(id);
+      if (!sameRecord(pair[1], value)) {
+        pair[1] = value;
+        changed = true;
+      }
+    }
+    return changed ? previous : null;
+  }
+  const saved = new Map(previous);
+  return ids.map(id => {
+    if (changes.has(id)) return [id, changes.get(id)];
+    if (!saved.has(id)) throw new Error('本地存档缺少原始记录');
+    return [id, saved.get(id)];
+  });
+}
+
 function append(table, id) {
   let n = table.pages.length - 1;
   if (n < 0 || table.pages[n].length >= table.capacity) { n++; table.pages.push([]); }
@@ -298,13 +320,8 @@ function* writePages(store, head, capture, dirty, reuse, incremental) {
       let rows;
       if (changes) {
         const previous = yield store.get(key);
-        const saved = new Map(previous);
-        rows = table.pages[number].map(id => {
-          if (changes.has(id)) return [id, changes.get(id)];
-          if (!saved.has(id)) throw new Error('本地存档缺少原始记录');
-          return [id, saved.get(id)];
-        });
-        if (sameRecord(rows, previous)) continue;
+        rows = patchSavedPage(table.pages[number], previous, changes);
+        if (!rows) continue;
       } else rows = table.pages[number].map(id => [id, lookup(capture, field, source, id)]);
       if (!touched && prior && number < prior.pages.length &&
           (!prior.samples?.[number] || sameRecord(rows[0], prior.samples[number]))) {

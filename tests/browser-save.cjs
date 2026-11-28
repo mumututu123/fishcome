@@ -336,6 +336,16 @@ async function detachedReplicaCheckpoint(page) {
     const last = await get('checkpoint', { observeCheckpoint: false });
     if (last.picture.tick !== 3 || (await get('known'))[0] !== 3 ||
         JSON.stringify(last.world) !== JSON.stringify(world)) throw new Error('重试后的记录或插入顺序错误');
+    edit({ ops: {} }, {}, ['c100', 'c500'], () => {
+      world.chars.c500 = structuredClone(world.chars.c500);
+    });
+    let charWrites = 0;
+    IDBObjectStore.prototype.put = function (value, key) {
+      if (Array.isArray(key) && key[1] === 'chars') charWrites++;
+      return put.call(this, value, key);
+    };
+    try { await save(); } finally { IDBObjectStore.prototype.put = put; }
+    if (charWrites) throw new Error('重复合流相同内容重写了字符页');
   });
 }
 
