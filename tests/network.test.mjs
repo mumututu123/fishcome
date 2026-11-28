@@ -105,12 +105,14 @@ test('直达实时帧验签后才合流，缺少基准、超大或未协商的�
   const via = { node: sender.node, packets: new Map(), replicaSignedFrames: true, replicaFrames: true, replicaRows: true };
   receiver.directControl = async (_, kind, receipt) => { assert.equal(kind, 'replicaReceipt'); receipts.push(receipt); };
   t.after(() => receiver.replicas.stop());
-  const world = { tick: 500, fishes: { fish: { id: 'fish', x: 1 } }, chars: {}, travel: {} };
+  const world = { tick: 500, fishes: { fish: { id: 'fish', x: 1 } }, chars: {}, travel: {}, archives: { chunks: { old: {} } } };
   const base = replicaRowBase(crypto.randomUUID(), world, true);
+  sender.recentArchivePacks = () => new Map([['old', '已有'], ['new', '新包'], ['unpublished', '尚未发布'], ['large', 'a'.repeat(65537)]]);
   for (const notes of ['', '海'.repeat(8192)]) {
-    const next = { delta: true, fromTick: 500, world: { ...world, tick: 1000, fishes: { fish: { id: 'fish', x: 2 } }, notes } };
+    const next = { delta: true, fromTick: 500, world: { ...world, tick: 1000, fishes: { fish: { id: 'fish', x: 2 } }, notes,
+      archives: { chunks: { ...world.archives.chunks, new: {}, large: {} } } } };
     const body = encodeReplicaRowDelta(next, base, true), id = crypto.randomUUID();
-    const wire = await sender.encodeLiveFrame(id, body);
+    const wire = await sender.encodeLiveFrame(id, body, base.archives);
     assert.equal(wire[0], notes ? 3 : 2);
     await sender.send(dest, id, wire, true);
     assert.equal(frames.length, 1);
@@ -127,9 +129,9 @@ test('直达实时帧验签后才合流，缺少基准、超大或未协商的�
     assert.equal(received.length, before);
     receiver.replicas.rowsReceived.set(via, base);
     const retry = crypto.randomUUID();
-    await sender.send(dest, retry, await sender.encodeLiveFrame(retry, body), true);
+    await sender.send(dest, retry, await sender.encodeLiveFrame(retry, body, base.archives), true);
     await receiver.receive(via, frames.pop());
-    assert.deepEqual(received.at(-1), next);
+    assert.deepEqual(received.at(-1), { ...next, archivePacks: { new: '新包' } });
     assert.deepEqual(receipts.at(-1), { id: retry, index: 0, next: 1 });
   }
   assert.equal(await sender.encodeLiveFrame(crypto.randomUUID(), { text: 'a'.repeat(LIVE_FRAME_UNITS) }), undefined);

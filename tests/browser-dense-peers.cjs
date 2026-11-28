@@ -195,8 +195,8 @@ Network.prototype.encode = async function (message) {
   return encoded;
 };
 const originalEncodeLiveFrame = Network.prototype.encodeLiveFrame;
-Network.prototype.encodeLiveFrame = async function (id, body) {
-  const wire = await originalEncodeLiveFrame.call(this, id, body);
+Network.prototype.encodeLiveFrame = async function (...args) {
+  const wire = await originalEncodeLiveFrame.apply(this, args);
   if (wire) testData.liveBytes.push({ at: Date.now(), directFrame: true, bytes: wire.length + Math.ceil(wire.length / 16000) * 44 });
   return wire;
 };

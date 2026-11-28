@@ -228,7 +228,7 @@ export function replicaRowBase(id, world, frames = false, previous) {
   // retain its last confirmed journey only while it occurs in the fish roster.
   const indices = poses?.indices ?? confirmedRosters.get(world) ?? new Map(rows[0].map(([fish], i) => [fish, i]));
   const travel = new ConfirmedTravel(indices, trips || world.travel, previous?.travel);
-  return { id, tick: world.tick, rows, tables, travel, roots: world.roots, terrain: world.terrain,
+  return { id, tick: world.tick, rows, tables, travel, roots: world.roots, terrain: world.terrain, archives: world.archives?.chunks,
     get fishIds() { return orderedFishIds(indices); },
     get fishTable() { return poses ? poses.table() : tables[0]; } };
 }

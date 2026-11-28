@@ -258,7 +258,7 @@ export class ReplicaTransfers {
     const id = crypto.randomUUID();
     let index = 0;
     const frame = peer.replicaFrames && body.frameRows === true;
-    const direct = frame && peer.replicaSignedFrames && await this.network.encodeLiveFrame(id, body);
+    const direct = frame && peer.replicaSignedFrames && await this.network.encodeLiveFrame(id, body, this.rowsSent.get(peer)?.archives);
     let sendLast;
     if (direct) {
       sendLast = () => this.network.send(peer, id, direct, true);

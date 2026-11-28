@@ -167,7 +167,7 @@ function verifyArchiveBirthSources(chunks, sources) {
   }
 }
 
-export async function loadReplicaArchives(data, target, load, { current = {}, persist, beforeIngest, ingest, diagnostics } = {}) {
+export async function loadReplicaArchives(data, target, load, { current = {}, persist, beforeIngest, ingest, diagnostics, archivePacks } = {}) {
   if (!validArchiveState(data.archives)) throw new Error('归档目录无效');
   const chunks = [];
   for (const [id, manifest] of Object.entries(data.archives?.chunks || {})) {
@@ -175,7 +175,7 @@ export async function loadReplicaArchives(data, target, load, { current = {}, pe
     if (existing && JSON.stringify(existing) !== JSON.stringify(manifest)) throw new Error('已有归档目录不可覆盖');
     let roots = target.rootsByChunk.get(id);
     if (!existing) {
-      const encoded = await load(id);
+      const encoded = archivePacks && Object.hasOwn(archivePacks, id) ? archivePacks[id] : await load(id);
       if (!encoded) throw Object.assign(new Error('备份或本地记忆缺少归档文件'), { code: 'archive_missing' });
       const raw = await decodeArchive(encoded, manifest);
       chunks.push({ encoded, manifest, raw });

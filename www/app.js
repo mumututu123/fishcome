@@ -150,7 +150,7 @@ async function requestArchive(id, peer) {
     throw new Error('缺少历史归档，等待持有记忆的伙伴重新接入');
   })(); archiveRequests.set(id, task); try { return await task; } finally { archiveRequests.delete(id); }
 }
-async function ensureArchives(data, peer, bundle, target = archiveStore, current = {}, beforeIngest) {
+async function ensureArchives(data, peer, bundle, target = archiveStore, current = {}, beforeIngest, archivePacks) {
   const load = async id => bundle ? bundle[id] : await get('archive:' + id) || (peer && await requestArchive(id, peer));
   const persist = peer && (chunks => putMany(chunks.map(chunk => ['archive:' + chunk.manifest.id, chunk.encoded])));
   const ingest = async chunks => {
@@ -164,7 +164,7 @@ async function ensureArchives(data, peer, bundle, target = archiveStore, current
       }
     }
   };
-  return loadReplicaArchives(data, target, load, { current, persist, diagnostics, beforeIngest, ingest });
+  return loadReplicaArchives(data, target, load, { current, persist, diagnostics, beforeIngest, ingest, archivePacks });
 }
 async function archiveWorld(now = Date.now()) {
   if (updateFrozen || archiveScanning || replacingCheckpoint || !amLeader() || now - archiveCheckAt < 60000) return;
@@ -229,7 +229,7 @@ async function mergeVerifiedWorld(data, peer, context, { local = false, worldMes
     const options = { context, current, diagnostics };
     if (local) incoming = await verifyLocalCheckpoint(data, sources, store, options);
     else checkedRules = await verifyReplica(data, sources, store, { ...options, mergeCut: delta && current === target.data });
-  });
+  }, worldMessage?.body.archivePacks);
   // Overlapping archive rows have a canonical winner after ingestion.
   if (revision !== store.revision) archived = await store.dependencies(incoming, target.data);
   const commit = () => {
@@ -942,7 +942,7 @@ async function start() {
   network = new Network(identity, meta, onMessage, networkChange, (error, peer) => {
     diagnostics.record('warn', 'network', `已拒绝来自 ${peer?.node || 'unknown'} 的消息：${error?.message || error}`);
     if ($('diagnosticsDialog').open) renderDiagnosticsLogs();
-  }); await network.start(displayNick(identity.nick)); members.set(network.node, member());
+  }, () => archiveStore.packs); await network.start(displayNick(identity.nick)); members.set(network.node, member());
   $('myUrl').value = meta.url;
   creator = new Creator(placement, balance, size => defaultFishName(identity.nick, world.myFishes(identity.actor).length + 1, size));
   syncIncomeSerial(); renderChat(); await saveHandoff({ startup: true });

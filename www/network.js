@@ -1,6 +1,6 @@
 import { signer, verifyEnvelope, readSignedFrame } from './storage.js';
 import { normalizeInvite, decodeInvite } from './invite.js';
-import { changesSince, coalesceWorld, fitsLegacyEnvelope, LIVE_FRAME_UNITS, ReplicaTransfers } from './replica-stream.js';
+import { changesSince, coalesceWorld, fitsLegacyEnvelope, LIVE_FRAME_UNITS, PAGE_UNITS, ReplicaTransfers } from './replica-stream.js';
 import { supportsPoseBytes } from './replica-row-delta.js';
 const CHUNK = 16000, MAX_PEERS = 8, MAX_RAW = 32 * 1024 * 1024, encoder = new TextEncoder(), decoder = new TextDecoder();
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -26,7 +26,7 @@ export async function lanDescription(description, fromUrl) {
 }
 async function inflateBounded(bytes, limit = MAX_RAW) { const reader = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip')).getReader(), chunks = []; let size = 0; while (true) { const { done, value } = await reader.read(); if (done) break; size += value.length; if (size > limit) { await reader.cancel(); throw new Error('解压数据过大'); } chunks.push(value); } const result = new Uint8Array(size); let offset = 0; for (const chunk of chunks) { result.set(chunk, offset); offset += chunk.length; } return result; }
 export class Network {
-  constructor(identity, meta, onMessage, onChange, onReject) { this.identity = identity; this.meta = meta; this.node = identity.actor.slice(0, 16) + '-' + crypto.randomUUID().replace(/-/g, '').slice(0, 19); this.onMessage = onMessage; this.onChange = onChange; this.onReject = onReject; this.replicas = new ReplicaTransfers(this); this.lastLegacyBeat = 0; this.worldMembers = new Map(); this.connections = new Map(); this.seen = new Map(); this.pending = new Map(); this.stats = { sent: 0, received: 0, rejected: 0 }; }
+  constructor(identity, meta, onMessage, onChange, onReject, recentArchivePacks) { this.recentArchivePacks = recentArchivePacks; this.identity = identity; this.meta = meta; this.node = identity.actor.slice(0, 16) + '-' + crypto.randomUUID().replace(/-/g, '').slice(0, 19); this.onMessage = onMessage; this.onChange = onChange; this.onReject = onReject; this.replicas = new ReplicaTransfers(this); this.lastLegacyBeat = 0; this.worldMembers = new Map(); this.connections = new Map(); this.seen = new Map(); this.pending = new Map(); this.stats = { sent: 0, received: 0, rejected: 0 }; }
   async local(route, payload = {}) { const response = await fetch('/local/' + route, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: this.meta.token, node: this.node, ...payload }) }); const result = await response.json(); if (!response.ok) throw new Error(result.error || '本地配对通道不可用'); return result; }
   async start(nick) { this.sign = await signer(this.identity); await this.local('register', { nick, actor: this.identity.actor }); this.events = new EventSource(`/local/events?node=${this.node}&token=${encodeURIComponent(this.meta.token)}`); this.events.onmessage = e => { try { this.signal(JSON.parse(e.data)).catch(error => this.onChange(error.message)); } catch { } }; }
   live() { return [...this.connections.values()].filter(p => p.dc?.readyState === 'open'); }
@@ -104,7 +104,16 @@ export class Network {
     for (const part of parts) { result.set(part, offset); offset += part.length; }
     return result;
   }
-  async encodeLiveFrame(id, body) {
+  async encodeLiveFrame(id, body, knownArchives) {
+    if (knownArchives && this.recentArchivePacks) {
+      let left = PAGE_UNITS, archivePacks;
+      for (const [hash, encoded] of this.recentArchivePacks()) {
+        if (encoded.length > left || Object.hasOwn(knownArchives, hash) || !Object.hasOwn(body.world.archives?.chunks ?? {}, hash)) continue;
+        (archivePacks ??= {})[hash] = encoded;
+        left -= encoded.length;
+      }
+      if (archivePacks) body = { ...body, archivePacks };
+    }
     const message = { id, kind: 'replicaFrame', from: this.node, actor: this.identity.actor, key: this.identity.pub, body };
     const text = JSON.stringify(message);
     if (text.length > LIVE_FRAME_UNITS) return;
