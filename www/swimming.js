@@ -131,9 +131,11 @@ export function advanceSwimming(world, now, dt, grid, groups, ambient, captured,
   const freeIntents = ambient && world.stableFishRoster;
   const nearFood = freeIntents && foodsNear && grid.ownersNear(edible, Math.max(CONFIG.sightShallow, CONFIG.sightDeep));
   if (freeIntents) planFreeSwimming(grid, singles, now);
-  const ordered = motionOrder(world, groups, layout, singles), batch = world.beginSwimBatch?.();
+  const ordered = motionOrder(world, groups, layout, singles);
+  const prior = world.currentSwimColumns?.(), batch = world.beginSwimBatch?.();
   const packed = Number.isFinite(dt) && ambient && batch && ordered.length && !magma.size && !grid.overlapped
     ? packedGrid(grid, ordered.length) : null;
+  const previous = packed && prior?.grid === packed ? prior.index : undefined;
   const phase = String(Math.floor(now / 12000));
   const avoidance = [0, 1, 2, 3].map(seed => hash(phase, seed) & 3);
   let start = 0, count = 0, travelDay;
@@ -144,11 +146,12 @@ export function advanceSwimming(world, now, dt, grid, groups, ambient, captured,
       if (Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(facing) && Number.isFinite(cx) && Number.isFinite(cy)) {
         const offset = batch.poses.length * 5;
         batch.poseIndex[ordinal] = batch.poses.push(ordinal);
-        batch.motion[offset] = x;
-        batch.motion[offset + 1] = y;
-        batch.motion[offset + 2] = facing;
-        batch.motion[offset + 3] = cx;
-        batch.motion[offset + 4] = cy;
+        const data = packed ? packed.doubles : batch.motion, p = (packed ? packed.poseOffset / 8 : 0) + offset;
+        data[p] = x;
+        data[p + 1] = y;
+        data[p + 2] = facing;
+        data[p + 3] = cx;
+        data[p + 4] = cy;
       } else world.movingFish(fish);
     }
   }
@@ -171,15 +174,15 @@ export function advanceSwimming(world, now, dt, grid, groups, ambient, captured,
   }
   function flush() {
     if (!count) return;
-    packed.advance(count, dt);
-    const poses = packed.doubles, trails = packed.words, base = packed.poseOffset / 8;
-    batch.motion.set(poses.subarray(base, base + count * 5), batch.poses.length * 5);
+    const first = batch.poses.length;
+    packed.advance(count, dt, first);
+    const poses = packed.doubles, trails = packed.words, base = packed.poseOffset / 8 + first * 5;
     for (let i = 0; i < count; i++) {
       const entry = ordered[start + i], swimmer = entry[3], f = swimmer.fish;
       const p = base + i * 5, oldFacing = f.facing;
       f.x = poses[p]; f.y = poses[p + 1]; f.facing = poses[p + 2]; f.cx = poses[p + 3]; f.cy = poses[p + 4]; f.posAt = now;
       batch.poseIndex[swimmer.ordinal] = batch.poses.push(swimmer.ordinal);
-      recordTrail(entry[0], null, swimmer.ordinal, trails[packed.trailsOffset / 4 + i], f.facing, oldFacing);
+      recordTrail(entry[0], null, swimmer.ordinal, trails[packed.trailsOffset / 4 + first + i], f.facing, oldFacing);
     }
     count = 0;
   }
@@ -212,7 +215,7 @@ export function advanceSwimming(world, now, dt, grid, groups, ambient, captured,
       const avoid = swimmer ? avoidance[swimmer.avoidanceSeed ??= hash('avoid:' + id + ':') & 3] : hash('avoid:' + id + ':' + phase) & 3;
       if (bulk) {
         if (!count) start = index;
-        packed.put(count++, swimmer, direction, avoid);
+        packed.put(batch.poses.length + count++, swimmer, direction, avoid, previous);
         continue;
       }
       if (pair) for (const member of pair.members) grid.update(member, groups.get(member.id) || [], true);
@@ -244,5 +247,9 @@ export function advanceSwimming(world, now, dt, grid, groups, ambient, captured,
     recordTrail(id, pair, ordinal, trail, f.facing, oldFacing);
   }
   flush();
-  if (batch) world.completeSwimBatch(batch, travelDay);
+  if (packed) {
+    const base = packed.poseOffset / 8;
+    batch.motion.set(packed.doubles.subarray(base, base + batch.poses.length * 5));
+  }
+  if (batch) world.completeSwimBatch(batch, travelDay, packed);
 }

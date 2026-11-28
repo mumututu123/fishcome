@@ -154,7 +154,7 @@ function schoolGeometry(world, layout, roster, previous) {
     if (!center || center.fish !== fish) {
       const box = layout.hull(cells)?.bounds ?? bounds(cells);
       const point = { id, x: 0, y: 0, halfWidth: (box.maxX - box.minX) / 2, halfHeight: (box.maxY - box.minY) / 2 };
-      center = { fish, point, localX: (box.minX + box.maxX) / 2, localY: (box.minY + box.maxY) / 2 };
+      center = { fish, point, ordinal: world.swimOrdinal?.(id), localX: (box.minX + box.maxX) / 2, localY: (box.minY + box.maxY) / 2 };
       centerByBody.set(cells, center);
     }
     if (subset && !previous.points.has(id)) subset = false;
@@ -215,9 +215,17 @@ export function lifeContext(world, now, scenery, groups, sharedLayout) {
   const nearScenery = sceneryPoints.length ? indexPoints(sceneryPoints) : null;
   const nearObstacle = geometry.obstacles ??= new Uint8Array(ordered.length);
   const buckets = schoolBuckets(geometry);
-  for (const { fish, point: p, localX, localY } of geometry.centers) {
-    p.x = wrapX(fish.x + fish.facing * localX);
-    p.y = fish.y + localY;
+  const poses = world.currentSwimColumns?.(), data = poses?.grid.doubles, base = poses?.grid.poseOffset / 8;
+  for (const { fish, point: p, ordinal, localX, localY } of geometry.centers) {
+    const row = poses?.index[ordinal];
+    if (row) {
+      const i = base + (row - 1) * 5;
+      p.x = wrapX(data[i] + data[i + 2] * localX);
+      p.y = data[i + 1] + localY;
+    } else {
+      p.x = wrapX(fish.x + fish.facing * localX);
+      p.y = fish.y + localY;
+    }
     placeSchoolCenter(buckets, p);
     nearObstacle[p.slot] = nearWalls[Math.floor(p.y / sectorSize)]?.[Math.floor(p.x / sectorSize)] || 0;
     if (!nearScenery || !nearObstacle[p.slot]) continue;

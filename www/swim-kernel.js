@@ -72,6 +72,8 @@ class PackedGrid {
       this.trailsOffset = this.inputOffset + this.capacity * inputBytes;
       this.shapeEnd = this.trailsOffset + this.capacity * 4;
       this.shapes = new Map();
+      this.swimmers = [];
+      this.hulls = [];
       this.reserve(this.shapeEnd);
     }
     if (this.grid.obstacles && this.mask !== this.grid.obstacles) {
@@ -93,27 +95,32 @@ class PackedGrid {
     this.shapes.set(hull, ptr);
     return ptr;
   }
-  put(index, swimmer, intent, avoid) {
-    const hull = this.shape(swimmer.hull);
-    const pose = this.poseOffset / 8 + index * 5;
-    const fish = swimmer.fish, doubles = this.doubles;
-    doubles[pose] = fish.x;
-    doubles[pose + 1] = fish.y;
-    doubles[pose + 2] = fish.facing;
+  put(index, swimmer, intent, avoid, previous) {
+    const fish = swimmer.fish, pose = this.poseOffset / 8 + index * 5;
+    const input = this.inputOffset / 8 + index * 5, word = input * 2;
+    if (!previous || this.swimmers[index] !== swimmer || this.hulls[index] !== swimmer.hull) {
+      const hull = this.shape(swimmer.hull);
+      this.swimmers[index] = swimmer;
+      this.hulls[index] = swimmer.hull;
+      this.doubles[input] = swimmer.speedX;
+      this.doubles[input + 1] = swimmer.speedY;
+      this.words[word + 4] = swimmer.slot;
+      this.words[word + 5] = hull;
+    }
+    const doubles = this.doubles;
+    if (!previous || previous[swimmer.ordinal] !== index + 1) {
+      doubles[pose] = fish.x;
+      doubles[pose + 1] = fish.y;
+      doubles[pose + 2] = fish.facing;
+    }
     doubles[pose + 3] = fish.cx || 0;
     doubles[pose + 4] = fish.cy || 0;
-    const input = this.inputOffset / 8 + index * 5;
-    doubles[input] = swimmer.speedX;
-    doubles[input + 1] = swimmer.speedY;
-    const word = input * 2;
-    this.words[word + 4] = swimmer.slot;
-    this.words[word + 5] = hull;
     this.words[word + 6] = intent.dx;
     this.words[word + 7] = intent.dy;
     this.words[word + 8] = avoid;
   }
-  advance(count, dt) {
+  advance(count, dt, start = 0) {
     this.program.swim(count, this.ownersOffset, this.maskOffset, WORLD_WIDTH, MAX_FLOOR,
-      this.poseOffset, this.inputOffset, this.trailsOffset, dt);
+      this.poseOffset + start * poseBytes, this.inputOffset + start * inputBytes, this.trailsOffset + start * 4, dt);
   }
 }

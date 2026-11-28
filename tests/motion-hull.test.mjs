@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { World, key } from '../www/engine.js';
+import { lifeContext } from '../www/life.js';
 import { motionOrder, writeBreedingRecord } from '../www/breeding.js';
 import { BodyLayout, compileHull, fitsHullAt, sweepsHullAt } from '../www/motion-hull.js';
 import { MovementGrid } from '../www/movement-grid.js';
@@ -72,6 +73,42 @@ test('游动意向跨过饥饿与换相边界，投食、改时和丢弃缓存�
     assert.deepEqual(JSON.parse(JSON.stringify(worker.world.data)), JSON.parse(JSON.stringify(reference.data)), '第 ' + step + ' 步');
   }
   assert(planned);
+});
+
+test('可转移的泳姿、独立观察与后续鱼位修正使用各自正确的鱼行', () => {
+  const at = Date.UTC(2025, 5, 15, 12), reference = makeFishWorld(World, 24, 1000, { now: at });
+  const ids = Object.keys(reference.data.fishes);
+  const worker = new WorkerSimulation();
+  worker.receive({ kind: 'open', values: reference.serialize(), tables: [], ambient: true });
+  worker.receive({ kind: 'ready' });
+  const observe = w => lifeContext(w, w.data.tick, w.sceneryMap(), w.fishGroups()).points;
+  const positions = points => [...points].map(([id, p]) => [id, p.x, p.y]);
+  let retained, original;
+  for (let step = 0; step < 7; step++) {
+    for (const w of [reference, worker.world]) {
+      const fish = w.data.fishes[ids[3]];
+      if (step === 1) { fish.cx = 0.3; fish.cy = 0.7; }
+      if (step === 2) { fish.x += 0.25; fish.facing *= -1; }
+      if (step === 3) { fish.x = Math.round(fish.x); fish.lastFed = w.data.tick; }
+      if (step === 4) {
+        delete w.data.fishes[ids[1]];
+        delete w.data.chars[ids[1] + ':0'];
+        delete w.data.chars[ids[1] + ':1'];
+      }
+      if (step === 5) w.data.fishes[ids[6]] = { ...w.data.fishes[ids[6]], x: 973 };
+    }
+    const base = reference.data.tick;
+    reference.step(base + 500);
+    const reply = worker.receive({ kind: 'step', base, names: [], foods: [] });
+    const wire = reply.patch.tables.fishes.motion;
+    assert(wire?.length);
+    wire.fill(999);
+    structuredClone(wire, { transfer: [wire.buffer] });
+    assert.deepEqual(positions(observe(worker.world)), positions(observe(reference)), '鱼体中心第 ' + step + ' 步');
+    assert.deepEqual(JSON.parse(JSON.stringify(worker.world.data)), JSON.parse(JSON.stringify(reference.data)), '生态第 ' + step + ' 步');
+    if (step === 0) { retained = observe(worker.world); original = positions(retained); }
+    assert.deepEqual(positions(retained), original);
+  }
 });
 
 test('亲鱼跨海界平移、转身、被分开或恢复旧小数位置，联合鱼体始终与重新摆放相同', () => {

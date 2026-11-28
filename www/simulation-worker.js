@@ -467,19 +467,26 @@ function trackWorld() {
   }
   // Ordinary fish publish their motion directly in the wire format. Later
   // feeding, death or repairs can still supersede that row in the same step.
-  let swimming;
+  let swimming, swimColumns;
+  function currentSwimColumns() {
+    return swimColumns?.revision === poseRevision ? swimColumns : undefined;
+  }
   function readDays(id, ordinal) {
     const record = raw(source.travel[id]);
     if (record) return daysByOrdinal[ordinal] = raw(record.days);
   }
   function beginSwimBatch() {
     const count = knownFish.size;
+    swimColumns = undefined;
     return { motion: new Float64Array(count * 5), poses: [], travel: [], distances: new Float64Array(count),
       poseIndex: new Int32Array(count), tripIndex: new Int32Array(count), daysByOrdinal, readDays };
   }
-  function completeSwimBatch(frame, day) {
+  function completeSwimBatch(frame, day, packed) {
     if (frame.poses.length) {
       poseRevision++;
+      // Edit compaction and delivery may overwrite or detach the wire buffer.
+      // The grid still owns the complete ordered result until the next movement.
+      if (packed) swimColumns = { revision: poseRevision, grid: packed, index: frame.poseIndex };
       tableChanges('fishes');
     }
     if (frame.travel.length) {
@@ -602,6 +609,7 @@ function trackWorld() {
     swimOrdinal: id => knownFish.get(id),
     beginSwimBatch,
     completeSwimBatch,
+    currentSwimColumns,
     recordMovement(id, distance, now, day) {
       if (!Number.isFinite(distance) || distance <= 0 || !source.fishes[id]) return;
       day ??= shanghaiDay(now);
@@ -808,6 +816,7 @@ export class WorkerSimulation {
       this.world.setFoodMotion = this.tracker.setFoodMotion;
       this.world.swimOrdinal = this.tracker.swimOrdinal;
       this.world.beginSwimBatch = this.tracker.beginSwimBatch;
+      this.world.currentSwimColumns = this.tracker.currentSwimColumns;
       this.world.completeSwimBatch = this.tracker.completeSwimBatch;
       this.world.recordMovement = this.tracker.recordMovement;
       // Index the checkpoint's existing bodies while loading it. Building
