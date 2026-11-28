@@ -166,14 +166,20 @@ export class SimulationClient {
     }
     await this.request({ kind: 'open', values, tables, ambient: world.ambient });
     if (!valid() || this.worker !== worker) return false;
-    let rows = [];
+    // Gather the next page while the worker installs the previous one. A single
+    // outstanding acknowledgement preserves cancellation and message ordering.
+    let rows = [], prior, slice = performance.now();
     for (const row of initialRows(world)) {
       if (row) rows.push(row);
-      if (row && rows.length < 256) continue;
-      await this.request({ kind: 'rows', rows });
+      if (rows.length < 1024 && (row && rows.length % 64 || performance.now() - slice < 2)) continue;
+      if (prior) await prior;
       if (!valid() || this.worker !== worker) return false;
+      prior = this.request({ kind: 'rows', rows });
       rows = [];
+      slice = performance.now();
     }
+    if (prior) await prior;
+    if (!valid() || this.worker !== worker) return false;
     if (rows.length) await this.request({ kind: 'rows', rows });
     if (!valid() || this.worker !== worker) return false;
     await this.request({ kind: 'ready' });

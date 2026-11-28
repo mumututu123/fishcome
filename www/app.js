@@ -259,11 +259,11 @@ async function archiveWorld(now = Date.now()) {
     const plan = await archivePlanAsync(target.data, now, { pressure, dependencies });
     if (!canArchive()) return;
     const hasNewRecords = Object.values(plan).some(table => Object.keys(table).length);
-    const session = ordered.current;
     const chunks = hasNewRecords ? await archiveChunks(plan, target.data.roots) : [];
     if (!canArchive()) return;
     if (chunks.length) await putMany(chunks.map(chunk => ['archive:' + chunk.manifest.id, chunk.encoded]), { generation: await saveGeneration });
     if (!canArchive()) return;
+    const session = ordered.current;
     if (session && await ordered.whenJoined(session)) {
       const boundary = { version: 1, at: now, chunks: Object.fromEntries(chunks.map(({ manifest }) => [manifest.id, manifest])) };
       if (await ordered.proposeArchive(boundary)) return;
